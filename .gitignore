@@ -1,0 +1,6 @@
+/target/
+/dist/
+tests/hw/.venv/
+tests/hw/reports/
+tests/hw/__pycache__/
+tests/hw/helpers/__pycache__/

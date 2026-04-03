@@ -1,0 +1,17 @@
+[package]
+name = "pico2hsm-integration-tests"
+version = "0.1.0"
+edition = "2021"
+description = "Integration test harness for pico2hsm"
+license = "MIT"
+
+[dependencies]
+pico2hsm-core = { path = "../../pico2hsm-core" }
+
+[[test]]
+name = "apdu_parsing"
+path = "tests/apdu_parsing.rs"
+
+[[test]]
+name = "key_types"
+path = "tests/key_types.rs"

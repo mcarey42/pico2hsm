@@ -1,0 +1,119 @@
+[package]
+name = "pico2hsm-firmware"
+version = "0.1.0"
+edition = "2021"
+description = "pico2hsm HSM firmware for Raspberry Pi RP2350/RP2354"
+license = "MIT"
+
+[lib]
+name = "pico2hsm_firmware"
+# lib target for unit testing without hardware
+test = true
+
+[[bin]]
+name = "pico2hsm"
+path = "src/main.rs"
+test = false
+
+[features]
+default = ["rp2350_one_4m"]
+rp2350_one_4m = []
+rp2350_one_16m = []
+rp2350_geek_16m = []
+rp2350_geek_sdcard = []
+rp2350_geek_sdcard_dual = []
+rp2354_embedded = []
+pico2_4m = []
+rsa = ["dep:rsa", "dep:embedded-alloc"]  # RSA support — adds ~1MB to binary; disabled by default
+debug = []         # Debug mode: enables memory dump APDUs, disables secure boot enforcement
+
+# ─── Platform-agnostic dependencies ──────────────────────────────────────────
+# All of these compile on both x86_64 (for tests) and thumbv8m.main-none-eabihf
+[dependencies]
+pico2hsm-core = { path = "../pico2hsm-core" }
+
+# Utilities (no_std compatible)
+heapless = { version = "0.9", features = ["zeroize"] }
+
+# Security primitives
+zeroize = { version = "1.7", default-features = false, features = ["zeroize_derive"] }
+subtle = { version = "2.5", default-features = false }
+
+# Hash / integrity
+blake2 = { version = "0.10", default-features = false }
+crc32fast = { version = "1.4", default-features = false }
+sha2 = { version = "0.10", default-features = false }
+sha1 = { version = "0.10", default-features = false }
+
+# Symmetric ciphers — use stable RustCrypto 0.x (not RC versions)
+aes = { version = "0.8", default-features = false }
+ctr = { version = "0.9", default-features = false }
+aes-gcm = { version = "0.10", default-features = false, features = ["aes"] }
+cmac = { version = "0.7", default-features = false }
+cbc = { version = "0.1", default-features = false, features = ["block-padding"] }
+chacha20poly1305 = { version = "0.10", default-features = false }
+cipher = { version = "0.4", default-features = false, features = ["block-padding"] }
+
+# Key derivation
+hkdf = { version = "0.12", default-features = false }
+pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
+hmac = { version = "0.12", default-features = false }
+
+# Elliptic curves
+p256 = { version = "0.13", default-features = false, features = ["ecdsa", "ecdh", "arithmetic", "sha256"] }
+p384 = { version = "0.13", default-features = false, features = ["ecdsa", "ecdh", "arithmetic", "sha384"] }
+p521 = { version = "0.13", default-features = false, features = ["ecdsa", "ecdh", "arithmetic", "sha512"] }
+k256 = { version = "0.13", default-features = false, features = ["ecdsa", "ecdh", "arithmetic", "sha256"] }
+
+# ECC trait crates — versions match those re-exported by p256/p384/p521/k256
+ecdsa = { version = "0.16", default-features = false, features = ["hazmat", "der"] }
+elliptic-curve = { version = "0.13", default-features = false, features = ["arithmetic", "sec1", "ecdh"] }
+rand_core = { version = "0.6", default-features = false }
+
+# RSA — feature-gated because it adds ~1MB to the binary
+rsa = { version = "0.9", default-features = false, optional = true }
+
+# Heap allocator for RSA big-integer arithmetic (no_std compatible)
+embedded-alloc = { version = "0.6", optional = true }
+
+# ─── ARM / bare-metal only dependencies ──────────────────────────────────────
+# These are only compiled when targeting thumbv8m.main-none-eabihf (or any arm
+# target). They are NOT available during `cargo test --target x86_64-...`.
+# Modules that import from these crates must be gated with
+# `#[cfg(target_arch = "arm")]`.
+[target.'cfg(target_arch = "arm")'.dependencies]
+
+# Embassy async runtime for Cortex-M / RP2350
+embassy-rp = { version = "0.10", features = ["rp235xa", "unstable-pac", "time-driver", "defmt", "imagedef-none"] }
+embassy-executor = { version = "0.10", features = ["platform-cortex-m", "executor-thread"] }
+static_cell = { version = "2", default-features = false }
+
+embassy-usb = { version = "0.6" }
+embassy-futures = { version = "0.1" }
+embassy-sync = { version = "0.8" }
+embassy-time = { version = "0.5" }
+embassy-embedded-hal = { version = "0.6" }
+
+# Hardware abstraction
+embedded-hal = { version = "1.0" }
+embedded-hal-async = { version = "1.0" }
+embedded-sdmmc = { version = "0.9" }
+
+# Logging / diagnostics
+defmt = { version = "0.3" }
+defmt-rtt = { version = "0.4" }
+
+# ARM Cortex-M runtime
+cortex-m = { version = "0.7", features = ["critical-section-single-core"] }
+cortex-m-rt = { version = "0.7" }
+panic-probe = { version = "0.3", features = ["print-defmt"] }
+
+# Noise Protocol Framework (DKEK exchange — not yet used on x86_64 tests)
+snow = { version = "0.10", default-features = false }
+
+[dev-dependencies]
+hex = { version = "0.4" }
+heapless = { version = "0.9" }
+rand_core = { version = "0.6" }
+
+[build-dependencies]

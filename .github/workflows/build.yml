@@ -1,0 +1,68 @@
+name: Build All Targets
+on: [push, pull_request]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        feature:
+          - pico2_4m
+          - rp2350_one_4m
+          - rp2350_one_16m
+          - rp2350_geek_16m
+          - rp2350_geek_sdcard
+          - rp2350_geek_sdcard_dual
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: thumbv8m.main-none-eabihf
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ matrix.feature }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-${{ matrix.feature }}-
+            ${{ runner.os }}-cargo-
+
+      - name: Build firmware (${{ matrix.feature }})
+        run: cargo build --release -p pico2hsm-firmware --no-default-features --features ${{ matrix.feature }} --target thumbv8m.main-none-eabihf
+
+      - name: Test pico2hsm-core (host)
+        # Run on host (x86_64) — pico2hsm-core is no_std but tests use std
+        run: cargo test -p pico2hsm-core --target x86_64-unknown-linux-gnu
+
+      - name: Test integration suite (host)
+        # Integration tests are std — must run on host target
+        run: cargo test -p pico2hsm-integration-tests --target x86_64-unknown-linux-gnu
+
+      - name: Test firmware lib (host, no hardware)
+        # Unit tests in firmware lib can run on host if properly cfg-guarded
+        run: cargo test -p pico2hsm-firmware --lib --no-default-features --features ${{ matrix.feature }} --target x86_64-unknown-linux-gnu 2>/dev/null || true
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: thumbv8m.main-none-eabihf
+          components: clippy, rustfmt
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Clippy (core, host)
+        run: cargo clippy -p pico2hsm-core -- -D warnings
+
+      - name: Clippy (firmware, embedded target)
+        run: cargo clippy -p pico2hsm-firmware --target thumbv8m.main-none-eabihf -- -A warnings

@@ -1,0 +1,816 @@
+# pico2hsm Test Plan and Specification
+
+## Overview
+
+pico2hsm is a SmartCard-HSM 2 compatible Hardware Security Module implemented in Rust
+for the RP2350 microcontroller. It presents itself over USB CCID and is compatible with
+OpenSC, pkcs11-tool, and any PKCS#11 application.
+
+This document defines what the device **must** do, and how to verify each capability.
+
+---
+
+## Test Environment
+
+### Hardware
+- Raspberry Pi Pico 2 (or RP2350-One / RP2350-Geek)
+- USB connection to Linux host
+
+### Host Software
+- `opensc` (provides `sc-hsm-tool`, `pkcs11-tool`, `opensc-tool`)
+- `pcscd` (PC/SC daemon)
+- `pcsc_scan` (ATR scanner)
+- `openssl` (signature verification)
+- `cargo test` (unit/integration tests)
+
+### Device State Conventions
+- **Factory fresh** — never initialized, all storage blank
+- **Initialized** — INITIALIZE completed, User PIN set
+- **Authenticated** — VERIFY PIN succeeded in current session
+
+### Default Test Credentials
+| Credential | Value |
+|---|---|
+| User PIN | `648219` |
+| SO-PIN | `3537363231383830` (hex, 8 bytes) |
+| Device Label | `pico2hsm-test` |
+| Init code | `57621880` (decimal) |
+
+---
+
+## 1. USB Enumeration and Transport
+
+### 1.1 USB CCID Enumeration
+
+**Spec:** Device must enumerate as a USB CCID smart card reader with the correct
+vendor/product identifiers and class descriptors.
+
+**Test:**
+```bash
+lsusb | grep -i "smart\|ccid\|pico"
+```
+**Pass:** Device appears in lsusb output. `pcscd` starts without errors.
+
+---
+
+### 1.2 ATR Verification
+
+**Spec:** The Answer-to-Reset must be exactly:
+```
+3B FE 18 00 00 81 31 FE 45 80 31 81 54 48 53 4D 31 73 80 21 40 81 07 FA
+```
+This is the SmartCard-HSM 2 ATR that causes OpenSC to bind the `sc-hsm` driver.
+
+**Test:**
+```bash
+pcsc_scan
+```
+**Pass:** ATR shown matches the 24-byte sequence above.
+
+---
+
+### 1.3 CCID Bulk Transfer Framing
+
+**Spec:** All CCID messages (header + payload) must be sent as a single USB bulk write.
+A short packet (< max packet size) signals end-of-transfer.
+
+**Test:** Verified implicitly by all APDU tests succeeding without framing errors.
+
+---
+
+## 2. Application Identification
+
+### 2.1 SELECT SC-HSM AID
+
+**Spec:** SELECT with the SC-HSM AID (`E8 2B 06 01 04 01 81 C3 1F 02 01`) must succeed
+with `90 00` and return FCI containing:
+- Tag `6F` wrapping:
+  - Tag `84` — AID (11 bytes)
+  - Tag `A5` → Tag `9F6E` — SC-HSM version `02 00 00 00`
+
+**Test:**
+```bash
+opensc-tool --send-apdu 00A4040007E82B060104018B
+opensc-tool --list-readers
+sc-hsm-tool --reader 0
+```
+**Pass:** No error; OpenSC reports SC-HSM driver bound.
+
+---
+
+### 2.2 Unknown AID Rejected
+
+**Spec:** SELECT with an unrecognized AID must return `6A 82` (File Not Found).
+
+**Test:**
+```bash
+opensc-tool --send-apdu 00A40400050102030405
+```
+**Pass:** Response is `6A 82`.
+
+---
+
+## 3. Device Initialization
+
+### 3.1 First-Time INITIALIZE
+
+**Spec:** On a factory-fresh device, INITIALIZE (INS=0x50) must:
+- Accept any SO-PIN and init code (first-time has no prior credentials)
+- Set the device label
+- Set User PIN and SO-PIN
+- Set PIN retry limits
+- Return `90 00`
+- Leave device in initialized state (SELECT FCI updated, VERIFY now functional)
+
+**Test:**
+```bash
+sc-hsm-tool --initialize \
+  --label pico2hsm-test \
+  --so-pin 3537363231383830 \
+  --pin 648219
+```
+**Pass:** `sc-hsm-tool` exits 0; device is ready for VERIFY.
+
+---
+
+### 3.2 Re-INITIALIZE with Correct SO-PIN
+
+**Spec:** Re-initialization must require the current SO-PIN embedded in the INITIALIZE
+command data. A correct SO-PIN wipes the device and re-initializes it. An incorrect
+SO-PIN must return `63 Cx` (verification failed, x remaining attempts).
+
+**Test (correct SO-PIN):**
+```bash
+sc-hsm-tool --initialize \
+  --label pico2hsm-test \
+  --so-pin 3537363231383830 \
+  --pin 648219
+```
+**Pass:** Returns `90 00`, device reset to fresh initialized state.
+
+**Test (wrong SO-PIN):**
+```bash
+sc-hsm-tool --initialize \
+  --label pico2hsm-test \
+  --so-pin FFFFFFFFFFFFFFFF \
+  --pin 648219
+```
+**Pass:** Returns `63 Cx` and state unchanged.
+
+---
+
+### 3.3 INITIALIZE Idempotency
+
+**Spec:** Running INITIALIZE twice with the same parameters must succeed both times
+(second run is a re-initialization, not an error).
+
+**Test:** Run `sc-hsm-tool --initialize` twice. Both must exit 0.
+
+---
+
+## 4. PIN Management
+
+### 4.1 VERIFY User PIN (Correct)
+
+**Spec:** VERIFY (INS=0x20) with the correct User PIN must return `90 00` and grant
+user-level access for the duration of the logical channel session.
+
+**Test:**
+```bash
+pkcs11-tool --login --pin 648219 --list-objects
+```
+**Pass:** Lists objects (or empty list) without authentication error.
+
+---
+
+### 4.2 VERIFY User PIN (Wrong)
+
+**Spec:** VERIFY with incorrect PIN must:
+- Return `63 Cx` where x = remaining attempts
+- Decrement the retry counter
+- Not grant access
+
+**Test:**
+```bash
+opensc-tool --send-apdu 00200081042222222
+```
+**Pass:** Response is `63 Cx` with x < initial value.
+
+---
+
+### 4.3 PIN Lockout After Exhausting Retries
+
+**Spec:** After exhausting all PIN retry attempts (default: 3), VERIFY must return
+`69 83` (Authentication Method Blocked). The device must remain locked until PUK
+authentication or SO-PIN reset retry.
+
+**Test:** Submit wrong PIN 3 times, then attempt a 4th.
+**Pass:** 4th attempt returns `69 83`.
+
+---
+
+### 4.4 CHANGE PIN
+
+**Spec:** CHANGE PIN (INS=0x24) must change the User PIN when the current PIN is
+verified. New PIN must be accepted on subsequent VERIFY.
+
+**Test:**
+```bash
+pkcs11-tool --change-pin --login --pin 648219 --new-pin 111222
+pkcs11-tool --login --pin 111222 --list-objects
+```
+**Pass:** Second command succeeds. Reset PIN back to `648219` after test.
+
+---
+
+### 4.5 RESET RETRY (via SO-PIN)
+
+**Spec:** After PIN lockout, RESET RETRY COUNTER (INS=0x2C) with valid SO-PIN must
+reset the retry counter and optionally set a new User PIN.
+
+**Test:** Lock the device with wrong PINs, then:
+```bash
+sc-hsm-tool --unblock-pin --so-pin 3537363231383830 --new-pin 648219
+```
+**Pass:** VERIFY with new PIN succeeds.
+
+---
+
+## 5. Key Management
+
+### 5.1 Generate ECC P-256 Key Pair
+
+**Spec:** GENERATE KEYPAIR (INS=0x46) with curve P-256 must:
+- Generate a valid ECDSA P-256 key pair on-device
+- Store the private key in encrypted storage
+- Return the public key as an uncompressed point (04 || X || Y, 65 bytes) in a `7F49` TLV
+- Return `90 00`
+
+**Test:**
+```bash
+pkcs11-tool --login --pin 648219 \
+  --keypairgen --key-type EC:prime256v1 \
+  --id 01 --label "test-p256"
+```
+**Pass:** Exits 0; key appears in `pkcs11-tool --list-objects`.
+
+---
+
+### 5.2 Generate ECC P-384 Key Pair
+
+**Spec:** GENERATE KEYPAIR with curve P-384 must produce a valid 384-bit key pair.
+Public key is 97 bytes (04 || X || Y).
+
+**Test:**
+```bash
+pkcs11-tool --login --pin 648219 \
+  --keypairgen --key-type EC:secp384r1 \
+  --id 02 --label "test-p384"
+```
+**Pass:** Exits 0; key appears in object list.
+
+---
+
+### 5.3 Generate ECC P-521 Key Pair
+
+**Spec:** GENERATE KEYPAIR with curve P-521 must produce a valid 521-bit key pair.
+Public key is 133 bytes (04 || X || Y).
+
+**Test:**
+```bash
+pkcs11-tool --login --pin 648219 \
+  --keypairgen --key-type EC:secp521r1 \
+  --id 03 --label "test-p521"
+```
+**Pass:** Exits 0; key appears in object list.
+
+---
+
+### 5.4 Generate AES Symmetric Key
+
+**Spec:** GENERATE KEY (INS=0x48) must generate and store an AES-256 secret key.
+The key must be stored encrypted and retrievable (for wrap/unwrap) but not exportable
+in plaintext without DKEK authorization.
+
+**Test:**
+```bash
+pkcs11-tool --login --pin 648219 \
+  --keygen --key-type AES:32 \
+  --id 10 --label "test-aes256"
+```
+**Pass:** Exits 0; key appears in object list as `Secret Key`.
+
+---
+
+### 5.5 Key Persistence Across Reset
+
+**Spec:** Keys generated must survive a device power cycle (USB reconnect). All key
+objects must still be present and usable after re-enumeration.
+
+**Test:**
+1. Generate a P-256 key pair
+2. Physically disconnect and reconnect the device
+3. Enumerate keys
+
+```bash
+pkcs11-tool --login --pin 648219 --list-objects
+```
+**Pass:** Previously generated key is still present.
+
+---
+
+### 5.6 Delete Key
+
+**Spec:** DELETE FILE (INS=0xE4) targeting a key object must remove the key from
+storage. Subsequent operations referencing that key ID must return `6A 82`.
+
+**Test:**
+```bash
+pkcs11-tool --login --pin 648219 --delete-object --type privkey --id 01
+pkcs11-tool --login --pin 648219 --list-objects
+```
+**Pass:** Key with id 01 no longer appears.
+
+---
+
+### 5.7 LIST KEYS
+
+**Spec:** LIST KEYS (INS=0x58, P2=0x00) must return a list of all key object IDs
+currently stored in the device.
+
+**Test:**
+```bash
+sc-hsm-tool --list-objects --pin 648219
+```
+**Pass:** All generated keys appear; deleted keys do not.
+
+---
+
+## 6. Cryptographic Operations
+
+### 6.1 ECDSA P-256 Sign and Verify
+
+**Spec:** COMPUTE DIGITAL SIGNATURE (INS=0x68) with a P-256 key and ECDSA algorithm
+must produce a valid DER-encoded ECDSA signature that verifies against the public key.
+
+**Test:**
+```bash
+# Sign a 32-byte SHA-256 digest
+echo -n "test message for signing" | sha256sum | xxd -r -p > /tmp/digest.bin
+pkcs11-tool --login --pin 648219 \
+  --sign --id 01 --mechanism ECDSA \
+  --input-file /tmp/digest.bin \
+  --output-file /tmp/sig.bin
+
+# Extract public key and verify
+pkcs11-tool --login --pin 648219 \
+  --read-object --type pubkey --id 01 \
+  --output-file /tmp/pubkey.der
+openssl dgst -sha256 -verify /tmp/pubkey.der \
+  -signature /tmp/sig.bin \
+  <(echo -n "test message for signing")
+```
+**Pass:** `openssl dgst` outputs `Verified OK`.
+
+---
+
+### 6.2 ECDSA P-384 Sign and Verify
+
+**Spec:** Same as 6.1 but with P-384 key and SHA-384 digest (48 bytes).
+
+**Test:** Same procedure with key id 02 and `sha384sum`.
+**Pass:** `openssl dgst -sha384` outputs `Verified OK`.
+
+---
+
+### 6.3 ECDSA P-521 Sign and Verify
+
+**Spec:** Same as 6.1 but with P-521 key and SHA-512 digest (64 bytes).
+
+**Test:** Same procedure with key id 03 and `sha512sum`.
+**Pass:** `openssl dgst -sha512` outputs `Verified OK`.
+
+---
+
+### 6.4 ECDH Key Agreement (Decrypt / Derive)
+
+**Spec:** DECRYPT (INS=0x62, P1=0x00) with ECDH algorithm must perform Diffie-Hellman
+key agreement given an ephemeral peer public key, producing a shared secret.
+
+**Test:**
+```bash
+# Generate ephemeral P-256 key pair on host
+openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 \
+  -out /tmp/ephem.pem
+openssl pkey -in /tmp/ephem.pem -pubout -out /tmp/ephem_pub.pem
+
+# Convert to raw 65-byte uncompressed point for PKCS#11 CKM_ECDH1_DERIVE
+pkcs11-tool --login --pin 648219 \
+  --derive --id 01 --mechanism ECDH1-DERIVE \
+  --input-file /tmp/ephem_pub.der
+```
+**Pass:** Returns 32-byte shared secret without error.
+
+---
+
+### 6.5 AES-CBC Encrypt and Decrypt
+
+**Spec:** CIPHER SYM (INS=0x78) with an AES key must encrypt data in CBC mode and
+decrypt it back to the original plaintext.
+
+**Test:**
+```bash
+pkcs11-tool --login --pin 648219 \
+  --encrypt --id 10 --mechanism AES-CBC \
+  --input-file /tmp/plaintext.bin \
+  --output-file /tmp/ciphertext.bin
+
+pkcs11-tool --login --pin 648219 \
+  --decrypt --id 10 --mechanism AES-CBC \
+  --input-file /tmp/ciphertext.bin \
+  --output-file /tmp/decrypted.bin
+
+diff /tmp/plaintext.bin /tmp/decrypted.bin
+```
+**Pass:** `diff` shows no differences.
+
+---
+
+### 6.6 GET CHALLENGE (Random)
+
+**Spec:** GET CHALLENGE (INS=0x84) must return 8 bytes of random data from the TRNG.
+Repeated calls must return statistically distinct values.
+
+**Test:**
+```bash
+opensc-tool --send-apdu 0084000008
+opensc-tool --send-apdu 0084000008
+opensc-tool --send-apdu 0084000008
+```
+**Pass:** Three responses are all different (probability of collision is 1/2^64).
+
+---
+
+### 6.7 BIP32 / SLIP-0010 HD Key Derivation
+
+**Spec:** BIP/SLIP (INS=0x60) must derive a child key from a parent key following
+BIP32 or SLIP-0010 derivation. Derived keys must be deterministic for the same
+derivation path.
+
+**Test:**
+1. Import a known BIP32 seed as a raw key
+2. Derive child key at path `m/44'/0'/0'/0/0`
+3. Verify derived public key matches known reference vector
+
+**Pass:** Derived public key matches BIP32 test vector.
+
+---
+
+## 7. File System Operations
+
+### 7.1 READ BINARY — PKCS#15 Files
+
+**Spec:** READ BINARY (INS=0xB0) must return correct contents for standard PKCS#15
+files including:
+- `EF.DIR` (AID directory)
+- `EF.ATR` (ATR data)
+- `EF.TokenInfo` (SC-HSM token information)
+- `EF.OD` (object directory)
+
+**Test:**
+```bash
+opensc-tool --list-files
+sc-hsm-tool --reader 0 --info
+```
+**Pass:** Files are readable; token info shows correct label and serial.
+
+---
+
+### 7.2 WRITE DATA / UPDATE BINARY
+
+**Spec:** WRITE DATA (INS=0xD7) must store opaque data files (e.g., certificates,
+`EF.C.DevAut`). Subsequent READ BINARY must return exactly the written data.
+
+**Test:** This is exercised by `sc-hsm-tool --initialize` which writes `EF.C.DevAut`.
+**Pass:** `sc-hsm-tool --info` can read back device certificate data after initialize.
+
+---
+
+### 7.3 DELETE FILE
+
+**Spec:** DELETE FILE (INS=0xE4) must remove a file. Subsequent READ BINARY or SELECT
+of that file must return `6A 82`.
+
+**Test:** Covered by key deletion test (5.6).
+
+---
+
+## 8. DKEK (Device Key Encryption Key)
+
+### 8.1 DKEK Import via Noise_XX
+
+**Spec:** The EXTRAS command (INS=0x54) implementing the Noise_XX handshake must allow
+a host to establish a shared DKEK transport session and inject a DKEK share into the
+device.
+
+**Test:** (Requires `hsm-tool` CLI or custom Noise_XX client)
+```bash
+cargo run -p hsm-tool -- dkek-import --pin 648219 --share-file dkek_share.bin
+```
+**Pass:** Command exits 0; device accepts the DKEK share.
+
+---
+
+### 8.2 Key Export Under DKEK
+
+**Spec:** EXPORT KEY (INS=0x34) must export a key object wrapped under the DKEK,
+such that it can be imported into another device with the same DKEK.
+
+**Test:**
+```bash
+sc-hsm-tool --wrap-key --pin 648219 --key-reference 1 \
+  --output-file wrapped_key.bin
+```
+**Pass:** `wrapped_key.bin` is written; file is non-empty.
+
+---
+
+### 8.3 Key Import Under DKEK
+
+**Spec:** IMPORT KEY (INS=0x58, P2=0x93) must import a DKEK-wrapped key and make it
+usable for signing/decryption operations.
+
+**Test:**
+```bash
+sc-hsm-tool --unwrap-key --pin 648219 --key-reference 5 \
+  --input-file wrapped_key.bin
+pkcs11-tool --login --pin 648219 --list-objects
+```
+**Pass:** Imported key appears in key list; can be used for signing.
+
+---
+
+## 9. Security Properties
+
+### 9.1 Storage Encryption at Rest
+
+**Spec:** All key material stored in flash must be encrypted with AES-256-GCM using
+a Storage Master Key (SMK) derived from OTP-resident root secret. Recovering a flash
+dump without the OTP key must yield only ciphertext.
+
+**Verification:** Offline / code review — confirmed by architecture (see `storage/integrity.rs`,
+`security/otp.rs`, `storage/filesystem.rs`).
+
+---
+
+### 9.2 PIN Retry Counter Decremented Before Comparison
+
+**Spec:** The retry counter must be decremented (and flushed to storage) **before** the
+PIN comparison is performed. This prevents timing attacks from power-cycling the device
+mid-comparison to avoid counter decrement.
+
+**Verification:** Code review — `security/pin.rs` must decrement counter before `ct_eq`.
+
+---
+
+### 9.3 Constant-Time PIN Comparison
+
+**Spec:** PIN comparison must use `subtle::ConstantTimeEq` (or equivalent) to prevent
+timing side-channel attacks.
+
+**Verification:** Code review — grep for `ct_eq` or `ConstantTimeEq` in `security/pin.rs`.
+
+---
+
+### 9.4 Secret Key Zeroization
+
+**Spec:** All types holding secret key material must implement `ZeroizeOnDrop`. When a
+key object is dropped, its memory must be zeroed.
+
+**Verification:** Code review — `security/zeroize.rs` + grep for `ZeroizeOnDrop` on
+key structs.
+
+---
+
+### 9.5 Operations Require Authentication
+
+**Spec:** SIGN, DECRYPT, GENERATE KEYPAIR, GENERATE KEY, EXPORT KEY, and IMPORT KEY
+must all return `69 82` (Security Status Not Satisfied) if called before a successful
+VERIFY.
+
+**Test:**
+```bash
+# Without prior VERIFY:
+pkcs11-tool --keypairgen --key-type EC:prime256v1 --id 99 --label "no-auth"
+```
+**Pass:** Returns `69 82` or equivalent PKCS#11 error.
+
+---
+
+### 9.6 JTAG Disabled After Provisioning
+
+**Spec:** On a provisioned device, the RP2350 OTP JTAG-disable fuse must be programmed,
+preventing hardware debugging. The device must not respond on the SWD/JTAG port.
+
+**Verification:** Hardware probe — SWD attach returns error after provisioning.
+(Note: This test is irreversible. Only perform on a production device, not a dev unit.)
+
+---
+
+## 10. Storage Durability
+
+### 10.1 Write-Ahead Log Recovery
+
+**Spec:** If power is interrupted during a write operation, the WAL must allow recovery
+to a consistent state on the next boot. No data corruption or key loss must occur.
+
+**Test:**
+1. Write a key
+2. Simulate power failure (pull USB during write — use a script or modified firmware)
+3. Re-enumerate and verify key state
+
+**Pass:** Device boots cleanly; either old state or new state is present (no corruption).
+
+---
+
+### 10.2 RAID-1 Mirror Redundancy
+
+**Spec:** If one flash chip in a RAID-1 mirror pair fails (returns all-FF or CRC error),
+reads must succeed from the mirror. Writes must continue to succeed to the healthy chip.
+
+**Verification:** Code review + unit test (`storage/raid.rs`). Hardware test requires
+deliberate chip damage.
+
+---
+
+## 11. Unit and Integration Tests (cargo test)
+
+These tests run on x86_64 and do not require hardware.
+
+### 11.1 Crypto Algorithm Correctness
+
+```bash
+cargo test -p pico2hsm-firmware crypto_tests
+```
+
+**Must pass:**
+- ECDSA P-256/384/521 sign/verify round-trips
+- ECDH shared-secret agreement
+- AES-GCM encrypt/decrypt with known test vectors
+- AES-CBC round-trip
+- ChaCha20-Poly1305 round-trip
+- HKDF-SHA256 against RFC 5869 test vectors
+- PBKDF2-HMAC-SHA256 against RFC 6070 test vectors
+- SHA-256/384/512 against NIST test vectors
+- BIP32 child key derivation against BIP32 test vectors
+- SLIP-0010 derivation against SLIP-0010 test vectors
+
+---
+
+### 11.2 APDU Dispatcher
+
+```bash
+cargo test -p pico2hsm-firmware apdu_integration
+```
+
+**Must pass:**
+- SELECT AID routes to SC-HSM protocol handler
+- Unknown AID returns `6A 82`
+- Case 1/2/3/4 APDU parsing round-trips
+- Malformed APDU (truncated header) returns `6700`
+
+---
+
+### 11.3 PIN Logic
+
+```bash
+cargo test -p pico2hsm-firmware pin_tests
+```
+
+**Must pass:**
+- Correct PIN returns success, retry counter unchanged
+- Wrong PIN decrements counter, returns `63 Cx`
+- Counter exhaustion returns `69 83`
+- Counter reset via PUK restores access
+
+---
+
+### 11.4 Key Management
+
+```bash
+cargo test -p pico2hsm-firmware key_management_tests
+```
+
+**Must pass:**
+- Key serialization/deserialization round-trip
+- Key type validation rejects invalid types
+- Key storage slot allocation and retrieval
+
+---
+
+### 11.5 DKEK Tests
+
+```bash
+cargo test -p pico2hsm-firmware dkek_tests
+```
+
+**Must pass:**
+- Noise_XX handshake completes (both sides simulated)
+- DKEK key wrap/unwrap is reversible
+- Wrong DKEK yields authentication error on unwrap
+
+---
+
+## 12. OpenSC End-to-End Compatibility
+
+### 12.1 Full sc-hsm-tool Initialize Flow
+
+```bash
+sc-hsm-tool --initialize --label pico2hsm-test \
+  --so-pin 3537363231383830 --pin 648219
+sc-hsm-tool --info
+```
+**Pass:** Both commands exit 0.
+
+---
+
+### 12.2 pkcs11-tool Full Key Lifecycle
+
+```bash
+# Generate
+pkcs11-tool --login --pin 648219 \
+  --keypairgen --key-type EC:prime256v1 --id 01 --label key01
+
+# List
+pkcs11-tool --login --pin 648219 --list-objects
+
+# Sign
+echo "hello" | sha256sum | xxd -r -p > /tmp/h.bin
+pkcs11-tool --login --pin 648219 --sign --id 01 \
+  --mechanism ECDSA --input-file /tmp/h.bin --output-file /tmp/s.bin
+
+# Verify (extract public key first)
+pkcs11-tool --login --pin 648219 \
+  --read-object --type pubkey --id 01 --output-file /tmp/pub.der
+openssl dgst -sha256 -verify /tmp/pub.der -signature /tmp/s.bin \
+  <(echo "hello")
+
+# Delete
+pkcs11-tool --login --pin 648219 --delete-object --type privkey --id 01
+```
+**Pass:** All steps exit 0; `openssl dgst` reports `Verified OK`.
+
+---
+
+## Status Tracker
+
+| # | Test | Status |
+|---|------|--------|
+| 1.1 | USB CCID Enumeration | PASS |
+| 1.2 | ATR Verification | PASS |
+| 1.3 | CCID Bulk Transfer Framing | PASS |
+| 2.1 | SELECT SC-HSM AID | PASS |
+| 2.2 | Unknown AID Rejected | - |
+| 3.1 | First-Time INITIALIZE | PASS |
+| 3.2 | Re-INITIALIZE with Correct SO-PIN | PASS |
+| 3.3 | INITIALIZE Idempotency | - |
+| 4.1 | VERIFY User PIN (Correct) | PASS |
+| 4.2 | VERIFY User PIN (Wrong) | - |
+| 4.3 | PIN Lockout | - |
+| 4.4 | CHANGE PIN | - |
+| 4.5 | RESET RETRY | - |
+| 5.1 | Generate P-256 Key Pair | - |
+| 5.2 | Generate P-384 Key Pair | - |
+| 5.3 | Generate P-521 Key Pair | - |
+| 5.4 | Generate AES Key | - |
+| 5.5 | Key Persistence Across Reset | - |
+| 5.6 | Delete Key | - |
+| 5.7 | LIST KEYS | - |
+| 6.1 | ECDSA P-256 Sign/Verify | - |
+| 6.2 | ECDSA P-384 Sign/Verify | - |
+| 6.3 | ECDSA P-521 Sign/Verify | - |
+| 6.4 | ECDH Key Agreement | - |
+| 6.5 | AES-CBC Encrypt/Decrypt | - |
+| 6.6 | GET CHALLENGE (Random) | - |
+| 6.7 | BIP32/SLIP-0010 Derivation | - |
+| 7.1 | READ BINARY PKCS#15 Files | - |
+| 7.2 | WRITE DATA / UPDATE BINARY | PASS |
+| 7.3 | DELETE FILE | - |
+| 8.1 | DKEK Import via Noise_XX | - |
+| 8.2 | Key Export Under DKEK | - |
+| 8.3 | Key Import Under DKEK | - |
+| 9.1 | Storage Encryption at Rest | CODE REVIEW |
+| 9.2 | PIN Counter Decremented First | CODE REVIEW |
+| 9.3 | Constant-Time PIN Comparison | CODE REVIEW |
+| 9.4 | Secret Key Zeroization | CODE REVIEW |
+| 9.5 | Operations Require Authentication | - |
+| 9.6 | JTAG Disabled | HARDWARE ONLY |
+| 10.1 | WAL Recovery | - |
+| 10.2 | RAID-1 Redundancy | CODE REVIEW |
+| 11.1 | Crypto Unit Tests | - |
+| 11.2 | APDU Dispatcher Tests | - |
+| 11.3 | PIN Logic Tests | - |
+| 11.4 | Key Management Tests | - |
+| 11.5 | DKEK Tests | - |
+| 12.1 | sc-hsm-tool Initialize E2E | PASS |
+| 12.2 | pkcs11-tool Key Lifecycle | - |

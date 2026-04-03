@@ -1,0 +1,18 @@
+[package]
+name = "pico2hsm-core"
+version = "0.1.0"
+edition = "2021"
+description = "Shared no_std types and traits for pico2hsm"
+license = "MIT"
+
+[features]
+default = []
+# Enable std for host-side tooling
+std = []
+
+[dependencies]
+heapless = { version = "0.9", default-features = false, features = ["zeroize"] }
+subtle = { version = "2.5", default-features = false }
+zeroize = { version = "1.7", default-features = false, features = ["zeroize_derive"] }
+
+[dev-dependencies]
