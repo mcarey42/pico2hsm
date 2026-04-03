@@ -46,7 +46,80 @@ pub fn handle(state: &mut ScHsmState, cmd: &ApduCommand<'_>) -> ApduResponse {
         return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED);
     }
 
-    // Only ECDSA algorithms are supported.
+    // ---- RSA signing (feature-gated) ----------------------------------------
+    // RSA algorithm codes (from OpenSC card-sc-hsm.h):
+    //   0x20 = ALGO_RSA_RAW     — input is already PKCS#1-padded (256 B); raw RSA op
+    //   0x31 = ALGO_RSA_PKCS1_SHA256, 0x32 = SHA384, 0x33 = SHA512
+    //   0x34 = RSA-PSS SHA-256 (internal), 0x40 = ALGO_RSA_PSS — pre-hashed (32 B)
+    // For 0x20 the host has already applied padding; the card performs c = m^d mod n.
+    // For 0x40 the host sends the SHA-256 digest; the card applies PSS and signs.
+    #[cfg(feature = "rsa")]
+    match algo {
+        0x20 | 0x31 | 0x32 | 0x33 | 0x34 | 0x40 => {
+            use crate::crypto::asymmetric::{HashAlgorithm, rsa_private_raw, rsa_sign_pkcs1v15, rsa_sign_pss};
+
+            // Look up the RSA key
+            let rsa_key = match state.rsa_keys.iter().find(|k| k.key_id == key_id) {
+                Some(k) => k,
+                None => return ApduResponse::err(SW_FILE_NOT_FOUND),
+            };
+
+            // Copy private key DER to a local stack buffer to release the borrow on state.
+            // RSA-2048 PKCS#1 DER is ≤1200 bytes.
+            let mut der_buf = [0u8; 1200];
+            let der_len = rsa_key.private_key_der.len();
+            let key_type = rsa_key.key_type;
+            der_buf[..der_len].copy_from_slice(&rsa_key.private_key_der);
+
+            let sig = match algo {
+                0x20 => {
+                    // ALGO_RSA_RAW: OpenSC pre-padded the data (PKCS#1 v1.5 block, 256 B).
+                    // Card performs raw RSA private key op: sig = input^d mod n.
+                    match rsa_private_raw(&der_buf[..der_len], cmd.data) {
+                        Ok(s) => s,
+                        Err(_) => return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
+                    }
+                }
+                0x34 | 0x40 => {
+                    // RSA-PSS: data is pre-hashed (32 bytes SHA-256). Card applies PSS + signs.
+                    match rsa_sign_pss(
+                        key_type,
+                        &der_buf[..der_len],
+                        cmd.data,
+                        HashAlgorithm::Sha256,
+                        32,
+                        &mut FwRng,
+                    ) {
+                        Ok(s) => s,
+                        Err(_) => return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
+                    }
+                }
+                _ => {
+                    let hash_algo = match algo {
+                        0x31 => HashAlgorithm::Sha256,
+                        0x32 => HashAlgorithm::Sha384,
+                        0x33 => HashAlgorithm::Sha512,
+                        _    => return ApduResponse::err(SW_INS_NOT_SUPPORTED),
+                    };
+                    match rsa_sign_pkcs1v15(
+                        key_type,
+                        &der_buf[..der_len],
+                        cmd.data,
+                        hash_algo,
+                        &mut FwRng,
+                    ) {
+                        Ok(s) => s,
+                        Err(_) => return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
+                    }
+                }
+            };
+
+            return ApduResponse::ok(&sig);
+        }
+        _ => {}
+    }
+
+    // ---- ECDSA path ---------------------------------------------------------
     // 0x13/0x15/0x17/0x19/0x70 = pre-hashed path: command data is already the digest.
     // 0x71–0x75 = card-hash path (OpenSC SC-HSM ALGO_EC_SHA* codes): command data
     //             is the raw message; the card must compute the hash before signing.

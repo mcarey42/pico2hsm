@@ -71,12 +71,42 @@ pub fn handle(state: &mut ScHsmState, cmd: &ApduCommand<'_>) -> ApduResponse {
         return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED);
     }
 
-    // Look up the key first — needed whether or not the algo byte is explicit.
+    // ---- RSA decryption (feature-gated) — checked BEFORE EC key lookup ------
+    // 0x21 = ALGO_RSA_DECRYPT: OpenSC sends ciphertext; card returns c^d mod n
+    //        (raw, no padding removal). OpenSC strips PKCS#1v1.5 or OAEP in software.
+    //        OpenSC uses P2=0x21 for BOTH CKM_RSA_PKCS and CKM_RSA_PKCS_OAEP.
+    // 0x22 = ALGO_RSA_OAEP (used by some OpenSC versions): same raw op.
+    #[cfg(feature = "rsa")]
+    match algo {
+        0x21 | 0x22 => {
+            use crate::crypto::asymmetric::rsa_private_raw;
+
+            let rsa_key = match state.rsa_keys.iter().find(|k| k.key_id == key_id) {
+                Some(k) => k,
+                None => return ApduResponse::err(SW_FILE_NOT_FOUND),
+            };
+
+            let mut der_buf = [0u8; 1200];
+            let der_len = rsa_key.private_key_der.len();
+            der_buf[..der_len].copy_from_slice(&rsa_key.private_key_der);
+
+            // Raw RSA: result = ciphertext^d mod n. OpenSC handles all unpadding.
+            return match rsa_private_raw(&der_buf[..der_len], cmd.data) {
+                Ok(p) => ApduResponse::ok(&p),
+                Err(_) => ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
+            };
+        }
+        _ => {}
+    }
+
+    // ---- ECDH path — EC key lookup ------------------------------------------
+    // Look up the EC key. RSA keys (handled above) never reach here.
     let key = match state.keys.iter().find(|k| k.key_id == key_id) {
         Some(k) => k,
         None => return ApduResponse::err(SW_FILE_NOT_FOUND),
     };
 
+    // ---- ECDH path ----------------------------------------------------------
     // Resolve the key type:
     // - If the algo byte maps to an explicit ECDH algorithm (0x23/0x25/0x27/0x29),
     //   validate it matches the stored key.

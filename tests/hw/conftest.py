@@ -60,6 +60,20 @@ KEY_SLOTS: list[dict] = [
     },
 ]
 
+# RSA key slot definitions (used by RSA-specific test modules).
+RSA_KEY_SLOTS: list[dict] = [
+    {
+        "name":        "rsa2048",
+        "key_size":    2048,
+        "key_id":      "10",   # slot 0x0A — after EC slots 01-04
+        "mechanism_pkcs": "SHA256-RSA-PKCS",
+        "mechanism_pss":  "SHA256-RSA-PKCS-PSS",
+        "mechanism_enc":  "RSA-PKCS",
+        "hash":        "sha256",
+        "sig_len":     256,    # RSA-2048 signature = 256 bytes
+    },
+]
+
 
 # ---------------------------------------------------------------------------
 # Session-scoped fixtures
@@ -246,6 +260,105 @@ def provisioned_keys(
         results[name] = {
             "generated": True,
             "pub_pem":   pub_pem,
+            "keygen_trace": keygen,
+        }
+        log.info("  %s: generated=True  pub_pem=%s", name, "OK" if pub_pem else "MISSING")
+
+    return results
+
+
+@pytest.fixture(scope="session")
+def provisioned_rsa_keys(
+    initialized_device,  # noqa: ARG001 – ensures init ran first
+    runner: CLIRunner,
+    config: dict,
+    run_dir: Path,
+) -> dict[str, dict]:
+    """Generate RSA key pairs on the device.
+
+    Returns a dict keyed by slot name:
+        {
+            "rsa2048": {
+                "generated": True,
+                "pub_pem": "-----BEGIN PUBLIC KEY-----\\n...",
+                "keygen_trace": CLIResult,
+            },
+            ...
+        }
+    """
+    import warnings as _warnings
+
+    results: dict[str, dict] = {}
+
+    for slot in RSA_KEY_SLOTS:
+        name     = slot["name"]
+        key_size = slot["key_size"]
+        key_id   = slot["key_id"]
+        save_key = f"06_rsa_keygen_{name}"
+
+        log.info("Generating %s key (id=%s)...", name, key_id)
+
+        keygen = runner.pkcs11_tool(
+            "--login",
+            "--pin",         config["pin"],
+            "--keypairgen",
+            "--key-type",    f"RSA:{key_size}",
+            "--id",          key_id,
+            "--label",       name,
+            save_as=save_key,
+        )
+
+        if keygen.returncode != 0:
+            _warnings.warn(
+                f"RSA key generation FAILED for {name} (id={key_id}): "
+                f"rc={keygen.returncode}\n{keygen.stderr}",
+                stacklevel=1,
+            )
+            results[name] = {"generated": False, "pub_pem": None, "keygen_trace": keygen}
+            continue
+
+        # Export the public key
+        pub_pem: str | None = None
+        pubkey_der_path = run_dir / f"pubkey_{name}.der"
+        export = runner.pkcs11_tool(
+            "--login",
+            "--pin",          config["pin"],
+            "--read-object",
+            "--type",         "pubkey",
+            "--id",           key_id,
+            "--output-file",  str(pubkey_der_path),
+            save_as=f"06_rsa_pubkey_{name}",
+        )
+
+        if export.returncode == 0 and pubkey_der_path.exists():
+            raw = pubkey_der_path.read_bytes()
+            try:
+                pub_key = serialization.load_der_public_key(raw, backend=default_backend())
+                pub_pem = pub_key.public_bytes(
+                    encoding=serialization.Encoding.PEM,
+                    format=serialization.PublicFormat.SubjectPublicKeyInfo,
+                ).decode("ascii")
+            except Exception:
+                raw_text = raw.decode("ascii", errors="replace")
+                if "-----BEGIN PUBLIC KEY-----" in raw_text:
+                    pub_pem = raw_text
+                else:
+                    _warnings.warn(
+                        f"Could not parse RSA public key for {name}: {raw[:80]!r}",
+                        stacklevel=1,
+                    )
+
+        exchanges = trace.parse_apdu_trace(keygen.stderr)
+        trace.save_json_trace(
+            run_dir / f"06_rsa_keygen_{name}.json",
+            f"rsa_keygen_{name}",
+            keygen,
+            exchanges,
+        )
+
+        results[name] = {
+            "generated":    True,
+            "pub_pem":      pub_pem,
             "keygen_trace": keygen,
         }
         log.info("  %s: generated=True  pub_pem=%s", name, "OK" if pub_pem else "MISSING")

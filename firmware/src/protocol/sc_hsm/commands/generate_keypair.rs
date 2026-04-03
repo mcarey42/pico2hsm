@@ -370,6 +370,17 @@ fn algo_from_order_tag(data: &[u8]) -> Option<u8> {
                 0x42 => return Some(0x17), // P-521
                 _ => {}
             },
+            // Tag 0x02 with a 2-byte length field = RSA modulusSize (bits).
+            // OpenSC encodes the requested key size as `02 02 <hi> <lo>` inside
+            // the 7F49 public-key template when the CPI (5F29) byte is 0x00.
+            0x02 if i + 3 < data.len() && data[i + 1] == 0x02 => {
+                let bits = ((data[i + 2] as u16) << 8) | (data[i + 3] as u16);
+                match bits {
+                    0x0800 => return Some(0x05), // RSA-2048
+                    0x1000 => return Some(0x07), // RSA-4096
+                    _ => {}
+                }
+            }
             _ => {}
         }
         i += 1;
@@ -383,9 +394,19 @@ fn algo_to_key_type(algo: u8) -> Option<CoreKeyType> {
         0x13 | 0x23 => Some(CoreKeyType::EcPrivateP256), // ECDSA/ECDH P-256
         0x15 | 0x25 => Some(CoreKeyType::EcPrivateP384), // ECDSA/ECDH P-384
         0x17 | 0x27 => Some(CoreKeyType::EcPrivateP521), // ECDSA/ECDH P-521
-        0x19 | 0x29 => Some(CoreKeyType::EcPrivateK256),   // ECDSA/ECDH K-256
+        0x19 | 0x29 => Some(CoreKeyType::EcPrivateK256), // ECDSA/ECDH K-256
+        #[cfg(feature = "rsa")]
+        0x05 => Some(CoreKeyType::RsaPrivate2048), // RSA-2048
+        #[cfg(feature = "rsa")]
+        0x07 => Some(CoreKeyType::RsaPrivate4096), // RSA-4096
         _ => None,
     }
+}
+
+/// Returns true when `key_type` is an RSA type.
+#[allow(dead_code)]
+fn is_rsa_key_type(kt: CoreKeyType) -> bool {
+    matches!(kt, CoreKeyType::RsaPrivate2048 | CoreKeyType::RsaPrivate4096)
 }
 
 /// Number of bytes needed to DER-encode a length value.
@@ -573,6 +594,108 @@ fn build_gakp_cvc(algo: u8, pub_key: &[u8]) -> Option<heapless::Vec<u8, 2048>> {
     Some(buf)
 }
 
+/// Build a Card Verifiable Certificate response for RSA GENERATE KEY PAIR.
+///
+/// The 7F49 public-key block mirrors the EC CVC structure: it starts with the
+/// algorithm OID (tag 0x06), then the RSA modulus (tag 0x81) and public
+/// exponent (tag 0x82).  OpenSC's `sc_pkcs15emu_sc_hsm_decode_cvc` requires
+/// the OID to identify the key type; without it the decoder returns
+/// SC_ERROR_ASN1_OBJECT_NOT_FOUND (-1402) and the keygen fails.
+///
+/// Structure (identical outer wrapper to the EC CVC):
+/// ```text
+/// 67 LL
+///   7F21 LL
+///     7F4E LL
+///       5F29 01 00
+///       7F49 LL
+///         06 LL algo_oid    -- RSA algorithm OID (echoed from request)
+///         81 LL modulus     -- RSA modulus n (big-endian)
+///         82 LL exponent    -- RSA public exponent e (big-endian)
+///       5F20 LL CHR
+///     5F37 LL sig           -- dummy zeros (modulus-length)
+///   42 LL outerCAR
+///   5F37 01 00
+/// ```
+#[cfg(feature = "rsa")]
+fn build_rsa_gakp_cvc(
+    modulus: &[u8],
+    exponent: &[u8],
+    sig_len: usize,
+    algo_oid: &[u8],
+) -> Option<heapless::Vec<u8, 2048>> {
+    let chr: &[u8] = b"UTDV00001";
+
+    // 7F49 content: 06 LL OID + 81 LL modulus + 82 LL exponent
+    let oid_field = 1 + der_len_size(algo_oid.len()) + algo_oid.len();
+    let mod_field = 1 + der_len_size(modulus.len()) + modulus.len();
+    let exp_field = 1 + der_len_size(exponent.len()) + exponent.len();
+    let pk49_content = oid_field + mod_field + exp_field;
+
+    // Certificate Body content
+    let cpi_field = 4usize;                                             // 5F29 01 00
+    let chr_field = 2 + der_len_size(chr.len()) + chr.len();           // 5F20 CHR
+    let pk49_total = 2 + der_len_size(pk49_content) + pk49_content;    // 7F49 TLV
+    let body_content = cpi_field + pk49_total + chr_field;
+
+    let sig_field = 2 + der_len_size(sig_len) + sig_len;               // 5F37 inner sig
+    let body_total = 2 + der_len_size(body_content) + body_content;    // 7F4E TLV
+    let inner_cvc_content = body_total + sig_field;
+    let inner_cvc_total = 2 + der_len_size(inner_cvc_content) + inner_cvc_content; // 7F21
+    let outer_car_field = 1 + 1 + 9usize;                              // 42 09 "DESE00001"
+    let outer_sig_field = 2 + 1 + 1usize;                              // 5F37 01 00
+    let wrapper_content = inner_cvc_total + outer_car_field + outer_sig_field;
+
+    let mut buf: heapless::Vec<u8, 2048> = heapless::Vec::new();
+
+    // 67 LL
+    let _ = buf.push(0x67);
+    push_der_len(&mut buf, wrapper_content);
+
+    // 7F21 LL
+    push_app_hdr(&mut buf, 0x7F, 0x21, inner_cvc_content);
+
+    // 7F4E LL
+    push_app_hdr(&mut buf, 0x7F, 0x4E, body_content);
+
+    // 5F29 01 00
+    let _ = buf.extend_from_slice(&[0x5F, 0x29, 0x01, 0x00]);
+
+    // 7F49 LL
+    push_app_hdr(&mut buf, 0x7F, 0x49, pk49_content);
+
+    // 06 LL algo_oid (RSA algorithm OID, required by OpenSC CVC decoder)
+    let _ = buf.push(0x06);
+    push_der_len(&mut buf, algo_oid.len());
+    let _ = buf.extend_from_slice(algo_oid);
+
+    // 81 LL modulus
+    push_ctx_tlv(&mut buf, 0x81, modulus);
+
+    // 82 LL exponent
+    push_ctx_tlv(&mut buf, 0x82, exponent);
+
+    // 5F20 LL CHR
+    let _ = buf.extend_from_slice(&[0x5F, 0x20]);
+    push_der_len(&mut buf, chr.len());
+    let _ = buf.extend_from_slice(chr);
+
+    // 5F37 LL zeros (dummy inner signature, sig_len = modulus_len)
+    let _ = buf.extend_from_slice(&[0x5F, 0x37]);
+    push_der_len(&mut buf, sig_len);
+    for _ in 0..sig_len {
+        let _ = buf.push(0x00);
+    }
+
+    // 42 09 "DESE00001"
+    push_ctx_tlv(&mut buf, 0x42, b"DESE00001");
+
+    // 5F37 01 00 (dummy outer signature)
+    let _ = buf.extend_from_slice(&[0x5F, 0x37, 0x01, 0x00]);
+
+    Some(buf)
+}
+
 /// Handle a GENERATE KEY PAIR APDU command.
 pub fn handle(state: &mut ScHsmState, cmd: &ApduCommand<'_>) -> ApduResponse {
     // Require PIN authentication
@@ -588,7 +711,15 @@ pub fn handle(state: &mut ScHsmState, cmd: &ApduCommand<'_>) -> ApduResponse {
         cmd.p1
     } else {
         let mut id = 0u8;
-        while id < 0xFF && state.keys.iter().any(|k| k.key_id == id) {
+        while id < 0xFF && (
+            state.keys.iter().any(|k| k.key_id == id)
+            || {
+                #[cfg(feature = "rsa")]
+                { state.rsa_keys.iter().any(|k| k.key_id == id) }
+                #[cfg(not(feature = "rsa"))]
+                { false }
+            }
+        ) {
             id = id.wrapping_add(1);
         }
         if id == 0xFF {
@@ -621,6 +752,58 @@ pub fn handle(state: &mut ScHsmState, cmd: &ApduCommand<'_>) -> ApduResponse {
         Some(kt) => kt,
         None => return ApduResponse::err(SW_INS_NOT_SUPPORTED),
     };
+
+    // ---- RSA key generation (feature-gated) ---------------------------------
+    #[cfg(feature = "rsa")]
+    if is_rsa_key_type(key_type) {
+        use crate::protocol::sc_hsm::RsaInMemoryKey;
+
+        // Extract the RSA algorithm OID from the incoming 7F49 block so we can
+        // echo it back in the response CVC.  OpenSC's sc_pkcs15emu_sc_hsm_decode_cvc
+        // requires a tag-0x06 OID inside 7F49 to recognise the key type.
+        // Fallback: id-TA-RSA-v1-5-SHA-256 (0.4.0.127.0.7.2.2.2.1.2)
+        const RSA_V15_SHA256_OID: &[u8] = &[0x04, 0x00, 0x7F, 0x00, 0x07, 0x02, 0x02, 0x02, 0x01, 0x02];
+        let rsa_oid: &[u8] = find_tlv_2(cmd.data, 0x7F, 0x49)
+            .and_then(|pk49| find_tlv(pk49, 0x06))
+            .unwrap_or(RSA_V15_SHA256_OID);
+
+        let pair = match crate::crypto::asymmetric::generate_rsa_keypair(key_type, &mut FwRng) {
+            Ok(p) => p,
+            Err(_) => return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
+        };
+
+        // Dummy RSA signature length = modulus length
+        let sig_len = pair.modulus.len(); // 256 for RSA-2048
+
+        // Build CVC with RSA public key (OID + modulus + exponent)
+        let cvc = match build_rsa_gakp_cvc(&pair.modulus, &pair.exponent, sig_len, rsa_oid) {
+            Some(c) => c,
+            None => return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
+        };
+
+        // Store RSA key (replacing any existing entry with the same key_id)
+        state.rsa_keys.retain(|k| k.key_id != key_id);
+
+        let mut entry = RsaInMemoryKey {
+            key_id,
+            key_type,
+            algo,
+            private_key_der: heapless::Vec::new(),
+            modulus: heapless::Vec::new(),
+            exponent: heapless::Vec::new(),
+        };
+        let _ = entry.private_key_der.extend_from_slice(&pair.private_key_der);
+        let _ = entry.modulus.extend_from_slice(&pair.modulus);
+        let _ = entry.exponent.extend_from_slice(&pair.exponent);
+
+        if state.rsa_keys.push(entry).is_err() {
+            return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED);
+        }
+
+        return ApduResponse::ok(&cvc);
+    }
+
+    // ---- EC key generation --------------------------------------------------
 
     // Generate the key pair using the firmware RNG
     let pair = match crate::crypto::asymmetric::generate_ec_keypair(key_type, &mut FwRng) {

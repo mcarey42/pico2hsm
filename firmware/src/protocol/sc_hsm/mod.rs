@@ -37,8 +37,12 @@ pub const MAX_PIN_LEN: usize = 16;
 /// Maximum SO-PIN length in bytes.
 pub const MAX_SO_PIN_LEN: usize = 16;
 
-/// Maximum number of in-memory key slots.
+/// Maximum number of in-memory EC key slots.
 pub const MAX_IN_MEMORY_KEYS: usize = 16;
+
+/// Maximum number of in-memory RSA key slots (feature-gated).
+#[cfg(feature = "rsa")]
+pub const MAX_RSA_IN_MEMORY_KEYS: usize = 4;
 
 /// Maximum number of EF (elementary file) entries stored in RAM.
 pub const MAX_EF_FILES: usize = 16;
@@ -54,6 +58,27 @@ pub struct EfEntry {
     pub file_id: u16,
     /// Raw file contents.
     pub data: heapless::Vec<u8, MAX_EF_DATA>,
+}
+
+/// An in-memory (volatile) RSA key slot.
+///
+/// Separate from `InMemoryKey` because RSA private keys are ~1200 bytes
+/// (PKCS#1 DER for RSA-2048) — too large to fit in `InMemoryKey.private_key`
+/// which is sized for the largest EC key (66 bytes for P-521).
+#[cfg(feature = "rsa")]
+pub struct RsaInMemoryKey {
+    /// SC-HSM key identifier (0x01–0xFE).
+    pub key_id: u8,
+    /// Key type: `RsaPrivate2048` or `RsaPrivate4096`.
+    pub key_type: CoreKeyType,
+    /// SC-HSM AlgorithmId byte used during keygen (e.g. 0x05 = RSA-2048).
+    pub algo: u8,
+    /// PKCS#1 DER-encoded `RSAPrivateKey` (≤1200 bytes for RSA-2048).
+    pub private_key_der: heapless::Vec<u8, 1200>,
+    /// Raw RSA modulus, big-endian (256 bytes for RSA-2048).
+    pub modulus: heapless::Vec<u8, 256>,
+    /// Raw RSA public exponent, big-endian (3 bytes for e=65537).
+    pub exponent: heapless::Vec<u8, 4>,
 }
 
 /// An in-memory (volatile) key slot.
@@ -174,8 +199,11 @@ pub struct ScHsmState {
     /// Stored SO-PIN hash (SHA-256, 32 bytes). None if not set.
     pub so_pin_hash: Option<[u8; 32]>,
 
-    /// In-memory (volatile) key store. Cleared on INITIALIZE.
+    /// In-memory (volatile) EC key store. Cleared on INITIALIZE.
     pub keys: heapless::Vec<InMemoryKey, MAX_IN_MEMORY_KEYS>,
+    /// In-memory (volatile) RSA key store. Cleared on INITIALIZE.
+    #[cfg(feature = "rsa")]
+    pub rsa_keys: heapless::Vec<RsaInMemoryKey, MAX_RSA_IN_MEMORY_KEYS>,
     /// In-memory (volatile) EF store (written via WRITE DATA INS=0xD7).
     pub ef_files: heapless::Vec<EfEntry, MAX_EF_FILES>,
 
@@ -206,6 +234,8 @@ impl ScHsmState {
             user_pin_hash: None,
             so_pin_hash: None,
             keys: heapless::Vec::new(),
+            #[cfg(feature = "rsa")]
+            rsa_keys: heapless::Vec::new(),
             ef_files: heapless::Vec::new(),
             write_target_file: None,
         }

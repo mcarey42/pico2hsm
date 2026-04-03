@@ -42,8 +42,8 @@ subtle = { version = "2.5", default-features = false }
 # Hash / integrity
 blake2 = { version = "0.10", default-features = false }
 crc32fast = { version = "1.4", default-features = false }
-sha2 = { version = "0.10", default-features = false }
-sha1 = { version = "0.10", default-features = false }
+sha2 = { version = "0.10", default-features = false, features = ["oid"] }
+sha1 = { version = "0.10", default-features = false, features = ["oid"] }
 
 # Symmetric ciphers — use stable RustCrypto 0.x (not RC versions)
 aes = { version = "0.8", default-features = false }
@@ -71,7 +71,7 @@ elliptic-curve = { version = "0.13", default-features = false, features = ["arit
 rand_core = { version = "0.6", default-features = false }
 
 # RSA — feature-gated because it adds ~1MB to the binary
-rsa = { version = "0.9", default-features = false, optional = true }
+rsa = { version = "0.9", default-features = false, features = ["hazmat"], optional = true }
 
 # Heap allocator for RSA big-integer arithmetic (no_std compatible)
 embedded-alloc = { version = "0.6", optional = true }

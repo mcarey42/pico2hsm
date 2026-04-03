@@ -28,12 +28,19 @@
 use embedded_alloc::LlffHeap as Heap;
 
 /// Global allocator instance — empty until `init()` is called.
-#[cfg(feature = "rsa")]
+///
+/// Only registered as the global allocator on ARM targets. On x86_64 (host
+/// tests), the std allocator is used and registering a second one would fail.
+#[cfg(all(feature = "rsa", target_arch = "arm"))]
 #[global_allocator]
 static HEAP: Heap = Heap::empty();
 
-/// Guard that prevents double-initialization.
-#[cfg(feature = "rsa")]
+/// Dummy instance used on non-ARM (test) targets so that `init()` compiles.
+#[cfg(all(feature = "rsa", not(target_arch = "arm")))]
+static HEAP: Heap = Heap::empty();
+
+/// Guard that prevents double-initialization (ARM only; no-op on host).
+#[cfg(all(feature = "rsa", target_arch = "arm"))]
 static HEAP_INITIALIZED: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
@@ -43,9 +50,12 @@ static HEAP_INITIALIZED: core::sync::atomic::AtomicBool =
 /// Safe to call multiple times — only the first call initializes the heap;
 /// subsequent calls return immediately.
 ///
+/// On non-ARM (x86_64 host test) targets this is a no-op because the std
+/// allocator is already available.
+///
 /// # Panics
 /// Does not panic. All unsafe operations are bounded by the static array.
-#[cfg(feature = "rsa")]
+#[cfg(all(feature = "rsa", target_arch = "arm"))]
 pub fn init() {
     use core::sync::atomic::Ordering;
 
@@ -73,10 +83,12 @@ pub fn init() {
     }
 }
 
+/// No-op on non-ARM hosts: std provides the global allocator.
+#[cfg(all(feature = "rsa", not(target_arch = "arm")))]
+pub fn init() {}
+
 /// No-op stub when the `rsa` feature is disabled.
 ///
 /// Allows callers to always call `allocator::init()` without feature guards.
 #[cfg(not(feature = "rsa"))]
-pub fn init() {
-    // No heap needed without RSA.
-}
+pub fn init() {}

@@ -138,6 +138,8 @@ pub fn handle(state: &mut ScHsmState, cmd: &ApduCommand<'_>) -> ApduResponse {
 
     state.initialized = true;
     state.keys.clear();
+    #[cfg(feature = "rsa")]
+    state.rsa_keys.clear();
     state.ef_files.clear();
 
     // Slot 0 is reserved for the device authentication key on SC-HSM.

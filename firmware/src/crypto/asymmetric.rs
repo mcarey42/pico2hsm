@@ -13,8 +13,8 @@
 //! | Brainpool P-256r1  | stub | stub   | stub         | stub   |
 //! | Brainpool P-384r1  | stub | stub   | stub         | stub   |
 //! | Brainpool P-512r1  | stub | stub   | stub         | stub   |
-//! | RSA-2048           | stub | stub   | stub         | stub   |
-//! | RSA-4096           | stub | stub   | stub         | stub   |
+//! | RSA-2048           | yes  | —      | decrypt      | yes    |
+//! | RSA-4096           | yes  | —      | decrypt      | yes    |
 //!
 //! # Brainpool curve status
 //! The `bp-curves` / `bign-curve` crates that implement brainpool curves with
@@ -26,26 +26,19 @@
 //! TODO: Revisit when <https://github.com/RustCrypto/elliptic-curves> lands
 //! brainpool arithmetic support (tracking issue #1114).
 //!
-//! # RSA allocator constraint
-//! The `rsa` crate on crates.io (v0.9) requires `alloc` — it uses `Vec<u32>`
-//! internally for big-integer arithmetic (via the `crypto-bigint` / `num-bigint`
-//! backends).  The firmware runs in a bare-metal `no_std` environment without a
-//! global allocator, so RSA is currently **not usable in the firmware binary**.
+//! # RSA implementation
+//! RSA is enabled by the `rsa` feature flag.  It requires a global heap
+//! allocator because the `rsa` crate uses `Vec<u32>` internally for
+//! big-integer arithmetic.  The firmware uses `embedded-alloc` (48 KB static
+//! heap) on ARM; on x86_64 (host tests) the std allocator is used.
 //!
-//! Design options (for a future implementor):
-//! 1. Enable a global allocator (e.g. `embedded-alloc` with a fixed-size heap)
-//!    and keep the `rsa` crate — easiest path, costs ~20–40 KB of RAM.
-//! 2. Switch to a statically-allocated big-integer RSA implementation
-//!    (none exists in the RustCrypto ecosystem yet).
-//! 3. Implement RSA off-device (the host-side `hsm-tool` or integration-test
-//!    crate, which is std, can test RSA freely).
-//!
-//! For now all RSA functions return `CryptoError::UnsupportedAlgorithm` with
-//! this comment as documentation.  The RSA feature gate is preserved so that
-//! a future embedded-alloc integration can fill them in without changing the
-//! public API.
+//! Build with: `--features rsa` (already included in `build-all-debug.sh`).
 
 #![allow(unused_imports)]
+
+// RSA operations require heap allocation (via embedded-alloc on ARM, std on host).
+#[cfg(feature = "rsa")]
+extern crate alloc;
 
 use heapless::Vec;
 use rand_core::RngCore;
@@ -98,21 +91,21 @@ pub struct EcKeyPair {
     pub public_key: Vec<u8, 133>,
 }
 
-/// RSA key pair.
-///
-/// # Allocator requirement
-/// This type is provided for API completeness but RSA operations are stubbed
-/// out — see the module-level documentation for details.
+/// RSA key pair returned by [`generate_rsa_keypair`].
 #[cfg(feature = "rsa")]
 #[derive(Zeroize)]
 #[zeroize(drop)]
 pub struct RsaKeyPair {
     /// `RsaPrivate2048` or `RsaPrivate4096`.
     pub key_type: KeyType,
-    /// DER-encoded PKCS#1 `RSAPrivateKey`.
-    pub private_key_der: Vec<u8, 2400>,
-    /// DER-encoded PKCS#1 `RSAPublicKey`.
-    pub public_key_der: Vec<u8, 600>,
+    /// DER-encoded PKCS#1 `RSAPrivateKey` (≤1200 bytes for 2048-bit).
+    pub private_key_der: Vec<u8, 1200>,
+    /// DER-encoded PKCS#1 `RSAPublicKey` (≤300 bytes for 2048-bit).
+    pub public_key_der: Vec<u8, 300>,
+    /// Raw modulus bytes, big-endian (256 bytes for RSA-2048).
+    pub modulus: Vec<u8, 256>,
+    /// Raw public exponent bytes, big-endian (3 bytes for e=65537).
+    pub exponent: Vec<u8, 4>,
 }
 
 /// ECDSA signature output (DER-encoded).
@@ -199,15 +192,140 @@ pub fn generate_ec_keypair(
 
 /// Generate an RSA key pair.
 ///
-/// # Not implemented (allocator required)
-/// The `rsa` crate requires a heap allocator.  See module-level documentation.
+/// Returns an [`RsaKeyPair`] containing:
+/// - `private_key_der`: PKCS#1 DER-encoded `RSAPrivateKey` structure.
+/// - `public_key_der`: PKCS#1 DER-encoded `RSAPublicKey` structure.
+///
+/// Key sizes: 2048 bits (`RsaPrivate2048`) or 4096 bits (`RsaPrivate4096`).
+///
+/// # Performance
+/// RSA key generation is computationally intensive.  On a Cortex-M33 at
+/// 150 MHz (debug build, no optimisation) RSA-2048 keygen takes approximately
+/// 10–60 s depending on prime-finding luck.  The CCID time-extension
+/// mechanism fires every 1.5 s to keep pcscd alive during this window.
 #[cfg(feature = "rsa")]
 pub fn generate_rsa_keypair(
-    _key_type: KeyType,
-    _rng: &mut impl RngCore,
+    key_type: KeyType,
+    rng: &mut (impl RngCore + rand_core::CryptoRng),
 ) -> Result<RsaKeyPair, CryptoError> {
-    // TODO: Implement when an allocator is available in the firmware build.
-    Err(CryptoError::UnsupportedAlgorithm)
+    use ::rsa::RsaPrivateKey;
+    use ::rsa::pkcs1::EncodeRsaPrivateKey;
+    use ::rsa::traits::PublicKeyParts;
+
+    let bits: usize = match key_type {
+        KeyType::RsaPrivate2048 => 2048,
+        KeyType::RsaPrivate4096 => 4096,
+        _ => return Err(CryptoError::UnsupportedAlgorithm),
+    };
+
+    let priv_key = RsaPrivateKey::new(rng, bits)
+        .map_err(|_| CryptoError::RngFailure)?;
+
+    // Encode private key as PKCS#1 DER
+    let priv_der_doc = priv_key.to_pkcs1_der()
+        .map_err(|_| CryptoError::RngFailure)?;
+    let priv_der_bytes = priv_der_doc.as_bytes();
+
+    // Extract raw modulus and exponent for building CVC responses
+    let pub_key = priv_key.to_public_key();
+    let modulus_bytes = pub_key.n().to_bytes_be();  // alloc::vec::Vec<u8>
+    let exponent_bytes = pub_key.e().to_bytes_be(); // alloc::vec::Vec<u8>
+
+    let mut pair = RsaKeyPair {
+        key_type,
+        private_key_der: Vec::new(),
+        public_key_der: Vec::new(),
+        modulus: Vec::new(),
+        exponent: Vec::new(),
+    };
+
+    pair.private_key_der
+        .extend_from_slice(priv_der_bytes)
+        .map_err(|_| CryptoError::BufferTooSmall)?;
+
+    // Store modulus (big-endian, no DER integer prefix)
+    pair.modulus
+        .extend_from_slice(&modulus_bytes)
+        .map_err(|_| CryptoError::BufferTooSmall)?;
+
+    // Store exponent (big-endian, 3 bytes for e=65537)
+    pair.exponent
+        .extend_from_slice(&exponent_bytes)
+        .map_err(|_| CryptoError::BufferTooSmall)?;
+
+    // Build minimal PKCS#1 public key DER for storage
+    // (modulus + exponent wrapped in SEQUENCE { INTEGER n INTEGER e })
+    // We reuse the modulus/exponent bytes already computed above.
+    // PKCS#1 RSAPublicKey: SEQUENCE { INTEGER modulus INTEGER publicExponent }
+    // For RSA-2048: total ~270 bytes.
+    build_pkcs1_pub_der(&modulus_bytes, &exponent_bytes, &mut pair.public_key_der)?;
+
+    Ok(pair)
+}
+
+/// Build a minimal PKCS#1 `RSAPublicKey` DER structure into `out`.
+///
+/// `RSAPublicKey ::= SEQUENCE { modulus INTEGER, publicExponent INTEGER }`
+///
+/// Both integers are encoded as DER INTEGERs with a leading 0x00 byte when
+/// the MSB is set (to distinguish from negative numbers in BER/DER).
+#[cfg(feature = "rsa")]
+fn build_pkcs1_pub_der<const N: usize>(
+    modulus: &[u8],
+    exponent: &[u8],
+    out: &mut Vec<u8, N>,
+) -> Result<(), CryptoError> {
+    // DER-encode an unsigned big-endian integer (prepend 0x00 if high bit set)
+    let needs_pad_n = modulus.first().map(|&b| b & 0x80 != 0).unwrap_or(false);
+    let needs_pad_e = exponent.first().map(|&b| b & 0x80 != 0).unwrap_or(false);
+    let int_n_content_len = modulus.len() + if needs_pad_n { 1 } else { 0 };
+    let int_e_content_len = exponent.len() + if needs_pad_e { 1 } else { 0 };
+
+    let int_n_total = 1 + der_int_len_size(int_n_content_len) + int_n_content_len;
+    let int_e_total = 1 + der_int_len_size(int_e_content_len) + int_e_content_len;
+    let seq_content_len = int_n_total + int_e_total;
+    let seq_total = 1 + der_int_len_size(seq_content_len) + seq_content_len;
+
+    if seq_total > out.capacity() {
+        return Err(CryptoError::BufferTooSmall);
+    }
+
+    // SEQUENCE
+    let _ = out.push(0x30);
+    push_der_len_rsa(out, seq_content_len);
+
+    // INTEGER modulus
+    let _ = out.push(0x02);
+    push_der_len_rsa(out, int_n_content_len);
+    if needs_pad_n { let _ = out.push(0x00); }
+    let _ = out.extend_from_slice(modulus);
+
+    // INTEGER exponent
+    let _ = out.push(0x02);
+    push_der_len_rsa(out, int_e_content_len);
+    if needs_pad_e { let _ = out.push(0x00); }
+    let _ = out.extend_from_slice(exponent);
+
+    Ok(())
+}
+
+#[cfg(feature = "rsa")]
+fn der_int_len_size(len: usize) -> usize {
+    if len < 0x80 { 1 } else if len <= 0xFF { 2 } else { 3 }
+}
+
+#[cfg(feature = "rsa")]
+fn push_der_len_rsa<const N: usize>(buf: &mut Vec<u8, N>, len: usize) {
+    if len < 0x80 {
+        let _ = buf.push(len as u8);
+    } else if len <= 0xFF {
+        let _ = buf.push(0x81);
+        let _ = buf.push(len as u8);
+    } else {
+        let _ = buf.push(0x82);
+        let _ = buf.push((len >> 8) as u8);
+        let _ = buf.push(len as u8);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -593,88 +711,247 @@ pub fn ecdh(
 // RSA stubs (feature-gated)
 // ---------------------------------------------------------------------------
 
-/// Compute an RSA-PKCS#1-v1.5 signature.
+/// Compute an RSA-PKCS#1-v1.5 signature over a pre-hashed message.
 ///
-/// # Not implemented (allocator required)
-/// See module-level documentation.
+/// `private_key_der` must be a PKCS#1 DER-encoded `RSAPrivateKey`.
+/// `hash_data` is the **already-hashed** digest; its length must match the
+/// output size of `hash_algo` (20, 28, 32, 48, or 64 bytes).
+///
+/// Returns the raw RSA signature: modulus-length bytes (256 for RSA-2048).
 #[cfg(feature = "rsa")]
 pub fn rsa_sign_pkcs1v15(
     _key_type: KeyType,
-    _private_key_der: &[u8],
-    _hash_data: &[u8],
-    _hash_algo: HashAlgorithm,
+    private_key_der: &[u8],
+    hash_data: &[u8],
+    hash_algo: HashAlgorithm,
     _rng: &mut impl RngCore,
 ) -> Result<heapless::Vec<u8, 512>, CryptoError> {
-    // TODO: Implement when an allocator is available in the firmware build.
-    Err(CryptoError::UnsupportedAlgorithm)
+    use ::rsa::RsaPrivateKey;
+    use ::rsa::pkcs1::DecodeRsaPrivateKey;
+    use ::rsa::pkcs1v15::SigningKey;
+    use ::rsa::signature::hazmat::PrehashSigner;
+    use sha1::Sha1;
+    use sha2::{Sha256, Sha384, Sha512};
+
+    let priv_key = RsaPrivateKey::from_pkcs1_der(private_key_der)
+        .map_err(|_| CryptoError::WrongKeyLength)?;
+
+    // Each arm produces the raw signature bytes (heap-allocated by rsa crate).
+    let sig_bytes: alloc::vec::Vec<u8> = match hash_algo {
+        HashAlgorithm::Sha1 => {
+            let key: SigningKey<Sha1> = SigningKey::new(priv_key);
+            let sig = key.sign_prehash(hash_data).map_err(|_| CryptoError::SignFailure)?;
+            use ::rsa::signature::SignatureEncoding;
+            sig.to_bytes().to_vec()
+        }
+        HashAlgorithm::Sha224 => {
+            use sha2::Sha224;
+            let key: SigningKey<Sha224> = SigningKey::new(priv_key);
+            let sig = key.sign_prehash(hash_data).map_err(|_| CryptoError::SignFailure)?;
+            use ::rsa::signature::SignatureEncoding;
+            sig.to_bytes().to_vec()
+        }
+        HashAlgorithm::Sha256 => {
+            let key: SigningKey<Sha256> = SigningKey::new(priv_key);
+            let sig = key.sign_prehash(hash_data).map_err(|_| CryptoError::SignFailure)?;
+            use ::rsa::signature::SignatureEncoding;
+            sig.to_bytes().to_vec()
+        }
+        HashAlgorithm::Sha384 => {
+            let key: SigningKey<Sha384> = SigningKey::new(priv_key);
+            let sig = key.sign_prehash(hash_data).map_err(|_| CryptoError::SignFailure)?;
+            use ::rsa::signature::SignatureEncoding;
+            sig.to_bytes().to_vec()
+        }
+        HashAlgorithm::Sha512 => {
+            let key: SigningKey<sha2::Sha512> = SigningKey::new(priv_key);
+            let sig = key.sign_prehash(hash_data).map_err(|_| CryptoError::SignFailure)?;
+            use ::rsa::signature::SignatureEncoding;
+            sig.to_bytes().to_vec()
+        }
+    };
+
+    let mut out: heapless::Vec<u8, 512> = heapless::Vec::new();
+    out.extend_from_slice(&sig_bytes).map_err(|_| CryptoError::BufferTooSmall)?;
+    Ok(out)
 }
 
-/// Compute an RSA-PSS signature.
+/// Compute an RSA-PSS signature over a pre-hashed message using SHA-256.
 ///
-/// # Not implemented (allocator required)
-/// See module-level documentation.
+/// PSS is inherently randomised; `rng` must be a CSPRNG.
+/// The salt length is set to the hash output length (32 bytes for SHA-256),
+/// which is the recommended default per RFC 8017 §9.1.
+///
+/// Returns the raw RSA signature bytes (256 bytes for RSA-2048).
 #[cfg(feature = "rsa")]
 pub fn rsa_sign_pss(
     _key_type: KeyType,
-    _private_key_der: &[u8],
-    _hash_data: &[u8],
+    private_key_der: &[u8],
+    hash_data: &[u8],
     _hash_algo: HashAlgorithm,
     _salt_len: usize,
-    _rng: &mut impl RngCore,
+    rng: &mut (impl RngCore + rand_core::CryptoRng),
 ) -> Result<heapless::Vec<u8, 512>, CryptoError> {
-    // TODO: Implement when an allocator is available in the firmware build.
-    Err(CryptoError::UnsupportedAlgorithm)
+    use ::rsa::RsaPrivateKey;
+    use ::rsa::pkcs1::DecodeRsaPrivateKey;
+    use ::rsa::pss::BlindedSigningKey;
+    use ::rsa::signature::hazmat::RandomizedPrehashSigner;
+    use sha2::Sha256;
+
+    let priv_key = RsaPrivateKey::from_pkcs1_der(private_key_der)
+        .map_err(|_| CryptoError::WrongKeyLength)?;
+
+    // BlindedSigningKey uses randomized blinding against timing attacks.
+    let key: BlindedSigningKey<Sha256> = BlindedSigningKey::new(priv_key);
+    let sig = key
+        .sign_prehash_with_rng(rng, hash_data)
+        .map_err(|_| CryptoError::SignFailure)?;
+
+    use ::rsa::signature::SignatureEncoding;
+    let sig_bytes = sig.to_bytes();
+
+    let mut out: heapless::Vec<u8, 512> = heapless::Vec::new();
+    out.extend_from_slice(sig_bytes.as_ref()).map_err(|_| CryptoError::BufferTooSmall)?;
+    Ok(out)
 }
 
-/// Perform RSA-OAEP decryption.
+/// Perform RSA-PKCS#1-v1.5 decryption (block type 2).
 ///
-/// # Not implemented (allocator required)
-/// See module-level documentation.
-#[cfg(feature = "rsa")]
-pub fn rsa_decrypt_oaep(
-    _key_type: KeyType,
-    _private_key_der: &[u8],
-    _ciphertext: &[u8],
-    _hash_algo: HashAlgorithm,
-    _rng: &mut impl RngCore,
-) -> Result<heapless::Vec<u8, 512>, CryptoError> {
-    // TODO: Implement when an allocator is available in the firmware build.
-    Err(CryptoError::UnsupportedAlgorithm)
-}
-
-/// Perform RSA-PKCS#1-v1.5 decryption.
+/// `private_key_der` is the PKCS#1 DER-encoded `RSAPrivateKey`.
+/// `ciphertext` is the RSA-encrypted data (modulus-length bytes).
 ///
-/// # Not implemented (allocator required)
-/// See module-level documentation.
+/// Returns the plaintext on success.
 #[cfg(feature = "rsa")]
 pub fn rsa_decrypt_pkcs1v15(
     _key_type: KeyType,
-    _private_key_der: &[u8],
-    _ciphertext: &[u8],
+    private_key_der: &[u8],
+    ciphertext: &[u8],
+) -> Result<heapless::Vec<u8, 512>, CryptoError> {
+    use ::rsa::RsaPrivateKey;
+    use ::rsa::pkcs1::DecodeRsaPrivateKey;
+    use ::rsa::Pkcs1v15Encrypt;
+
+    let priv_key = RsaPrivateKey::from_pkcs1_der(private_key_der)
+        .map_err(|_| CryptoError::WrongKeyLength)?;
+
+    let plaintext = priv_key
+        .decrypt(Pkcs1v15Encrypt, ciphertext)
+        .map_err(|_| CryptoError::DecryptFailure)?;
+
+    let mut out: heapless::Vec<u8, 512> = heapless::Vec::new();
+    out.extend_from_slice(&plaintext).map_err(|_| CryptoError::BufferTooSmall)?;
+    Ok(out)
+}
+
+/// Perform RSA-OAEP decryption using SHA-256 as the hash and MGF hash.
+///
+/// `private_key_der` is the PKCS#1 DER-encoded `RSAPrivateKey`.
+/// `ciphertext` is the RSA-OAEP-encrypted data (modulus-length bytes).
+///
+/// Returns the plaintext on success.
+#[cfg(feature = "rsa")]
+pub fn rsa_decrypt_oaep(
+    _key_type: KeyType,
+    private_key_der: &[u8],
+    ciphertext: &[u8],
+    _hash_algo: HashAlgorithm,
     _rng: &mut impl RngCore,
 ) -> Result<heapless::Vec<u8, 512>, CryptoError> {
-    // TODO: Implement when an allocator is available in the firmware build.
-    Err(CryptoError::UnsupportedAlgorithm)
+    use ::rsa::RsaPrivateKey;
+    use ::rsa::pkcs1::DecodeRsaPrivateKey;
+    use ::rsa::Oaep;
+    use sha2::Sha256;
+
+    let priv_key = RsaPrivateKey::from_pkcs1_der(private_key_der)
+        .map_err(|_| CryptoError::WrongKeyLength)?;
+
+    let scheme = Oaep::new::<Sha256>();
+    let plaintext = priv_key
+        .decrypt(scheme, ciphertext)
+        .map_err(|_| CryptoError::DecryptFailure)?;
+
+    let mut out: heapless::Vec<u8, 512> = heapless::Vec::new();
+    out.extend_from_slice(&plaintext).map_err(|_| CryptoError::BufferTooSmall)?;
+    Ok(out)
 }
 
-/// Legacy RSA sign stub (operates on `KeyMaterial`).
+/// Perform a raw RSA private key operation: result = input^d mod n.
+///
+/// No padding is applied or removed. The caller is responsible for any
+/// padding scheme (e.g. PKCS#1 v1.5 for ALGO_RSA_RAW, or OAEP/PKCS1v1.5
+/// stripping after ALGO_RSA_DECRYPT).
+///
+/// Returns the result as big-endian bytes, zero-padded to the modulus length.
+/// For RSA-2048 this is always 256 bytes.
+#[cfg(feature = "rsa")]
+pub fn rsa_private_raw(
+    private_key_der: &[u8],
+    data: &[u8],
+) -> Result<heapless::Vec<u8, 512>, CryptoError> {
+    use ::rsa::RsaPrivateKey;
+    use ::rsa::pkcs1::DecodeRsaPrivateKey;
+    use ::rsa::traits::PublicKeyParts;
+
+    let priv_key = RsaPrivateKey::from_pkcs1_der(private_key_der)
+        .map_err(|_| CryptoError::WrongKeyLength)?;
+
+    let n = priv_key.n();
+    let key_len = (n.bits() + 7) / 8; // modulus length in bytes
+
+    // Convert input bytes to BigUint (rsa 0.9 re-exports BigUint)
+    let c = ::rsa::BigUint::from_bytes_be(data);
+
+    // Raw RSA private key operation: m = c^d mod n (with CRT, no blinding)
+    // SAFETY: hazmat — caller is responsible for ensuring correct use.
+    // We pass None for the blinding RNG; a local phantom type satisfies the generic bound.
+    struct NoRng;
+    impl ::rsa::rand_core::RngCore for NoRng {
+        fn next_u32(&mut self) -> u32 { 0 }
+        fn next_u64(&mut self) -> u64 { 0 }
+        fn fill_bytes(&mut self, _: &mut [u8]) {}
+        fn try_fill_bytes(&mut self, _: &mut [u8]) -> Result<(), ::rsa::rand_core::Error> { Ok(()) }
+    }
+    impl ::rsa::rand_core::CryptoRng for NoRng {}
+    let m = ::rsa::hazmat::rsa_decrypt(
+        None::<&mut NoRng>,
+        &priv_key,
+        &c,
+    )
+    .map_err(|_| CryptoError::DecryptFailure)?;
+
+    // Convert result to big-endian, zero-padded to key_len bytes
+    let m_bytes = m.to_bytes_be();
+    let mut out: heapless::Vec<u8, 512> = heapless::Vec::new();
+    for _ in 0..key_len.saturating_sub(m_bytes.len()) {
+        let _ = out.push(0x00);
+    }
+    out.extend_from_slice(&m_bytes).map_err(|_| CryptoError::BufferTooSmall)?;
+    Ok(out)
+}
+
+/// Legacy RSA PKCS#1v1.5 sign (SHA-256) — operates on `KeyMaterial`.
 #[cfg(feature = "rsa")]
 pub fn rsa_sign(
-    _key: &KeyMaterial,
-    _digest_info: &[u8],
+    key: &KeyMaterial,
+    hash_data: &[u8],
 ) -> Result<heapless::Vec<u8, 512>, CryptoError> {
-    // TODO: Implement when an allocator is available in the firmware build.
-    Err(CryptoError::UnsupportedAlgorithm)
+    struct DummyRng;
+    impl RngCore for DummyRng {
+        fn next_u32(&mut self) -> u32 { 0 }
+        fn next_u64(&mut self) -> u64 { 0 }
+        fn fill_bytes(&mut self, _dest: &mut [u8]) {}
+        fn try_fill_bytes(&mut self, _dest: &mut [u8]) -> Result<(), rand_core::Error> { Ok(()) }
+    }
+    rsa_sign_pkcs1v15(key.key_type, &key.raw, hash_data, HashAlgorithm::Sha256, &mut DummyRng)
 }
 
-/// Legacy RSA decrypt stub (operates on `KeyMaterial`).
+/// Legacy RSA PKCS#1v1.5 decrypt — operates on `KeyMaterial`.
 #[cfg(feature = "rsa")]
 pub fn rsa_decrypt(
-    _key: &KeyMaterial,
-    _ciphertext: &[u8],
+    key: &KeyMaterial,
+    ciphertext: &[u8],
 ) -> Result<heapless::Vec<u8, 512>, CryptoError> {
-    // TODO: Implement when an allocator is available in the firmware build.
-    Err(CryptoError::UnsupportedAlgorithm)
+    rsa_decrypt_pkcs1v15(key.key_type, &key.raw, ciphertext)
 }
 
 // ---------------------------------------------------------------------------

@@ -61,13 +61,13 @@ CHIP="RP235x"
 
 # ── Build (debug profile) ─────────────────────────────────────────────────────
 section "Debug build: $FEAT"
-info "cargo build --no-default-features --features $FEAT"
+info "cargo build --no-default-features --features $FEAT,rsa"
 
 DEFMT_LOG=trace \
 cargo build \
     --manifest-path firmware/Cargo.toml \
     --no-default-features \
-    --features "$FEAT"
+    --features "$FEAT,rsa"
 
 [[ -f "$ELF" ]] || die "ELF not found at $ELF"
 ok "Build complete: $ELF"
