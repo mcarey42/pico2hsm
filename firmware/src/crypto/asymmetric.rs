@@ -226,26 +226,51 @@ pub fn generate_rsa_keypair(
 /// P-521 uses randomized k (hardware TRNG) because no standard hash function
 /// matches P-521's 66-byte field size — RFC 6979 type bounds cannot be satisfied.
 /// Randomized ECDSA with a CSPRNG is cryptographically equivalent in security.
+///
+/// Short hashes (e.g. MD5, SHA-1, RIPEMD-160) are left-padded with zeros to the
+/// curve's full field size before signing. `ecdsa::hazmat::bits2field` requires
+/// input length >= FieldBytesSize/2; pre-padding ensures that constraint is met for
+/// all hashes and all curves.
 pub fn ecdsa_sign(
     key_type: KeyType,
     private_key_raw: &[u8],
     hash_data: &[u8],
     rng: &mut (impl rand_core::CryptoRng + RngCore),
 ) -> Result<EcdsaSignature, CryptoError> {
+    // Left-pad hash to full field size so bits2field never rejects it.
+    // bits2field rejects inputs shorter than FieldBytesSize/2; padding to the full
+    // field size ensures short hashes (MD5=16 B, SHA-1=20 B, SHA-256=32 B on P-521)
+    // are accepted. Excess bytes are truncated by bits2field, so over-length hashes
+    // (e.g. SHA-512 for P-256) are also handled correctly.
+    let field_size: usize = match key_type {
+        KeyType::EcPrivateP256 | KeyType::EcPrivateK256 => 32,
+        KeyType::EcPrivateP384 => 48,
+        KeyType::EcPrivateP521 => 66,
+        _ => 0,
+    };
+    let mut pad_buf = [0u8; 66];
+    let hash: &[u8] = if field_size > 0 && hash_data.len() < field_size {
+        let offset = field_size - hash_data.len();
+        pad_buf[offset..field_size].copy_from_slice(hash_data);
+        &pad_buf[..field_size]
+    } else {
+        hash_data
+    };
+
     match key_type {
         KeyType::EcPrivateP256 => {
-            ecdsa_sign_curve::<p256::NistP256>(private_key_raw, hash_data)
+            ecdsa_sign_curve::<p256::NistP256>(private_key_raw, hash)
         }
         KeyType::EcPrivateP384 => {
-            ecdsa_sign_curve::<p384::NistP384>(private_key_raw, hash_data)
+            ecdsa_sign_curve::<p384::NistP384>(private_key_raw, hash)
         }
         KeyType::EcPrivateP521 => {
             // P-521 does not implement DigestPrimitive (no hash matches 66-byte field size).
             // Use randomized k from hardware TRNG — equivalent security to RFC 6979.
-            ecdsa_sign_p521(private_key_raw, hash_data, rng)
+            ecdsa_sign_p521(private_key_raw, hash, rng)
         }
         KeyType::EcPrivateK256 => {
-            ecdsa_sign_curve::<k256::Secp256k1>(private_key_raw, hash_data)
+            ecdsa_sign_curve::<k256::Secp256k1>(private_key_raw, hash)
         }
         KeyType::EcPrivateBrainpoolP256
         | KeyType::EcPrivateBrainpoolP384
@@ -358,24 +383,42 @@ fn ecdsa_verify_p521(
 /// `public_key_raw` must be the uncompressed SEC1 encoding: `0x04 || X || Y`.
 /// Returns `Ok(true)` on success, `Ok(false)` on invalid signature (the
 /// distinction is intentional — callers can choose how to surface it).
+///
+/// Short hashes are left-padded to the curve's full field size, matching the
+/// behaviour of `ecdsa_sign`.
 pub fn ecdsa_verify(
     key_type: KeyType,
     public_key_raw: &[u8],
     hash_data: &[u8],
     signature_der: &[u8],
 ) -> Result<bool, CryptoError> {
+    let field_size: usize = match key_type {
+        KeyType::EcPrivateP256 | KeyType::EcPrivateK256 => 32,
+        KeyType::EcPrivateP384 => 48,
+        KeyType::EcPrivateP521 => 66,
+        _ => 0,
+    };
+    let mut pad_buf = [0u8; 66];
+    let hash: &[u8] = if field_size > 0 && hash_data.len() < field_size {
+        let offset = field_size - hash_data.len();
+        pad_buf[offset..field_size].copy_from_slice(hash_data);
+        &pad_buf[..field_size]
+    } else {
+        hash_data
+    };
+
     match key_type {
         KeyType::EcPrivateP256 => {
-            ecdsa_verify_curve::<p256::NistP256>(public_key_raw, hash_data, signature_der)
+            ecdsa_verify_curve::<p256::NistP256>(public_key_raw, hash, signature_der)
         }
         KeyType::EcPrivateP384 => {
-            ecdsa_verify_curve::<p384::NistP384>(public_key_raw, hash_data, signature_der)
+            ecdsa_verify_curve::<p384::NistP384>(public_key_raw, hash, signature_der)
         }
         KeyType::EcPrivateP521 => {
-            ecdsa_verify_p521(public_key_raw, hash_data, signature_der)
+            ecdsa_verify_p521(public_key_raw, hash, signature_der)
         }
         KeyType::EcPrivateK256 => {
-            ecdsa_verify_curve::<k256::Secp256k1>(public_key_raw, hash_data, signature_der)
+            ecdsa_verify_curve::<k256::Secp256k1>(public_key_raw, hash, signature_der)
         }
         KeyType::EcPrivateBrainpoolP256
         | KeyType::EcPrivateBrainpoolP384
