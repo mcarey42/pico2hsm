@@ -60,7 +60,7 @@ fn hash_pin(pin: &[u8], out: &mut [u8; 32]) {
 ///   0x82  Init code / SO-PIN (always exactly 8 bytes, hex-decoded by the tool)
 ///   0x91  User PIN retry counter (1 byte)
 ///   0x92  DKEK share count (1 byte, 0 = no DKEK)
-pub fn handle(state: &mut ScHsmState, cmd: &ApduCommand<'_>) -> ApduResponse {
+pub fn handle(state: &mut ScHsmState, store: &mut dyn crate::storage::KeyStore, cmd: &ApduCommand<'_>) -> ApduResponse {
     if cmd.p1 != 0x00 || cmd.p2 != 0x00 {
         return ApduResponse::err(SW_WRONG_DATA);
     }
@@ -154,9 +154,8 @@ pub fn handle(state: &mut ScHsmState, cmd: &ApduCommand<'_>) -> ApduResponse {
     };
     let _ = state.keys.push(dev_key);
 
-    // TODO: erase persistent flash keystore, write EF.DevAut, format RAID sectors.
-
-    #[cfg(target_arch = "arm")]
-    defmt::info!("INITIALIZE: done, dkek_shares={}", dkek_count);
+    // Wipe persistent flash keystore.
+    // Degraded flash does not fail the INITIALIZE command.
+    let _ = store.wipe_all(); // best-effort; InvalidCore returns Ok(()) on Core1
     ApduResponse::ok(&[])
 }

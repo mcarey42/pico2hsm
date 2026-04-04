@@ -22,11 +22,37 @@ pub mod pkcs15_objects;
 use heapless::{String, Vec};
 use pico2hsm_core::{
     apdu::{ApduCommand, ApduResponse, SW_INS_NOT_SUPPORTED, SW_OK},
-    key::KeyType as CoreKeyType,
+    error::HsmError,
+    key::{KeyId, KeyType as CoreKeyType},
     protocol::HsmProtocol,
 };
 
 use commands::*;
+
+/// Local no-op `KeyStore` used by the legacy `dispatch()` path.
+///
+/// On the firmware this path is never reached for store-mutating commands
+/// (they are intercepted by `dispatch_with_store`).  On host-side tests
+/// the mutations are silently dropped, which is the desired behaviour.
+struct LocalNullStore;
+
+impl crate::storage::KeyStore for LocalNullStore {
+    fn save_key(&mut self, _: &crate::security::key_management::KeyObject) -> Result<(), HsmError> {
+        Ok(())
+    }
+    fn fetch_key(&mut self, _: u8) -> Result<Option<crate::security::key_management::KeyObject>, HsmError> {
+        Ok(None)
+    }
+    fn erase_key(&mut self, _: u8) -> Result<(), HsmError> {
+        Ok(())
+    }
+    fn wipe_all(&mut self) -> Result<(), HsmError> {
+        Ok(())
+    }
+    fn enumerate_keys(&self) -> heapless::Vec<KeyId, 512> {
+        heapless::Vec::new()
+    }
+}
 
 /// AID for SmartCard-HSM (pico2hsm variant).
 pub const SC_HSM_AID: &[u8] =
@@ -253,10 +279,28 @@ impl ScHsm {
         ScHsm { state: ScHsmState::new() }
     }
 
+    /// Dispatch an already-parsed APDU to the appropriate command handler,
+    /// with access to persistent storage for key-mutating commands.
+    fn dispatch_with_store(
+        &mut self,
+        cmd: &ApduCommand<'_>,
+        store: &mut dyn crate::storage::KeyStore,
+    ) -> ApduResponse {
+        match cmd.ins {
+            initialize::INS_INITIALIZE => initialize::handle(&mut self.state, store, cmd),
+            generate_keypair::INS_GENERATE_KEYPAIR => {
+                generate_keypair::handle(&mut self.state, store, cmd)
+            }
+            delete_file::INS_DELETE_FILE => delete_file::handle(&mut self.state, store, cmd),
+            // All other commands fall through to the stateless dispatch.
+            _ => self.dispatch(cmd),
+        }
+    }
+
     /// Dispatch an already-parsed APDU to the appropriate command handler.
     fn dispatch(&mut self, cmd: &ApduCommand<'_>) -> ApduResponse {
         match cmd.ins {
-            initialize::INS_INITIALIZE => initialize::handle(&mut self.state, cmd),
+            initialize::INS_INITIALIZE => initialize::handle(&mut self.state, &mut LocalNullStore, cmd),
             verify::INS_VERIFY => verify::handle(&mut self.state, cmd),
             change_pin::INS_CHANGE_PIN => change_pin::handle(&mut self.state, cmd),
             reset_retry::INS_RESET_RETRY => reset_retry::handle(&mut self.state, cmd),
@@ -264,7 +308,7 @@ impl ScHsm {
             challenge::INS_CHALLENGE => challenge::handle(&mut self.state, cmd),
             external_auth::INS_EXTERNAL_AUTH => external_auth::handle(&mut self.state, cmd),
             general_auth::INS_GENERAL_AUTH => general_auth::handle(&mut self.state, cmd),
-            generate_keypair::INS_GENERATE_KEYPAIR => generate_keypair::handle(&mut self.state, cmd),
+            generate_keypair::INS_GENERATE_KEYPAIR => generate_keypair::handle(&mut self.state, &mut LocalNullStore, cmd),
             generate_key::INS_GENERATE_KEY => generate_key::handle(&mut self.state, cmd),
             sign::INS_SIGN => sign::handle(&mut self.state, cmd),
             // INS 0x62: DECIPHER (ECDH). P1 = key_reference, P2 = algo.
@@ -285,7 +329,7 @@ impl ScHsm {
             update_binary::INS_UPDATE_BINARY => update_binary::handle(&mut self.state, cmd),
             write_data::INS_WRITE_DATA => write_data::handle(&mut self.state, cmd),
             create_file::INS_CREATE_FILE => create_file::handle(&mut self.state, cmd),
-            delete_file::INS_DELETE_FILE => delete_file::handle(&mut self.state, cmd),
+            delete_file::INS_DELETE_FILE => delete_file::handle(&mut self.state, &mut LocalNullStore, cmd),
             pso::INS_PSO => pso::handle(&mut self.state, cmd),
             cipher_sym::INS_CIPHER_SYM => cipher_sym::handle(&mut self.state, cmd),
             key_domain::INS_KEY_DOMAIN => key_domain::handle(&mut self.state, cmd),
@@ -301,8 +345,32 @@ impl ScHsm {
     }
 }
 
+impl ScHsm {
+    /// Process a raw APDU with access to persistent storage.
+    ///
+    /// All key-mutating commands (INITIALIZE, GENERATE KEY PAIR, DELETE FILE)
+    /// will persist/erase via `store`. Non-mutating commands fall through to
+    /// the stateless dispatch path.
+    pub fn process_apdu_with_store(
+        &mut self,
+        apdu: &[u8],
+        store: &mut dyn crate::storage::KeyStore,
+    ) -> Vec<u8, 4096> {
+        let resp = match ApduCommand::parse(apdu) {
+            Ok(cmd) => self.dispatch_with_store(&cmd, store),
+            Err(_) => ApduResponse::err(SW_INS_NOT_SUPPORTED),
+        };
+        let serialized = resp.serialize();
+        let mut out: Vec<u8, 4096> = Vec::new();
+        let _ = out.extend_from_slice(&serialized[..serialized.len().min(4096)]);
+        out
+    }
+}
+
 impl HsmProtocol for ScHsm {
     fn process_apdu(&mut self, apdu: &[u8]) -> Vec<u8, 4096> {
+        // Used by the stateless dispatch path (host-side tests and non-ScHsm protocols).
+        // Key-mutating commands here use NullKeyStore (no-op flash writes).
         let resp = match ApduCommand::parse(apdu) {
             Ok(cmd) => self.dispatch(&cmd),
             Err(_) => ApduResponse::err(SW_INS_NOT_SUPPORTED),

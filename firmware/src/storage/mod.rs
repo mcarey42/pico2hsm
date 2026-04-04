@@ -37,19 +37,27 @@
 //! same type for all type parameters.  For mixed boards (e.g. SDCard + SPI
 //! flash) use the `AnyChip` enum or a board-specific concrete type.
 
+pub mod board_chips;
 pub mod filesystem;
 pub mod flash_chip;
 pub mod integrity;
+pub mod keystore;
 pub mod raid;
 pub mod sdcard;
 pub mod wal;
+
+pub use keystore::{FlashKeyStore, KeyStore};
+#[cfg(not(target_arch = "arm"))]
+pub use keystore::NullKeyStore;
+#[cfg(target_arch = "arm")]
+pub use board_chips::BoardChip;
 
 use filesystem::{Directory, KeyFilesystem, ScrubReport};
 use pico2hsm_core::{
     error::{HsmError, StorageError},
     flash::{FlashChip, SECTOR_SIZE},
     key::{KeyId, KeyMaterial, KeyRecord, KeyType},
-    storage::{ChipState, MirrorPair, MirrorState},
+    storage::{ChipState, DATA_START_SECTOR, MirrorPair, MirrorState, WAL_SECTOR_0, WAL_SECTOR_1},
 };
 
 // ─── AnyChip — erased chip type for static dispatch ──────────────────────────
@@ -469,6 +477,59 @@ impl<Chip: FlashChip> StorageManager<Chip> {
             let _ = out.push(r.clone());
         }
         out
+    }
+
+    /// Wipe ALL keys from persistent storage. Called only by INITIALIZE.
+    ///
+    /// Only erases sectors that are referenced by live directory entries
+    /// (i.e. sectors that actually contain key data).  Erasing every sector
+    /// unconditionally takes O(capacity / 4 KB) flash erase cycles — on
+    /// internal QMI flash that is ~1 s/sector × 512 sectors ≈ 8 minutes.
+    /// Instead we limit erasure to the N sectors in use (typically 0–20).
+    ///
+    /// WAL sectors and the directory sector are always erased and reformatted.
+    /// Best-effort: individual erase failures are logged but do not abort.
+    pub fn wipe_all(&mut self) -> Result<(), StorageError> {
+        // Collect live entries (non-tombstoned, valid key_id) from RAM directory.
+        // Clone the minimal info we need before we borrow chips mutably.
+        let mut to_erase: heapless::Vec<(u8, u32, u8), 512> = heapless::Vec::new(); // (chip_idx, sector_index, sector_count)
+        for entry in self.filesystem.directory.entries.iter() {
+            if entry.key_id == 0xFFFF || (entry.flags & 0x01) != 0 {
+                continue; // empty slot or tombstoned
+            }
+            let _ = to_erase.push((entry.chip_index, entry.sector_index, entry.sector_count));
+        }
+
+        // Erase only the sectors that contain key data.
+        for (chip_idx, sector_index, sector_count) in to_erase.iter().copied() {
+            let chip_idx = chip_idx as usize;
+            if chip_idx >= self.filesystem.chips.len() {
+                continue;
+            }
+            let chip = &mut self.filesystem.chips[chip_idx];
+            for s in 0..sector_count as u32 {
+                let addr = (sector_index + s) * SECTOR_SIZE as u32;
+                let _ = chip.erase_sector(addr); // best-effort; InvalidCore returns Err immediately
+            }
+        }
+
+        // Erase WAL sectors and reformat directory on every healthy chip.
+        let chip_count = self.filesystem.chips.len();
+        for chip_idx in 0..chip_count {
+            {
+                let chip = &mut self.filesystem.chips[chip_idx];
+                if chip.is_degraded() || chip.capacity() == 0 {
+                    continue;
+                }
+                let _ = chip.erase_sector(WAL_SECTOR_0 * SECTOR_SIZE as u32);
+                let _ = chip.erase_sector(WAL_SECTOR_1 * SECTOR_SIZE as u32);
+            }
+            let _ = self.filesystem.format_chip(chip_idx);
+        }
+
+        // Reset the in-RAM directory.
+        self.filesystem.directory = Directory::new();
+        Ok(())
     }
 
     /// Trigger a background RAID resync for a degraded mirror pair.

@@ -73,6 +73,73 @@ impl Dispatcher {
         }
     }
 
+    /// Load all persisted keys from flash into the in-memory key cache.
+    ///
+    /// Called at session start and on USB reconnect (new Dispatcher).
+    pub fn load_keys_from_store(&mut self, store: &mut dyn crate::storage::KeyStore) {
+        let ids = store.enumerate_keys();
+        let mut loaded = 0usize;
+        for kid in ids.iter() {
+            let key_id = kid.0 as u8;
+            match store.fetch_key(key_id) {
+                Ok(Some(obj)) => {
+                    push_key_object_to_state(&mut self.sc_hsm.state, obj);
+                    loaded += 1;
+                }
+                Ok(None) => {}
+                Err(_) => {}
+            }
+        }
+        let _ = loaded;
+    }
+
+    /// Dispatch a raw APDU byte slice with access to persistent storage.
+    ///
+    /// For key-mutating commands (INITIALIZE, GENERATE KEY PAIR, DELETE FILE)
+    /// routes through the storage-aware path.  All other commands (and all
+    /// non-ScHsm APDUs) fall through to the stateless `dispatch()`.
+    pub fn dispatch_with_store(
+        &mut self,
+        raw_apdu: &[u8],
+        store: &mut dyn crate::storage::KeyStore,
+    ) -> Vec<u8, 4098> {
+        // Parse the APDU
+        let cmd = match pico2hsm_core::apdu::ApduCommand::parse(raw_apdu) {
+            Ok(c) => c,
+            Err(_) => {
+                return pico2hsm_core::apdu::ApduResponse::err(
+                    pico2hsm_core::apdu::SW_INS_NOT_SUPPORTED,
+                )
+                .serialize()
+            }
+        };
+
+        // Intercept SELECT by AID before forwarding.
+        if cmd.ins == INS_SELECT && cmd.p1 == P1_SELECT_BY_AID {
+            let resp = self.select_aid(cmd.data);
+            return resp.serialize();
+        }
+
+        // For the active ScHsm protocol use the storage-aware path.
+        // All other protocols (Piv, OpenPgp) are stateless and use the
+        // existing path.
+        let raw_resp: Vec<u8, 4096> = match self.active {
+            ActiveProtocol::ScHsm => self.sc_hsm.process_apdu_with_store(raw_apdu, store),
+            ActiveProtocol::Piv => self.piv.process_apdu(raw_apdu),
+            ActiveProtocol::OpenPgp => self.openpgp.process_apdu(raw_apdu),
+            ActiveProtocol::None => {
+                return pico2hsm_core::apdu::ApduResponse::err(
+                    pico2hsm_core::apdu::SW_INS_NOT_SUPPORTED,
+                )
+                .serialize()
+            }
+        };
+
+        let mut out: Vec<u8, 4098> = Vec::new();
+        let _ = out.extend_from_slice(&raw_resp);
+        out
+    }
+
     /// Dispatch a raw APDU byte slice.
     ///
     /// Handles SELECT AID (INS=0xA4, P1=0x04) by switching the active
@@ -134,6 +201,121 @@ impl Dispatcher {
         // Unknown AID
         ApduResponse::err(SW_FILE_NOT_FOUND)
     }
+}
+
+// ─── Key loader helpers ───────────────────────────────────────────────────────
+
+/// Map a `security::key_management::AlgorithmId` to the `pico2hsm_core` `CoreKeyType`
+/// used by `InMemoryKey.key_type`.
+fn km_algo_to_core_key_type(
+    algo: crate::security::key_management::AlgorithmId,
+) -> pico2hsm_core::key::KeyType {
+    use crate::security::key_management::AlgorithmId;
+    use pico2hsm_core::key::KeyType as CoreKeyType;
+    match algo {
+        AlgorithmId::EcdsaP256 | AlgorithmId::EcdhP256 => CoreKeyType::EcPrivateP256,
+        AlgorithmId::EcdsaP384 | AlgorithmId::EcdhP384 => CoreKeyType::EcPrivateP384,
+        AlgorithmId::EcdsaP521 | AlgorithmId::EcdhP521 => CoreKeyType::EcPrivateP521,
+        AlgorithmId::EcdsaK256 => CoreKeyType::EcPrivateK256,
+        AlgorithmId::EcdsaBrainpool256 => CoreKeyType::EcPrivateBrainpoolP256,
+        AlgorithmId::EcdsaBrainpool384 => CoreKeyType::EcPrivateBrainpoolP384,
+        AlgorithmId::EcdsaBrainpool512 => CoreKeyType::EcPrivateBrainpoolP512,
+        AlgorithmId::RsaPkcs1Sha256
+        | AlgorithmId::RsaPkcs1Sha384
+        | AlgorithmId::RsaPkcs1Sha512
+        | AlgorithmId::RsaPss
+        | AlgorithmId::RsaDecrypt => CoreKeyType::RsaPrivate2048,
+        AlgorithmId::AesEcb
+        | AlgorithmId::AesCbc
+        | AlgorithmId::AesCtr
+        | AlgorithmId::AesGcm => CoreKeyType::Aes256,
+    }
+}
+
+/// Convert a `KeyObject` (security layer) to an `InMemoryKey` (protocol layer)
+/// and push it into `ScHsmState`, honouring the slot limits.
+///
+/// RSA keys are partially reconstructed: the PKCS#1 DER is placed back in
+/// `RsaInMemoryKey.private_key_der`, and the modulus / exponent are extracted
+/// from the stored `public_key` blob (layout: `[2 BE mod_len] || modulus || exponent`).
+fn push_key_object_to_state(
+    state: &mut crate::protocol::sc_hsm::ScHsmState,
+    obj: crate::security::key_management::KeyObject,
+) {
+    use crate::security::key_management::KeyType as KmKeyType;
+    use crate::protocol::sc_hsm::{InMemoryKey, MAX_IN_MEMORY_KEYS};
+
+    let is_rsa = matches!(obj.key_type, KmKeyType::Rsa);
+
+    #[cfg(feature = "rsa")]
+    if is_rsa {
+        use crate::protocol::sc_hsm::{RsaInMemoryKey, MAX_RSA_IN_MEMORY_KEYS};
+        if state.rsa_keys.len() >= MAX_RSA_IN_MEMORY_KEYS {
+            #[cfg(target_arch = "arm")]
+            defmt::warn!("MAX_RSA_IN_MEMORY_KEYS reached, key {} not loaded", obj.key_id);
+            return;
+        }
+
+        // Reconstruct modulus and exponent from the stored public_key blob.
+        // Layout written by generate_keypair: [2-byte mod_len BE] || modulus || exponent
+        let (modulus_bytes, exponent_bytes) = if obj.public_key.len() >= 2 {
+            let mod_len = ((obj.public_key[0] as usize) << 8) | (obj.public_key[1] as usize);
+            let rest = &obj.public_key[2..];
+            if rest.len() >= mod_len {
+                (&rest[..mod_len], &rest[mod_len..])
+            } else {
+                #[cfg(target_arch = "arm")]
+                defmt::warn!("RSA key {} public_key blob malformed, skipping", obj.key_id);
+                return;
+            }
+        } else {
+            #[cfg(target_arch = "arm")]
+            defmt::warn!("RSA key {} missing public_key blob, skipping", obj.key_id);
+            return;
+        };
+
+        let core_key_type = km_algo_to_core_key_type(obj.algorithm);
+        let algo = obj.algorithm as u8;
+
+        let mut entry = RsaInMemoryKey {
+            key_id: obj.key_id,
+            key_type: core_key_type,
+            algo,
+            private_key_der: heapless::Vec::new(),
+            modulus: heapless::Vec::new(),
+            exponent: heapless::Vec::new(),
+        };
+        let _ = entry.private_key_der.extend_from_slice(&obj.private_key);
+        let _ = entry.modulus.extend_from_slice(modulus_bytes);
+        let _ = entry.exponent.extend_from_slice(exponent_bytes);
+        let _ = state.rsa_keys.push(entry);
+        return;
+    }
+
+    // For non-rsa feature flag builds, suppress the unused variable warning.
+    #[cfg(not(feature = "rsa"))]
+    let _ = is_rsa;
+
+    // EC / symmetric key
+    if state.keys.len() >= MAX_IN_MEMORY_KEYS {
+        #[cfg(target_arch = "arm")]
+        defmt::warn!("MAX_IN_MEMORY_KEYS reached, key {} not loaded", obj.key_id);
+        return;
+    }
+
+    let algo = obj.algorithm as u8;
+    let core_key_type = km_algo_to_core_key_type(obj.algorithm);
+
+    let mut entry = InMemoryKey {
+        key_id: obj.key_id,
+        key_type: core_key_type,
+        algo,
+        private_key: heapless::Vec::new(),
+        public_key: heapless::Vec::new(),
+    };
+    let _ = entry.private_key.extend_from_slice(&obj.private_key);
+    let _ = entry.public_key.extend_from_slice(&obj.public_key);
+    let _ = state.keys.push(entry);
 }
 
 /// Build the FCI (File Control Information) template returned on SELECT SC-HSM AID.

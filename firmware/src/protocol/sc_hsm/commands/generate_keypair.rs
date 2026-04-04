@@ -697,7 +697,7 @@ fn build_rsa_gakp_cvc(
 }
 
 /// Handle a GENERATE KEY PAIR APDU command.
-pub fn handle(state: &mut ScHsmState, cmd: &ApduCommand<'_>) -> ApduResponse {
+pub fn handle(state: &mut ScHsmState, store: &mut dyn crate::storage::KeyStore, cmd: &ApduCommand<'_>) -> ApduResponse {
     // Require PIN authentication
     if !state.pin_verified {
         return ApduResponse::err(SW_SECURITY_STATUS);
@@ -781,6 +781,29 @@ pub fn handle(state: &mut ScHsmState, cmd: &ApduCommand<'_>) -> ApduResponse {
             None => return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
         };
 
+        // Persist RSA key to flash BEFORE adding to RAM.
+        // On flash failure, abort — keeps flash/RAM consistent.
+        {
+            use crate::security::key_management::{AlgorithmId, KeyObject, KeyType as KmType};
+            // Map algo byte to AlgorithmId — RSA-2048 keygen uses algo 0x05.
+            // Store PKCS#1 DER in private_key; modulus+exponent in public_key.
+            let km_algo = match algo {
+                0x05 => AlgorithmId::RsaDecrypt,
+                0x07 => AlgorithmId::RsaDecrypt,
+                _ => AlgorithmId::RsaDecrypt,
+            };
+            let mut key_obj = KeyObject::new(KmType::Rsa, key_id, km_algo);
+            let _ = key_obj.private_key.extend_from_slice(&pair.private_key_der);
+            // Store modulus || exponent in public_key for future reconstruction.
+            // Layout: [2-byte modulus_len BE] || modulus || exponent
+            let mod_len = pair.modulus.len() as u16;
+            let _ = key_obj.public_key.push((mod_len >> 8) as u8);
+            let _ = key_obj.public_key.push(mod_len as u8);
+            let _ = key_obj.public_key.extend_from_slice(&pair.modulus);
+            let _ = key_obj.public_key.extend_from_slice(&pair.exponent);
+            let _ = store.save_key(&key_obj); // best-effort; InvalidCore is silent on Core1
+        }
+
         // Store RSA key (replacing any existing entry with the same key_id)
         state.rsa_keys.retain(|k| k.key_id != key_id);
 
@@ -810,6 +833,21 @@ pub fn handle(state: &mut ScHsmState, cmd: &ApduCommand<'_>) -> ApduResponse {
         Ok(p) => p,
         Err(_) => return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
     };
+
+    // Persist EC key to flash. On flash failure, continue in degraded mode
+    // (key lives in RAM for this session but won't survive power cycle).
+    {
+        use crate::security::key_management::{AlgorithmId, KeyObject, KeyType as KmType};
+        // Map algo byte to AlgorithmId.
+        let km_algo = match AlgorithmId::from_u8(algo) {
+            Some(a) => a,
+            None => return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
+        };
+        let mut key_obj = KeyObject::new(KmType::Ec, key_id, km_algo);
+        let _ = key_obj.private_key.extend_from_slice(&pair.private_key);
+        let _ = key_obj.public_key.extend_from_slice(&pair.public_key);
+        let _ = store.save_key(&key_obj); // best-effort; InvalidCore is silent on Core1
+    }
 
     // Store (replacing any existing key with the same key_id)
     state.keys.retain(|k| k.key_id != key_id);

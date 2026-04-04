@@ -1,18 +1,20 @@
 //! SPI flash chip implementations of `FlashChip`.
 //!
-//! Provides two concrete `FlashChip` implementations:
+//! Provides three concrete `FlashChip` implementations:
 //!
 //! # `SpiFlash<SPI, CS>` — General SPI flash over SPI0 or SPI1
 //! Supports W25Qxx Winbond flash chips with JEDEC ID auto-detection.
 //! 3-byte addressing for chips up to 128 Mbit; 4-byte addressing for
 //! 256 Mbit and larger (EN4B command sent on `init()`).
 //!
-//! # `QmiFlashCs1` — RP2350 QMI second CS (intentionally unused)
-//! The QMI CS1 interface is NOT used for keystore storage.
-//! Rationale: driving keystore writes via QMI CS1 interferes with XIP
-//! bus stability because the XIP cache cannot be safely invalidated from
-//! a running firmware image without a custom bootloader stub.  All
-//! keystore storage uses the SPI0/SPI1 buses via `SpiFlash` instead.
+//! # `QmiFlash` — RP2350 built-in QMI flash (pico2_4m keystore partition)
+//! Uses `embassy_rp::flash::Flash` in blocking mode to access the upper half
+//! of the 4 MB on-board flash.  The lower 2 MB (firmware XIP region) is
+//! protected by a compile-time partition guard (`QMI_KEYSTORE_OFFSET`).
+//! All erase/write calls go through the RP2350 bootrom routines
+//! (`flash_range_erase` / `flash_range_program`) which automatically manage
+//! XIP cache invalidation from a SRAM trampoline — safe to call from running
+//! firmware without a custom bootloader stub.
 //!
 //! # Supported ICs (JEDEC ID → capacity)
 //! | JEDEC ID | Part      | Capacity | Addressing |
@@ -393,41 +395,57 @@ where
     }
 }
 
-// ─── QmiFlashCs1 — intentionally unused ──────────────────────────────────────
+// ─── QmiFlash — RP2350 built-in flash (pico2_4m) ─────────────────────────────
 
-// NOTE: The RP2350 QMI CS1 interface is NOT used for keystore storage.
-//
-// Design decision: Driving keystore writes through QMI CS1 requires
-// temporarily disabling the XIP cache and pausing instruction fetch —
-// this can only be done safely from a ROM/SRAM trampoline, not from
-// running firmware.  The risk of a crash (power loss, IRQ, watchdog)
-// during XIP-pause leaves the chip in an unusable state.
-//
-// All keystore storage uses `SpiFlash<SPI, CS>` on the SPI0/SPI1 buses
-// which have independent CS lines and no XIP entanglement.
-//
-// If you need to access QMI CS1 for a secondary boot/data flash chip,
-// use the RP2350 ROM `flash_range_erase` / `flash_range_program` APIs
-// from a SRAM-resident trampoline (see RP2350 datasheet §4.7).
-//
-// pub struct QmiFlashCs1 { /* intentionally omitted */ }
+/// Byte offset from flash start where the keystore partition begins.
+/// The first 2 MB is firmware (XIP-executable). Never touch below this.
+pub const QMI_KEYSTORE_OFFSET: u32 = 0x0020_0000;
 
-/// The RP2350 built-in QMI flash chip (firmware execution + optional keystore).
+/// Total physical flash size for the pico2_4m board.
+pub const QMI_FLASH_SIZE: usize = 0x0040_0000; // 4 MB
+
+/// The RP2350 built-in QMI flash chip, restricted to the keystore partition.
 ///
-/// Kept for source compatibility with the original stub.  Not wired to
-/// any real QMI access — see comment above about design decision.
+/// All `addr` arguments in the `FlashChip` trait methods are **relative to
+/// the keystore start** (0 = first byte of keystore, not start of chip).
+/// `QMI_KEYSTORE_OFFSET` is added internally before every hardware call,
+/// ensuring firmware flash (below 2 MB) can never be accidentally erased.
+///
+/// Erase/write operations are routed through the RP2350 bootrom routines
+/// (`flash_range_erase` / `flash_range_program`) via a SRAM trampoline
+/// managed by `embassy_rp::flash`.  This is safe to call from running
+/// firmware — the bootrom handles XIP cache invalidation automatically.
 pub struct QmiFlash {
+    flash: embassy_rp::flash::Flash<
+        'static,
+        embassy_rp::peripherals::FLASH,
+        embassy_rp::flash::Blocking,
+        QMI_FLASH_SIZE,
+    >,
     capacity: u64,
     degraded: bool,
+    bad_sectors: heapless::Vec<u32, 256>,
 }
 
 impl QmiFlash {
-    /// Create a new `QmiFlash` instance.
+    /// Create a new `QmiFlash` wrapping an embassy-rp blocking flash driver.
     ///
-    /// NOTE: This type is intentionally unused for keystore operations.
-    /// See module-level doc comment for rationale.
-    pub fn new(_capacity: u64) -> Self {
-        QmiFlash { capacity: _capacity, degraded: false }
+    /// `flash` must be created with `Flash::new_blocking(p.FLASH)` and the
+    /// `FLASH_SIZE` const generic must equal `QMI_FLASH_SIZE` (4 MB).
+    pub fn new(
+        flash: embassy_rp::flash::Flash<
+            'static,
+            embassy_rp::peripherals::FLASH,
+            embassy_rp::flash::Blocking,
+            QMI_FLASH_SIZE,
+        >,
+    ) -> Self {
+        QmiFlash {
+            flash,
+            capacity: (QMI_FLASH_SIZE as u64) - (QMI_KEYSTORE_OFFSET as u64),
+            degraded: false,
+            bad_sectors: heapless::Vec::new(),
+        }
     }
 }
 
@@ -436,23 +454,65 @@ impl FlashChip for QmiFlash {
         self.capacity
     }
 
-    fn read(&mut self, _addr: u32, _buf: &mut [u8]) -> Result<(), StorageError> {
-        // QMI CS1 not used for keystore — see module doc.
-        Err(StorageError::ReadError)
+    fn read(&mut self, addr: u32, buf: &mut [u8]) -> Result<(), StorageError> {
+        if addr as u64 + buf.len() as u64 > self.capacity {
+            return Err(StorageError::ReadError);
+        }
+        self.flash
+            .blocking_read(QMI_KEYSTORE_OFFSET + addr, buf)
+            .map_err(|_| StorageError::ReadError)
     }
 
-    fn write_page(&mut self, _addr: u32, _data: &[u8]) -> Result<(), StorageError> {
-        // QMI CS1 not used for keystore — see module doc.
-        Err(StorageError::WriteError)
+    fn write_page(&mut self, addr: u32, data: &[u8]) -> Result<(), StorageError> {
+        if addr as u64 + data.len() as u64 > self.capacity {
+            return Err(StorageError::WriteError);
+        }
+        if self.degraded || self.bad_sectors.contains(&(addr / 4096)) {
+            return Err(StorageError::WriteError);
+        }
+        self.flash
+            .blocking_write(QMI_KEYSTORE_OFFSET + addr, data)
+            .map_err(|_| StorageError::WriteError)?;
+
+        // Write-back verification.
+        let mut verify_buf = [0u8; 256];
+        let verify_slice = &mut verify_buf[..data.len()];
+        self.flash
+            .blocking_read(QMI_KEYSTORE_OFFSET + addr, verify_slice)
+            .map_err(|_| StorageError::ReadError)?;
+
+        if verify_slice != data {
+            let sector = addr / 4096;
+            defmt::error!(
+                "QmiFlash: write-verify failed at addr 0x{:08X} (sector {})",
+                addr,
+                sector,
+            );
+            let _ = self.mark_bad_sector(sector);
+            return Err(StorageError::BadBlock { chip: 0, sector });
+        }
+        Ok(())
     }
 
-    fn erase_sector(&mut self, _addr: u32) -> Result<(), StorageError> {
-        // QMI CS1 not used for keystore — see module doc.
-        Err(StorageError::EraseError)
+    fn erase_sector(&mut self, addr: u32) -> Result<(), StorageError> {
+        if addr as u64 + 4096 > self.capacity {
+            return Err(StorageError::EraseError);
+        }
+        if self.degraded || self.bad_sectors.contains(&(addr / 4096)) {
+            return Err(StorageError::EraseError);
+        }
+        if addr % 4096 != 0 {
+            return Err(StorageError::EraseError);
+        }
+        let from = QMI_KEYSTORE_OFFSET + addr;
+        let to = from + 4096;
+        self.flash
+            .blocking_erase(from, to)
+            .map_err(|_| StorageError::EraseError)
     }
 
     fn jedec_id(&mut self) -> Option<[u8; 3]> {
-        // QMI CS1 not used for keystore — see module doc.
+        // Internal flash has no JEDEC ID accessible via SPI from firmware.
         None
     }
 
@@ -460,8 +520,13 @@ impl FlashChip for QmiFlash {
         self.degraded
     }
 
-    fn mark_bad_sector(&mut self, _sector: u32) -> Result<(), StorageError> {
-        Err(StorageError::WriteError)
+    fn mark_bad_sector(&mut self, sector: u32) -> Result<(), StorageError> {
+        // Ignore push errors (table full); degrade if too many bad sectors.
+        let _ = self.bad_sectors.push(sector);
+        if self.bad_sectors.len() > 32 {
+            self.degraded = true;
+        }
+        Ok(())
     }
 }
 

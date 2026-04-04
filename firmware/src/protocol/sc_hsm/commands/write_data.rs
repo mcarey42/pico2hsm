@@ -131,8 +131,6 @@ fn write_at_offset(
             entry.data.truncate(offset);
         }
         let _ = entry.data.extend_from_slice(payload);
-        #[cfg(target_arch = "arm")]
-        defmt::info!("WRITE_DATA: updated EF {:04X} off={} len={}", file_id, offset, payload.len());
         return ApduResponse::ok(&[]);
     }
 
@@ -145,11 +143,7 @@ fn write_at_offset(
     let _ = data_buf.extend_from_slice(payload);
     let entry = EfEntry { file_id, data: data_buf };
     match state.ef_files.push(entry) {
-        Ok(()) => {
-            #[cfg(target_arch = "arm")]
-            defmt::info!("WRITE_DATA: stored EF {:04X} len={}", file_id, payload.len());
-            ApduResponse::ok(&[])
-        }
+        Ok(()) => ApduResponse::ok(&[]),
         Err(_) => ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
     }
 }

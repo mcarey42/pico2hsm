@@ -60,7 +60,7 @@ use static_cell::StaticCell;
 /// 16 × 2 KB EF entries inline, plus multiple 4 KB response Vec<u8, 4096>
 /// temporaries across the dispatch call chain.
 #[cfg(target_arch = "arm")]
-static mut CORE1_STACK: Stack<131072> = Stack::new();
+static mut CORE1_STACK: Stack<262144> = Stack::new();
 #[cfg(target_arch = "arm")]
 static CORE1_EXECUTOR: StaticCell<embassy_executor::Executor> = StaticCell::new();
 
@@ -73,23 +73,51 @@ static APDU_CHANNEL: Channel<SpinlockRawMutex<29>, heapless::Vec<u8, 4096>, 1> =
 #[cfg(target_arch = "arm")]
 static RESP_CHANNEL: Channel<SpinlockRawMutex<30>, heapless::Vec<u8, 4098>, 1> = Channel::new();
 
+/// One-time initialised key store — lives for the duration of the firmware.
+/// Owned by core1 dispatcher task; initialised by the board run function before
+/// spawning core1.
+#[cfg(target_arch = "arm")]
+static KEYSTORE_CELL: StaticCell<
+    pico2hsm_firmware::storage::FlashKeyStore<pico2hsm_firmware::storage::BoardChip>
+> = StaticCell::new();
+
+/// Dispatcher — stored in BSS outside the async task state machine so that
+/// the `dispatcher_task` pool does not need to hold the full 50 KB Dispatcher
+/// struct (which would overflow when combined with the 4 KB APDU/response
+/// buffers that are also live at each await point).
+#[cfg(target_arch = "arm")]
+static DISPATCHER_CELL: StaticCell<pico2hsm_firmware::apdu::dispatcher::Dispatcher> =
+    StaticCell::new();
+
 /// APDU dispatcher task — runs on core1 so that blocking ECC crypto does not
 /// starve the USB driver which runs cooperatively on core0.
+///
+/// `store` is the persistent key store initialised by the board run function.
 #[cfg(target_arch = "arm")]
 #[embassy_executor::task]
-async fn dispatcher_task() {
+async fn dispatcher_task(
+    store: &'static mut pico2hsm_firmware::storage::FlashKeyStore<
+        pico2hsm_firmware::storage::BoardChip,
+    >,
+) {
     use pico2hsm_firmware::apdu::dispatcher::Dispatcher;
-    let mut dispatcher = Dispatcher::new();
+    // Core1 must not call defmt: embassy-rp's critical_section uses Spinlock31; if Core1
+    // holds it while spinning for RTT buffer space, Core0 blocks with interrupts disabled
+    // and USB processing stalls entirely.
+    let dispatcher: &'static mut Dispatcher = DISPATCHER_CELL.init(Dispatcher::new());
+    dispatcher.load_keys_from_store(store);
     loop {
         let apdu_bytes = APDU_CHANNEL.receive().await;
+        // No defmt logging inside the receive loop.  All embassy_rp TRACE logs
+        // from Core0 fill the RTT buffer rapidly; any defmt write from Core1
+        // here would block on BLOCK_IF_FULL mode and deadlock both cores.
         if apdu_bytes.is_empty() {
             // Empty APDU = reset signal issued by core0 on USB disconnect.
-            defmt::info!("Dispatcher: session reset (USB disconnect)");
-            dispatcher = Dispatcher::new();
-            // Ack so core0 knows the reset completed.
+            *dispatcher = Dispatcher::new();
+            dispatcher.load_keys_from_store(store);
             let _ = RESP_CHANNEL.send(heapless::Vec::new()).await;
         } else {
-            let response = dispatcher.dispatch(&apdu_bytes);
+            let response = dispatcher.dispatch_with_store(&apdu_bytes, store);
             let _ = RESP_CHANNEL.send(response).await;
         }
     }
@@ -150,17 +178,7 @@ async fn main(_spawner: Spawner) {
         }
     }
 
-    // Sentinel A: firmware reached this point (before defmt).
-    // Read addr 0x20004000; if 0xDEAD_A000 the firmware reached here.
-    #[cfg(debug_assertions)]
-    unsafe { core::ptr::write_volatile(0x20004000 as *mut u32, 0xDEAD_A000_u32); }
-
     defmt::info!("pico2hsm: peripherals initialised");
-
-    // Sentinel B: firmware returned from defmt::info! (defmt did not block/panic).
-    // Read addr 0x20004004; if 0xDEAD_B000 the defmt call returned normally.
-    #[cfg(debug_assertions)]
-    unsafe { core::ptr::write_volatile(0x20004004 as *mut u32, 0xDEAD_B000_u32); }
 
 
     // ── Pico 2: security + OTP + board loop ──────────────────────────────────
@@ -253,6 +271,32 @@ async fn run_one_board(p: embassy_rp::Peripherals) {
     let mut board = Rp2350OneBoard::new(spi0, spi1);
     board.led().set_status(LedStatus::Busy);
 
+    // ── Storage initialization (rp2350_one: RAID-1 SPI flash pair) ───────────
+    // TODO (board-storage wiring): The SPI buses spi0/spi1 are consumed by
+    // Rp2350OneBoard::new() above and stored as board.spi0/board.spi1.  To use
+    // them for SpiFlash storage, the board struct would need to be refactored
+    // so that SPI buses are either:
+    //   a) consumed into SpiFlash before board construction (requires a LED-only
+    //      board constructor), or
+    //   b) extracted from the board struct (partial move; incompatible with
+    //      subsequent board.led() calls in the CCID loop).
+    // For now we initialise the keystore with AnyChip::Empty (no physical chips)
+    // so that the storage infrastructure compiles and the dispatcher_task()
+    // parameter is wired in.  Real SPI flash wiring will be added once the board
+    // struct is refactored.
+    let smk_bytes = pico2hsm_firmware::security::otp::derive_smk()
+        .unwrap_or([0u8; 32]);
+    let smk = zeroize::Zeroizing::new(smk_bytes);
+    let mut fs = pico2hsm_firmware::storage::filesystem::KeyFilesystem::new();
+    // No chips added — degraded mode (all key operations will fail gracefully).
+    let sm = pico2hsm_firmware::storage::StorageManager::new(fs);
+    let mut ks = pico2hsm_firmware::storage::FlashKeyStore::new(sm, smk);
+    match ks.init() {
+        Ok(()) => defmt::info!("KeyStore: initialized (rp2350_one — degraded, no chips)"),
+        Err(_) => defmt::warn!("KeyStore: init failed — degraded mode"),
+    }
+    let store: &'static mut _ = KEYSTORE_CELL.init(ks);
+
     // ── USB CCID transport ───────────────────────────────────────────────────
     let usb_driver = UsbDriver::new(p.USB, Irqs);
 
@@ -292,9 +336,9 @@ async fn run_one_board(p: embassy_rp::Peripherals) {
     // By running the dispatcher on core1 and awaiting the response channel on
     // core0, the Embassy executor on core0 continues to poll `usb.run()` while
     // core1 computes.
-    spawn_core1(p.CORE1, unsafe { &mut *addr_of_mut!(CORE1_STACK) }, || {
+    spawn_core1(p.CORE1, unsafe { &mut *addr_of_mut!(CORE1_STACK) }, move || {
         let executor = CORE1_EXECUTOR.init(embassy_executor::Executor::new());
-        executor.run(|spawner| spawner.spawn(dispatcher_task().unwrap()));
+        executor.run(|spawner| spawner.spawn(dispatcher_task(store).expect("dispatcher task")));
     });
 
     // ── Concurrent USB + CCID command loop (core0) ───────────────────────────
@@ -309,11 +353,6 @@ async fn run_one_board(p: embassy_rp::Peripherals) {
                 match ccid.recv_apdu().await {
                     Ok(apdu_bytes) => {
                         board.led().set_status(LedStatus::Busy);
-                        if apdu_bytes.len() >= 4 { defmt::info!("APDU {:02X} {:02X} {:02X} {:02X} len={}", apdu_bytes[0], apdu_bytes[1], apdu_bytes[2], apdu_bytes[3], apdu_bytes.len()); } else { defmt::trace!("APDU: {} bytes", apdu_bytes.len()); }
-
-                        // Send APDU to core1. While core1 computes (P-384/P-521 ECC
-                        // can exceed pcscd's ~2.5 s timeout), send CCID time extension
-                        // packets every 1.5 s so the host resets its countdown.
                         let _ = APDU_CHANNEL.send(apdu_bytes).await;
                         let response = {
                             use embassy_futures::select::{select, Either};
@@ -321,11 +360,7 @@ async fn run_one_board(p: embassy_rp::Peripherals) {
                                 match select(RESP_CHANNEL.receive(), embassy_time::Timer::after_millis(1500)).await {
                                     Either::First(r) => break r,
                                     Either::Second(_) => {
-                                        defmt::debug!("CCID: time extension sent");
                                         if let Err(CcidError::UsbDisconnected) = ccid.send_time_extension().await {
-                                            // USB dropped while sending the extension.
-                                            // Drain the eventual core1 response so the
-                                            // channel is empty, then treat as disconnect.
                                             let _ = RESP_CHANNEL.receive().await;
                                             break heapless::Vec::new();
                                         }
@@ -333,34 +368,24 @@ async fn run_one_board(p: embassy_rp::Peripherals) {
                                 }
                             }
                         };
-                        if response.len() >= 2 { defmt::info!("  SW {:02X}{:02X}", response[response.len()-2], response[response.len()-1]); }
-
                         match ccid.send_response(&response).await {
                             Ok(()) => {}
                             Err(CcidError::UsbDisconnected) => {
-                                defmt::info!("CCID: disconnected mid-response");
-                                // Signal core1 to reset its session state.
                                 let _ = APDU_CHANNEL.send(heapless::Vec::new()).await;
                                 let _ = RESP_CHANNEL.receive().await;
-                                break; // re-enter outer loop → wait_connected()
+                                break;
                             }
-                            Err(_) => {
-                                defmt::warn!("CCID: send_response error");
-                            }
+                            Err(_) => {}
                         }
                         board.led().set_status(LedStatus::Ready);
                     }
                     Err(CcidError::UsbDisconnected) => {
-                        defmt::info!("CCID: USB disconnected — resetting session state");
-                        // Signal core1 to reset its session state.
                         let _ = APDU_CHANNEL.send(heapless::Vec::new()).await;
                         let _ = RESP_CHANNEL.receive().await;
                         board.led().set_status(LedStatus::Ready);
-                        break; // re-enter outer loop → wait_connected()
+                        break;
                     }
-                    Err(_) => {
-                        defmt::warn!("CCID: protocol error, recovering");
-                    }
+                    Err(_) => {}
                 }
             }
         }
@@ -526,12 +551,32 @@ async fn run_geek_board(p: embassy_rp::Peripherals) {
     serial_ln!("LED=Ready — entering main loop");
     defmt::info!("pico2hsm (RP2350-Geek): USB CCID ready, entering main loop");
 
+    // ── Storage initialization (rp2350_geek: RAID-1 SPI flash pair) ──────────
+    // TODO (board-storage wiring): Same constraint as rp2350_one — spi0/spi1
+    // are owned by Rp2350GeekBoard.  Real SPI flash wiring requires a board
+    // struct refactor (separate LED from SPI ownership) so that the buses can
+    // be consumed into SpiFlash instances.  For now, initialise with no chips
+    // (AnyChip::Empty) so the storage plumbing compiles and the store parameter
+    // is wired to the dispatcher.
+    serial_ln!("KeyStore init (degraded — no chips)...");
+    let smk_bytes = pico2hsm_firmware::security::otp::derive_smk()
+        .unwrap_or([0u8; 32]);
+    let smk = zeroize::Zeroizing::new(smk_bytes);
+    let fs = pico2hsm_firmware::storage::filesystem::KeyFilesystem::new();
+    let sm = pico2hsm_firmware::storage::StorageManager::new(fs);
+    let mut ks = pico2hsm_firmware::storage::FlashKeyStore::new(sm, smk);
+    match ks.init() {
+        Ok(()) => serial_ln!("KeyStore ok (degraded — no chips)"),
+        Err(_) => serial_ln!("KeyStore init failed"),
+    }
+    let store: &'static mut _ = KEYSTORE_CELL.init(ks);
+
     // ── CHECKPOINT 7 — spawn core1 dispatcher, then run USB + CCID on core0 ──
     // NOTE: CORE1_STACK and CORE1_EXECUTOR are module-level statics shared by
     // all board variants; only one board function runs per firmware build.
-    spawn_core1(p.CORE1, unsafe { &mut *addr_of_mut!(CORE1_STACK) }, || {
+    spawn_core1(p.CORE1, unsafe { &mut *addr_of_mut!(CORE1_STACK) }, move || {
         let executor = CORE1_EXECUTOR.init(embassy_executor::Executor::new());
-        executor.run(|spawner| spawner.spawn(dispatcher_task().unwrap()));
+        executor.run(|spawner| spawner.spawn(dispatcher_task(store).expect("dispatcher task")));
     });
 
     let usb_fut = usb.run();
@@ -547,9 +592,6 @@ async fn run_geek_board(p: embassy_rp::Peripherals) {
                     Ok(apdu_bytes) => {
                         apdu_count += 1;
                         board.led().set_status(LedStatus::Busy);
-                        serial_fmt!("APDU #{} len={}", apdu_count, apdu_bytes.len());
-                        if apdu_bytes.len() >= 4 { defmt::info!("APDU {:02X} {:02X} {:02X} {:02X} len={}", apdu_bytes[0], apdu_bytes[1], apdu_bytes[2], apdu_bytes[3], apdu_bytes.len()); } else { defmt::trace!("APDU: {} bytes", apdu_bytes.len()); }
-
                         let _ = APDU_CHANNEL.send(apdu_bytes).await;
                         let response = {
                             use embassy_futures::select::{select, Either};
@@ -557,8 +599,6 @@ async fn run_geek_board(p: embassy_rp::Peripherals) {
                                 match select(RESP_CHANNEL.receive(), embassy_time::Timer::after_millis(1500)).await {
                                     Either::First(r) => break r,
                                     Either::Second(_) => {
-                                        serial_ln!("CCID: time extension sent");
-                                        defmt::debug!("CCID: time extension sent");
                                         if let Err(CcidError::UsbDisconnected) = ccid.send_time_extension().await {
                                             let _ = RESP_CHANNEL.receive().await;
                                             break heapless::Vec::new();
@@ -567,39 +607,24 @@ async fn run_geek_board(p: embassy_rp::Peripherals) {
                                 }
                             }
                         };
-                        if response.len() >= 2 { defmt::info!("  SW {:02X}{:02X}", response[response.len()-2], response[response.len()-1]); }
-                        serial_fmt!("response len={}", response.len());
-
                         match ccid.send_response(&response).await {
-                            Ok(()) => {
-                                serial_ln!("response sent ok");
-                            }
+                            Ok(()) => {}
                             Err(CcidError::UsbDisconnected) => {
-                                serial_ln!("USB disconnected mid-response; session reset");
-                                defmt::info!("CCID: disconnected mid-response");
                                 let _ = APDU_CHANNEL.send(heapless::Vec::new()).await;
                                 let _ = RESP_CHANNEL.receive().await;
                                 break;
                             }
-                            Err(_) => {
-                                serial_ln!("send_response error");
-                                defmt::warn!("CCID: send_response error");
-                            }
+                            Err(_) => {}
                         }
                         board.led().set_status(LedStatus::Ready);
                     }
                     Err(CcidError::UsbDisconnected) => {
-                        serial_ln!("USB disconnected; session reset");
-                        defmt::info!("CCID: USB disconnected — resetting session state");
                         let _ = APDU_CHANNEL.send(heapless::Vec::new()).await;
                         let _ = RESP_CHANNEL.receive().await;
                         board.led().set_status(LedStatus::Ready);
                         break;
                     }
-                    Err(_) => {
-                        serial_ln!("CCID protocol error, recovering");
-                        defmt::warn!("CCID: protocol error, recovering");
-                    }
+                    Err(_) => {}
                 }
             }
         }
@@ -640,6 +665,28 @@ async fn run_pico2_board(p: embassy_rp::Peripherals) {
     let mut board = Pico2Board::new(p.PIN_25, spi0, spi1);
     board.led().set_status(LedStatus::Busy);
 
+    // ── Storage initialization (pico2_4m: RP2350 internal QMI flash) ─────────
+    let smk_bytes = pico2hsm_firmware::security::otp::derive_smk()
+        .unwrap_or([0u8; 32]); // degraded mode if OTP unprovisioned
+    let smk = zeroize::Zeroizing::new(smk_bytes);
+
+    let qmi_flash = embassy_rp::flash::Flash::<
+        _,
+        embassy_rp::flash::Blocking,
+        { pico2hsm_firmware::storage::flash_chip::QMI_FLASH_SIZE },
+    >::new_blocking(p.FLASH);
+    let qmi = pico2hsm_firmware::storage::flash_chip::QmiFlash::new(qmi_flash);
+
+    let mut fs = pico2hsm_firmware::storage::filesystem::KeyFilesystem::new();
+    let _ = fs.add_chip(qmi);
+    let sm = pico2hsm_firmware::storage::StorageManager::new(fs);
+    let mut ks = pico2hsm_firmware::storage::FlashKeyStore::new(sm, smk);
+    match ks.init() {
+        Ok(()) => defmt::info!("KeyStore: initialized (pico2_4m internal flash)"),
+        Err(_) => defmt::warn!("KeyStore: init failed — degraded mode (blank flash?)"),
+    }
+    let store: &'static mut _ = KEYSTORE_CELL.init(ks);
+
     // ── USB CCID transport ───────────────────────────────────────────────────
     let usb_driver = UsbDriver::new(p.USB, Irqs);
 
@@ -669,22 +716,28 @@ async fn run_pico2_board(p: embassy_rp::Peripherals) {
     defmt::info!("pico2hsm (Pico 2): USB CCID ready, entering main loop");
     board.led().set_status(LedStatus::Ready);
 
-    spawn_core1(p.CORE1, unsafe { &mut *addr_of_mut!(CORE1_STACK) }, || {
+    defmt::info!("core0: spawning core1");
+    spawn_core1(p.CORE1, unsafe { &mut *addr_of_mut!(CORE1_STACK) }, move || {
         let executor = CORE1_EXECUTOR.init(embassy_executor::Executor::new());
-        executor.run(|spawner| spawner.spawn(dispatcher_task().unwrap()));
+        executor.run(|spawner| spawner.spawn(dispatcher_task(store).expect("dispatcher task")));
     });
+    defmt::info!("core0: core1 spawned, building usb_fut");
 
     let usb_fut = usb.run();
+    defmt::info!("core0: usb_fut created, building ccid_fut");
     let ccid_fut = async {
+        defmt::info!("core0: ccid_fut: starting wait_connected");
         loop {
             ccid.wait_connected().await;
+            defmt::info!("core0: USB connected");
 
             loop {
                 match ccid.recv_apdu().await {
                     Ok(apdu_bytes) => {
                         board.led().set_status(LedStatus::Busy);
-                        if apdu_bytes.len() >= 4 { defmt::info!("APDU {:02X} {:02X} {:02X} {:02X} len={}", apdu_bytes[0], apdu_bytes[1], apdu_bytes[2], apdu_bytes[3], apdu_bytes.len()); } else { defmt::trace!("APDU: {} bytes", apdu_bytes.len()); }
-
+                        // No defmt logging here — the RTT buffer fills from trace-level
+                        // embassy_rp USB logs; any defmt call here blocks Core0 before
+                        // the APDU reaches Core1, causing a permanent hang.
                         let _ = APDU_CHANNEL.send(apdu_bytes).await;
                         let response = {
                             use embassy_futures::select::{select, Either};
@@ -692,7 +745,6 @@ async fn run_pico2_board(p: embassy_rp::Peripherals) {
                                 match select(RESP_CHANNEL.receive(), embassy_time::Timer::after_millis(1500)).await {
                                     Either::First(r) => break r,
                                     Either::Second(_) => {
-                                        defmt::debug!("CCID: time extension sent");
                                         if let Err(CcidError::UsbDisconnected) = ccid.send_time_extension().await {
                                             let _ = RESP_CHANNEL.receive().await;
                                             break heapless::Vec::new();
@@ -701,32 +753,24 @@ async fn run_pico2_board(p: embassy_rp::Peripherals) {
                                 }
                             }
                         };
-                        if response.len() >= 2 { defmt::info!("  SW {:02X}{:02X}", response[response.len()-2], response[response.len()-1]); }
-
                         match ccid.send_response(&response).await {
                             Ok(()) => {}
                             Err(CcidError::UsbDisconnected) => {
-                                defmt::info!("CCID: disconnected mid-response");
                                 let _ = APDU_CHANNEL.send(heapless::Vec::new()).await;
                                 let _ = RESP_CHANNEL.receive().await;
                                 break;
                             }
-                            Err(_) => {
-                                defmt::warn!("CCID: send_response error");
-                            }
+                            Err(_) => {}
                         }
                         board.led().set_status(LedStatus::Ready);
                     }
                     Err(CcidError::UsbDisconnected) => {
-                        defmt::info!("CCID: USB disconnected — resetting session state");
                         let _ = APDU_CHANNEL.send(heapless::Vec::new()).await;
                         let _ = RESP_CHANNEL.receive().await;
                         board.led().set_status(LedStatus::Ready);
                         break;
                     }
-                    Err(_) => {
-                        defmt::warn!("CCID: protocol error, recovering");
-                    }
+                    Err(_) => {}
                 }
             }
         }

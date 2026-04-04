@@ -22,7 +22,7 @@ use crate::protocol::sc_hsm::ScHsmState;
 pub const INS_DELETE_FILE: u8 = 0xE4;
 
 /// Handle a DELETE FILE APDU command.
-pub fn handle(state: &mut ScHsmState, cmd: &ApduCommand<'_>) -> ApduResponse {
+pub fn handle(state: &mut ScHsmState, store: &mut dyn crate::storage::KeyStore, cmd: &ApduCommand<'_>) -> ApduResponse {
     if !state.pin_verified && !state.so_pin_verified {
         return ApduResponse::err(SW_SECURITY_STATUS);
     }
@@ -49,13 +49,28 @@ pub fn handle(state: &mut ScHsmState, cmd: &ApduCommand<'_>) -> ApduResponse {
     let deleted_ef = state.ef_files.len() < before;
 
     // C4 xx: also remove the key entry itself
-    let deleted_key = if hi == 0xC4 {
+    let mut deleted_key = if hi == 0xC4 {
         let before_keys = state.keys.len();
         state.keys.retain(|k| k.key_id != key_id);
         state.keys.len() < before_keys
     } else {
         false
     };
+
+    // Also remove from RSA key store (fixes RSA deletion bug).
+    #[cfg(feature = "rsa")]
+    if hi == 0xC4 {
+        let before_rsa = state.rsa_keys.len();
+        state.rsa_keys.retain(|k| k.key_id != key_id);
+        if state.rsa_keys.len() < before_rsa {
+            deleted_key = true;
+        }
+    }
+
+    // Erase from flash (best-effort; do not fail APDU on flash error).
+    if deleted_key {
+        let _ = store.erase_key(key_id);
+    }
 
     if deleted_ef || deleted_key {
         ApduResponse::ok(&[])
