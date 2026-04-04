@@ -56,7 +56,7 @@ KEY_SLOTS: list[dict] = [
         "key_id":      "04",
         "hash":        "sha256",
         "mechanism":   "ECDSA-SHA256",
-        "ecdh":        False,
+        "ecdh":        True,
     },
 ]
 
@@ -71,6 +71,16 @@ RSA_KEY_SLOTS: list[dict] = [
         "mechanism_enc":  "RSA-PKCS",
         "hash":        "sha256",
         "sig_len":     256,    # RSA-2048 signature = 256 bytes
+    },
+    {
+        "name":        "rsa4096",
+        "key_size":    4096,
+        "key_id":      "11",   # slot 0x0B — after rsa2048
+        "mechanism_pkcs": "SHA256-RSA-PKCS",
+        "mechanism_pss":  "SHA256-RSA-PKCS-PSS",
+        "mechanism_enc":  "RSA-PKCS",
+        "hash":        "sha256",
+        "sig_len":     512,    # RSA-4096 signature = 512 bytes
     },
 ]
 
@@ -296,7 +306,14 @@ def provisioned_rsa_keys(
         key_id   = slot["key_id"]
         save_key = f"06_rsa_keygen_{name}"
 
-        log.info("Generating %s key (id=%s)...", name, key_id)
+        # RSA keygen on a debug Cortex-M33 (opt-level=1) is slow:
+        #   RSA-2048: typically 10–60 s (rarely >120 s)
+        #   RSA-4096: highly variable; 15–60 min is not unusual due to large
+        #             prime-finding with pure-Rust big-integer arithmetic.
+        # Allow 3600 s (1 h) so that the test can complete on unlucky runs.
+        keygen_timeout = 3600
+
+        log.info("Generating %s key (id=%s, timeout=%ds)...", name, key_id, keygen_timeout)
 
         keygen = runner.pkcs11_tool(
             "--login",
@@ -306,6 +323,7 @@ def provisioned_rsa_keys(
             "--id",          key_id,
             "--label",       name,
             save_as=save_key,
+            timeout=keygen_timeout,
         )
 
         if keygen.returncode != 0:

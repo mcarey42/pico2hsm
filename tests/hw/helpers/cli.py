@@ -37,8 +37,16 @@ class CLIRunner:
         env_extra: Optional[dict] = None,
         save_as: Optional[str] = None,
         stdin_data: Optional[bytes] = None,
+        timeout: int = 300,
     ) -> CLIResult:
-        """Run a command, capturing stdout/stderr separately with APDU tracing enabled."""
+        """Run a command, capturing stdout/stderr separately with APDU tracing enabled.
+
+        Args:
+            timeout: Subprocess wall-clock timeout in seconds (default 300).
+                     RSA-2048 sign/decrypt on a debug Cortex-M33 build can take
+                     up to ~180 s.  Use a larger value for RSA-4096 keygen
+                     (which can take 15–60 min on opt-level=1 hardware).
+        """
         env = os.environ.copy()
         # Always enable OpenSC APDU tracing to stderr
         env["OPENSC_DEBUG"] = "9"
@@ -48,12 +56,25 @@ class CLIRunner:
             env.update(env_extra)
 
         t_start = time.perf_counter()
-        proc = subprocess.run(
-            args,
-            input=stdin_data,
-            capture_output=True,
-            env=env,
-        )
+        try:
+            proc = subprocess.run(
+                args,
+                input=stdin_data,
+                capture_output=True,
+                env=env,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired:
+            elapsed_ms = (time.perf_counter() - t_start) * 1000.0
+            msg = f"[TIMEOUT after {timeout}s] {' '.join(args)}"
+            return CLIResult(
+                cmd=args,
+                returncode=-1,
+                stdout="",
+                stdout_bytes=b"",
+                stderr=msg,
+                elapsed_ms=elapsed_ms,
+            )
         elapsed_ms = (time.perf_counter() - t_start) * 1000.0
 
         stdout_bytes = proc.stdout
@@ -82,30 +103,32 @@ class CLIRunner:
             trace_file=trace_file,
         )
 
-    def sc_hsm_tool(self, *args: str, save_as: Optional[str] = None) -> CLIResult:
+    def sc_hsm_tool(self, *args: str, save_as: Optional[str] = None, timeout: int = 300) -> CLIResult:
         """Run sc-hsm-tool with the given arguments."""
-        return self.run(["sc-hsm-tool"] + list(args), save_as=save_as)
+        return self.run(["sc-hsm-tool"] + list(args), save_as=save_as, timeout=timeout)
 
-    def pkcs11_tool(self, *args: str, save_as: Optional[str] = None) -> CLIResult:
+    def pkcs11_tool(self, *args: str, save_as: Optional[str] = None, timeout: int = 300) -> CLIResult:
         """Run pkcs11-tool with --module prepended."""
         cmd = ["pkcs11-tool", "--module", self.config["module"]] + list(args)
-        return self.run(cmd, save_as=save_as)
+        return self.run(cmd, save_as=save_as, timeout=timeout)
 
-    def openssl(self, *args: str, save_as: Optional[str] = None) -> CLIResult:
+    def openssl(self, *args: str, save_as: Optional[str] = None, timeout: int = 300) -> CLIResult:
         """Run openssl with the given arguments."""
-        return self.run(["openssl"] + list(args), save_as=save_as)
+        return self.run(["openssl"] + list(args), save_as=save_as, timeout=timeout)
 
     def openssl_stdin(
         self,
         args: list[str],
         stdin_data: bytes,
         save_as: Optional[str] = None,
+        timeout: int = 300,
     ) -> CLIResult:
         """Run openssl with stdin input."""
         return self.run(
             ["openssl"] + args,
             stdin_data=stdin_data,
             save_as=save_as,
+            timeout=timeout,
         )
 
 

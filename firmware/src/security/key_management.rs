@@ -70,16 +70,17 @@ const KEK_INFO_PREFIX: &[u8] = b"pico2hsm-keyobj-v1";
 /// Maximum private key size.
 ///
 /// RSA-2048 PKCS#1 DER private keys are ~1192 bytes; RSA-4096 are ~2350 bytes.
-/// We size to 1200 bytes to cover RSA-2048 and all EC curves without bloating
-/// the stack in non-RSA builds.  RSA-4096 is not currently supported at this
-/// limit — raise further if RSA-4096 key generation is added.
+/// Sized to 2400 bytes to cover both RSA key sizes and all EC curves.
 #[cfg(feature = "rsa")]
-pub const MAX_PRIVATE_KEY_SIZE: usize = 1200;
+pub const MAX_PRIVATE_KEY_SIZE: usize = 2400;
 #[cfg(not(feature = "rsa"))]
 pub const MAX_PRIVATE_KEY_SIZE: usize = 512;
 
-/// Maximum public key size (uncompressed P-521 point = 133 bytes; allow 512).
-pub const MAX_PUBLIC_KEY_SIZE: usize = 512;
+/// Maximum public key size.
+///
+/// Uncompressed P-521 point = 133 bytes.  RSA-4096 public key blob layout is
+/// `[2 BE mod_len] || modulus (512 B) || exponent (≤4 B)` = 518 bytes.
+pub const MAX_PUBLIC_KEY_SIZE: usize = 520;
 
 // ---------------------------------------------------------------------------
 // KeyType

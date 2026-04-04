@@ -74,7 +74,7 @@ impl KeyType {
 ///
 /// Sized to hold an RSA-4096 PKCS#1 DER private key (~2350 bytes).
 /// This determines the stack size of `KeyMaterial`.
-pub const MAX_KEY_BYTES: usize = 2048;
+pub const MAX_KEY_BYTES: usize = 2400;
 
 // ---------------------------------------------------------------------------
 // KeyMaterial — in-memory decrypted key, must be zeroized on drop

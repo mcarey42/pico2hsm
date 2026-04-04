@@ -1,6 +1,6 @@
 [package]
 name = "pico2hsm-core"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Shared no_std types and traits for pico2hsm"
 license = "MIT"

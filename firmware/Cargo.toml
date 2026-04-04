@@ -1,6 +1,6 @@
 [package]
 name = "pico2hsm-firmware"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "pico2hsm HSM firmware for Raspberry Pi RP2350/RP2354"
 license = "MIT"
@@ -26,6 +26,9 @@ rp2354_embedded = []
 pico2_4m = []
 rsa = ["dep:rsa", "dep:embedded-alloc"]  # RSA support — adds ~1MB to binary; disabled by default
 debug = []         # Debug mode: enables memory dump APDUs, disables secure boot enforcement
+applet-piv = ["dep:des"]                 # PIV applet (NIST SP 800-73-4); adds 3DES (~10 KB)
+applet-openpgp = []                      # OpenPGP Card 3.4 applet (RSA + NIST ECC)
+applet-openpgp-curve25519 = ["applet-openpgp"]  # Adds Ed25519/X25519 (~50 KB, not yet implemented)
 
 # ─── Platform-agnostic dependencies ──────────────────────────────────────────
 # All of these compile on both x86_64 (for tests) and thumbv8m.main-none-eabihf
@@ -51,6 +54,9 @@ ctr = { version = "0.9", default-features = false }
 aes-gcm = { version = "0.10", default-features = false, features = ["aes"] }
 cmac = { version = "0.7", default-features = false }
 cbc = { version = "0.1", default-features = false, features = ["block-padding"] }
+# 3DES for PIV GENERAL AUTHENTICATE (ECB, single 8-byte block, 24-byte key).
+# Pin to 0.8.1 — 0.9.0-rc.3 bumps cipher to 0.5 which conflicts with our cipher 0.4 pins.
+des = { version = "0.8.1", default-features = false, features = ["zeroize"], optional = true }
 chacha20poly1305 = { version = "0.10", default-features = false }
 cipher = { version = "0.4", default-features = false, features = ["block-padding"] }
 

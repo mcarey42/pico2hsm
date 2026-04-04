@@ -65,8 +65,8 @@ pub fn handle(state: &mut ScHsmState, cmd: &ApduCommand<'_>) -> ApduResponse {
             };
 
             // Copy private key DER to a local stack buffer to release the borrow on state.
-            // RSA-2048 PKCS#1 DER is ≤1200 bytes.
-            let mut der_buf = [0u8; 1200];
+            // RSA-2048 PKCS#1 DER is ≤1200 bytes; RSA-4096 is ≤2400 bytes.
+            let mut der_buf = [0u8; 2400];
             let der_len = rsa_key.private_key_der.len();
             let key_type = rsa_key.key_type;
             der_buf[..der_len].copy_from_slice(&rsa_key.private_key_der);

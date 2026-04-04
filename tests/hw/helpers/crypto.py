@@ -55,6 +55,7 @@ def verify_ecdsa_signature(
     """
     _hash_map: dict[str, type[hashes.HashAlgorithm]] = {
         "sha1":   hashes.SHA1,
+        "sha224": hashes.SHA224,
         "sha256": hashes.SHA256,
         "sha384": hashes.SHA384,
         "sha512": hashes.SHA512,
@@ -142,6 +143,7 @@ def generate_ec_peer_key(curve_name: str) -> tuple[bytes, bytes]:
         "prime256v1": ec.SECP256R1(),
         "secp384r1":  ec.SECP384R1(),
         "secp521r1":  ec.SECP521R1(),
+        "secp256k1":  ec.SECP256K1(),
     }
     if curve_name not in curve_map:
         raise ValueError(

@@ -42,10 +42,64 @@ Both channels use RP2350 hardware spinlocks (29 and 30) for SMP-safe cross-core 
 ```
 dispatcher_task()
   └─ Dispatcher::dispatch()          [apdu/dispatcher.rs]
-       └─ ScHsm::process_apdu()      [protocol/sc_hsm/mod.rs]
-            └─ ScHsm::dispatch()
-                 └─ <command>::handle()   [protocol/sc_hsm/commands/]
+       ├─ SELECT AID → activates one of:
+       │     ScHsm  (always present)
+       │     Piv    (#[cfg(feature = "applet-piv")])
+       │     OpenPgp (#[cfg(feature = "applet-openpgp")])
+       └─ all other INS → active protocol's process_apdu()
+            └─ ScHsm::dispatch() → <command>::handle()   [protocol/sc_hsm/commands/]
 ```
+
+## Multi-applet feature flag architecture
+
+The device supports multiple smartcard applets on one firmware, selected at compile time via
+Cargo features.  A client (OpenSC, GnuPG, macOS CryptoTokenKit) picks an applet by sending
+`SELECT AID`; the Dispatcher activates the matching protocol for all subsequent APDUs.
+
+**Applet feature flags:**
+
+| Feature flag | Applet | AID |
+|---|---|---|
+| *(always on)* | SC-HSM | `E8 2B 06 01 04 01 81 C3 1F 02 01` |
+| `applet-piv` | PIV (NIST SP 800-73-4) | `A0 00 00 03 08 00 00 10 00 01 00` |
+| `applet-openpgp` | OpenPGP Card 3.4 | `D2 76 00 01 24 01 ...` |
+| `applet-openpgp-curve25519` | adds Ed25519 + X25519 to OpenPGP | *(implies applet-openpgp)* |
+
+These compose freely with the board feature flags, e.g.:
+
+```sh
+# SC-HSM + PIV on Pico 2:
+cargo build --release --no-default-features --features pico2_4m,applet-piv
+
+# All three applets + Ed25519:
+cargo build --release --no-default-features \
+    --features pico2_4m,applet-piv,applet-openpgp,applet-openpgp-curve25519
+```
+
+**Flash / RAM budget (release, pico2_4m):**
+- Current SC-HSM only: 366 KB flash / 377 KB RAM (18% / 73% of device limits)
+- + PIV (3DES new, all curves already in): +18–27 KB flash / +2 KB RAM
+- + OpenPGP NIST-ECC only: +10–15 KB flash / +2 KB RAM
+- + `applet-openpgp-curve25519` (curve25519-dalek, entirely new): +45–60 KB flash / 0 KB RAM
+- Worst case all three + curve25519: ~476 KB flash (23%) / ~383 KB RAM (74%)
+
+Flash is not a concern.  RAM is the metric to watch; the 128 KB core1 stack and the
+SC-HSM key caches dominate; applet state structs are small by comparison.
+
+**Storage namespace — design constraint for any new applet:**
+
+All three applets share one flash keystore.  Each `KeyObject` must carry an `owner` tag
+so that SC-HSM `INITIALIZE` only wipes SC-HSM-owned slots, not PIV or OpenPGP keys.
+Reserved key ID ranges (to be enforced in `storage/keystore.rs`):
+
+| Key ID range | Owner |
+|---|---|
+| `0x01–0x7F` | SC-HSM |
+| `0x80–0x8F` | PIV (9A→0x80, 9C→0x81, 9D→0x82, 9E→0x83, retired→0x84–0x8F) |
+| `0x90–0x92` | OpenPGP (SIG→0x90, DEC→0x91, AUTH→0x92) |
+
+PIN storage in flash likewise needs per-applet slots.  **This namespace design must be
+implemented before any PIV or OpenPGP command handler is written.**
 
 ## Known pitfalls
 

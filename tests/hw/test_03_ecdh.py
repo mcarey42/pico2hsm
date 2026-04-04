@@ -1,7 +1,4 @@
-"""ECDH key agreement tests for P-256, P-384, and P-521 slots.
-
-K-256 (secp256k1) is excluded because ECDH1-COFACTOR-DERIVE is not supported
-for that curve in the SC-HSM firmware.
+"""ECDH key agreement tests for P-256, P-384, P-521, and K-256 slots.
 
 The cross-check test (test_ecdh_cross_check) is a real cryptographic correctness
 test: both the device and the host independently compute the ECDH shared secret,
@@ -35,6 +32,7 @@ _SECRET_LEN: dict[str, int] = {
     "prime256v1": 32,
     "secp384r1":  48,
     "secp521r1":  66,
+    "secp256k1":  32,
 }
 
 

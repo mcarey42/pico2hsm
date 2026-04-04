@@ -6,128 +6,7 @@ state of the firmware and test suite.
 
 ---
 
-## 1. RSA — Stubs only, zero tests
-
-**What is advertised:**
-`RSA-PKCS-KEY-PAIR-GEN`, `RSA-PKCS`, `RSA-X-509`, `SHA256/384/512-RSA-PKCS`,
-`RSA-PKCS-PSS`, `SHA256/384/512-RSA-PKCS-PSS`, `RSA-PKCS-OAEP`
-(all with `hw` flag for keygen/sign/decrypt)
-
-**Current state:**
-Every RSA function in `firmware/src/crypto/asymmetric.rs` returns
-`CryptoError::UnsupportedAlgorithm`.  The `rsa` crate (v0.9) requires a heap
-allocator (`Vec<u32>` internally); the firmware has no global allocator, so the
-feature is compiled out.  No RSA tests exist anywhere in the test suite.
-
-**What needs to happen:**
-- Decide on an allocator strategy (options documented in `asymmetric.rs:29–41`):
-  - Add a small static bump allocator (easiest, ~20–40 KB RAM cost).
-  - Switch to a `no_std`-native big-integer RSA crate (e.g. `rsa` fork or
-    `micro-rsa`) that does not need `alloc`.
-- Implement `generate_rsa_keypair()`, `rsa_sign_pkcs1v15()`, `rsa_sign_pss()`,
-  and `rsa_decrypt_oaep()` / `rsa_decrypt_pkcs1v15()` in `asymmetric.rs`.
-- Wire RSA key types through the SC-HSM GENERATE KEY PAIR command
-  (`generate_keypair.rs`) so that `pkcs11-tool --keypairgen --key-type RSA:2048`
-  produces a stored RSA key pair.
-- Wire RSA signing through the PSO COMPUTE DIGITAL SIGNATURE command (`sign.rs`)
-  for algorithm IDs `0x31` (SHA-256/PKCS#1v1.5), `0x32` (SHA-384), `0x33`
-  (SHA-512), `0x34` (PSS).
-- Wire RSA decryption through the DECIPHER command (`decrypt.rs`) for algorithm
-  ID `0x41`.
-- Add integration tests (`test_06_rsa_keygen.py`, `test_07_rsa_sign.py`,
-  `test_08_rsa_decrypt.py`) covering at minimum RSA-2048 keygen, PKCS#1v1.5
-  sign+verify, PSS sign+verify, and OAEP decrypt.
-- Evaluate core1 stack headroom: an RSA-2048 private key DER is ~1.2 KB; RSA-4096
-  is ~2.4 KB.  Stack temporaries during RSA ops will be significant — check
-  `CORE1_STACK` size before enabling.
-
----
-
-## 2. ECDH for K-256 (secp256k1) — Protocol gap, crypto code present
-
-**What is advertised:**
-`ECDH1-DERIVE` and `ECDH1-COFACTOR-DERIVE` claim `keySize={192,521}`, which
-covers the secp256k1 key size (256 bits).
-
-**Current state:**
-The crypto layer (`asymmetric.rs:492`) correctly implements
-`ecdh_agree_curve::<k256::Secp256k1>` and unit tests pass.  However,
-`tests/hw/conftest.py` marks the k256 slot with `"ecdh": False` and
-`test_03_ecdh.py` documents that "ECDH1-COFACTOR-DERIVE is not supported for
-that curve in the SC-HSM firmware".  The PSO / DERIVE command handler in the
-protocol layer apparently does not route K-256 ECDH requests to the crypto
-function — the exact failure mode (wrong algorithm ID mapping, missing branch,
-or explicit rejection) has not been diagnosed.
-
-**What needs to happen:**
-- Investigate the PSO command handler (`pso.rs`) and the MSE SET command
-  (`mse.rs`) to find where P-256/P-384/P-521 ECDH is dispatched and confirm
-  whether K-256 is missing from the dispatch table or rejected for another
-  reason.
-- If it is simply a missing branch: add K-256 to the dispatch path, matching
-  the existing pattern for the other curves.
-- Add an ECDH test fixture for K-256 in `test_03_ecdh.py` (flip `"ecdh": True`
-  in conftest once the fix is confirmed working on hardware).
-- Update the expected secret-length table in the test (`_SECRET_LEN`) for
-  `secp256k1` → 32 bytes.
-
----
-
-## 3. ECDSA-SHA224 — Implemented, not tested
-
-**What is advertised:**
-`ECDSA-SHA224` with `hw` flag (sign/verify for all EC key sizes).
-
-**Current state:**
-`firmware/src/protocol/sc_hsm/commands/sign.rs:82` handles algorithm byte
-`0x72` (ALGO_EC_SHA224) and dispatches to SHA-224 hashing.  The implementation
-appears complete but there is no integration test covering it.  `test_04` covers
-SHA-256/384/512; `test_05` covers SHA-1/MD5/RIPEMD-160/GOSTR3411-2012.
-SHA-224 falls through the gap between the two files.
-
-**What needs to happen:**
-- Add `sha224` to the hash fixture list in `test_04_sign_hashes.py` (or create
-  `test_04b` / extend `test_05`) parametrized over all four curves
-  (P-256, P-384, P-521, K-256).
-- The test should follow the existing cross-hash pattern: sign on-device via
-  `pkcs11-tool --mechanism ECDSA-SHA224`, then verify the DER signature
-  off-device with `openssl dgst -sha224 -verify`.
-- Confirm `openssl` on the test host supports `SHA224withECDSA` (it does on any
-  OpenSSL ≥ 1.0.2 build).
-
----
-
-## 4. Key persistence — Keys are RAM-only, lost on reset
-
-**Current state:**
-`protocol/sc_hsm/commands/initialize.rs:155` has a TODO:
-> "erase persistent flash keystore, write EF.DevAut, format RAID sectors."
-
-Key pairs generated via GENERATE KEY PAIR are pushed into `ScHsmState.keys` (a
-`heapless::Vec` in RAM).  On power-cycle or firmware reset, all generated keys
-are gone.  The INITIALIZE command also does not durably write the DKEK share
-count or the SO-PIN hash to flash.  The device currently behaves like a session
-HSM only.
-
-**What needs to happen:**
-- Design a flash storage layout: key slots (key ID → DER private key), PIN/SO-PIN
-  hashes, DKEK metadata, device certificate (EF.C.DevAut).
-- Implement erase-on-INITIALIZE: wipe all key slots, write fresh SO-PIN hash and
-  DKEK share count to flash.
-- Implement write-on-GENERATE KEY PAIR: after generating an EC or RSA key pair,
-  persist the private key DER to the corresponding flash slot.
-- Implement read-on-boot: load key metadata (not necessarily the full private key,
-  just IDs and types) into `ScHsmState.keys` from flash so LIST KEYS works after
-  reset.
-- Evaluate wear-levelling: private-key slots are written once and never
-  overwritten (only deleted on INITIALIZE), so raw sector writes are acceptable;
-  the PIN hash slot may need a small write-counter.
-- Consider the existing `storage/mod.rs` and `security/otp.rs` modules as the
-  starting point.
-
----
-
-## 5. DKEK — Key backup/restore is fully stubbed
+## 1. DKEK — Key backup/restore is fully stubbed
 
 **Current state:**
 Three layers are all unimplemented:
@@ -163,61 +42,57 @@ Three layers are all unimplemented:
 
 ---
 
-## 6. Remaining SC-HSM command stubs
+## 2. Remaining SC-HSM command stubs
 
 These commands all return `SW_INS_NOT_SUPPORTED`.  They are lower priority than
-items 4 and 5 but are needed for full SC-HSM compatibility.
+item 1 but are needed for full SC-HSM compatibility.
 
-**6a. PSO Sign / Decipher / MAC (`commands/pso.rs`)**
-The PSO command handler (INS=0x2A) stubs out four operations.  Note: the current
-working ECDSA sign path uses a separate INS (probably INS=0x68 via `sign.rs`);
-PSO Sign may be a secondary compatibility path required by certain PKCS#11
-operations or for RSA.  Needs investigation to determine if/when OpenSC routes
-through PSO vs the direct sign command.
-- `(0x80, 0x84)` — PSO: Compute Digital Signature → call `key_management::sign()`
-- `(0x80, 0x86)` — PSO: Decipher → call `key_management::decrypt()`
-- `(0x8E, 0x80)` — PSO: Compute Cryptographic Checksum (CMAC/HMAC)
-- `(0x86, 0x80)` — PSO: Verify Cryptographic Checksum
+**2a. PSO Compute Cryptographic Checksum / Verify (`commands/pso.rs`)**
+PSO CDS (0x9E,0x9A) and PSO Decipher (0x80,0x86) are now implemented, delegating
+to the same ECDSA/RSA and ECDH/RSA paths as `sign.rs` and `decrypt.rs` but reading
+key/algo from MSE state.  Still stubbed:
+- `(0x8E, 0x80)` — PSO: Compute Cryptographic Checksum (CMAC/HMAC) — needs item 2d
+- `(0x86, 0x80)` — PSO: Verify Cryptographic Checksum — needs item 2d
 
-**6b. Symmetric key generation (`commands/generate_key.rs`)**
+**2b. Symmetric key generation (`commands/generate_key.rs`)**
 INS for GENERATE KEY (symmetric).  Stub calls
 `key_management::generate_symmetric_key()`.  Needed for AES key objects.
 
-**6c. Symmetric cipher (`commands/cipher_sym.rs`)**
+**2c. Symmetric cipher (`commands/cipher_sym.rs`)**
 AES-CBC / AES-GCM encrypt/decrypt.  Stub should dispatch to `crypto::symmetric`
 based on the current MSE (Manage Security Environment) state.
 
-**6d. HKDF / PBKDF2 / X9.63 / CMAC / HMAC extras (`commands/extras.rs`)**
+**2d. HKDF / PBKDF2 / X9.63 / CMAC / HMAC extras (`commands/extras.rs`)**
 Six sub-operations under a single INS, all stubbed:
 `HKDF-Extract`, `HKDF-Expand`, `PBKDF2-SHA256`, `X9.63-KDF`, `AES-CMAC`,
 `HMAC-SHA256`.  The `crypto/kdf.rs` module has partial implementations; these
 commands just need to be wired up.
 
-**6e. BIP-32 / SLIP-10 key derivation (`commands/bip_slip.rs`)**
+**2e. BIP-32 / SLIP-10 key derivation (`commands/bip_slip.rs`)**
 Stub should call `crypto::kdf::bip32_derive()` or `slip10_derive()`.
-Note: the SLIP-10 child key derivation has a known bug (see item 8).
+Note: the SLIP-10 child key derivation has a known bug (see item 4).
 
-**6f. Asymmetric key derivation (`commands/derive_asym.rs`)**
+**2f. Asymmetric key derivation (`commands/derive_asym.rs`)**
 INS=0x62 / P1=0x01.  Stub should call `crypto::kdf::x963_derive()` or
 `hkdf_derive()` with the source key ID and derivation info from the command data.
 
-**6g. Session PIN (`commands/session_pin.rs`)**
+**2g. Session PIN (`commands/session_pin.rs`)**
 Generate a one-time session PIN, store with expiry.
 
-**6h. External auth (`commands/external_auth.rs`)**
+**2h. External auth (`commands/external_auth.rs`)**
 Verify a cryptogram over the stored INTERNAL AUTHENTICATE challenge using the
 device auth key.  Must clear the challenge after use to prevent replay.
 
-**6i. General auth (`commands/general_auth.rs`)**
+**2i. General auth (`commands/general_auth.rs`)**
 Multi-step authentication state machine using the 0x7C TLV template.
 
-**6j. PUK auth and PIN unblock (`commands/puk_auth.rs`)**
+**2j. PUK auth and PIN unblock (`commands/puk_auth.rs`)**
 Constant-time PUK comparison, retry counter management, and PIN unblock logic.
 Currently no PUK is stored.
 
 ---
 
-## 7. Brainpool curves — Blocked on upstream crate
+## 3. Brainpool curves — Blocked on upstream crate
 
 **Current state:**
 `asymmetric.rs:26` tracks RustCrypto/elliptic-curves issue #1114.
@@ -237,7 +112,7 @@ context compatible with `elliptic-curve 0.13`.
 
 ---
 
-## 8. SLIP-10 child key derivation bug
+## 4. SLIP-10 child key derivation bug
 
 **Current state:**
 `firmware/src/crypto/kdf.rs:828` has a disabled test:
@@ -247,7 +122,7 @@ context compatible with `elliptic-curve 0.13`.
 > child step.  Needs investigation and fix before enabling."
 
 The master key derivation unit test passes; only the child step is wrong.  Because
-`commands/bip_slip.rs` is also stubbed (item 6e), this bug is not yet
+`commands/bip_slip.rs` is also stubbed (item 3e), this bug is not yet
 user-visible, but it will block any correct BIP-32 / SLIP-10 operation once that
 command is wired up.
 
@@ -261,43 +136,43 @@ command is wired up.
 
 ---
 
-## 9. Security hardening — Several stubs awaiting hardware/crate API
+## 5. Security hardening — Several stubs awaiting hardware/crate API
 
-**9a. PIN hash not zeroized (`commands/initialize.rs:46`)**
+**5a. PIN hash not zeroized (`commands/initialize.rs:46`)**
 `hash_pin()` calls `Sha256::new()` / `finalize()` and copies the result, but the
 `Sha256` state on the stack is not explicitly zeroized.  The comment says
 "replace with proper zeroizing hash call."  Fix: use `sha2::Sha256` via the
 `zeroize` crate's `ZeroizeOnDrop` wrapper or call `Zeroize::zeroize()` on the
 digest object after copying.
 
-**9b. Anti-glitch detector not armed (`security/anti_glitch.rs:153`)**
+**5b. Anti-glitch detector not armed (`security/anti_glitch.rs:153`)**
 `arm_glitch_detector()` is a no-op stub.  The POWMAN VREG register fields
 `GLITCH_DETECT_DISABLE` and `GLITCH_DETECT_SENS` are documented in the RP2350
 TRM but not yet exposed by `embassy-rp` / `rp-pac`.  Software double-checks
 (`double_check()`) are the current primary countermeasure.  Track the
 `embassy-rp` / `rp-pac` crates for POWMAN VREG support.
 
-**9c. OTP lock operations stubbed (`security/otp.rs:311, 326`)**
+**5c. OTP lock operations stubbed (`security/otp.rs:311, 326`)**
 `Otp::lock_read()` and `Otp::lock_write()` return `Ok(())` without doing anything
 because `embassy-rp 0.10` does not expose a lock API.  Fix requires PAC access to
 OTP_DATA_RAW permission bits or the ROM `otp_access` function with a lock flag.
 Currently non-fatal: provisioning proceeds but OTP rows are not read- or
 write-locked after programming.
 
-**9d. JTAG disable OTP row unverified (`security/otp.rs:222`)**
+**5d. JTAG disable OTP row unverified (`security/otp.rs:222`)**
 `disable_jtag_permanent()` uses row `0x110` bit 0 as the JTAG disable fuse, but
 the comment notes this is the user-land flag and the hardware JTAG fuse may be at
 a different row in OTP page 0.  Cross-reference RP2350 TRM §5.1 "OTP Boot Flags"
 to confirm the correct row before this function is called in production
 provisioning.
 
-**9e. SMK derivation missing device serial (`security/otp.rs:364`)**
+**5e. SMK derivation missing device serial (`security/otp.rs:364`)**
 `derive_smk()` (Storage Master Key derivation) has a TODO to pass the device
 serial number from OTP as the HKDF `info` parameter.  Currently it likely uses an
 empty or default info string, making the SMK the same across all devices with the
 same key material.
 
-**9f. CSPRNG reseed hook not wired (`crypto/rng.rs:244`)**
+**5f. CSPRNG reseed hook not wired (`crypto/rng.rs:244`)**
 `reseed()` exists as a hook for a future ChaCha20-based CSPRNG but currently does
 nothing — the TRNG is used directly for every call.  A CSPRNG would allow
 reseeding from TRNG periodically, improving performance for bulk random generation
@@ -307,15 +182,15 @@ reference passed to the RNG module (see `rng.rs:38`).
 
 ---
 
-## 10. Board bringup — Hardware peripherals not driven
+## 6. Board bringup — Hardware peripherals not driven
 
-**10a. WS2812 LED on rp2350_one (`board/rp2350_one.rs:88`)**
+**6a. WS2812 LED on rp2350_one (`board/rp2350_one.rs:88`)**
 `Ws2812Led::set_color()` stores the colour value but does not write to the LED.
 The comment says "Wire up PIO0 / DMA0 in `init()` and replace the `_current`
 field with a real `PioWs2812<PIO0, 0, 1>` handle."  Until fixed, the status LED
 on the Pico One board is always off regardless of device state.
 
-**10b. ST7789 LCD on rp2350_geek (`board/rp2350_geek.rs`)**
+**6b. ST7789 LCD on rp2350_geek (`board/rp2350_geek.rs`)**
 `init_lcd()` logs a warning and returns; `update_status_display()` is a no-op.
 The `LcdDisplay::set_status()` method also does nothing except log via defmt.
 Full implementation requires: store SPI + D/C + RST pin handles, implement the
@@ -324,17 +199,63 @@ ST7789 hardware reset + init command sequence, and render a status screen using
 
 ---
 
-## 11. Future protocols — PIV and OpenPGP
+## 7. PIV and OpenPGP applets
 
-Both protocols have placeholder module stubs that compile and dispatch to a
-`process_apdu()` that returns an empty/error response.  No commands are
-implemented.  These are intentionally deferred.
+Both protocols have placeholder stubs (`protocol/piv/mod.rs`,
+`protocol/openpgp/mod.rs`) that compile and return `SW_INS_NOT_SUPPORTED`.
+The Dispatcher (`apdu/dispatcher.rs`) already routes by AID to all three protocols.
 
-**11a. PIV (`protocol/piv/mod.rs`)**
-Standard NIST SP 800-73-4 PIV card protocol.  Used by macOS/Windows login,
-YubiKey-compatible tools, and many government/enterprise systems.
+**Architecture decision (2026-04-04):** implement as Cargo feature flags
+(`applet-piv`, `applet-openpgp`, `applet-openpgp-curve25519`), not separate
+firmware targets.  All three applets coexist in one binary and are selected at
+runtime by `SELECT AID`.  See CLAUDE.md §"Multi-applet feature flag architecture"
+for the full design including flash/RAM budget and feature flag usage.
 
-**11b. OpenPGP (`protocol/openpgp/mod.rs`)**
-OpenPGP card protocol (BSI TR-03110).  Used by GnuPG / gpg-agent for SSH and
-email signing.  GnuPG can drive the card via `--card-status` when OpenPGP AID is
-selected.
+**7a. Storage namespace — prerequisite for both applets**
+
+This must be done before any command handler is written.  The flash keystore
+currently has no concept of applet ownership; SC-HSM `INITIALIZE` would wipe PIV
+and OpenPGP keys.
+
+- Add an `owner: AppletId` field to `KeyObject` in `security/key_management.rs`.
+- Reserve ID ranges in `storage/keystore.rs`: SC-HSM `0x01–0x7F`, PIV `0x80–0x8F`,
+  OpenPGP `0x90–0x92`.
+- Change SC-HSM `INITIALIZE` to call `wipe_by_owner(AppletId::ScHsm)` instead of
+  `wipe_all()`.
+- Add per-applet PIN slots to flash (SC-HSM already has one; PIV needs a second
+  for its own PIN; OpenPGP needs PW1 + PW3).
+
+**7b. PIV (`applet-piv` feature)**
+
+3DES dependency is already wired: `des = { version = "0.8.1", ... , optional = true }`
+in `Cargo.toml`, pulled in by `applet-piv = ["dep:des"]`.  The `applet-openpgp` and
+`applet-openpgp-curve25519` feature stubs are also declared.
+
+3DES usage notes (from research):
+- Use `TdesEde3` (EDE, three-key, 24-byte key) — not `TdesEee3` or two-key variants.
+- PIV GENERAL AUTHENTICATE challenge/response is **ECB** (single 8-byte block,
+  no IV) — the `cbc` crate is not needed for this operation.
+- `BlockEncrypt` / `BlockDecrypt` + `KeyInit` from `cipher 0.4` (already in tree).
+- Do NOT upgrade to `des 0.9.0-rc.3` — it requires `cipher 0.5`, conflicting with
+  all existing cipher crates pinned to `0.4`.
+
+Commands to implement: SELECT, GET DATA, PUT DATA, VERIFY, CHANGE REFERENCE DATA,
+RESET RETRY COUNTER, GENERAL AUTHENTICATE, GENERATE KEY PAIR.
+
+Key slots: 9A (PIV Auth), 9C (Digital Sig), 9D (Key Mgmt), 9E (Card Auth),
+82–95 (20 retired slots — implement last).
+
+**7c. OpenPGP (`applet-openpgp` feature)**
+
+Base applet (RSA + NIST ECC — all crypto already in): +10–15 KB flash.
+
+Commands to implement: SELECT, GET DATA, PUT DATA, VERIFY (PW1/PW3), CHANGE
+REFERENCE DATA, PSO:CDS, PSO:DEC, AUTHENTICATE, GENERATE KEY PAIR, GET CHALLENGE.
+
+Key slots: SIG (0x90), DEC (0x91), AUTH (0x92).
+
+**7d. Ed25519 / X25519 (`applet-openpgp-curve25519` feature)**
+
+Adds `curve25519-dalek` (~45–60 KB release, not currently in binary at all) for
+EdDSA signing and X25519 key agreement — the modern OpenPGP key defaults preferred
+by GnuPG.  Gate behind its own sub-flag so NIST-ECC-only builds don't pay the cost.

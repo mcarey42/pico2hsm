@@ -88,8 +88,8 @@ pub struct EfEntry {
 
 /// An in-memory (volatile) RSA key slot.
 ///
-/// Separate from `InMemoryKey` because RSA private keys are ~1200 bytes
-/// (PKCS#1 DER for RSA-2048) — too large to fit in `InMemoryKey.private_key`
+/// Separate from `InMemoryKey` because RSA private keys are ~1200–2350 bytes
+/// (PKCS#1 DER for RSA-2048/4096) — too large to fit in `InMemoryKey.private_key`
 /// which is sized for the largest EC key (66 bytes for P-521).
 #[cfg(feature = "rsa")]
 pub struct RsaInMemoryKey {
@@ -97,12 +97,12 @@ pub struct RsaInMemoryKey {
     pub key_id: u8,
     /// Key type: `RsaPrivate2048` or `RsaPrivate4096`.
     pub key_type: CoreKeyType,
-    /// SC-HSM AlgorithmId byte used during keygen (e.g. 0x05 = RSA-2048).
+    /// SC-HSM AlgorithmId byte used during keygen (e.g. 0x05 = RSA-2048, 0x07 = RSA-4096).
     pub algo: u8,
-    /// PKCS#1 DER-encoded `RSAPrivateKey` (≤1200 bytes for RSA-2048).
-    pub private_key_der: heapless::Vec<u8, 1200>,
-    /// Raw RSA modulus, big-endian (256 bytes for RSA-2048).
-    pub modulus: heapless::Vec<u8, 256>,
+    /// PKCS#1 DER-encoded `RSAPrivateKey` (≤1200 bytes for RSA-2048, ≤2350 bytes for RSA-4096).
+    pub private_key_der: heapless::Vec<u8, 2400>,
+    /// Raw RSA modulus, big-endian (256 bytes for RSA-2048, 512 bytes for RSA-4096).
+    pub modulus: heapless::Vec<u8, 512>,
     /// Raw RSA public exponent, big-endian (3 bytes for e=65537).
     pub exponent: heapless::Vec<u8, 4>,
 }

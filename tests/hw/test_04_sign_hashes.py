@@ -1,10 +1,11 @@
 """Cross-hash ECDSA sign + verify tests.
 
-Tests all combinations of the three firmware-supported hash algorithms
-(SHA-256, SHA-384, SHA-512) × all four key slots (P-256, P-384, P-521, K-256).
+Tests all combinations of the firmware-supported hash algorithms
+(SHA-224, SHA-256, SHA-384, SHA-512) × all four key slots (P-256, P-384, P-521, K-256).
 
 The firmware's sign.rs handles:
   algo 0x71/0x73 → SHA-256  (card hashes the raw message)
+  algo 0x72      → SHA-224
   algo 0x75      → SHA-384
   algo 0x77      → SHA-512
   algo 0x13/0x15/0x17/0x19/0x70 → pass-through (host pre-hashed)
@@ -28,8 +29,9 @@ log = logging.getLogger(__name__)
 
 TEST_MESSAGE = b"pico2hsm cross-hash sign test message"
 
-# All three hash algorithms the firmware supports for ECDSA.
+# All hash algorithms the firmware supports for ECDSA (sign.rs algo 0x72–0x77).
 HASH_MECHANISMS = [
+    {"hash": "sha224", "mechanism": "ECDSA-SHA224"},
     {"hash": "sha256", "mechanism": "ECDSA-SHA256"},
     {"hash": "sha384", "mechanism": "ECDSA-SHA384"},
     {"hash": "sha512", "mechanism": "ECDSA-SHA512"},

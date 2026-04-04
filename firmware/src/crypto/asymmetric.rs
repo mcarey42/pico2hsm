@@ -98,12 +98,12 @@ pub struct EcKeyPair {
 pub struct RsaKeyPair {
     /// `RsaPrivate2048` or `RsaPrivate4096`.
     pub key_type: KeyType,
-    /// DER-encoded PKCS#1 `RSAPrivateKey` (≤1200 bytes for 2048-bit).
-    pub private_key_der: Vec<u8, 1200>,
-    /// DER-encoded PKCS#1 `RSAPublicKey` (≤300 bytes for 2048-bit).
-    pub public_key_der: Vec<u8, 300>,
-    /// Raw modulus bytes, big-endian (256 bytes for RSA-2048).
-    pub modulus: Vec<u8, 256>,
+    /// DER-encoded PKCS#1 `RSAPrivateKey` (≤1200 bytes for 2048-bit, ≤2350 bytes for 4096-bit).
+    pub private_key_der: Vec<u8, 2400>,
+    /// DER-encoded PKCS#1 `RSAPublicKey` (≤300 bytes for 2048-bit, ≤560 bytes for 4096-bit).
+    pub public_key_der: Vec<u8, 560>,
+    /// Raw modulus bytes, big-endian (256 bytes for RSA-2048, 512 bytes for RSA-4096).
+    pub modulus: Vec<u8, 512>,
     /// Raw public exponent bytes, big-endian (3 bytes for e=65537).
     pub exponent: Vec<u8, 4>,
 }
