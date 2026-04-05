@@ -42,17 +42,6 @@ Three layers are all unimplemented:
 
 ---
 
-## 2. Remaining SC-HSM command stubs
-
-These commands all return `SW_INS_NOT_SUPPORTED`.  They are lower priority than
-item 1 but are needed for full SC-HSM compatibility.
-
-**2e. BIP-32 / SLIP-10 key derivation (`commands/bip_slip.rs`)**
-Stub should call `crypto::kdf::bip32_derive()` or `slip10_derive()`.
-The underlying `slip10_child_key` implementation is correct and tested against
-all SLIP-0010 test vector 1 paths (m, m/0', m/0'/1, m/0'/1/2').
-
----
 
 ## 3. Brainpool curves — Blocked on upstream crate
 
