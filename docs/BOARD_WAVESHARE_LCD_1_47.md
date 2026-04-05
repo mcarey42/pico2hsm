@@ -1,0 +1,334 @@
+# Waveshare RP2350-LCD-1.47-B Board Reference
+
+**Feature flag**: `waveshare_rp2350_lcd_16m`
+**Source file**: `firmware/src/board/waveshare_rp2350_lcd.rs`
+
+---
+
+## Board overview
+
+The Waveshare RP2350-LCD-1.47-B is a compact RP2350A development board with an
+integrated 1.47" colour LCD and a single WS2812B RGB LED.
+
+| Parameter       | Value                                            |
+|-----------------|--------------------------------------------------|
+| MCU             | RP2350A (dual Cortex-M33 + dual RISC-V, 150 MHz) |
+| SRAM            | 520 KB on-chip                                   |
+| External flash  | Winbond W25Q128JVSIQ 16 MB QSPI NOR              |
+| Display         | 1.47" ST7789V3 IPS, 172 × 320 pixels, RGB565     |
+| RGB LED         | Single WS2812B RGB LED                           |
+| SD card         | MicroSD slot (SPI1)                              |
+| USB             | USB 1.1 full-speed (USB-C connector)             |
+| Power           | 3.3 V from USB via onboard regulator             |
+
+Pin source: official Waveshare example code (`RP2350-LCD-1.47.zip`, waveshare.net 2025),
+cross-referenced with schematic `RP2350-LCD-1.47-A.pdf`.
+
+---
+
+## Full GPIO pinout
+
+| GPIO | Function          | Direction | Notes                                     |
+|------|-------------------|-----------|-------------------------------------------|
+|  0   | UART0 TX          | out       | Debug UART (optional)                     |
+|  1   | UART0 RX          | in        | Debug UART (optional)                     |
+|  2   | —                 | —         | Available                                 |
+|  3   | —                 | —         | Available                                 |
+|  4   | SPI0 MISO         | in        | LCD hardware netlist pin; display is write-only, pin never driven by ST7789V3 |
+|  5   | —                 | —         | Available                                 |
+|  6   | —                 | —         | Available                                 |
+|  7   | —                 | —         | Available                                 |
+|  8   | —                 | —         | Available                                 |
+|  9   | —                 | —         | Available                                 |
+| 10   | SPI1 SCK          | out       | SD card clock                             |
+| 11   | SPI1 MOSI         | out       | SD card data in                           |
+| 12   | SPI1 MISO         | in        | SD card data out                          |
+| 13   | —                 | —         | Available                                 |
+| 14   | —                 | —         | Available                                 |
+| 15   | SPI1 CS           | out       | SD card chip-select (active-low)          |
+| 16   | LCD DC            | out       | ST7789V3 Data/Command select              |
+| 17   | LCD CS            | out       | ST7789V3 chip-select (active-low)         |
+| 18   | SPI0 SCK          | out       | ST7789V3 SPI clock                        |
+| 19   | SPI0 MOSI         | out       | ST7789V3 SPI data in                      |
+| 20   | LCD RST           | out       | ST7789V3 hardware reset (active-low)      |
+| 21   | LCD BL            | out       | ST7789V3 backlight enable (active-high)   |
+| 22   | WS2812B DIN       | out       | RGB LED data (PIO0 SM0)                   |
+| 23   | —                 | —         | Available                                 |
+| 24   | —                 | —         | Available                                 |
+| 25   | —                 | —         | Available (no onboard LED on this board)  |
+| 26   | ADC0              | in/out    | Available                                 |
+| 27   | ADC1              | in/out    | Available                                 |
+| 28   | ADC2              | in/out    | Available                                 |
+| 29   | ADC3 / VSYS sense | in        | Internal VSYS voltage divider             |
+
+QSPI flash (W25Q128) is connected to the RP2350A QSPI interface (not general GPIO).
+
+---
+
+## ST7789V3 LCD
+
+### Pin assignments
+
+| Signal     | GPIO | Embassy-rp peripheral  | Note                           |
+|------------|------|-------------------------|--------------------------------|
+| SCK        |  18  | SPI0 CLK                | 40 MHz, SPI mode 0 (CPOL=0/CPHA=0) |
+| MOSI / DIN |  19  | SPI0 TX                 | Data to display                |
+| MISO       |   4  | SPI0 RX (hardware only) | Display never drives this pin  |
+| DC         |  16  | GPIO Output             | Low = command, High = data     |
+| CS         |  17  | GPIO Output             | Active-low chip-select         |
+| RST        |  20  | GPIO Output             | Active-low hardware reset      |
+| BL         |  21  | GPIO Output             | High = backlight on            |
+
+### Display geometry
+
+| Parameter      | Value              |
+|----------------|--------------------|
+| Resolution     | 172 × 320 pixels   |
+| Colour depth   | 16-bit RGB565      |
+| CASET range    | 0x0000 – 0x00AB    |
+| RASET range    | 0x0000 – 0x013F    |
+| Pixel count    | 55 040 pixels      |
+| Frame size     | 110 080 bytes      |
+| Byte order     | Big-endian (MSB first) |
+
+### Init sequence
+
+Derived from the Waveshare C reference `LCD_1in47_Init()` in `RP2350-LCD-1.47.zip`.
+
+```
+Hardware reset: RST high → low (10 ms) → high → wait 120 ms
+
+SWRESET  (01h)           Software reset                    150 ms delay
+SLPOUT   (11h)           Sleep out (enable oscillator)     255 ms delay
+COLMOD   (3Ah) 05h       16-bit/pixel RGB565
+MADCTL   (36h) 00h       Normal scan, no mirror, RGB order
+INVON    (21h)           Display inversion on (required for V3 panel)
+NORON    (13h)           Normal display mode
+CASET    (2Ah) 00 00 00 AB   Columns 0–171
+RASET    (2Bh) 00 00 01 3F   Rows 0–319
+DISPON   (29h)           Display on                        255 ms delay
+BL → high                Backlight on (GPIO21)
+```
+
+### Pixel write protocol
+
+After `CASET`/`RASET`, send `RAMWR (2Ch)` then stream pixel data:
+- CS asserted (low) for the entire `RAMWR` + data transfer
+- DC high during data bytes
+- Each pixel: 2 bytes big-endian RGB565 (high byte first)
+- Full-screen fill: 110 080 bytes, sent in 128-byte chunks
+
+### RGB565 status colours
+
+| `LedStatus`   | RGB565   | Hex    | Description        |
+|---------------|----------|--------|--------------------|
+| Off           | Black    | 0x0000 | Display blank      |
+| Ready         | Green    | 0x07E0 | HSM idle           |
+| Busy          | Blue     | 0x001F | Command processing |
+| Error         | Red      | 0xF800 | Unrecoverable error|
+| Degraded      | Yellow   | 0xFFE0 | Storage degraded   |
+| Resyncing     | Cyan     | 0x07FF | RAID resync        |
+| WaitingForPin | Bright blue | 0x031F | PIN entry required |
+
+---
+
+## WS2812B RGB LED
+
+### Pin assignment
+
+| Signal  | GPIO | Peripheral  | Note                        |
+|---------|------|-------------|-----------------------------|
+| DIN     |  22  | PIO0 SM0    | 800 kHz, GRB byte order     |
+
+### Protocol
+
+The WS2812B uses a single-wire protocol at 800 kHz.  The embassy-rp
+`pio_programs::ws2812` driver implements the timing in PIO assembly with
+DMA transfer.
+
+**Byte order**: Green, Red, Blue (GRB) — the LED expects green byte first.
+The `PioWs2812<_, _, _, Grb>` driver handles GRB packing automatically;
+callers pass standard `RGB8 { r, g, b }` values.
+
+**Reset signal**: 55 µs low after the last bit (handled automatically by
+`PioWs2812::write()`).
+
+### Required resources
+
+| Resource    | Value                                |
+|-------------|--------------------------------------|
+| PIO         | PIO0                                 |
+| State machine | SM0 (or any free SM)               |
+| DMA channel | DMA_CH0 (or any free channel)       |
+| Pixel count | N = 1                                |
+
+### GRB colour mapping
+
+| `LedStatus`   | GRB tuple  | Description       |
+|---------------|------------|-------------------|
+| Off           | (0,  0,  0)| LED off           |
+| Ready         | (8,  0,  0)| Dim green         |
+| Busy          | (0,  0,  8)| Dim blue          |
+| Error         | (0,  8,  0)| Dim red           |
+| Degraded      | (8,  8,  0)| Dim yellow        |
+| Resyncing     | (8,  0,  8)| Dim cyan          |
+| WaitingForPin | (0,  0, 24)| Brighter blue     |
+
+Values ≤ 24/255 keep current draw within the USB 100 mA power budget.
+
+### Wiring the PIO driver in `main.rs`
+
+```rust
+use embassy_rp::gpio::{Level, Output};
+use embassy_rp::pio::Pio;
+use embassy_rp::pio_programs::ws2812::{PioWs2812, PioWs2812Program};
+
+// Obtain PIO0 — bind the DMA interrupt in the embassy_rp bind_interrupts! macro.
+let Pio { mut common, sm0, .. } = Pio::new(p.PIO0, Irqs);
+let ws2812_prog = PioWs2812Program::new(&mut common);
+
+// Single-pixel chain on GPIO22, DMA channel 0.
+let mut ws2812 = PioWs2812::new(
+    &mut common, sm0, p.DMA_CH0, Irqs, p.PIN_22, &ws2812_prog,
+);
+
+// Wrap with the adapter from waveshare_rp2350_lcd.
+use pico2hsm_firmware::board::waveshare_rp2350_lcd::PioWs2812Writer;
+let mut led_writer = PioWs2812Writer::new(ws2812);
+```
+
+---
+
+## SD card
+
+### Pin assignments (SPI1)
+
+| Signal | GPIO | Note                                  |
+|--------|------|---------------------------------------|
+| SCK    |  10  | SPI1 clock (up to 25 MHz for SD)      |
+| MOSI   |  11  | SPI1 data to SD card                  |
+| MISO   |  12  | SPI1 data from SD card                |
+| CS     |  15  | Chip-select (active-low, GPIO Output) |
+
+Source: Waveshare MicroPython example `MicroPython/02-SD/boot.py`
+(`machine.SPI(1, sck=Pin(10), mosi=Pin(11), miso=Pin(12))`).
+
+### Integration with `embedded-sdmmc`
+
+The `embedded-sdmmc` crate (v0.9, already in `Cargo.toml`) provides `SdCard`
+and `VolumeManager` for FAT32 access.
+
+```rust
+use embedded_sdmmc::{SdCard, VolumeManager};
+use embassy_rp::gpio::{Level, Output};
+
+let cs = Output::new(p.PIN_15, Level::High);
+let sdcard = SdCard::new(board.spi1(), cs, embassy_time::Delay);
+let mut volume_mgr = VolumeManager::new(sdcard, FakeTimesource);
+```
+
+SPI1 is already constructed at 40 MHz in `run_waveshare_lcd_board()`.  SD
+cards accept up to 25 MHz in SPI mode; 40 MHz may work but 25 MHz is safer
+for long traces or non-SDHC cards.  Reduce `SPI_FREQ_HZ` for SPI1 or use a
+separate SPI1 config if needed.
+
+---
+
+## Feature flags
+
+| Feature flag                  | Effect                                          |
+|-------------------------------|-------------------------------------------------|
+| `waveshare_rp2350_lcd_16m`    | Enables `WaveshareRp2350LcdBoard` and the `Board` trait impl |
+
+The feature flag activates:
+- `impl Board for WaveshareRp2350LcdBoard` in `waveshare_rp2350_lcd.rs`
+- `run_waveshare_lcd_board()` in `main.rs`
+- Flash layout matching the 16 MB W25Q128 chip (via QSPI / `embassy_rp::flash`)
+
+---
+
+## Build command
+
+```sh
+# SC-HSM only (default applet set):
+./build-all-debug.sh waveshare_rp2350_lcd_16m
+
+# Or manually with cargo:
+cargo build --release \
+  --no-default-features \
+  --features waveshare_rp2350_lcd_16m
+```
+
+The debug script sets `DEFMT_LOG=trace` and uses the debug profile; see
+`CLAUDE.md` for the full workflow.
+
+---
+
+## Async rendering wiring
+
+`LedController::set_status()` is synchronous — it stores the desired status
+and returns immediately.  Actual LCD rendering and WS2812B updates require
+async operations and GPIO handles that cannot be stored in `St7789V3StatusDisplay`
+without changing the `WaveshareRp2350LcdBoard::new(spi0, spi1)` call site.
+
+The intended usage pattern in `run_waveshare_lcd_board()`:
+
+```rust
+use embassy_rp::gpio::{Level, Output};
+use pico2hsm_firmware::board::waveshare_rp2350_lcd::{
+    init_lcd, update_status_display, PioWs2812Writer,
+};
+
+// Claim LCD control pins.
+let mut dc  = Output::new(p.PIN_16, Level::Low);
+let mut cs  = Output::new(p.PIN_17, Level::High);
+let mut rst = Output::new(p.PIN_20, Level::High);
+let mut bl  = Output::new(p.PIN_21, Level::Low);
+
+// Initialise the ST7789V3 (hardware reset + init sequence).
+init_lcd(&mut board.spi0, &mut dc, &mut cs, &mut rst, &mut bl).await;
+
+// After any set_status() call, push the colour to hardware:
+board.led().set_status(LedStatus::Ready);
+update_status_display(
+    board.led(),
+    &mut board.spi0,
+    &mut dc,
+    &mut cs,
+    &mut led_writer,   // PioWs2812Writer from the WS2812B section above
+).await;
+```
+
+`update_status_display()` reads `pending_rgb565` and `pending_grb` set by
+`set_status()` and performs both the LCD fill and the WS2812B update.
+
+---
+
+## Dual SD card wiring (hypothetical `waveshare_rp2350_lcd_sdcard_dual` variant)
+
+The board has a single microSD slot on SPI1 (GPIO10/11/12, CS=GPIO15).
+A second SD card could be wired externally using the free GPIOs.
+
+**Suggested wiring for a second card sharing SPI1:**
+
+| Signal     | GPIO | Rationale                                          |
+|------------|------|----------------------------------------------------|
+| SCK        |  10  | Shared with card 0 (same SPI1 bus)                |
+| MOSI       |  11  | Shared with card 0                                |
+| MISO       |  12  | Shared with card 0 (tri-state when CS high)       |
+| CS (card 1)|   5  | Free GPIO; near the SPI1 group on the pinout      |
+
+Alternative CS pins if GPIO5 is taken: GPIO6, GPIO7, GPIO8, GPIO9, GPIO13.
+Avoid GPIO16–22 (LCD and LED) and GPIO4 (SPI0 MISO hardware netlist).
+
+**Feature flag name convention**: `waveshare_rp2350_lcd_sdcard_dual`
+
+**`SPI1_CS` constant** would expand from `[15]` to `[15, 5]` (card 0 first).
+
+**Caveats:**
+- Two SD cards on one SPI bus work only if both support 3.3 V logic and
+  share the same SPI mode and speed.
+- `embedded-sdmmc` drives CS as a generic GPIO; both cards can be managed
+  by the same `SdCard` + `VolumeManager` instantiation by swapping CS pins.
+- Route SPI1 traces as short as possible; 40 MHz may be marginal on longer
+  breadboard wires — reduce to 25 MHz if card init fails.
