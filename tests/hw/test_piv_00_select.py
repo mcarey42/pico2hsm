@@ -20,7 +20,7 @@ from pathlib import Path
 
 import pytest
 
-from helpers import trace
+from helpers import trace, sw_from_output, last_response_hex
 from helpers.cli import CLIRunner
 
 log = logging.getLogger(__name__)
@@ -142,8 +142,8 @@ def test_piv_select_returns_fci(runner: CLIRunner, run_dir: Path) -> None:
         f"opensc-tool failed (rc={result.returncode}):\n{result.stderr}"
     )
 
-    # Extract hex response bytes from stdout (opensc-tool prints them space-separated)
-    resp_hex = result.stdout.replace(" ", "").replace("\n", "").strip()
+    # Extract hex response bytes from the last received APDU in stdout
+    resp_hex = last_response_hex(result.stdout)
     log.info("PIV SELECT raw response: %s", resp_hex)
 
     assert resp_hex, "No response data returned from PIV SELECT."
@@ -164,7 +164,7 @@ def test_piv_select_fci_contains_aid(runner: CLIRunner, run_dir: Path) -> None:
         f"opensc-tool failed (rc={result.returncode}):\n{result.stderr}"
     )
 
-    resp_hex = result.stdout.replace(" ", "").replace("\n", "").strip()
+    resp_hex = last_response_hex(result.stdout)
     fci = _parse_fci_application_template(resp_hex)
 
     returned_aid = fci.get("aid", "")

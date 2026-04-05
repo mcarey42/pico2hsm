@@ -17,7 +17,7 @@ from pathlib import Path
 
 import pytest
 
-from helpers import trace
+from helpers import trace, sw_from_output
 from helpers.cli import CLIRunner
 
 log = logging.getLogger(__name__)
@@ -58,25 +58,7 @@ def _send_apdus(runner: CLIRunner, *apdus: str, save_as: str | None = None, time
 
 
 def _sw_from_output(output: str) -> str | None:
-    """Extract the last 4-hex SW from opensc-tool output.
-
-    opensc-tool prints the response followed by SW on the last line, or the
-    debug trace contains 'sw1=XX sw2=YY'.  We scan for either.
-    """
-    import re
-    # Look for sw1= sw2= pattern in debug output
-    matches = re.findall(r"sw1=([0-9A-Fa-f]{2})[\s,]+sw2=([0-9A-Fa-f]{2})", output)
-    if matches:
-        sw1, sw2 = matches[-1]
-        return (sw1 + sw2).upper()
-
-    # Look for trailing 4-char hex on its own line (opensc-tool normal output)
-    lines = [l.strip() for l in output.splitlines() if l.strip()]
-    for line in reversed(lines):
-        clean = line.replace(" ", "")
-        if len(clean) == 4 and all(c in "0123456789ABCDEFabcdef" for c in clean):
-            return clean.upper()
-    return None
+    return sw_from_output(output)
 
 
 # ---------------------------------------------------------------------------

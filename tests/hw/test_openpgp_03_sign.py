@@ -33,7 +33,7 @@ from cryptography.hazmat.primitives.asymmetric.ec import (
     SECP256R1,
 )
 
-from helpers import trace
+from helpers import trace, sw_from_output, last_response_hex
 from helpers.cli import CLIRunner
 
 log = logging.getLogger(__name__)
@@ -71,17 +71,7 @@ def _send_apdus(runner: CLIRunner, *apdus: str, save_as: str | None = None, time
 
 
 def _sw_from_output(output: str) -> str | None:
-    import re
-    matches = re.findall(r"sw1=([0-9A-Fa-f]{2})[\s,]+sw2=([0-9A-Fa-f]{2})", output)
-    if matches:
-        sw1, sw2 = matches[-1]
-        return (sw1 + sw2).upper()
-    lines = [l.strip() for l in output.splitlines() if l.strip()]
-    for line in reversed(lines):
-        clean = line.replace(" ", "")
-        if len(clean) == 4 and all(c in "0123456789ABCDEFabcdef" for c in clean):
-            return clean.upper()
-    return None
+    return sw_from_output(output)
 
 
 def _decode_length(data: bytes, idx: int) -> tuple[int, int]:
@@ -228,7 +218,7 @@ def test_openpgp_pso_cds_returns_signature(runner: CLIRunner, run_dir: Path) -> 
         f"Expected SW=9000 from PSO:CDS; got SW={sw!r}."
     )
 
-    resp_hex = result.stdout.replace(" ", "").replace("\n", "").strip()
+    resp_hex = last_response_hex(result.stdout)
     sig = _extract_signature_from_pso_cds_response(resp_hex)
     assert sig is not None and len(sig) > 0, (
         f"No DER signature in PSO:CDS response.\n"
@@ -260,7 +250,7 @@ def test_openpgp_pso_cds_signature_verifies(runner: CLIRunner, run_dir: Path) ->
     if sw != "9000":
         pytest.skip(f"PSO:CDS returned SW={sw!r}; cannot verify signature.")
 
-    resp_hex = result.stdout.replace(" ", "").replace("\n", "").strip()
+    resp_hex = last_response_hex(result.stdout)
     sig = _extract_signature_from_pso_cds_response(resp_hex)
     if sig is None:
         pytest.skip("Could not extract signature from PSO:CDS response.")
@@ -335,7 +325,7 @@ def test_openpgp_pso_cds_two_signatures_both_valid(runner: CLIRunner) -> None:
         if sw != "9000":
             pytest.skip(f"PSO:CDS attempt {attempt} returned SW={sw!r}.")
 
-        resp_hex = result.stdout.replace(" ", "").replace("\n", "").strip()
+        resp_hex = last_response_hex(result.stdout)
         sig = _extract_signature_from_pso_cds_response(resp_hex)
         if sig is None:
             pytest.skip(f"Could not extract signature on attempt {attempt}.")
@@ -389,7 +379,7 @@ def test_openpgp_pso_cds_verify_with_openssl(
     if sw != "9000":
         pytest.skip(f"PSO:CDS returned SW={sw!r}.")
 
-    resp_hex = result.stdout.replace(" ", "").replace("\n", "").strip()
+    resp_hex = last_response_hex(result.stdout)
     sig = _extract_signature_from_pso_cds_response(resp_hex)
     if sig is None:
         pytest.skip("Could not extract signature from PSO:CDS response.")

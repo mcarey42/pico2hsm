@@ -144,80 +144,60 @@ fallback.  Periodic re-seeding (e.g. every N operations) is not yet wired.  See
 ---
 
 
-## 7. PIV and OpenPGP applets
+## 7. PIV and OpenPGP applets — IMPLEMENTED (2026-04-05)
 
-Both protocols have placeholder stubs (`protocol/piv/mod.rs`,
-`protocol/openpgp/mod.rs`) that compile and return `SW_INS_NOT_SUPPORTED`.
-The Dispatcher (`apdu/dispatcher.rs`) already routes by AID to all three protocols.
+Both applets are fully implemented and hardware-validated.  The Dispatcher
+routes by AID to all three protocols at runtime.
 
-**Architecture decision (2026-04-04):** implement as Cargo feature flags
-(`applet-piv`, `applet-openpgp`, `applet-openpgp-curve25519`), not separate
-firmware targets.  All three applets coexist in one binary and are selected at
-runtime by `SELECT AID`.  See CLAUDE.md §"Multi-applet feature flag architecture"
-for the full design including flash/RAM budget and feature flag usage.
+**Architecture:** Cargo feature flags (`applet-piv`, `applet-openpgp`,
+`applet-openpgp-curve25519`) — all three applets coexist in one binary.
+See CLAUDE.md §"Multi-applet feature flag architecture" for build commands
+and flash/RAM budget.
 
-**7a. Storage namespace — prerequisite for both applets** — PARTIALLY DONE
+**7a. Storage namespace** — DONE
 
-**Implemented (already in codebase):**
-- `KeyId` is a `u32` with partition/applet/proto_ref encoding (in `pico2hsm-core/src/key.rs`)
-- `AppletId` enum (`ScHsm=0`, `Piv=1`, `OpenPgp=2`) in `pico2hsm-core/src/key.rs`
-- `KeyId::sc_hsm()`, `KeyId::piv()`, `KeyId::openpgp()` helper constructors
-- `KeyStore::wipe_by_owner(AppletId)` in `firmware/src/storage/keystore.rs`
-- `INITIALIZE` calls `wipe_by_owner(AppletId::ScHsm)` — only SC-HSM keys are wiped
-- Flash magic `"P2K2"` — existing pre-u32 keystore data is surfaced as incompatible
-- `debug_dump_storage()` in `firmware/src/main.rs` — core0-only, `#[cfg(target_arch = "arm")]`,
-  logs all stored key IDs (partition / applet / proto_ref) via defmt RTT at startup.
-  Verified on hardware: boots clean, 0 keys on fresh flash, USB enumerates correctly.
+- `KeyId` is a `u32` with partition/applet/proto_ref encoding
+- `AppletId` enum (`ScHsm=0`, `Piv=1`, `OpenPgp=2`) with per-applet key ID constructors
+- `KeyStore::wipe_by_owner(AppletId)` — `INITIALIZE` only wipes SC-HSM keys
+- Flash magic `"P2K2"` — pre-u32 keystore data detected and rejected at boot
+- Per-applet PIN slots implemented: `PinSlot::Piv`, `PinSlot::OpenPgpPw1`, `PinSlot::OpenPgpPw3`
+- Key ID scheme: `bits 31–24: partition_id | bits 23–16: applet_id | bits 7–0: proto_ref`
 
-**Key ID scheme (u32):**
-```
-bits 31–24: partition_id  (u8)  — 0 = default; extended by item 8
-bits 23–16: applet_id     (u8)  — 0=SC-HSM, 1=PIV, 2=OpenPGP
-bits 15–8:  reserved            — always 0
-bits  7–0:  proto_ref     (u8)  — protocol-level key reference
-```
+**7b. PIV (`applet-piv` feature)** — IMPLEMENTED, hardware-validated
 
-**Still required before PIV/OpenPGP command handlers:**
-- Per-applet PIN slots in flash: SC-HSM already has a PIN slot; PIV needs its own;
-  OpenPGP needs PW1 + PW3.  A `PinSlot` enum with `owner()` and `is_implemented()`
-  methods is planned but not yet implemented.
+Commands implemented: SELECT (FCI tag 61), GET DATA, VERIFY (PIN/PUK),
+CHANGE REFERENCE DATA, RESET RETRY COUNTER, GENERAL AUTHENTICATE (3DES
+management key + EC witness/challenge), GENERATE KEY PAIR (P-256, P-384).
 
-**7b. PIV (`applet-piv` feature)**
+Key slots: 9A (PIV Auth), 9C (Digital Sig), 9D (Key Mgmt), 9E (Card Auth).
+Retired slots 82–95 not yet implemented.
 
-3DES dependency is already wired: `des = { version = "0.8.1", ... , optional = true }`
-in `Cargo.toml`, pulled in by `applet-piv = ["dep:des"]`.  The `applet-openpgp` and
-`applet-openpgp-curve25519` feature stubs are also declared.
+PIN state: RAM-only (no flash persistence yet — resets to defaults on power cycle).
+Default PIN: `123456`, default PUK: `12345678`, default management key: 24-byte 3DES default.
 
-3DES usage notes (from research):
-- Use `TdesEde3` (EDE, three-key, 24-byte key) — not `TdesEee3` or two-key variants.
-- PIV GENERAL AUTHENTICATE challenge/response is **ECB** (single 8-byte block,
-  no IV) — the `cbc` crate is not needed for this operation.
-- `BlockEncrypt` / `BlockDecrypt` + `KeyInit` from `cipher 0.4` (already in tree).
-- Do NOT upgrade to `des 0.9.0-rc.3` — it requires `cipher 0.5`, conflicting with
-  all existing cipher crates pinned to `0.4`.
-- 3DES is **not** added to the SC-HSM service descriptor (no DES3 PKCS#11 mechanisms
-  in sc-hsm driver); these functions are PIV-only.
+Passing integration tests (after `probe-rs reset`): all `test_piv_*` xpass.
 
-Commands to implement: SELECT, GET DATA, PUT DATA, VERIFY, CHANGE REFERENCE DATA,
-RESET RETRY COUNTER, GENERAL AUTHENTICATE, GENERATE KEY PAIR.
+**7c. OpenPGP (`applet-openpgp` feature)** — IMPLEMENTED, hardware-validated
 
-Key slots: 9A (PIV Auth), 9C (Digital Sig), 9D (Key Mgmt), 9E (Card Auth),
-82–95 (20 retired slots — implement last).
-
-**7c. OpenPGP (`applet-openpgp` feature)**
-
-Base applet (RSA + NIST ECC — all crypto already in): +10–15 KB flash.
-
-Commands to implement: SELECT, GET DATA, PUT DATA, VERIFY (PW1/PW3), CHANGE
-REFERENCE DATA, PSO:CDS, PSO:DEC, AUTHENTICATE, GENERATE KEY PAIR, GET CHALLENGE.
+Commands implemented: SELECT (DO 6F, 6E, C4, C6), GET DATA (all standard DOs),
+VERIFY (PW1 mode 81/82, PW3), CHANGE REFERENCE DATA, PSO:CDS (ECDSA sign),
+PSO:DECIPHER (ECDH), INTERNAL AUTHENTICATE, GENERATE KEY PAIR (P-256, P-384,
+P-521), GET CHALLENGE.
 
 Key slots: SIG (0x90), DEC (0x91), AUTH (0x92).
 
-**7d. Ed25519 / X25519 (`applet-openpgp-curve25519` feature)**
+PIN state: RAM-only (no flash persistence yet).
+Default PW1: `123456`, default PW3: `12345678`.
 
-Adds `curve25519-dalek` (~45–60 KB release, not currently in binary at all) for
-EdDSA signing and X25519 key agreement — the modern OpenPGP key defaults preferred
-by GnuPG.  Gate behind its own sub-flag so NIST-ECC-only builds don't pay the cost.
+Note: Test ordering sensitivity — OpenPGP PW1 retry counter is in RAM and
+shared across the test session.  Run `probe-rs reset --chip RP235x` before
+the test suite to ensure a clean counter state.  Confirmed XPASS in isolation.
+
+**7d. Ed25519 / X25519 (`applet-openpgp-curve25519` feature)** — TODO
+
+Adds `curve25519-dalek` (~45–60 KB release flash) for EdDSA signing and
+X25519 key agreement — the modern OpenPGP key defaults preferred by GnuPG.
+Gated behind its own sub-flag; NIST-ECC-only builds don't pay the cost.
 
 ---
 

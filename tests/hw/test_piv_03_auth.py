@@ -41,7 +41,7 @@ from cryptography.hazmat.primitives.asymmetric.ec import (
 )
 from cryptography.hazmat.primitives.asymmetric.utils import decode_dss_signature
 
-from helpers import trace
+from helpers import trace, sw_from_output, last_response_hex
 from helpers.cli import CLIRunner
 
 log = logging.getLogger(__name__)
@@ -76,17 +76,7 @@ def _send_apdus(runner: CLIRunner, *apdus: str, save_as: str | None = None, time
 
 
 def _sw_from_output(output: str) -> str | None:
-    import re
-    matches = re.findall(r"sw1=([0-9A-Fa-f]{2})[\s,]+sw2=([0-9A-Fa-f]{2})", output)
-    if matches:
-        sw1, sw2 = matches[-1]
-        return (sw1 + sw2).upper()
-    lines = [l.strip() for l in output.splitlines() if l.strip()]
-    for line in reversed(lines):
-        clean = line.replace(" ", "")
-        if len(clean) == 4 and all(c in "0123456789ABCDEFabcdef" for c in clean):
-            return clean.upper()
-    return None
+    return sw_from_output(output)
 
 
 def _decode_length(data: bytes, idx: int) -> tuple[int, int]:
@@ -186,7 +176,7 @@ def _get_or_generate_p256_pubkey(runner: CLIRunner) -> ec.EllipticCurvePublicKey
     if sw != "9000":
         return None
 
-    resp_hex = result.stdout.replace(" ", "").replace("\n", "").strip()
+    resp_hex = last_response_hex(result.stdout)
     ec_point = _extract_ec_point_from_genkey_response(resp_hex)
     if ec_point is None or len(ec_point) != 65 or ec_point[0] != 0x04:
         return None
@@ -246,7 +236,7 @@ def test_piv_general_authenticate_sign_returns_data(
         f"Expected SW=9000 from GENERAL AUTHENTICATE; got SW={sw!r}."
     )
 
-    resp_hex = result.stdout.replace(" ", "").replace("\n", "").strip()
+    resp_hex = last_response_hex(result.stdout)
     sig = _extract_signature_from_ga_response(resp_hex)
     assert sig is not None and len(sig) > 0, (
         f"Could not extract signature from GENERAL AUTHENTICATE response.\n"
@@ -282,7 +272,7 @@ def test_piv_general_authenticate_signature_is_valid_ecdsa(
     if sw != "9000":
         pytest.skip(f"GENERAL AUTHENTICATE returned SW={sw!r}; cannot verify signature.")
 
-    resp_hex = result.stdout.replace(" ", "").replace("\n", "").strip()
+    resp_hex = last_response_hex(result.stdout)
     sig = _extract_signature_from_ga_response(resp_hex)
     if sig is None:
         pytest.skip("Could not extract signature from response.")
@@ -353,7 +343,7 @@ def test_piv_general_authenticate_two_signatures_both_valid(
         if sw != "9000":
             pytest.skip(f"GENERAL AUTHENTICATE attempt {attempt} returned SW={sw!r}.")
 
-        resp_hex = result.stdout.replace(" ", "").replace("\n", "").strip()
+        resp_hex = last_response_hex(result.stdout)
         sig = _extract_signature_from_ga_response(resp_hex)
         if sig is None:
             pytest.skip(f"Could not extract signature on attempt {attempt}.")

@@ -20,7 +20,7 @@ from pathlib import Path
 
 import pytest
 
-from helpers import trace
+from helpers import trace, sw_from_output, last_response_hex
 from helpers.cli import CLIRunner
 
 log = logging.getLogger(__name__)
@@ -51,17 +51,7 @@ def _send_apdus(runner: CLIRunner, *apdus: str, save_as: str | None = None, time
 
 
 def _sw_from_output(output: str) -> str | None:
-    import re
-    matches = re.findall(r"sw1=([0-9A-Fa-f]{2})[\s,]+sw2=([0-9A-Fa-f]{2})", output)
-    if matches:
-        sw1, sw2 = matches[-1]
-        return (sw1 + sw2).upper()
-    lines = [l.strip() for l in output.splitlines() if l.strip()]
-    for line in reversed(lines):
-        clean = line.replace(" ", "")
-        if len(clean) == 4 and all(c in "0123456789ABCDEFabcdef" for c in clean):
-            return clean.upper()
-    return None
+    return sw_from_output(output)
 
 
 def _parse_fci_6f(resp_hex: str) -> dict:
@@ -165,7 +155,7 @@ def test_openpgp_select_returns_fci_6f(runner: CLIRunner) -> None:
     if sw != "9000":
         pytest.skip(f"SELECT returned SW={sw!r}.")
 
-    resp_hex = result.stdout.replace(" ", "").replace("\n", "").strip()
+    resp_hex = last_response_hex(result.stdout)
     log.info("OpenPGP SELECT FCI: %s", resp_hex[:80])
 
     assert resp_hex, "No FCI data returned."
@@ -237,7 +227,7 @@ def test_openpgp_get_data_006e_returns_data(runner: CLIRunner, run_dir: Path) ->
         f"Expected SW=9000 from GET DATA 006E; got SW={sw!r}."
     )
 
-    resp_hex = result.stdout.replace(" ", "").replace("\n", "").strip()
+    resp_hex = last_response_hex(result.stdout)
     log.info("DO 006E response: %s ...", resp_hex[:64])
 
     assert resp_hex, "GET DATA 006E returned no response data."
