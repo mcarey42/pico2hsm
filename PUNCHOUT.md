@@ -49,7 +49,8 @@ item 1 but are needed for full SC-HSM compatibility.
 
 **2e. BIP-32 / SLIP-10 key derivation (`commands/bip_slip.rs`)**
 Stub should call `crypto::kdf::bip32_derive()` or `slip10_derive()`.
-Note: the SLIP-10 child key derivation has a known bug (see item 4).
+The underlying `slip10_child_key` implementation is correct and tested against
+all SLIP-0010 test vector 1 paths (m, m/0', m/0'/1, m/0'/1/2').
 
 ---
 
@@ -73,14 +74,6 @@ context compatible with `elliptic-curve 0.13`.
 
 ---
 
-## 4. SLIP-10 child key derivation bug — DONE (2026-04-04)
-
-The disabled test had wrong expected values (not from the spec).  The implementation
-was correct.  Fixed by replacing test expected values with SLIP-0010 test vector 1
-values for m/0', and adding two additional tests (m/0'/1 normal, m/0'/1/2' hardened).
-All 132 unit tests pass.
-
----
 
 ## 5. Security hardening — Several stubs awaiting hardware/crate API
 
