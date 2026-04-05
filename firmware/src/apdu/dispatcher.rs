@@ -186,7 +186,7 @@ impl Dispatcher {
         // PIV AID
         if aid == PIV_AID {
             self.active = ActiveProtocol::Piv;
-            return ApduResponse::ok(&[]);
+            return build_piv_fci();
         }
 
         // OpenPGP AID (prefix match)
@@ -194,7 +194,7 @@ impl Dispatcher {
             && &aid[..OPENPGP_AID_PREFIX.len()] == OPENPGP_AID_PREFIX
         {
             self.active = ActiveProtocol::OpenPgp;
-            return ApduResponse::ok(&[]);
+            return build_openpgp_fci(&mut self.openpgp);
         }
 
         // Unknown AID
@@ -348,6 +348,73 @@ fn build_sc_hsm_fci() -> ApduResponse {
     let _ = fci.extend_from_slice(aid);
 
     // A5: proprietary — contains 9F6E version TLV
+    let _ = fci.push(0xA5);
+    let _ = fci.push(a5_inner_len);
+    let _ = fci.push(0x9F);
+    let _ = fci.push(0x6E);
+    let _ = fci.push(version.len() as u8);
+    let _ = fci.extend_from_slice(version);
+
+    ApduResponse::ok(&fci)
+}
+
+/// Build the Application Property Template returned on SELECT PIV AID.
+///
+/// Structure per NIST SP 800-73-4:
+/// ```text
+/// 61 11
+///   4F 0B <PIV AID>       — Application Identifier
+///   50 03 50 49 56         — Application Label "PIV"
+/// ```
+fn build_piv_fci() -> ApduResponse {
+    let label = b"PIV";
+    let aid_tlv_len = 2 + PIV_AID.len();
+    let label_tlv_len = 2 + label.len();
+    let inner_len = aid_tlv_len + label_tlv_len;
+
+    let mut fci: Vec<u8, 32> = Vec::new();
+    let _ = fci.push(0x61);
+    let _ = fci.push(inner_len as u8);
+
+    let _ = fci.push(0x4F);
+    let _ = fci.push(PIV_AID.len() as u8);
+    let _ = fci.extend_from_slice(PIV_AID);
+
+    let _ = fci.push(0x50);
+    let _ = fci.push(label.len() as u8);
+    let _ = fci.extend_from_slice(label);
+
+    ApduResponse::ok(&fci)
+}
+
+/// Build the FCI returned on SELECT OpenPGP AID and reset security state.
+///
+/// Structure per OpenPGP Card 3.4:
+/// ```text
+/// 6F xx
+///   84 10 <full 16-byte AID>
+///   A5 xx
+///     9F6E 04 03 04 00 00   — version 3.4
+/// ```
+fn build_openpgp_fci(openpgp: &mut crate::protocol::openpgp::OpenPgp) -> ApduResponse {
+    use crate::protocol::openpgp::OPENPGP_AID;
+
+    openpgp.state.reset_security_state();
+
+    let aid = &OPENPGP_AID;
+    let version: &[u8] = &[0x03, 0x04, 0x00, 0x00];
+
+    let a5_inner_len: u8 = 2 + 1 + version.len() as u8;
+    let outer_len: u8 = (2 + aid.len() as u8) + (2 + a5_inner_len);
+
+    let mut fci: Vec<u8, 48> = Vec::new();
+    let _ = fci.push(0x6F);
+    let _ = fci.push(outer_len);
+
+    let _ = fci.push(0x84);
+    let _ = fci.push(aid.len() as u8);
+    let _ = fci.extend_from_slice(aid);
+
     let _ = fci.push(0xA5);
     let _ = fci.push(a5_inner_len);
     let _ = fci.push(0x9F);
