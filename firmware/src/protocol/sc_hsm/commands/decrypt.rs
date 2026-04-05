@@ -64,7 +64,8 @@ pub fn handle(state: &mut ScHsmState, cmd: &ApduCommand<'_>) -> ApduResponse {
 
     // SC-HSM encodes the key reference in P1 and the algorithm in P2 directly
     // in the DECIPHER APDU (no preceding MSE SET required).
-    let key_id = cmd.p1;
+    let key_id = cmd.p1; // u8 protocol key reference
+    let full_key_id = pico2hsm_core::key::KeyId::sc_hsm(0, key_id).0; // u32 internal ID
     let algo = cmd.p2;
 
     if cmd.data.is_empty() {
@@ -81,7 +82,7 @@ pub fn handle(state: &mut ScHsmState, cmd: &ApduCommand<'_>) -> ApduResponse {
         0x21 | 0x22 => {
             use crate::crypto::asymmetric::rsa_private_raw;
 
-            let rsa_key = match state.rsa_keys.iter().find(|k| k.key_id == key_id) {
+            let rsa_key = match state.rsa_keys.iter().find(|k| k.key_id == full_key_id) {
                 Some(k) => k,
                 None => return ApduResponse::err(SW_FILE_NOT_FOUND),
             };
@@ -102,7 +103,7 @@ pub fn handle(state: &mut ScHsmState, cmd: &ApduCommand<'_>) -> ApduResponse {
 
     // ---- ECDH path — EC key lookup ------------------------------------------
     // Look up the EC key. RSA keys (handled above) never reach here.
-    let key = match state.keys.iter().find(|k| k.key_id == key_id) {
+    let key = match state.keys.iter().find(|k| k.key_id == full_key_id) {
         Some(k) => k,
         None => return ApduResponse::err(SW_FILE_NOT_FOUND),
     };

@@ -80,8 +80,7 @@ impl Dispatcher {
         let ids = store.enumerate_keys();
         let mut loaded = 0usize;
         for kid in ids.iter() {
-            let key_id = kid.0 as u8;
-            match store.fetch_key(key_id) {
+            match store.fetch_key(*kid) {
                 Ok(Some(obj)) => {
                     push_key_object_to_state(&mut self.sc_hsm.state, obj);
                     loaded += 1;

@@ -29,12 +29,12 @@ pub fn handle(state: &mut ScHsmState, cmd: &ApduCommand<'_>) -> ApduResponse {
     let mut resp: heapless::Vec<u8, 256> = heapless::Vec::new();
     for key in &state.keys {
         let _ = resp.push(0xCC);
-        let _ = resp.push(key.key_id);
+        let _ = resp.push((key.key_id & 0xFF) as u8); // proto_ref byte
     }
     #[cfg(feature = "rsa")]
     for key in &state.rsa_keys {
         let _ = resp.push(0xCC);
-        let _ = resp.push(key.key_id);
+        let _ = resp.push((key.key_id & 0xFF) as u8); // proto_ref byte
     }
     // Also expose PRKD (C4 xx) and EE-cert (CE xx) EF entries so that
     // SELECT by those file IDs succeeds and sc_pkcs15emu_sc_hsm_add_prkd

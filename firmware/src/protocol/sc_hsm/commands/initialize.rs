@@ -10,9 +10,10 @@
 //! - Tag 0x91: DKEK share count (1 byte, 0–8; 0 = no DKEK)
 //! - Tag 0x92: Options bitmask (2 bytes LE16)
 
-use pico2hsm_core::apdu::{
-    ApduCommand, ApduResponse, SW_CONDITIONS_NOT_SATISFIED, SW_OK, SW_SECURITY_STATUS,
-    SW_WRONG_DATA, SW_WRONG_LENGTH,
+use pico2hsm_core::{
+    apdu::{ApduCommand, ApduResponse, SW_CONDITIONS_NOT_SATISFIED, SW_OK, SW_SECURITY_STATUS,
+        SW_WRONG_DATA, SW_WRONG_LENGTH},
+    key::AppletId,
 };
 
 use crate::protocol::sc_hsm::ScHsmState;
@@ -121,6 +122,20 @@ pub fn handle(state: &mut ScHsmState, store: &mut dyn crate::storage::KeyStore, 
         state.pin_retry_count = retry_counter;
     }
 
+    // Tag 0x93: PUK (optional, 8–16 bytes).
+    if let Some(puk) = find_tlv(data, 0x93) {
+        if puk.len() < 8 || puk.len() > 16 {
+            return ApduResponse::err(SW_WRONG_LENGTH);
+        }
+        let mut puk_h = [0u8; 32];
+        hash_pin(puk, &mut puk_h);
+        state.puk_hash = Some(puk_h);
+        state.puk_retry_count = 10;
+    } else {
+        state.puk_hash = None;
+        state.puk_retry_count = 10;
+    }
+
     state.options = options.unwrap_or(0);
     state.dkek_shares_required = dkek_count;
     state.dkek_shares_imported = 0;
@@ -146,7 +161,7 @@ pub fn handle(state: &mut ScHsmState, store: &mut dyn crate::storage::KeyStore, 
     // Pre-populate a sentinel entry so sc_hsm_determine_free_id skips it
     // and assigns user keys starting at slot 1.
     let dev_key = crate::protocol::sc_hsm::InMemoryKey {
-        key_id: 0,
+        key_id: pico2hsm_core::key::KeyId::sc_hsm(0, 0).0,
         key_type: pico2hsm_core::key::KeyType::EcPrivateP256,
         algo: 0x13,
         private_key: heapless::Vec::new(),
@@ -154,8 +169,8 @@ pub fn handle(state: &mut ScHsmState, store: &mut dyn crate::storage::KeyStore, 
     };
     let _ = state.keys.push(dev_key);
 
-    // Wipe persistent flash keystore.
+    // Wipe only SC-HSM-owned keys from persistent flash keystore.
     // Degraded flash does not fail the INITIALIZE command.
-    let _ = store.wipe_all(); // best-effort; InvalidCore returns Ok(()) on Core1
+    let _ = store.wipe_by_owner(AppletId::ScHsm); // best-effort; InvalidCore returns Ok(()) on Core1
     ApduResponse::ok(&[])
 }

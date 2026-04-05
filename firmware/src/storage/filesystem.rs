@@ -19,11 +19,11 @@
 //! [0..4]   Magic  *b"P2KD"
 //! [4..6]   Entry count (u16 LE)
 //! [6..8]   CRC16 of entries area (u16 LE) — simple XOR sum for fast check
-//! [8..N]   DirectoryEntry records (10 bytes each)
+//! [8..N]   DirectoryEntry records (12 bytes each)
 //! [N..4096] Padding (0xFF)
 //! ```
-//! Maximum entries per chip: (4096 - 8) / 10 = 408.  Total across 8 chips:
-//! 3264.  The in-RAM `Directory` caps at 512 entries (heapless Vec limit).
+//! Maximum entries per chip: (4096 - 8) / 12 = 340.  Total across 8 chips:
+//! 2720.  The in-RAM `Directory` caps at 512 entries (heapless Vec limit).
 
 use crate::storage::{
     integrity::{
@@ -51,7 +51,7 @@ const DIR_MAGIC: [u8; 4] = *b"P2KD";
 /// Size of the directory sector header (magic + count + crc16).
 const DIR_HEADER_SIZE: usize = 8;
 /// Size of a single `DirectoryEntry` on disk (packed layout).
-const DIR_ENTRY_SIZE: usize = 10;
+const DIR_ENTRY_SIZE: usize = 12;
 /// Maximum number of directory entries in one sector.
 const DIR_MAX_ENTRIES: usize = (SECTOR_SIZE - DIR_HEADER_SIZE) / DIR_ENTRY_SIZE;
 /// Maximum entries tracked in the in-RAM `Directory`.
@@ -159,12 +159,12 @@ impl Directory {
                 return Err(StorageError::KeystoreFull);
             }
             let chunk = &mut buf[offset..offset + DIR_ENTRY_SIZE];
-            chunk[0..2].copy_from_slice(&entry.key_id.to_le_bytes());
-            chunk[2] = entry.chip_index;
-            chunk[3..7].copy_from_slice(&entry.sector_index.to_le_bytes());
-            chunk[7] = entry.sector_count;
-            chunk[8] = entry.flags;
-            chunk[9] = entry._pad[0];
+            chunk[0..4].copy_from_slice(&entry.key_id.to_le_bytes());
+            chunk[4] = entry.chip_index;
+            chunk[5..9].copy_from_slice(&entry.sector_index.to_le_bytes());
+            chunk[9] = entry.sector_count;
+            chunk[10] = entry.flags;
+            chunk[11] = entry._pad[0];
             // XOR-sum CRC (simple; catches random corruption).
             for &b in chunk.iter() {
                 crc_accum ^= b as u16;
@@ -198,12 +198,12 @@ impl Directory {
             for &b in chunk.iter() {
                 crc_accum ^= b as u16;
             }
-            let key_id = u16::from_le_bytes([chunk[0], chunk[1]]);
-            let chip_index = chunk[2];
-            let sector_index = u32::from_le_bytes([chunk[3], chunk[4], chunk[5], chunk[6]]);
-            let sector_count = chunk[7];
-            let flags = chunk[8];
-            let pad = chunk[9];
+            let key_id = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+            let chip_index = chunk[4];
+            let sector_index = u32::from_le_bytes([chunk[5], chunk[6], chunk[7], chunk[8]]);
+            let sector_count = chunk[9];
+            let flags = chunk[10];
+            let pad = chunk[11];
 
             let entry = DirectoryEntry {
                 key_id,
@@ -229,7 +229,7 @@ impl Directory {
     pub fn list_keys(&self) -> impl Iterator<Item = KeyId> + '_ {
         self.entries
             .iter()
-            .filter(|e| e.key_id != 0xFFFF && (e.flags & 0x01) == 0)
+            .filter(|e| e.key_id != 0xFFFF_FFFF && (e.flags & 0x01) == 0)
             .map(|e| KeyId(e.key_id))
     }
 

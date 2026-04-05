@@ -17,7 +17,7 @@
 //! # On-disk sector layout
 //! ```text
 //! [0..4]    SECTOR_MAGIC (*b"P2HM")
-//! [4..48]   ObjectHeader (magic, key_id, key_type, flags, plaintext_len,
+//! [4..50]   ObjectHeader (magic, key_id, key_type, flags, plaintext_len,
 //!                         sector_count, seq_no, crc32, blake2s[32])
 //! [48..N]   AES-256-CTR ciphertext (N = 48 + roundup(plaintext_len, PAGE_SIZE))
 //! ```
@@ -27,16 +27,19 @@
 //! verified by the key management layer after decryption.
 
 use blake2::{Blake2s256, Digest};
-use core::mem;
 use crc32fast::Hasher as Crc32Hasher;
 use pico2hsm_core::{error::StorageError, storage::ObjectHeader};
 
 // Byte offset of the `crc32` field within a serialised `ObjectHeader`.
-// Layout: magic[4] + key_id[2] + key_type[1] + flags[1] + plaintext_len[2] +
-//         sector_count[1] + seq_no[1]  = 12 bytes before crc32.
-const HEADER_CRC32_OFFSET: usize = 12;
-/// Total serialised header size (matches repr(C) layout).
-pub const HEADER_SIZE: usize = mem::size_of::<ObjectHeader>();
+// Layout: magic[4] + key_id[4] + key_type[1] + flags[1] + plaintext_len[2] +
+//         sector_count[1] + seq_no[1]  = 14 bytes before crc32.
+const HEADER_CRC32_OFFSET: usize = 14;
+/// Total serialised header size in bytes.
+///
+/// Manual layout (not mem::size_of — repr(C) may insert padding):
+///   magic[4] + key_id[4] + key_type[1] + flags[1] + plaintext_len[2]
+///   + sector_count[1] + seq_no[1] + crc32[4] + blake2s[32] = 50 bytes.
+pub const HEADER_SIZE: usize = 50;
 
 // ─── Header serialisation helpers ────────────────────────────────────────────
 
@@ -46,14 +49,14 @@ pub const HEADER_SIZE: usize = mem::size_of::<ObjectHeader>();
 pub fn write_header(buf: &mut [u8], header: &ObjectHeader) {
     assert!(buf.len() >= HEADER_SIZE, "buffer too small for ObjectHeader");
     buf[0..4].copy_from_slice(&header.magic);
-    buf[4..6].copy_from_slice(&header.key_id.to_le_bytes());
-    buf[6] = header.key_type;
-    buf[7] = header.flags;
-    buf[8..10].copy_from_slice(&header.plaintext_len.to_le_bytes());
-    buf[10] = header.sector_count;
-    buf[11] = header.seq_no;
-    buf[12..16].copy_from_slice(&header.crc32.to_le_bytes());
-    buf[16..48].copy_from_slice(&header.blake2s);
+    buf[4..8].copy_from_slice(&header.key_id.to_le_bytes());
+    buf[8] = header.key_type;
+    buf[9] = header.flags;
+    buf[10..12].copy_from_slice(&header.plaintext_len.to_le_bytes());
+    buf[12] = header.sector_count;
+    buf[13] = header.seq_no;
+    buf[14..18].copy_from_slice(&header.crc32.to_le_bytes());
+    buf[18..50].copy_from_slice(&header.blake2s);
 }
 
 /// Deserialise an `ObjectHeader` from the first `HEADER_SIZE` bytes of `buf`.
@@ -63,15 +66,15 @@ pub fn read_header(buf: &[u8]) -> Result<ObjectHeader, StorageError> {
     }
     let mut magic = [0u8; 4];
     magic.copy_from_slice(&buf[0..4]);
-    let key_id = u16::from_le_bytes([buf[4], buf[5]]);
-    let key_type = buf[6];
-    let flags = buf[7];
-    let plaintext_len = u16::from_le_bytes([buf[8], buf[9]]);
-    let sector_count = buf[10];
-    let seq_no = buf[11];
-    let crc32 = u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]);
+    let key_id = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
+    let key_type = buf[8];
+    let flags = buf[9];
+    let plaintext_len = u16::from_le_bytes([buf[10], buf[11]]);
+    let sector_count = buf[12];
+    let seq_no = buf[13];
+    let crc32 = u32::from_le_bytes([buf[14], buf[15], buf[16], buf[17]]);
     let mut blake2s = [0u8; 32];
-    blake2s.copy_from_slice(&buf[16..48]);
+    blake2s.copy_from_slice(&buf[18..50]);
 
     Ok(ObjectHeader {
         magic,
@@ -237,7 +240,8 @@ impl IntegrityChecker {
     pub fn verify_crc32(sector_data: &[u8; 4096]) -> Result<(), StorageError> {
         let header_bytes = &sector_data[..HEADER_SIZE];
         // Read plaintext_len to determine ciphertext extent.
-        let plaintext_len = u16::from_le_bytes([sector_data[8], sector_data[9]]) as usize;
+        // plaintext_len is at bytes [10..12] (after magic[4] + key_id[4] + key_type[1] + flags[1]).
+        let plaintext_len = u16::from_le_bytes([sector_data[10], sector_data[11]]) as usize;
         // Round up to PAGE_SIZE (256) boundary.
         let ciphertext_len = (plaintext_len + 255) & !255;
         let ciphertext_end = HEADER_SIZE + ciphertext_len;

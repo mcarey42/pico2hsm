@@ -47,48 +47,33 @@ Three layers are all unimplemented:
 These commands all return `SW_INS_NOT_SUPPORTED`.  They are lower priority than
 item 1 but are needed for full SC-HSM compatibility.
 
-**2a. PSO Compute Cryptographic Checksum / Verify (`commands/pso.rs`)**
-PSO CDS (0x9E,0x9A) and PSO Decipher (0x80,0x86) are now implemented, delegating
-to the same ECDSA/RSA and ECDH/RSA paths as `sign.rs` and `decrypt.rs` but reading
-key/algo from MSE state.  Still stubbed:
-- `(0x8E, 0x80)` — PSO: Compute Cryptographic Checksum (CMAC/HMAC) — needs item 2d
-- `(0x86, 0x80)` — PSO: Verify Cryptographic Checksum — needs item 2d
-
-**2b. Symmetric key generation (`commands/generate_key.rs`)**
-INS for GENERATE KEY (symmetric).  Stub calls
-`key_management::generate_symmetric_key()`.  Needed for AES key objects.
-
-**2c. Symmetric cipher (`commands/cipher_sym.rs`)**
-AES-CBC / AES-GCM encrypt/decrypt.  Stub should dispatch to `crypto::symmetric`
-based on the current MSE (Manage Security Environment) state.
-
-**2d. HKDF / PBKDF2 / X9.63 / CMAC / HMAC extras (`commands/extras.rs`)**
-Six sub-operations under a single INS, all stubbed:
-`HKDF-Extract`, `HKDF-Expand`, `PBKDF2-SHA256`, `X9.63-KDF`, `AES-CMAC`,
-`HMAC-SHA256`.  The `crypto/kdf.rs` module has partial implementations; these
-commands just need to be wired up.
-
 **2e. BIP-32 / SLIP-10 key derivation (`commands/bip_slip.rs`)**
 Stub should call `crypto::kdf::bip32_derive()` or `slip10_derive()`.
 Note: the SLIP-10 child key derivation has a known bug (see item 4).
 
-**2f. Asymmetric key derivation (`commands/derive_asym.rs`)**
-INS=0x62 / P1=0x01.  Stub should call `crypto::kdf::x963_derive()` or
-`hkdf_derive()` with the source key ID and derivation info from the command data.
+**2f. Asymmetric key derivation (`commands/derive_asym.rs`) — DONE**
+INS=0x62/P1=0x01 dispatched via P1 check in mod.rs. Looks up EC or sym key by
+MSE key_id; HKDF-SHA256(ikm=private_key, salt=[], info=cmd.data) → 32-byte output.
+6 unit tests pass.
 
-**2g. Session PIN (`commands/session_pin.rs`)**
-Generate a one-time session PIN, store with expiry.
+**2g. Session PIN (`commands/session_pin.rs`) — DONE**
+INS=0x26 generates 8 random bytes, stores in `state.session_pin`, returns to host.
+`verify.rs` P2=0x82 verifies constant-time, clears after any attempt (one-time use).
+8 unit tests pass.
 
-**2h. External auth (`commands/external_auth.rs`)**
-Verify a cryptogram over the stored INTERNAL AUTHENTICATE challenge using the
-device auth key.  Must clear the challenge after use to prevent replay.
+**2h. External auth (`commands/external_auth.rs`) — DONE**
+HMAC-SHA256(so_pin_hash, challenge) → 32-byte expected response. Constant-time
+compare; clears challenge always; sets `so_pin_verified=true` on success.
+5 unit tests pass.
 
-**2i. General auth (`commands/general_auth.rs`)**
-Multi-step authentication state machine using the 0x7C TLV template.
+**2i. General auth (`commands/general_auth.rs`) — DONE**
+Parses 0x7C(0x81=challenge) TLV; SHA-256 hashes challenge; ECDSA-signs with
+MSE-selected key; returns 0x7C(0x82=signature). 6 unit tests pass.
 
-**2j. PUK auth and PIN unblock (`commands/puk_auth.rs`)**
-Constant-time PUK comparison, retry counter management, and PIN unblock logic.
-Currently no PUK is stored.
+**2j. PUK auth and PIN unblock (`commands/puk_auth.rs`) — DONE**
+`puk_hash`/`puk_retry_count` added to ScHsmState; tag 0x93 in INITIALIZE sets PUK.
+Constant-time SHA-256 compare; on success resets pin_retry_count=3, pin_verified=true.
+7 unit tests pass.
 
 ---
 
@@ -217,13 +202,35 @@ This must be done before any command handler is written.  The flash keystore
 currently has no concept of applet ownership; SC-HSM `INITIALIZE` would wipe PIV
 and OpenPGP keys.
 
-- Add an `owner: AppletId` field to `KeyObject` in `security/key_management.rs`.
-- Reserve ID ranges in `storage/keystore.rs`: SC-HSM `0x01–0x7F`, PIV `0x80–0x8F`,
-  OpenPGP `0x90–0x92`.
-- Change SC-HSM `INITIALIZE` to call `wipe_by_owner(AppletId::ScHsm)` instead of
-  `wipe_all()`.
-- Add per-applet PIN slots to flash (SC-HSM already has one; PIV needs a second
-  for its own PIN; OpenPGP needs PW1 + PW3).
+**Key ID scheme — u32 internal key ID:**
+
+The internal key ID is a `u32` with the following layout:
+
+```
+bits 31–24: partition_id  (u8)  — 0 = default; extended by item 8
+bits 23–16: applet_id     (u8)  — 0=SC-HSM, 1=PIV, 2=OpenPGP
+bits 15–8:  reserved            — always 0
+bits  7–0:  proto_ref     (u8)  — protocol-level key reference
+```
+
+Helper constructors:
+- `KeyId::sc_hsm(partition, key_ref)` → `(partition<<24) | key_ref`
+- `KeyId::piv(key_ref)` → `(1<<16) | key_ref`
+- `KeyId::openpgp(slot)` → `(2<<16) | slot`
+
+For partition 0 SC-HSM keys (current), `KeyId(proto_ref as u32)` — numerically
+identical to the old u8 value, just stored as u32 LE in flash.
+
+**Note: flash format change.** Existing stored keys become unreadable — re-INITIALIZE
+after firmware update.  Bump `KEY_MAGIC` to `*b"P2K2"` to surface the incompatibility.
+
+**u32 key ID refactor — DONE** (2026-04-04): All files updated; flash format bumped
+to `P2K2`; `AppletId` enum added; `KeyId::sc_hsm/piv/openpgp` constructors in place;
+`wipe_by_owner(AppletId::ScHsm)` in INITIALIZE; all key lookups use `KeyId::sc_hsm(0, ref).0`.
+
+**Still required:**
+- Add per-applet PIN slots to flash (SC-HSM already has one; PIV needs its own;
+  OpenPGP needs PW1 + PW3).
 
 **7b. PIV (`applet-piv` feature)**
 
@@ -238,6 +245,14 @@ in `Cargo.toml`, pulled in by `applet-piv = ["dep:des"]`.  The `applet-openpgp` 
 - `BlockEncrypt` / `BlockDecrypt` + `KeyInit` from `cipher 0.4` (already in tree).
 - Do NOT upgrade to `des 0.9.0-rc.3` — it requires `cipher 0.5`, conflicting with
   all existing cipher crates pinned to `0.4`.
+- 3DES is **not** added to the SC-HSM service descriptor (no DES3 PKCS#11 mechanisms
+  in sc-hsm driver); these functions are PIV-only.
+
+**Pre-requisite: 3DES backing functions — DONE**
+`tdes_ecb_encrypt(key: &[u8; 24], block: &[u8; 8]) -> [u8; 8]` and
+`tdes_ecb_decrypt` added to `firmware/src/crypto/symmetric.rs` gated on
+`#[cfg(feature = "applet-piv")]`.  Round-trip unit test passes.
+Uses `des::TdesEde3` with `cipher::{BlockEncrypt, BlockDecrypt, KeyInit}`.
 
 Commands to implement: SELECT, GET DATA, PUT DATA, VERIFY, CHANGE REFERENCE DATA,
 RESET RETRY COUNTER, GENERAL AUTHENTICATE, GENERATE KEY PAIR.
@@ -259,3 +274,52 @@ Key slots: SIG (0x90), DEC (0x91), AUTH (0x92).
 Adds `curve25519-dalek` (~45–60 KB release, not currently in binary at all) for
 EdDSA signing and X25519 key agreement — the modern OpenPGP key defaults preferred
 by GnuPG.  Gate behind its own sub-flag so NIST-ECC-only builds don't pay the cost.
+
+---
+
+## 8. Multi-partition key store — thousands of keys via separate AID instances
+
+**Motivation:**
+A single SC-HSM AID session can address at most 254 keys (1-byte protocol key
+reference).  The partition architecture breaks through this limit by presenting
+each partition as a separate AID instance; clients SELECT the desired partition AID
+before operating on its keys.  With u32 internal key IDs (item 7a), the storage
+layer can hold thousands of keys limited only by flash capacity.
+
+**Design:**
+- Each partition registers a distinct AID: last byte encodes partition index.
+  Partition 0 = existing AID (backward compatible).
+  Partition N = `E8 2B 06 01 04 01 81 C3 1F 02 [N+1]`.
+- u32 key ID `partition_id << 24 | applet_id << 16 | proto_ref` unambiguously
+  identifies every key in flash across all partitions.
+- Each partition has its own independent PIN, session state, and key namespace.
+- Dispatcher already does AID-based routing — adding partitions is a new entry
+  per partition in the routing table, not a new code path.
+
+**Management APDUs (vendor extension, gated on partition 0 + SO-PIN):**
+- `INS=0xD0` CREATE PARTITION — allocate partition, set SO-PIN
+- `INS=0xD1` DELETE PARTITION — wipe all partition keys
+- `INS=0xD2` LIST PARTITIONS — return count + AID bytes for active partitions
+- `INS=0xD3` PARTITION STATS — key count, auth attempts, storage used (TLV response)
+
+**PKCS#11 integration:**
+- Custom PKCS#11 provider enumerates partitions via `LIST PARTITIONS` on connect,
+  then presents each as a separate PKCS#11 slot/token.
+- Standard OpenSC / pkcs11-tool will see only partition 0 (existing AID).
+
+**Capacity (pico2_4m, 2 MB keystore region):**
+- EC key: ~200 bytes → ~10,000 EC keys total
+- RSA-2048: ~1.5 KB → ~1,300 RSA-2048 keys total
+- 40 partitions × 254 keys = 10,160 addressable slots
+
+**Prerequisites:**
+- Item 7a (u32 key IDs + AppletId owner field) — must land first.
+- Item 7a PIN-slot design extended to per-partition PIN storage.
+
+**What needs to happen:**
+- Extend `Dispatcher` to instantiate up to N `ScHsm` instances, one per partition.
+- Register N AIDs (one per partition) in the AID routing table.
+- Add `wipe_by_partition(partition_id: u8)` to `KeyStore` trait.
+- Implement the four management APDUs behind SO-PIN gate on partition 0.
+- Design partition metadata storage (active partitions list, per-partition label/flags).
+- Write integration tests covering multi-partition round-trip.

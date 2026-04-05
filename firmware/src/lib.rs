@@ -22,7 +22,10 @@ pub mod security;
 pub mod board;
 #[cfg(target_arch = "arm")]
 pub mod image_def;
-#[cfg(target_arch = "arm")]
+// The storage module's keystore.rs (KeyStore trait + NullKeyStore) is
+// required by protocol/sc_hsm/mod.rs on all targets. ARM-specific sub-modules
+// (board_chips, flash_chip, filesystem, StorageManager) are gated inside
+// storage/mod.rs via #[cfg(target_arch = "arm")].
 pub mod storage;
 #[cfg(target_arch = "arm")]
 pub mod transport;

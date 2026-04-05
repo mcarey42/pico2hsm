@@ -10,13 +10,60 @@
 use heapless::{String, Vec};
 use zeroize::Zeroize;
 
-/// A key object identifier — 2 bytes matching SC-HSM file ID convention.
+/// A key object identifier — 4 bytes with a structured encoding scheme.
 ///
-/// Key IDs 0x0001–0x00FE are reserved for asymmetric private keys.
-/// Key IDs 0x0100–0x01FE are reserved for symmetric keys.
-/// Key ID 0x0000 and 0xFFFF are reserved.
+/// Encoding (bits 31–0):
+/// - bits 31–24: partition_id (u8) — 0 = default partition
+/// - bits 23–16: applet_id    (u8) — 0=SC-HSM, 1=PIV, 2=OpenPGP
+/// - bits 15–8:  reserved          — always 0
+/// - bits  7–0:  proto_ref    (u8) — protocol-level key reference
+///
+/// SC-HSM partition-0 keys: `KeyId(proto_ref as u32)` — e.g. key 0x01 → `KeyId(0x00000001)`.
+/// Key ID 0x00000000 and 0xFFFF_FFFF are reserved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct KeyId(pub u16);
+pub struct KeyId(pub u32);
+
+/// Applet identifier — identifies which applet owns a key slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum AppletId {
+    ScHsm   = 0x00,
+    Piv     = 0x01,
+    OpenPgp = 0x02,
+}
+
+impl zeroize::Zeroize for AppletId {
+    fn zeroize(&mut self) {
+        *self = AppletId::ScHsm;
+    }
+}
+
+impl KeyId {
+    /// SC-HSM key on the given partition (partition=0 for default).
+    pub fn sc_hsm(partition: u8, key_ref: u8) -> Self {
+        KeyId(((partition as u32) << 24) | (key_ref as u32))
+    }
+    /// PIV key reference (always partition 0 — PIV has no partition concept).
+    pub fn piv(key_ref: u8) -> Self {
+        KeyId((AppletId::Piv as u32) << 16 | (key_ref as u32))
+    }
+    /// OpenPGP key slot index (0=SIG, 1=DEC, 2=AUTH).
+    pub fn openpgp(slot: u8) -> Self {
+        KeyId((AppletId::OpenPgp as u32) << 16 | (slot as u32))
+    }
+    /// Extract the protocol key reference (low byte).
+    pub fn proto_ref(self) -> u8 {
+        (self.0 & 0xFF) as u8
+    }
+    /// Extract the applet byte (bits 23–16).
+    pub fn applet_byte(self) -> u8 {
+        ((self.0 >> 16) & 0xFF) as u8
+    }
+    /// Extract the partition byte (bits 31–24).
+    pub fn partition(self) -> u8 {
+        ((self.0 >> 24) & 0xFF) as u8
+    }
+}
 
 /// Key algorithm and type tag.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

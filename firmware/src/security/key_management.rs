@@ -41,6 +41,8 @@ use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use zeroize::{Zeroize, Zeroizing};
 
+use pico2hsm_core::key::AppletId;
+
 use aes_gcm::{
     aead::{AeadInPlace, KeyInit as GcmKeyInit},
     Aes256Gcm,
@@ -53,7 +55,7 @@ use aes_gcm::{
 // ---------------------------------------------------------------------------
 
 /// Magic header for stored key blobs.
-pub const KEY_MAGIC: [u8; 4] = *b"P2KY";
+pub const KEY_MAGIC: [u8; 4] = *b"P2K2";
 
 /// Maximum number of key slots (key_id 0x01–0xFF).
 pub const MAX_KEYS: usize = 255;
@@ -210,7 +212,10 @@ pub enum KeyError {
 /// is wrapped in `Zeroizing` at call sites where it leaves a function.
 pub struct KeyObject {
     pub key_type:    KeyType,
-    pub key_id:      u8,
+    /// Full u32 internal key ID (structured: partition | applet | reserved | proto_ref).
+    pub key_id:      u32,
+    /// Owning applet.
+    pub owner:       AppletId,
     pub algorithm:   AlgorithmId,
     pub key_domain:  u8,
     pub use_count:   u32,
@@ -226,6 +231,7 @@ impl Zeroize for KeyObject {
         self.public_key.zeroize();
         self.use_count = 0;
         self.key_id = 0;
+        self.owner.zeroize();
         self.key_domain = 0;
     }
 }
@@ -240,12 +246,14 @@ impl KeyObject {
     /// Create a new `KeyObject` with empty key material.
     pub fn new(
         key_type:  KeyType,
-        key_id:    u8,
+        key_id:    u32,
+        owner:     AppletId,
         algorithm: AlgorithmId,
     ) -> Self {
         KeyObject {
             key_type,
             key_id,
+            owner,
             algorithm,
             key_domain: 0,
             use_count: 0,
@@ -260,17 +268,17 @@ impl KeyObject {
 
     /// Serialise the fixed metadata header into `buf` (AAD portion).
     ///
-    /// Layout: magic(4) | key_type(1) | key_id(1) | algorithm(1) |
+    /// Layout: magic(4) | key_type(1) | key_id(4) | algorithm(1) |
     ///         key_size(1) | key_domain(1) | use_count(4)
-    fn write_header(&self, buf: &mut [u8; 13]) {
+    fn write_header(&self, buf: &mut [u8; 16]) {
         buf[0..4].copy_from_slice(&KEY_MAGIC);
         buf[4] = self.key_type as u8;
-        buf[5] = self.key_id;
-        buf[6] = self.algorithm as u8;
-        buf[7] = self.private_key.len() as u8;
-        buf[8] = self.key_domain;
+        buf[5..9].copy_from_slice(&self.key_id.to_le_bytes());
+        buf[9] = self.algorithm as u8;
+        buf[10] = self.private_key.len() as u8;
+        buf[11] = self.key_domain;
         let uc = self.use_count.to_be_bytes();
-        buf[9..13].copy_from_slice(&uc);
+        buf[12..16].copy_from_slice(&uc);
     }
 
     // -----------------------------------------------------------------------
@@ -280,7 +288,7 @@ impl KeyObject {
     /// Encrypt this key object into a storage blob.
     ///
     /// The returned buffer contains:
-    /// `header(13) || priv_key(N) || pub_len(2) || pub_key(M) || tag(16) || nonce(12)`
+    /// `header(16) || priv_key(N) || pub_len(2) || pub_key(M) || tag(16) || nonce(12)`
     ///
     /// where `header` also acts as the GCM AAD so any tampering with metadata
     /// is detected on decryption.
@@ -289,11 +297,11 @@ impl KeyObject {
         smk: &[u8; 32],
         nonce: &[u8; NONCE_SIZE],
     ) -> Result<heapless::Vec<u8, 1200>, KeyError> {
-        // Derive per-key encryption key.
-        let kek = derive_key_encryption_key(smk, self.key_id)?;
+        // Derive per-key encryption key using the low-byte proto_ref.
+        let kek = derive_key_encryption_key(smk, (self.key_id & 0xFF) as u8)?;
 
         // Build AAD = header bytes.
-        let mut header = [0u8; 13];
+        let mut header = [0u8; 16];
         self.write_header(&mut header);
 
         // Build plaintext = priv_key || pub_len(2) || pub_key
@@ -319,9 +327,9 @@ impl KeyObject {
             .map_err(|_| KeyError::EncryptFailure)?;
         let nonce_arr = GcmNonce::from_slice(nonce);
 
-        // payload slice starts after the 13-byte header
+        // payload slice starts after the 16-byte header
         let tag = cipher
-            .encrypt_in_place_detached(nonce_arr, &header, &mut ct_buf.as_mut_slice()[13..])
+            .encrypt_in_place_detached(nonce_arr, &header, &mut ct_buf.as_mut_slice()[16..])
             .map_err(|_| KeyError::EncryptFailure)?;
 
         // Append tag then nonce.
@@ -338,9 +346,11 @@ impl KeyObject {
     /// Decrypt a storage blob and reconstruct the `KeyObject`.
     ///
     /// `blob` must be the exact bytes returned by [`KeyObject::encrypt`].
-    pub fn decrypt(blob: &[u8], key_id: u8, smk: &[u8; 32]) -> Result<Self, KeyError> {
-        // Minimum: header(13) + tag(16) + nonce(12) = 41 bytes
-        if blob.len() < 41 {
+    /// `key_id` is the full u32 internal key ID; the low byte (proto_ref) is
+    /// used for KEK derivation and must match the blob header.
+    pub fn decrypt(blob: &[u8], key_id: u32, smk: &[u8; 32]) -> Result<Self, KeyError> {
+        // Minimum: header(16) + tag(16) + nonce(12) = 44 bytes
+        if blob.len() < 44 {
             return Err(KeyError::InvalidFormat);
         }
 
@@ -354,8 +364,8 @@ impl KeyObject {
         let tag_bytes: &[u8; 16] = blob[tag_start..nonce_start].try_into()
             .map_err(|_| KeyError::InvalidFormat)?;
 
-        // The header is the first 13 bytes (also AAD).
-        let header: &[u8; 13] = blob[..13].try_into()
+        // The header is the first 16 bytes (also AAD).
+        let header: &[u8; 16] = blob[..16].try_into()
             .map_err(|_| KeyError::InvalidFormat)?;
 
         // Validate magic.
@@ -365,22 +375,22 @@ impl KeyObject {
 
         // Parse header fields.
         let kt   = KeyType::from_u8(header[4]).ok_or(KeyError::UnknownKeyType)?;
-        let kid  = header[5];
-        let algo = AlgorithmId::from_u8(header[6]).ok_or(KeyError::UnknownAlgorithm)?;
-        let priv_size = header[7] as usize;
-        let domain    = header[8];
-        let use_count = u32::from_be_bytes(header[9..13].try_into().unwrap());
+        let stored_key_id = u32::from_le_bytes(header[5..9].try_into().unwrap());
+        let algo = AlgorithmId::from_u8(header[9]).ok_or(KeyError::UnknownAlgorithm)?;
+        let priv_size = header[10] as usize;
+        let domain    = header[11];
+        let use_count = u32::from_be_bytes(header[12..16].try_into().unwrap());
 
         // Sanity: the key_id in the blob must match the requested key_id.
-        if kid != key_id {
+        if stored_key_id != key_id {
             return Err(KeyError::InvalidFormat);
         }
 
-        // Derive per-key encryption key.
-        let kek = derive_key_encryption_key(smk, key_id)?;
+        // Derive per-key encryption key using the low-byte proto_ref.
+        let kek = derive_key_encryption_key(smk, (key_id & 0xFF) as u8)?;
 
         // Decrypt the payload portion (between header and tag).
-        let ct_payload = &blob[13..tag_start];
+        let ct_payload = &blob[16..tag_start];
         if ct_payload.len() < priv_size + 2 {
             return Err(KeyError::InvalidFormat);
         }
@@ -418,9 +428,17 @@ impl KeyObject {
             return Err(KeyError::InvalidFormat);
         }
 
+        // Determine owner from applet byte (bits 23-16) of key_id.
+        let owner = match ((key_id >> 16) & 0xFF) as u8 {
+            0x01 => AppletId::Piv,
+            0x02 => AppletId::OpenPgp,
+            _ => AppletId::ScHsm,
+        };
+
         let mut obj = KeyObject {
             key_type: kt,
-            key_id: kid,
+            key_id,
+            owner,
             algorithm: algo,
             key_domain: domain,
             use_count,
@@ -513,7 +531,7 @@ impl KeyObject {
         blob:      &[u8],
         dkek:      &[u8; 32],
         device_id: &[u8],
-        key_id:    u8,
+        key_id:    u32,
         algorithm: AlgorithmId,
     ) -> Result<Self, KeyError> {
         // blob = nonce(12) || ciphertext || tag(16)
@@ -553,9 +571,17 @@ impl KeyObject {
             return Err(KeyError::InvalidFormat);
         }
 
+        // Determine owner from applet byte (bits 23-16) of key_id.
+        let owner = match ((key_id >> 16) & 0xFF) as u8 {
+            0x01 => AppletId::Piv,
+            0x02 => AppletId::OpenPgp,
+            _ => AppletId::ScHsm,
+        };
+
         let mut obj = KeyObject {
             key_type:   raw_kt,
             key_id,
+            owner,
             algorithm,
             key_domain: 0,
             use_count:  0,
@@ -681,20 +707,21 @@ mod tests {
 
     #[test]
     fn test_encrypt_decrypt_roundtrip_ec() {
+        use pico2hsm_core::key::AppletId;
         let smk = test_smk();
         let nonce = test_nonce();
 
-        let mut obj = KeyObject::new(KeyType::Ec, 0x01, AlgorithmId::EcdsaP256);
+        let mut obj = KeyObject::new(KeyType::Ec, 0x00000001u32, AppletId::ScHsm, AlgorithmId::EcdsaP256);
         // Fake 32-byte P-256 private key scalar.
         obj.private_key.extend_from_slice(&[0x42u8; 32]).unwrap();
         // Fake 65-byte uncompressed P-256 public key.
         obj.public_key.extend_from_slice(&[0x04u8; 65]).unwrap();
 
         let blob = obj.encrypt(&smk, &nonce).unwrap();
-        let recovered = KeyObject::decrypt(&blob, 0x01, &smk).unwrap();
+        let recovered = KeyObject::decrypt(&blob, 0x00000001u32, &smk).unwrap();
 
         assert_eq!(recovered.key_type, KeyType::Ec);
-        assert_eq!(recovered.key_id, 0x01);
+        assert_eq!(recovered.key_id, 0x00000001u32);
         assert_eq!(recovered.algorithm, AlgorithmId::EcdsaP256);
         assert_eq!(recovered.private_key.as_slice(), &[0x42u8; 32]);
         assert_eq!(recovered.public_key.as_slice(), &[0x04u8; 65]);
@@ -702,14 +729,15 @@ mod tests {
 
     #[test]
     fn test_encrypt_decrypt_roundtrip_aes() {
+        use pico2hsm_core::key::AppletId;
         let smk = test_smk();
         let nonce = test_nonce();
 
-        let mut obj = KeyObject::new(KeyType::Aes, 0x10, AlgorithmId::AesGcm);
+        let mut obj = KeyObject::new(KeyType::Aes, 0x00000010u32, AppletId::ScHsm, AlgorithmId::AesGcm);
         obj.private_key.extend_from_slice(&[0xBEu8; 32]).unwrap();
 
         let blob = obj.encrypt(&smk, &nonce).unwrap();
-        let recovered = KeyObject::decrypt(&blob, 0x10, &smk).unwrap();
+        let recovered = KeyObject::decrypt(&blob, 0x00000010u32, &smk).unwrap();
 
         assert_eq!(recovered.algorithm, AlgorithmId::AesGcm);
         assert_eq!(recovered.private_key.as_slice(), &[0xBEu8; 32]);
@@ -718,61 +746,65 @@ mod tests {
 
     #[test]
     fn test_decrypt_wrong_key_id_fails() {
+        use pico2hsm_core::key::AppletId;
         let smk = test_smk();
         let nonce = test_nonce();
 
-        let mut obj = KeyObject::new(KeyType::Aes, 0x05, AlgorithmId::AesCbc);
+        let mut obj = KeyObject::new(KeyType::Aes, 0x00000005u32, AppletId::ScHsm, AlgorithmId::AesCbc);
         obj.private_key.extend_from_slice(&[0x11u8; 16]).unwrap();
 
         let blob = obj.encrypt(&smk, &nonce).unwrap();
         // Decrypt claiming a different key_id — should fail on authentication tag.
-        let result = KeyObject::decrypt(&blob, 0x06, &smk);
+        let result = KeyObject::decrypt(&blob, 0x00000006u32, &smk);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_decrypt_tampered_blob_fails() {
+        use pico2hsm_core::key::AppletId;
         let smk = test_smk();
         let nonce = test_nonce();
 
-        let mut obj = KeyObject::new(KeyType::Ec, 0x02, AlgorithmId::EcdsaP384);
+        let mut obj = KeyObject::new(KeyType::Ec, 0x00000002u32, AppletId::ScHsm, AlgorithmId::EcdsaP384);
         obj.private_key.extend_from_slice(&[0xFFu8; 48]).unwrap();
 
         let mut blob = obj.encrypt(&smk, &nonce).unwrap();
         // Tamper with the ciphertext body.
         blob[20] ^= 0xFF;
-        let result = KeyObject::decrypt(&blob, 0x02, &smk);
+        let result = KeyObject::decrypt(&blob, 0x00000002u32, &smk);
         assert!(matches!(result, Err(KeyError::DecryptFailure)));
     }
 
     #[test]
     fn test_dkek_wrap_unwrap_roundtrip() {
+        use pico2hsm_core::key::AppletId;
         let dkek = [0xDEu8; 32];
         let device_id = b"pico2hsm-test-device-id";
         let nonce = test_nonce();
 
-        let mut obj = KeyObject::new(KeyType::Ec, 0x03, AlgorithmId::EcdhP256);
+        let mut obj = KeyObject::new(KeyType::Ec, 0x00000003u32, AppletId::ScHsm, AlgorithmId::EcdhP256);
         obj.private_key.extend_from_slice(&[0xABu8; 32]).unwrap();
 
         let wrapped = obj.wrap_dkek(&dkek, device_id, &nonce).unwrap();
         let recovered = KeyObject::unwrap_dkek(
-            &wrapped, &dkek, device_id, 0x07, AlgorithmId::EcdhP256,
+            &wrapped, &dkek, device_id, 0x00000007u32, AlgorithmId::EcdhP256,
         ).unwrap();
 
         assert_eq!(recovered.private_key.as_slice(), &[0xABu8; 32]);
-        assert_eq!(recovered.key_id, 0x07);
+        assert_eq!(recovered.key_id, 0x00000007u32);
     }
 
     #[test]
     fn test_dkek_wrap_wrong_device_id_fails() {
+        use pico2hsm_core::key::AppletId;
         let dkek = [0xDEu8; 32];
         let nonce = test_nonce();
 
-        let mut obj = KeyObject::new(KeyType::Aes, 0x01, AlgorithmId::AesGcm);
+        let mut obj = KeyObject::new(KeyType::Aes, 0x00000001u32, AppletId::ScHsm, AlgorithmId::AesGcm);
         obj.private_key.extend_from_slice(&[0x99u8; 32]).unwrap();
 
         let wrapped = obj.wrap_dkek(&dkek, b"device-A", &nonce).unwrap();
-        let result = KeyObject::unwrap_dkek(&wrapped, &dkek, b"device-B", 0x01, AlgorithmId::AesGcm);
+        let result = KeyObject::unwrap_dkek(&wrapped, &dkek, b"device-B", 0x00000001u32, AlgorithmId::AesGcm);
         assert!(matches!(result, Err(KeyError::DecryptFailure)));
     }
 

@@ -17,15 +17,27 @@
 
 use heapless::Vec;
 use pico2hsm_core::{
-    error::{CryptoError, HsmError, StorageError},
-    key::{KeyId, KeyType as CoreKeyType},
+    error::HsmError,
+    key::{AppletId, KeyId},
 };
+
+use crate::security::key_management::KeyObject;
+
+// ARM-only imports used by FlashKeyStore.
+#[cfg(target_arch = "arm")]
+use pico2hsm_core::{
+    error::{CryptoError, StorageError},
+    key::KeyType as CoreKeyType,
+};
+#[cfg(target_arch = "arm")]
 use zeroize::Zeroizing;
-
+#[cfg(target_arch = "arm")]
 use pico2hsm_core::flash::FlashChip;
-
-use crate::security::key_management::{AlgorithmId, KeyObject};
-use crate::storage::{StorageManager};
+#[cfg(target_arch = "arm")]
+use crate::security::key_management::AlgorithmId;
+#[cfg(target_arch = "arm")]
+use crate::storage::StorageManager;
+#[cfg(target_arch = "arm")]
 use crate::storage::integrity::compute_plaintext_blake2s;
 
 // ─── KeyStore trait ───────────────────────────────────────────────────────────
@@ -39,13 +51,16 @@ pub trait KeyStore {
     fn save_key(&mut self, obj: &KeyObject) -> Result<(), HsmError>;
 
     /// Load and decrypt a key by ID. Returns `Ok(None)` if not found.
-    fn fetch_key(&mut self, key_id: u8) -> Result<Option<KeyObject>, HsmError>;
+    fn fetch_key(&mut self, key_id: KeyId) -> Result<Option<KeyObject>, HsmError>;
 
     /// Delete a key from persistent storage.
-    fn erase_key(&mut self, key_id: u8) -> Result<(), HsmError>;
+    fn erase_key(&mut self, key_id: KeyId) -> Result<(), HsmError>;
 
     /// Wipe ALL keys. Called by INITIALIZE only.
     fn wipe_all(&mut self) -> Result<(), HsmError>;
+
+    /// Wipe only keys owned by the given applet. Called by applet INITIALIZE.
+    fn wipe_by_owner(&mut self, owner: AppletId) -> Result<(), HsmError>;
 
     /// List all key IDs currently in persistent storage.
     fn enumerate_keys(&self) -> Vec<KeyId, 512>;
@@ -55,11 +70,13 @@ pub trait KeyStore {
 
 /// Concrete key store backed by a `StorageManager<Chip>` and protected by the
 /// Storage Master Key (`smk`).
+#[cfg(target_arch = "arm")]
 pub struct FlashKeyStore<Chip: FlashChip> {
     storage: StorageManager<Chip>,
     smk: Zeroizing<[u8; 32]>,
 }
 
+#[cfg(target_arch = "arm")]
 impl<Chip: FlashChip> FlashKeyStore<Chip> {
     /// Construct a new `FlashKeyStore`.
     ///
@@ -75,6 +92,7 @@ impl<Chip: FlashChip> FlashKeyStore<Chip> {
     }
 }
 
+#[cfg(target_arch = "arm")]
 impl<Chip: FlashChip> KeyStore for FlashKeyStore<Chip> {
     fn save_key(&mut self, obj: &KeyObject) -> Result<(), HsmError> {
         // --- 1. Generate a fresh 12-byte nonce from the hardware TRNG. ---
@@ -98,37 +116,48 @@ impl<Chip: FlashChip> KeyStore for FlashKeyStore<Chip> {
 
         // --- 5. Write to flash. ---
         self.storage
-            .write_key(KeyId(obj.key_id as u16), core_key_type, &blob, &hash)
+            .write_key(KeyId(obj.key_id), core_key_type, &blob, &hash)
             .map_err(HsmError::Storage)
     }
 
-    fn fetch_key(&mut self, key_id: u8) -> Result<Option<KeyObject>, HsmError> {
+    fn fetch_key(&mut self, key_id: KeyId) -> Result<Option<KeyObject>, HsmError> {
         // Check whether the key exists in the directory first so we can
         // return Ok(None) cleanly instead of propagating a ReadError.
         let key_ids = self.storage.list_keys();
-        if !key_ids.iter().any(|k| k.0 == key_id as u16) {
+        if !key_ids.iter().any(|k| k.0 == key_id.0) {
             return Ok(None);
         }
 
         let blob = self
             .storage
-            .read_key(KeyId(key_id as u16))
+            .read_key(key_id)
             .map_err(HsmError::Storage)?;
 
-        let obj = KeyObject::decrypt(&blob, key_id, &self.smk)
+        // Pass the u32 key_id to decrypt — decrypt uses the low byte for KEK derivation.
+        let obj = KeyObject::decrypt(&blob, key_id.0, &self.smk)
             .map_err(|_| HsmError::Crypto(CryptoError::DecryptFailure))?;
 
         Ok(Some(obj))
     }
 
-    fn erase_key(&mut self, key_id: u8) -> Result<(), HsmError> {
+    fn erase_key(&mut self, key_id: KeyId) -> Result<(), HsmError> {
         self.storage
-            .delete_key(KeyId(key_id as u16))
+            .delete_key(key_id)
             .map_err(HsmError::Storage)
     }
 
     fn wipe_all(&mut self) -> Result<(), HsmError> {
         self.storage.wipe_all().map_err(HsmError::Storage)
+    }
+
+    fn wipe_by_owner(&mut self, owner: AppletId) -> Result<(), HsmError> {
+        let keys = self.storage.list_keys();
+        for k in keys {
+            if ((k.0 >> 16) & 0xFF) as u8 == owner as u8 {
+                self.storage.delete_key(k).map_err(HsmError::Storage)?;
+            }
+        }
+        Ok(())
     }
 
     fn enumerate_keys(&self) -> Vec<KeyId, 512> {
@@ -150,15 +179,19 @@ impl KeyStore for NullKeyStore {
         Ok(())
     }
 
-    fn fetch_key(&mut self, _: u8) -> Result<Option<KeyObject>, HsmError> {
+    fn fetch_key(&mut self, _: KeyId) -> Result<Option<KeyObject>, HsmError> {
         Ok(None)
     }
 
-    fn erase_key(&mut self, _: u8) -> Result<(), HsmError> {
+    fn erase_key(&mut self, _: KeyId) -> Result<(), HsmError> {
         Ok(())
     }
 
     fn wipe_all(&mut self) -> Result<(), HsmError> {
+        Ok(())
+    }
+
+    fn wipe_by_owner(&mut self, _: AppletId) -> Result<(), HsmError> {
         Ok(())
     }
 
@@ -171,6 +204,7 @@ impl KeyStore for NullKeyStore {
 
 /// Map a `security::key_management::AlgorithmId` to the `pico2hsm_core::key::KeyType`
 /// used by the storage layer.
+#[cfg(target_arch = "arm")]
 fn algo_to_core_key_type(algo: AlgorithmId) -> CoreKeyType {
     match algo {
         // EC curves

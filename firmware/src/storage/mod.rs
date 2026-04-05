@@ -37,22 +37,37 @@
 //! same type for all type parameters.  For mixed boards (e.g. SDCard + SPI
 //! flash) use the `AnyChip` enum or a board-specific concrete type.
 
-pub mod board_chips;
-pub mod filesystem;
-pub mod flash_chip;
-pub mod integrity;
 pub mod keystore;
-pub mod raid;
-pub mod sdcard;
-pub mod wal;
+pub use keystore::KeyStore;
 
-pub use keystore::{FlashKeyStore, KeyStore};
 #[cfg(not(target_arch = "arm"))]
 pub use keystore::NullKeyStore;
+
+// The following sub-modules use embassy-rp / embassy-time / defmt and can
+// only compile for ARM bare-metal targets.
+#[cfg(target_arch = "arm")]
+pub mod board_chips;
+#[cfg(target_arch = "arm")]
+pub mod filesystem;
+#[cfg(target_arch = "arm")]
+pub mod flash_chip;
+#[cfg(target_arch = "arm")]
+pub mod integrity;
+#[cfg(target_arch = "arm")]
+pub mod raid;
+#[cfg(target_arch = "arm")]
+pub mod sdcard;
+#[cfg(target_arch = "arm")]
+pub mod wal;
+
+#[cfg(target_arch = "arm")]
+pub use keystore::FlashKeyStore;
 #[cfg(target_arch = "arm")]
 pub use board_chips::BoardChip;
 
+#[cfg(target_arch = "arm")]
 use filesystem::{Directory, KeyFilesystem, ScrubReport};
+#[cfg(target_arch = "arm")]
 use pico2hsm_core::{
     error::{HsmError, StorageError},
     flash::{FlashChip, SECTOR_SIZE},
@@ -69,6 +84,7 @@ use pico2hsm_core::{
 /// absent chip slots.
 ///
 /// Implement new variants here as additional hardware is supported.
+#[cfg(target_arch = "arm")]
 pub enum AnyChip<S0, S1, SD>
 where
     S0: FlashChip,
@@ -85,6 +101,7 @@ where
     Empty,
 }
 
+#[cfg(target_arch = "arm")]
 impl<S0, S1, SD> FlashChip for AnyChip<S0, S1, SD>
 where
     S0: FlashChip,
@@ -158,6 +175,7 @@ where
 // ─── StorageStatus ────────────────────────────────────────────────────────────
 
 /// Health and utilisation snapshot for the host tool status query.
+#[cfg(target_arch = "arm")]
 #[derive(Debug, Clone)]
 pub struct StorageStatus {
     /// Per-chip health state (slots 0–7, `NotPresent` for unused slots).
@@ -179,6 +197,7 @@ pub struct StorageStatus {
 ///
 /// Type parameter `Chip` is the concrete `FlashChip` type used for all
 /// slots.  For boards with heterogeneous chips, use `AnyChip<S0, S1, SD>`.
+#[cfg(target_arch = "arm")]
 pub struct StorageManager<Chip: FlashChip> {
     /// Logical key filesystem (owns chip instances and in-RAM directory).
     filesystem: KeyFilesystem<Chip>,
@@ -188,6 +207,7 @@ pub struct StorageManager<Chip: FlashChip> {
     mirror_pairs: [MirrorPair; 4],
 }
 
+#[cfg(target_arch = "arm")]
 impl<Chip: FlashChip> StorageManager<Chip> {
     /// Create a new `StorageManager` from a pre-built `KeyFilesystem`.
     ///
@@ -319,7 +339,7 @@ impl<Chip: FlashChip> StorageManager<Chip> {
             .directory
             .entries
             .iter()
-            .filter(|e| (e.flags & 0x01) == 0 && e.key_id != 0xFFFF)
+            .filter(|e| (e.flags & 0x01) == 0 && e.key_id != 0xFFFF_FFFF)
             .map(|e| e.sector_count as u32)
             .sum();
 
@@ -494,7 +514,7 @@ impl<Chip: FlashChip> StorageManager<Chip> {
         // Clone the minimal info we need before we borrow chips mutably.
         let mut to_erase: heapless::Vec<(u8, u32, u8), 512> = heapless::Vec::new(); // (chip_idx, sector_index, sector_count)
         for entry in self.filesystem.directory.entries.iter() {
-            if entry.key_id == 0xFFFF || (entry.flags & 0x01) != 0 {
+            if entry.key_id == 0xFFFF_FFFF || (entry.flags & 0x01) != 0 {
                 continue; // empty slot or tombstoned
             }
             let _ = to_erase.push((entry.chip_index, entry.sector_index, entry.sector_count));

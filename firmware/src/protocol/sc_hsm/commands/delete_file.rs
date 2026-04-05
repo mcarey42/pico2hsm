@@ -42,7 +42,8 @@ pub fn handle(state: &mut ScHsmState, store: &mut dyn crate::storage::KeyStore, 
     };
 
     let hi = file_id >> 8;
-    let key_id = (file_id & 0xFF) as u8;
+    let key_id_proto = (file_id & 0xFF) as u8;
+    let full_key_id = pico2hsm_core::key::KeyId::sc_hsm(0, key_id_proto).0; // u32 internal ID
 
     let before = state.ef_files.len();
     state.ef_files.retain(|e| e.file_id != file_id);
@@ -51,7 +52,7 @@ pub fn handle(state: &mut ScHsmState, store: &mut dyn crate::storage::KeyStore, 
     // C4 xx: also remove the key entry itself
     let mut deleted_key = if hi == 0xC4 {
         let before_keys = state.keys.len();
-        state.keys.retain(|k| k.key_id != key_id);
+        state.keys.retain(|k| k.key_id != full_key_id);
         state.keys.len() < before_keys
     } else {
         false
@@ -61,7 +62,7 @@ pub fn handle(state: &mut ScHsmState, store: &mut dyn crate::storage::KeyStore, 
     #[cfg(feature = "rsa")]
     if hi == 0xC4 {
         let before_rsa = state.rsa_keys.len();
-        state.rsa_keys.retain(|k| k.key_id != key_id);
+        state.rsa_keys.retain(|k| k.key_id != full_key_id);
         if state.rsa_keys.len() < before_rsa {
             deleted_key = true;
         }
@@ -69,7 +70,7 @@ pub fn handle(state: &mut ScHsmState, store: &mut dyn crate::storage::KeyStore, 
 
     // Erase from flash (best-effort; do not fail APDU on flash error).
     if deleted_key {
-        let _ = store.erase_key(key_id);
+        let _ = store.erase_key(pico2hsm_core::key::KeyId(full_key_id));
     }
 
     if deleted_ef || deleted_key {

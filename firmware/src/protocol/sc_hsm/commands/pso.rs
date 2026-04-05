@@ -11,10 +11,11 @@
 use sha2::Digest as _;
 
 use pico2hsm_core::apdu::{
-    ApduCommand, ApduResponse, SW_CONDITIONS_NOT_SATISFIED, SW_FILE_NOT_FOUND,
-    SW_INS_NOT_SUPPORTED, SW_SECURITY_STATUS, SW_WRONG_DATA,
+    ApduCommand, ApduResponse, SW_CONDITIONS_NOT_SATISFIED, SW_DATA_INVALID,
+    SW_FILE_NOT_FOUND, SW_INS_NOT_SUPPORTED, SW_OK, SW_SECURITY_STATUS, SW_WRONG_DATA,
+    SW_WRONG_LENGTH,
 };
-use pico2hsm_core::key::KeyType;
+use pico2hsm_core::key::{KeyId, KeyMaterial, KeyType};
 
 use crate::protocol::sc_hsm::{FwRng, ScHsmState};
 
@@ -33,16 +34,10 @@ pub fn handle(state: &mut ScHsmState, cmd: &ApduCommand<'_>) -> ApduResponse {
         (0x9E, 0x9A) => pso_compute_digital_signature(state, cmd),
         // PSO: Decipher — key/algo from MSE SET state
         (0x80, 0x86) => pso_decipher(state, cmd),
-        // PSO: Compute Cryptographic Checksum (MAC)
-        (0x8E, 0x80) => {
-            // TODO (Agent 7): compute CMAC/HMAC
-            ApduResponse::err(SW_INS_NOT_SUPPORTED)
-        }
+        // PSO: Compute Cryptographic Checksum (AES-CMAC or HMAC-SHA256)
+        (0x8E, 0x80) => pso_compute_checksum(state, cmd),
         // PSO: Verify Cryptographic Checksum
-        (0x86, 0x80) => {
-            // TODO (Agent 7): verify CMAC/HMAC
-            ApduResponse::err(SW_INS_NOT_SUPPORTED)
-        }
+        (0x86, 0x80) => pso_verify_checksum(state, cmd),
         _ => ApduResponse::err(SW_WRONG_DATA),
     }
 }
@@ -53,10 +48,11 @@ pub fn handle(state: &mut ScHsmState, cmd: &ApduCommand<'_>) -> ApduResponse {
 /// but reads key_id and algo from the security environment set by MSE SET.
 fn pso_compute_digital_signature(state: &mut ScHsmState, cmd: &ApduCommand<'_>) -> ApduResponse {
     // Require MSE SET to have configured key and algorithm
-    let key_id = match state.current_key_id {
+    let key_id_proto = match state.current_key_id {
         Some(id) => id,
         None => return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
     };
+    let key_id = pico2hsm_core::key::KeyId::sc_hsm(0, key_id_proto).0; // u32 internal ID
     let algo = match state.current_algo {
         Some(a) => a,
         None => return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
@@ -243,10 +239,11 @@ fn is_ec_private(kt: KeyType) -> bool {
 /// but reads key_id and algo from the security environment set by MSE SET.
 fn pso_decipher(state: &mut ScHsmState, cmd: &ApduCommand<'_>) -> ApduResponse {
     // Require MSE SET to have configured key and algorithm
-    let key_id = match state.current_key_id {
+    let key_id_proto = match state.current_key_id {
         Some(id) => id,
         None => return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
     };
+    let key_id = pico2hsm_core::key::KeyId::sc_hsm(0, key_id_proto).0; // u32 internal ID
     let algo = match state.current_algo {
         Some(a) => a,
         None => return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
@@ -338,5 +335,431 @@ fn pso_decipher(state: &mut ScHsmState, cmd: &ApduCommand<'_>) -> ApduResponse {
         ApduResponse::ok(&resp)
     } else {
         ApduResponse::ok(&shared)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PSO Compute / Verify Cryptographic Checksum helpers
+// ---------------------------------------------------------------------------
+
+/// Build a `KeyMaterial` from raw symmetric key bytes.
+fn make_sym_key_material(key_id: u32, raw: &[u8]) -> Option<KeyMaterial> {
+    use pico2hsm_core::key::KeyType as Kt;
+    let key_type = match raw.len() {
+        16 => Kt::Aes128,
+        24 => Kt::Aes192,
+        32 => Kt::Aes256,
+        _ => return None,
+    };
+    let mut km_raw: heapless::Vec<u8, { pico2hsm_core::key::MAX_KEY_BYTES }> =
+        heapless::Vec::new();
+    km_raw.extend_from_slice(raw).ok()?;
+    Some(KeyMaterial { key_type, key_id: KeyId(key_id), raw: km_raw })
+}
+
+/// PSO Compute Cryptographic Checksum (P1=0x8E, P2=0x80).
+///
+/// Uses the symmetric key selected by the preceding MSE SET.
+/// - AES key (16/24/32 B) → AES-CMAC, returns 16-byte tag
+/// - Any other size → error
+///
+/// If `current_algo` is `0xA0` (HMAC-SHA256 indicator), HMAC-SHA256 is used
+/// instead and returns a 32-byte tag.
+fn pso_compute_checksum(state: &mut ScHsmState, cmd: &ApduCommand<'_>) -> ApduResponse {
+    let key_id_proto = match state.current_key_id {
+        Some(id) => id,
+        None => return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
+    };
+    let full_key_id = KeyId::sc_hsm(0, key_id_proto).0;
+
+    if cmd.data.is_empty() {
+        return ApduResponse::err(SW_WRONG_DATA);
+    }
+
+    let raw_key: heapless::Vec<u8, 32> = match state.sym_keys.iter().find(|k| k.key_id == full_key_id) {
+        Some(sk) => sk.raw_key.clone(),
+        None => return ApduResponse::err(SW_FILE_NOT_FOUND),
+    };
+
+    // Determine MAC algorithm from current_algo:
+    // 0xA0 = HMAC-SHA256; anything else (or None) defaults to AES-CMAC.
+    let use_hmac = state.current_algo == Some(0xA0);
+
+    if use_hmac {
+        let tag = crate::crypto::kdf::hmac_sha256(&raw_key, cmd.data);
+        ApduResponse::ok(&tag)
+    } else {
+        let km = match make_sym_key_material(full_key_id, &raw_key) {
+            Some(k) => k,
+            None => return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
+        };
+        match crate::crypto::symmetric::aes_cmac(&km, cmd.data) {
+            Ok(tag) => ApduResponse::ok(&tag),
+            Err(_) => ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
+        }
+    }
+}
+
+/// PSO Verify Cryptographic Checksum (P1=0x86, P2=0x80).
+///
+/// Wire format: `[message || tag]`
+/// - AES-CMAC: tag is 16 bytes
+/// - HMAC-SHA256: tag is 32 bytes (if `current_algo == 0xA0`)
+///
+/// Returns SW_OK if the tag matches, SW_DATA_INVALID otherwise.
+fn pso_verify_checksum(state: &mut ScHsmState, cmd: &ApduCommand<'_>) -> ApduResponse {
+    let key_id_proto = match state.current_key_id {
+        Some(id) => id,
+        None => return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
+    };
+    let full_key_id = KeyId::sc_hsm(0, key_id_proto).0;
+
+    let raw_key: heapless::Vec<u8, 32> = match state.sym_keys.iter().find(|k| k.key_id == full_key_id) {
+        Some(sk) => sk.raw_key.clone(),
+        None => return ApduResponse::err(SW_FILE_NOT_FOUND),
+    };
+
+    let use_hmac = state.current_algo == Some(0xA0);
+    let tag_len: usize = if use_hmac { 32 } else { 16 };
+
+    if cmd.data.len() < tag_len {
+        return ApduResponse::err(SW_WRONG_LENGTH);
+    }
+
+    let msg_len = cmd.data.len() - tag_len;
+    let message = &cmd.data[..msg_len];
+    let expected_tag = &cmd.data[msg_len..];
+
+    if use_hmac {
+        let computed = crate::crypto::kdf::hmac_sha256(&raw_key, message);
+        if computed.as_ref() == expected_tag {
+            ApduResponse::ok(&[])
+        } else {
+            ApduResponse::err(SW_DATA_INVALID)
+        }
+    } else {
+        let expected: [u8; 16] = match expected_tag.try_into() {
+            Ok(a) => a,
+            Err(_) => return ApduResponse::err(SW_WRONG_LENGTH),
+        };
+        match crate::crypto::symmetric::aes_cmac_verify(&raw_key, message, &expected) {
+            Ok(true) => ApduResponse::ok(&[]),
+            Ok(false) => ApduResponse::err(SW_DATA_INVALID),
+            Err(_) => ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Host-side unit tests (cargo test --target x86_64-unknown-linux-gnu)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pico2hsm_core::key::KeyType;
+    use rand_core::RngCore;
+
+    use crate::crypto::asymmetric::generate_ec_keypair;
+    use crate::protocol::sc_hsm::{InMemoryKey, ScHsmState};
+
+    // A simple counter-hash PRNG adequate for tests (no hardware RNG needed).
+    struct CounterRng(u64);
+
+    impl RngCore for CounterRng {
+        fn next_u32(&mut self) -> u32 {
+            let mut b = [0u8; 4];
+            self.fill_bytes(&mut b);
+            u32::from_le_bytes(b)
+        }
+
+        fn next_u64(&mut self) -> u64 {
+            let mut b = [0u8; 8];
+            self.fill_bytes(&mut b);
+            u64::from_le_bytes(b)
+        }
+
+        fn fill_bytes(&mut self, dest: &mut [u8]) {
+            for chunk in dest.chunks_mut(8) {
+                self.0 = self.0.wrapping_add(0x9e3779b97f4a7c15u64);
+                let v = self.0
+                    .wrapping_mul(0x6c62272e07bb0142u64)
+                    ^ 0xbf58476d1ce4e5b9u64;
+                let vb = v.to_le_bytes();
+                chunk.copy_from_slice(&vb[..chunk.len()]);
+            }
+        }
+
+        fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), rand_core::Error> {
+            self.fill_bytes(dest);
+            Ok(())
+        }
+    }
+
+    impl rand_core::CryptoRng for CounterRng {}
+
+    // Helper to build an ApduCommand with data using the raw-byte parse path.
+    fn make_cmd_with_data<'a>(
+        buf: &'a mut heapless::Vec<u8, 512>,
+        p1: u8,
+        p2: u8,
+        data: &[u8],
+    ) -> ApduCommand<'a> {
+        buf.clear();
+        let _ = buf.push(0x00);
+        let _ = buf.push(INS_PSO);
+        let _ = buf.push(p1);
+        let _ = buf.push(p2);
+        let _ = buf.push(data.len() as u8);
+        let _ = buf.extend_from_slice(data);
+        ApduCommand::parse(buf).unwrap()
+    }
+
+    #[test]
+    fn test_pso_cds_requires_pin() {
+        let mut state = ScHsmState::new();
+        let data = [0xABu8; 32];
+        let mut buf: heapless::Vec<u8, 512> = heapless::Vec::new();
+        let cmd = make_cmd_with_data(&mut buf, 0x9E, 0x9A, &data);
+        let resp = handle(&mut state, &cmd);
+        assert_eq!(resp.sw, pico2hsm_core::apdu::SW_SECURITY_STATUS);
+        assert!(resp.data.is_empty());
+    }
+
+    #[test]
+    fn test_pso_cds_requires_mse() {
+        let mut state = ScHsmState::new();
+        state.pin_verified = true;
+        let data = [0xABu8; 32];
+        let mut buf: heapless::Vec<u8, 512> = heapless::Vec::new();
+        let cmd = make_cmd_with_data(&mut buf, 0x9E, 0x9A, &data);
+        let resp = handle(&mut state, &cmd);
+        assert_eq!(resp.sw, pico2hsm_core::apdu::SW_CONDITIONS_NOT_SATISFIED);
+    }
+
+    #[test]
+    fn test_pso_cds_p256_ecdsa() {
+        let mut rng = CounterRng(1);
+        let kp = generate_ec_keypair(KeyType::EcPrivateP256, &mut rng)
+            .expect("P-256 keygen");
+
+        let mut state = ScHsmState::new();
+        state.pin_verified = true;
+        state.current_key_id = Some(0x01);
+        state.current_algo = Some(0x13);
+
+        let key = InMemoryKey {
+            key_id: pico2hsm_core::key::KeyId::sc_hsm(0, 0x01).0,
+            key_type: KeyType::EcPrivateP256,
+            algo: 0x13,
+            private_key: kp.private_key.clone(),
+            public_key: kp.public_key.clone(),
+        };
+        assert!(state.keys.push(key).is_ok());
+
+        let hash = [0xAAu8; 32];
+        let mut buf: heapless::Vec<u8, 512> = heapless::Vec::new();
+        let cmd = make_cmd_with_data(&mut buf, 0x9E, 0x9A, &hash);
+        let resp = handle(&mut state, &cmd);
+        assert_eq!(resp.sw, pico2hsm_core::apdu::SW_OK);
+        assert!(!resp.data.is_empty());
+    }
+
+    #[test]
+    fn test_pso_cds_p256_card_hash() {
+        let mut rng = CounterRng(2);
+        let kp = generate_ec_keypair(KeyType::EcPrivateP256, &mut rng)
+            .expect("P-256 keygen");
+
+        let mut state = ScHsmState::new();
+        state.pin_verified = true;
+        state.current_key_id = Some(0x01);
+        state.current_algo = Some(0x73);
+
+        let key = InMemoryKey {
+            key_id: pico2hsm_core::key::KeyId::sc_hsm(0, 0x01).0,
+            key_type: KeyType::EcPrivateP256,
+            algo: 0x73,
+            private_key: kp.private_key.clone(),
+            public_key: kp.public_key.clone(),
+        };
+        assert!(state.keys.push(key).is_ok());
+
+        let message = b"hello pico2hsm test message";
+        let mut buf: heapless::Vec<u8, 512> = heapless::Vec::new();
+        let cmd = make_cmd_with_data(&mut buf, 0x9E, 0x9A, message);
+        let resp = handle(&mut state, &cmd);
+        assert_eq!(resp.sw, pico2hsm_core::apdu::SW_OK);
+        assert!(!resp.data.is_empty());
+    }
+
+    #[test]
+    fn test_pso_decipher_ecdh_p256() {
+        let mut rng = CounterRng(3);
+
+        let alice = generate_ec_keypair(KeyType::EcPrivateP256, &mut rng)
+            .expect("Alice keygen");
+        let bob = generate_ec_keypair(KeyType::EcPrivateP256, &mut rng)
+            .expect("Bob keygen");
+
+        let mut state = ScHsmState::new();
+        state.pin_verified = true;
+        state.current_key_id = Some(0x01);
+        state.current_algo = Some(0x80);
+
+        let key = InMemoryKey {
+            key_id: pico2hsm_core::key::KeyId::sc_hsm(0, 0x01).0,
+            key_type: KeyType::EcPrivateP256,
+            algo: 0x80,
+            private_key: alice.private_key.clone(),
+            public_key: alice.public_key.clone(),
+        };
+        assert!(state.keys.push(key).is_ok());
+
+        let peer_pub = bob.public_key.clone();
+        assert_eq!(peer_pub[0], 0x04);
+        assert_eq!(peer_pub.len(), 65);
+
+        let mut buf: heapless::Vec<u8, 512> = heapless::Vec::new();
+        let cmd = make_cmd_with_data(&mut buf, 0x80, 0x86, &peer_pub);
+        let resp = handle(&mut state, &cmd);
+        assert_eq!(resp.sw, pico2hsm_core::apdu::SW_OK);
+        assert!(!resp.data.is_empty());
+        assert_eq!(resp.data[0], 0x04);
+    }
+
+    #[test]
+    fn test_pso_unknown_operation() {
+        let mut state = ScHsmState::new();
+        state.pin_verified = true;
+        state.current_key_id = Some(0x01);
+        state.current_algo = Some(0x13);
+
+        let data = [0x01u8; 4];
+        let mut buf: heapless::Vec<u8, 512> = heapless::Vec::new();
+        let cmd = make_cmd_with_data(&mut buf, 0x01, 0x02, &data);
+        let resp = handle(&mut state, &cmd);
+        assert_eq!(resp.sw, pico2hsm_core::apdu::SW_WRONG_DATA);
+    }
+
+    // -----------------------------------------------------------------------
+    // PSO Compute / Verify Cryptographic Checksum tests
+    // -----------------------------------------------------------------------
+
+    fn make_state_with_sym_key(key_bytes: &[u8]) -> ScHsmState {
+        use crate::protocol::sc_hsm::InMemorySymKey;
+        let mut state = ScHsmState::new();
+        state.pin_verified = true;
+        state.current_key_id = Some(0x10);
+        state.current_algo = Some(0x61); // AES-CBC → default to CMAC
+        let full_id = pico2hsm_core::key::KeyId::sc_hsm(0, 0x10).0;
+        let mut raw_key: heapless::Vec<u8, 32> = heapless::Vec::new();
+        raw_key.extend_from_slice(key_bytes).unwrap();
+        state.sym_keys.push(InMemorySymKey { key_id: full_id, raw_key }).unwrap();
+        state
+    }
+
+    #[test]
+    fn test_pso_ccc_aes_cmac_produces_16_bytes() {
+        // AES-256 key
+        let key = [0x2bu8; 32];
+        let mut state = make_state_with_sym_key(&key);
+        let message = b"hello world";
+        let mut buf: heapless::Vec<u8, 512> = heapless::Vec::new();
+        let cmd = make_cmd_with_data(&mut buf, 0x8E, 0x80, message);
+        let resp = handle(&mut state, &cmd);
+        assert_eq!(resp.sw, pico2hsm_core::apdu::SW_OK);
+        assert_eq!(resp.data.len(), 16);
+    }
+
+    #[test]
+    fn test_pso_ccc_cmac_then_verify_round_trip() {
+        let key = [0x42u8; 32];
+        let mut state = make_state_with_sym_key(&key);
+        let message = b"round trip test";
+
+        // Compute tag
+        let mut buf: heapless::Vec<u8, 512> = heapless::Vec::new();
+        let cmd = make_cmd_with_data(&mut buf, 0x8E, 0x80, message);
+        let resp_compute = handle(&mut state, &cmd);
+        assert_eq!(resp_compute.sw, pico2hsm_core::apdu::SW_OK);
+        let tag = resp_compute.data.clone();
+        assert_eq!(tag.len(), 16);
+
+        // Verify: message || tag
+        let mut verify_data: heapless::Vec<u8, 512> = heapless::Vec::new();
+        verify_data.extend_from_slice(message).unwrap();
+        verify_data.extend_from_slice(&tag).unwrap();
+        let mut buf2: heapless::Vec<u8, 512> = heapless::Vec::new();
+        let cmd2 = make_cmd_with_data(&mut buf2, 0x86, 0x80, &verify_data);
+        let resp_verify = handle(&mut state, &cmd2);
+        assert_eq!(resp_verify.sw, pico2hsm_core::apdu::SW_OK);
+    }
+
+    #[test]
+    fn test_pso_vcc_bad_tag_rejected() {
+        let key = [0x11u8; 32];
+        let mut state = make_state_with_sym_key(&key);
+        let message = b"tamper test";
+
+        // Wrong tag (all zeros)
+        let mut verify_data: heapless::Vec<u8, 512> = heapless::Vec::new();
+        verify_data.extend_from_slice(message).unwrap();
+        verify_data.extend_from_slice(&[0u8; 16]).unwrap();
+
+        let mut buf: heapless::Vec<u8, 512> = heapless::Vec::new();
+        let cmd = make_cmd_with_data(&mut buf, 0x86, 0x80, &verify_data);
+        let resp = handle(&mut state, &cmd);
+        assert_eq!(resp.sw, pico2hsm_core::apdu::SW_DATA_INVALID);
+    }
+
+    #[test]
+    fn test_pso_ccc_requires_mse_key() {
+        let mut state = ScHsmState::new();
+        state.pin_verified = true;
+        // No current_key_id set
+        let message = b"no key";
+        let mut buf: heapless::Vec<u8, 512> = heapless::Vec::new();
+        let cmd = make_cmd_with_data(&mut buf, 0x8E, 0x80, message);
+        let resp = handle(&mut state, &cmd);
+        assert_eq!(resp.sw, pico2hsm_core::apdu::SW_CONDITIONS_NOT_SATISFIED);
+    }
+
+    #[test]
+    fn test_pso_ccc_hmac_sha256_produces_32_bytes() {
+        let key = [0x77u8; 32];
+        let mut state = make_state_with_sym_key(&key);
+        state.current_algo = Some(0xA0); // HMAC-SHA256
+        let message = b"hmac test message";
+        let mut buf: heapless::Vec<u8, 512> = heapless::Vec::new();
+        let cmd = make_cmd_with_data(&mut buf, 0x8E, 0x80, message);
+        let resp = handle(&mut state, &cmd);
+        assert_eq!(resp.sw, pico2hsm_core::apdu::SW_OK);
+        assert_eq!(resp.data.len(), 32);
+    }
+
+    #[test]
+    fn test_pso_vcc_hmac_round_trip() {
+        let key = [0x99u8; 32];
+        let mut state = make_state_with_sym_key(&key);
+        state.current_algo = Some(0xA0);
+        let message = b"hmac verify test";
+
+        // Compute
+        let mut buf: heapless::Vec<u8, 512> = heapless::Vec::new();
+        let cmd = make_cmd_with_data(&mut buf, 0x8E, 0x80, message);
+        let resp = handle(&mut state, &cmd);
+        assert_eq!(resp.sw, pico2hsm_core::apdu::SW_OK);
+        let tag = resp.data.clone();
+        assert_eq!(tag.len(), 32);
+
+        // Verify
+        let mut verify_data: heapless::Vec<u8, 512> = heapless::Vec::new();
+        verify_data.extend_from_slice(message).unwrap();
+        verify_data.extend_from_slice(&tag).unwrap();
+        let mut buf2: heapless::Vec<u8, 512> = heapless::Vec::new();
+        let cmd2 = make_cmd_with_data(&mut buf2, 0x86, 0x80, &verify_data);
+        let resp2 = handle(&mut state, &cmd2);
+        assert_eq!(resp2.sw, pico2hsm_core::apdu::SW_OK);
     }
 }

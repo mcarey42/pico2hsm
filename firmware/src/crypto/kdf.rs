@@ -89,6 +89,19 @@ pub fn hkdf_sha256(
 }
 
 // -------------------------------------------------------------------------
+// HMAC-SHA256
+// -------------------------------------------------------------------------
+
+/// Compute HMAC-SHA256(key, message). Returns 32-byte digest.
+pub fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
+    use hmac::Mac as _;
+    let mut mac = HmacSha256::new_from_slice(key)
+        .unwrap_or_else(|_| HmacSha256::new_from_slice(&[0u8; 64]).unwrap());
+    mac.update(message);
+    mac.finalize().into_bytes().into()
+}
+
+// -------------------------------------------------------------------------
 // PBKDF2-HMAC-SHA256
 // -------------------------------------------------------------------------
 

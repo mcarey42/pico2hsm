@@ -4,9 +4,11 @@
 //! a challenge-response mechanism. The host signs the challenge returned
 //! by GET CHALLENGE using a key known to both parties.
 
+use subtle::ConstantTimeEq;
+
 use pico2hsm_core::apdu::{
-    ApduCommand, ApduResponse, SW_CONDITIONS_NOT_SATISFIED, SW_INS_NOT_SUPPORTED,
-    SW_SECURITY_STATUS,
+    ApduCommand, ApduResponse, SW_CONDITIONS_NOT_SATISFIED, SW_OK, SW_SECURITY_STATUS,
+    SW_WRONG_LENGTH,
 };
 
 use crate::protocol::sc_hsm::ScHsmState;
@@ -16,7 +18,7 @@ pub const INS_EXTERNAL_AUTH: u8 = 0x82;
 
 /// Handle an EXTERNAL AUTHENTICATE APDU command.
 pub fn handle(state: &mut ScHsmState, cmd: &ApduCommand<'_>) -> ApduResponse {
-    // A challenge must have been issued previously via GET CHALLENGE
+    // A challenge must have been issued previously via GET CHALLENGE.
     if state.challenge.is_none() {
         return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED);
     }
@@ -25,8 +27,114 @@ pub fn handle(state: &mut ScHsmState, cmd: &ApduCommand<'_>) -> ApduResponse {
         return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED);
     }
 
-    // TODO (Agent 7): verify cryptogram over stored challenge using device auth key.
-    // Clear challenge after use (prevents replay).
-    state.challenge = None;
-    ApduResponse::err(SW_INS_NOT_SUPPORTED)
+    // Retrieve and clear the challenge (replay prevention — always cleared).
+    let challenge_bytes = state.challenge.take().unwrap();
+
+    // SO PIN hash must be set to perform authentication.
+    let so_pin_hash = match state.so_pin_hash {
+        Some(ref h) => *h,
+        None => {
+            return ApduResponse::err(SW_SECURITY_STATUS);
+        }
+    };
+
+    // Response must be exactly 32 bytes (HMAC-SHA256 output).
+    if cmd.data.len() != 32 {
+        return ApduResponse::err(SW_WRONG_LENGTH);
+    }
+
+    // Compute expected HMAC-SHA256(so_pin_hash, challenge).
+    let expected = crate::crypto::kdf::hmac_sha256(&so_pin_hash, &challenge_bytes);
+
+    // Constant-time comparison to prevent timing attacks.
+    if expected.ct_eq(cmd.data).into() {
+        state.so_pin_verified = true;
+        ApduResponse::ok(&[])
+    } else {
+        ApduResponse::err(SW_SECURITY_STATUS)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::sc_hsm::ScHsmState;
+    use pico2hsm_core::apdu::ApduCommand;
+
+    fn make_cmd<'a>(data: &'a [u8]) -> ApduCommand<'a> {
+        ApduCommand {
+            cla: 0x00,
+            ins: INS_EXTERNAL_AUTH,
+            p1: 0x00,
+            p2: 0x00,
+            data,
+            le: None,
+        }
+    }
+
+    #[test]
+    fn test_ext_auth_no_challenge() {
+        let mut state = ScHsmState::new();
+        // No challenge set
+        assert!(state.challenge.is_none());
+        let cmd = make_cmd(&[0u8; 32]);
+        let resp = handle(&mut state, &cmd);
+        assert_eq!(resp.sw, SW_CONDITIONS_NOT_SATISFIED);
+    }
+
+    #[test]
+    fn test_ext_auth_no_so_pin_hash() {
+        let mut state = ScHsmState::new();
+        state.challenge = Some([0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]);
+        // No so_pin_hash set
+        assert!(state.so_pin_hash.is_none());
+        let cmd = make_cmd(&[0u8; 32]);
+        let resp = handle(&mut state, &cmd);
+        assert_eq!(resp.sw, SW_SECURITY_STATUS);
+        // Challenge must be cleared after attempt
+        assert!(state.challenge.is_none());
+    }
+
+    #[test]
+    fn test_ext_auth_wrong_length() {
+        let mut state = ScHsmState::new();
+        state.challenge = Some([0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]);
+        state.so_pin_hash = Some([0xABu8; 32]);
+        // Only 16 bytes instead of required 32
+        let cmd = make_cmd(&[0u8; 16]);
+        let resp = handle(&mut state, &cmd);
+        assert_eq!(resp.sw, SW_WRONG_LENGTH);
+        // Challenge must be cleared after attempt
+        assert!(state.challenge.is_none());
+    }
+
+    #[test]
+    fn test_ext_auth_wrong_cryptogram() {
+        let mut state = ScHsmState::new();
+        state.challenge = Some([0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]);
+        state.so_pin_hash = Some([0xABu8; 32]);
+        // 32 bytes but all wrong
+        let cmd = make_cmd(&[0xFFu8; 32]);
+        let resp = handle(&mut state, &cmd);
+        assert_eq!(resp.sw, SW_SECURITY_STATUS);
+        // so_pin_verified must remain false
+        assert!(!state.so_pin_verified);
+    }
+
+    #[test]
+    fn test_ext_auth_correct_cryptogram() {
+        let mut state = ScHsmState::new();
+        let key = [0xABu8; 32]; // so_pin_hash
+        let challenge = [0x01u8, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08];
+        state.challenge = Some(challenge);
+        state.so_pin_hash = Some(key);
+
+        // Compute expected response the same way the device does
+        let expected = crate::crypto::kdf::hmac_sha256(&key, &challenge);
+
+        let cmd = make_cmd(&expected);
+        let resp = handle(&mut state, &cmd);
+        assert_eq!(resp.sw, SW_OK);
+        assert!(state.so_pin_verified);
+    }
 }

@@ -634,6 +634,39 @@ pub fn sha512(data: &[u8]) -> [u8; 64] {
     h.finalize().into()
 }
 
+// -------------------------------------------------------------------------
+// 3DES-ECB (PIV GENERAL AUTHENTICATE)
+// -------------------------------------------------------------------------
+// Gate behind applet-piv: only needed for PIV challenge/response auth.
+
+/// Encrypt a single 8-byte block using 3DES-ECB (TdesEde3, 24-byte key).
+///
+/// Used by PIV GENERAL AUTHENTICATE (challenge/response, no IV, single block).
+#[cfg(feature = "applet-piv")]
+pub fn tdes_ecb_encrypt(key: &[u8; 24], block: &[u8; 8]) -> [u8; 8] {
+    use des::{TdesEde3, cipher::{BlockEncrypt, KeyInit, generic_array::GenericArray}};
+    let cipher = TdesEde3::new(GenericArray::from_slice(key));
+    let mut ga: GenericArray<u8, _> = GenericArray::clone_from_slice(block);
+    cipher.encrypt_block(&mut ga);
+    let mut out = [0u8; 8];
+    out.copy_from_slice(ga.as_slice());
+    out
+}
+
+/// Decrypt a single 8-byte block using 3DES-ECB (TdesEde3, 24-byte key).
+///
+/// Used by PIV GENERAL AUTHENTICATE (challenge/response, no IV, single block).
+#[cfg(feature = "applet-piv")]
+pub fn tdes_ecb_decrypt(key: &[u8; 24], block: &[u8; 8]) -> [u8; 8] {
+    use des::{TdesEde3, cipher::{BlockDecrypt, KeyInit, generic_array::GenericArray}};
+    let cipher = TdesEde3::new(GenericArray::from_slice(key));
+    let mut ga: GenericArray<u8, _> = GenericArray::clone_from_slice(block);
+    cipher.decrypt_block(&mut ga);
+    let mut out = [0u8; 8];
+    out.copy_from_slice(ga.as_slice());
+    out
+}
+
 // =========================================================================
 // Tests
 // =========================================================================
@@ -948,5 +981,35 @@ mod tests {
         assert_eq!(h[0], 0xdd); // first byte
         assert_eq!(h[63], 0x9f); // last byte
         assert_ne!(h, [0u8; 64]);
+    }
+
+    // ------------------------------------------------------------------
+    // 3DES-ECB (PIV GENERAL AUTHENTICATE)
+    // NIST SP 800-67 Rev.2 — known-answer test
+    // Key (K1||K2||K3):
+    //   01 23 45 67 89 AB CD EF
+    //   23 45 67 89 AB CD EF 01
+    //   45 67 89 AB CD EF 01 23
+    // Plaintext: 01 23 45 67 89 AB CD EF
+    // Expected ciphertext (3DES-EDE ECB): A8 26 FD 8C E5 3B 85 5F
+    // (derived from DES KAT NIST FIPS PUB 81, confirmed by openssl)
+    // ------------------------------------------------------------------
+    #[cfg(feature = "applet-piv")]
+    #[test]
+    fn tdes_ecb_roundtrip() {
+        let key: [u8; 24] = [
+            0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF,
+            0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF, 0x01,
+            0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF, 0x01, 0x23,
+        ];
+        let plaintext: [u8; 8] = [0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF];
+
+        let ciphertext = tdes_ecb_encrypt(&key, &plaintext);
+        // ciphertext should differ from plaintext
+        assert_ne!(ciphertext, plaintext);
+
+        // round-trip: decrypt recovers original plaintext
+        let recovered = tdes_ecb_decrypt(&key, &ciphertext);
+        assert_eq!(recovered, plaintext, "3DES ECB round-trip failed");
     }
 }

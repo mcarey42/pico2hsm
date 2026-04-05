@@ -177,7 +177,9 @@ fn build_prkdf(state: &ScHsmState) -> Vec<u8, 256> {
     let mut out: Vec<u8, 256> = Vec::new();
     for key in &state.keys {
         // A0 06  30 04  04 02 C4 <key_id>
-        let _ = out.extend_from_slice(&[0xA0, 0x06, 0x30, 0x04, 0x04, 0x02, 0xC4, key.key_id]);
+        // key.key_id is u32; extract the proto_ref byte (low byte) for the file ID.
+        let proto_ref = (key.key_id & 0xFF) as u8;
+        let _ = out.extend_from_slice(&[0xA0, 0x06, 0x30, 0x04, 0x04, 0x02, 0xC4, proto_ref]);
     }
     out
 }
@@ -252,13 +254,14 @@ fn read_file(state: &ScHsmState, file_id: u16, offset: usize, max_len: usize) ->
 
     // Dynamic EFs by high byte
     let hi = file_id >> 8;
-    let key_id = (file_id & 0xFF) as u8;
+    let key_id_proto = (file_id & 0xFF) as u8;
+    let full_key_id = pico2hsm_core::key::KeyId::sc_hsm(0, key_id_proto).0;
 
     match hi {
         0xC4 => {
-            let key_algo = state.keys.iter().find(|k| k.key_id == key_id).map(|k| k.algo);
+            let key_algo = state.keys.iter().find(|k| k.key_id == full_key_id).map(|k| k.algo);
             match key_algo {
-                Some(algo) => match build_ec_prkd(key_id, algo) {
+                Some(algo) => match build_ec_prkd(key_id_proto, algo) {
                     Some(prkd) => {
                         let start = offset.min(prkd.len());
                         let slice = &prkd[start..prkd.len().min(start + max_len)];

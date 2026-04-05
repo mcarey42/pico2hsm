@@ -4,6 +4,7 @@
 //! and DKEK wrap/unwrap (HSM-to-HSM export format).
 //! No embassy-rp / embassy-executor imports — runs on x86_64.
 
+use pico2hsm_core::key::AppletId;
 use pico2hsm_firmware::security::key_management::{
     AlgorithmId, KeyError, KeyObject, KeyType, derive_key_encryption_key,
 };
@@ -27,7 +28,8 @@ const TEST_NONCE: [u8; 12] = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x
 
 /// Build a minimal EC key object with a 32-byte fake private key.
 fn ec_key(id: u8) -> KeyObject {
-    let mut obj = KeyObject::new(KeyType::Ec, id, AlgorithmId::EcdsaP256);
+    let key_id = pico2hsm_core::key::KeyId::sc_hsm(0, id).0;
+    let mut obj = KeyObject::new(KeyType::Ec, key_id, AppletId::ScHsm, AlgorithmId::EcdsaP256);
     // Fake 32-byte P-256 scalar
     obj.private_key.extend_from_slice(&[0x42u8; 32]).unwrap();
     // Fake 65-byte uncompressed public key
@@ -37,7 +39,8 @@ fn ec_key(id: u8) -> KeyObject {
 
 /// Build a minimal AES-256 key object with a 32-byte fake key.
 fn aes_key(id: u8) -> KeyObject {
-    let mut obj = KeyObject::new(KeyType::Aes, id, AlgorithmId::AesGcm);
+    let key_id = pico2hsm_core::key::KeyId::sc_hsm(0, id).0;
+    let mut obj = KeyObject::new(KeyType::Aes, key_id, AppletId::ScHsm, AlgorithmId::AesGcm);
     obj.private_key.extend_from_slice(&[0x55u8; 32]).unwrap();
     // AES keys have no public component
     obj
@@ -97,10 +100,11 @@ fn test_kek_derivation_all_key_ids_unique() {
 fn test_key_object_encrypt_decrypt_roundtrip_ec() {
     let obj = ec_key(0x01);
     let blob = obj.encrypt(&TEST_SMK, &TEST_NONCE).unwrap();
-    let recovered = KeyObject::decrypt(&blob, 0x01, &TEST_SMK).unwrap();
+    let kid = pico2hsm_core::key::KeyId::sc_hsm(0, 0x01).0;
+    let recovered = KeyObject::decrypt(&blob, kid, &TEST_SMK).unwrap();
 
     assert_eq!(recovered.key_type, KeyType::Ec);
-    assert_eq!(recovered.key_id, 0x01);
+    assert_eq!(recovered.key_id, kid);
     assert_eq!(recovered.algorithm, AlgorithmId::EcdsaP256);
     assert_eq!(recovered.private_key.as_slice(), &[0x42u8; 32]);
     assert_eq!(recovered.public_key.as_slice(), &[0x04u8; 65]);
@@ -112,10 +116,11 @@ fn test_key_object_encrypt_decrypt_roundtrip_ec() {
 fn test_key_object_encrypt_decrypt_roundtrip_aes() {
     let obj = aes_key(0x05);
     let blob = obj.encrypt(&TEST_SMK, &TEST_NONCE).unwrap();
-    let recovered = KeyObject::decrypt(&blob, 0x05, &TEST_SMK).unwrap();
+    let kid = pico2hsm_core::key::KeyId::sc_hsm(0, 0x05).0;
+    let recovered = KeyObject::decrypt(&blob, kid, &TEST_SMK).unwrap();
 
     assert_eq!(recovered.key_type, KeyType::Aes);
-    assert_eq!(recovered.key_id, 0x05);
+    assert_eq!(recovered.key_id, kid);
     assert_eq!(recovered.algorithm, AlgorithmId::AesGcm);
     assert_eq!(recovered.private_key.as_slice(), &[0x55u8; 32]);
     assert!(recovered.public_key.is_empty(), "AES keys have no public component");
@@ -141,7 +146,8 @@ fn test_key_object_wrong_smk_fails() {
     let blob = obj.encrypt(&TEST_SMK, &TEST_NONCE).unwrap();
 
     let wrong_smk = [0xFFu8; 32];
-    let result = KeyObject::decrypt(&blob, 0x02, &wrong_smk);
+    let kid = pico2hsm_core::key::KeyId::sc_hsm(0, 0x02).0;
+    let result = KeyObject::decrypt(&blob, kid, &wrong_smk);
 
     assert!(
         matches!(result, Err(KeyError::DecryptFailure)),
@@ -155,7 +161,8 @@ fn test_key_object_wrong_key_id_fails() {
     let blob = obj.encrypt(&TEST_SMK, &TEST_NONCE).unwrap();
 
     // Try to decrypt claiming it's key_id = 0x07 (different from 0x03)
-    let result = KeyObject::decrypt(&blob, 0x07, &TEST_SMK);
+    let kid = pico2hsm_core::key::KeyId::sc_hsm(0, 0x07).0;
+    let result = KeyObject::decrypt(&blob, kid, &TEST_SMK);
 
     assert!(
         matches!(result, Err(KeyError::DecryptFailure | KeyError::InvalidFormat)),
@@ -168,11 +175,12 @@ fn test_key_object_tamper_detection_ciphertext() {
     let obj = ec_key(0x04);
     let mut blob = obj.encrypt(&TEST_SMK, &TEST_NONCE).unwrap();
 
-    // Flip a byte in the ciphertext portion (between header [0..13] and tag [len-28..len-12])
+    // Flip a byte in the ciphertext portion (between header [0..16] and tag [len-28..len-12])
     // Safe index: offset 20 is inside the encrypted key material.
     blob[20] ^= 0xFF;
 
-    let result = KeyObject::decrypt(&blob, 0x04, &TEST_SMK);
+    let kid = pico2hsm_core::key::KeyId::sc_hsm(0, 0x04).0;
+    let result = KeyObject::decrypt(&blob, kid, &TEST_SMK);
     assert!(
         matches!(result, Err(KeyError::DecryptFailure)),
         "Tampered ciphertext must cause DecryptFailure"
@@ -188,7 +196,8 @@ fn test_key_object_tamper_detection_tag() {
     let tag_start = blob.len() - 28;
     blob[tag_start] ^= 0x01;
 
-    let result = KeyObject::decrypt(&blob, 0x05, &TEST_SMK);
+    let kid = pico2hsm_core::key::KeyId::sc_hsm(0, 0x05).0;
+    let result = KeyObject::decrypt(&blob, kid, &TEST_SMK);
     assert!(
         matches!(result, Err(KeyError::DecryptFailure)),
         "Tampered GCM tag must cause DecryptFailure"
@@ -200,10 +209,11 @@ fn test_key_object_tamper_detection_header_magic() {
     let obj = ec_key(0x06);
     let mut blob = obj.encrypt(&TEST_SMK, &TEST_NONCE).unwrap();
 
-    // Header is the first 13 bytes; magic is first 4 bytes.
-    blob[0] = b'X'; // Break "P2KY" magic
+    // Header is the first 16 bytes; magic is first 4 bytes.
+    blob[0] = b'X'; // Break "P2K2" magic
 
-    let result = KeyObject::decrypt(&blob, 0x06, &TEST_SMK);
+    let kid = pico2hsm_core::key::KeyId::sc_hsm(0, 0x06).0;
+    let result = KeyObject::decrypt(&blob, kid, &TEST_SMK);
     // BadMagic is checked before decryption, so we get BadMagic not DecryptFailure
     assert!(
         matches!(result, Err(KeyError::BadMagic | KeyError::DecryptFailure)),
@@ -213,9 +223,10 @@ fn test_key_object_tamper_detection_header_magic() {
 
 #[test]
 fn test_key_object_too_short_blob_fails() {
-    // Minimum blob: header(13) + tag(16) + nonce(12) = 41 bytes
-    let short_blob = [0u8; 40];
-    let result = KeyObject::decrypt(&short_blob, 0x01, &TEST_SMK);
+    // Minimum blob: header(16) + tag(16) + nonce(12) = 44 bytes
+    let short_blob = [0u8; 43];
+    let kid = pico2hsm_core::key::KeyId::sc_hsm(0, 0x01).0;
+    let result = KeyObject::decrypt(&short_blob, kid, &TEST_SMK);
     assert!(
         matches!(result, Err(KeyError::InvalidFormat)),
         "Too-short blob must return InvalidFormat"
@@ -228,7 +239,8 @@ fn test_key_object_with_use_count_preserved() {
     obj.use_count = 1234;
 
     let blob = obj.encrypt(&TEST_SMK, &TEST_NONCE).unwrap();
-    let recovered = KeyObject::decrypt(&blob, 0x08, &TEST_SMK).unwrap();
+    let kid = pico2hsm_core::key::KeyId::sc_hsm(0, 0x08).0;
+    let recovered = KeyObject::decrypt(&blob, kid, &TEST_SMK).unwrap();
 
     assert_eq!(recovered.use_count, 1234, "use_count must be preserved through encrypt/decrypt");
 }

@@ -707,15 +707,15 @@ pub fn handle(state: &mut ScHsmState, store: &mut dyn crate::storage::KeyStore, 
     // P1=0x00..0xFE is used directly as the key reference — OpenSC's
     // sc_hsm_determine_free_id() pre-computes the free slot and passes it
     // as P1, including P1=0x00 for the very first key.
-    let key_id: u8 = if cmd.p1 != 0xFF {
+    let key_id_proto: u8 = if cmd.p1 != 0xFF {
         cmd.p1
     } else {
         let mut id = 0u8;
         while id < 0xFF && (
-            state.keys.iter().any(|k| k.key_id == id)
+            state.keys.iter().any(|k| k.key_id == pico2hsm_core::key::KeyId::sc_hsm(0, id).0)
             || {
                 #[cfg(feature = "rsa")]
-                { state.rsa_keys.iter().any(|k| k.key_id == id) }
+                { state.rsa_keys.iter().any(|k| k.key_id == pico2hsm_core::key::KeyId::sc_hsm(0, id).0) }
                 #[cfg(not(feature = "rsa"))]
                 { false }
             }
@@ -727,6 +727,7 @@ pub fn handle(state: &mut ScHsmState, store: &mut dyn crate::storage::KeyStore, 
         }
         id
     };
+    let key_id = pico2hsm_core::key::KeyId::sc_hsm(0, key_id_proto).0; // u32 full internal ID
 
     // Determine algorithm byte: try two-byte tag 5F29 first, then single-byte 0x41,
     // then fall back to inferring from EC order length (tag 0x85) in the data.
@@ -792,7 +793,7 @@ pub fn handle(state: &mut ScHsmState, store: &mut dyn crate::storage::KeyStore, 
                 0x07 => AlgorithmId::RsaDecrypt,
                 _ => AlgorithmId::RsaDecrypt,
             };
-            let mut key_obj = KeyObject::new(KmType::Rsa, key_id, km_algo);
+            let mut key_obj = KeyObject::new(KmType::Rsa, key_id, pico2hsm_core::key::AppletId::ScHsm, km_algo);
             let _ = key_obj.private_key.extend_from_slice(&pair.private_key_der);
             // Store modulus || exponent in public_key for future reconstruction.
             // Layout: [2-byte modulus_len BE] || modulus || exponent
@@ -843,7 +844,7 @@ pub fn handle(state: &mut ScHsmState, store: &mut dyn crate::storage::KeyStore, 
             Some(a) => a,
             None => return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
         };
-        let mut key_obj = KeyObject::new(KmType::Ec, key_id, km_algo);
+        let mut key_obj = KeyObject::new(KmType::Ec, key_id, pico2hsm_core::key::AppletId::ScHsm, km_algo);
         let _ = key_obj.private_key.extend_from_slice(&pair.private_key);
         let _ = key_obj.public_key.extend_from_slice(&pair.public_key);
         let _ = store.save_key(&key_obj); // best-effort; InvalidCore is silent on Core1

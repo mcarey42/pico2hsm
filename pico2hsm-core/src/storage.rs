@@ -45,7 +45,7 @@ pub struct ObjectHeader {
     /// SECTOR_MAGIC — *b"P2HM". Redundantly stored for alignment convenience.
     pub magic: [u8; 4],
     /// Key object identifier (matches DirectoryEntry::key_id).
-    pub key_id: u16,
+    pub key_id: u32,
     /// Algorithm tag byte (see KeyType discriminant mapping in firmware).
     pub key_type: u8,
     /// Access flags bitfield.
@@ -72,11 +72,11 @@ pub struct ObjectHeader {
 ///
 /// The directory sector holds up to `(SECTOR_SIZE - 8) / size_of::<DirectoryEntry>()`
 /// entries, preceded by an 8-byte header (magic + entry count + CRC16).
-/// A `key_id` of `0xFFFF` marks an empty/erased slot.
+/// A `key_id` of `0xFFFF_FFFF` marks an empty/erased slot.
 #[repr(C)]
 pub struct DirectoryEntry {
-    /// Key object identifier. `0xFFFF` = empty slot.
-    pub key_id: u16,
+    /// Key object identifier. `0xFFFF_FFFF` = empty slot.
+    pub key_id: u32,
     /// Index of the chip that holds this key's data sectors (0–7).
     pub chip_index: u8,
     /// First data sector number on that chip (relative to chip base).

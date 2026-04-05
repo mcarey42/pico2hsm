@@ -125,10 +125,11 @@ pub fn handle(state: &mut ScHsmState, cmd: &ApduCommand<'_>) -> ApduResponse {
     if hi == 0xCC {
         // Key blob files exist when the corresponding key is in the keystore
         // (EC or RSA).
-        let key_id = (fid & 0xFF) as u8;
-        let in_ec = state.keys.iter().any(|k| k.key_id == key_id);
+        let key_id_proto = (fid & 0xFF) as u8;
+        let full_key_id = pico2hsm_core::key::KeyId::sc_hsm(0, key_id_proto).0;
+        let in_ec = state.keys.iter().any(|k| k.key_id == full_key_id);
         #[cfg(feature = "rsa")]
-        let exists = in_ec || state.rsa_keys.iter().any(|k| k.key_id == key_id);
+        let exists = in_ec || state.rsa_keys.iter().any(|k| k.key_id == full_key_id);
         #[cfg(not(feature = "rsa"))]
         let exists = in_ec;
         if !exists {
@@ -141,11 +142,12 @@ pub fn handle(state: &mut ScHsmState, cmd: &ApduCommand<'_>) -> ApduResponse {
         // - the file was written via WRITE DATA and is in ef_files (e.g. RSA PRKD
         //   written by OpenSC after keygen), OR
         // - an RSA key with this key_id is in the keystore.
-        let key_id = (fid & 0xFF) as u8;
-        let in_ec = state.keys.iter().any(|k| k.key_id == key_id);
+        let key_id_proto = (fid & 0xFF) as u8;
+        let full_key_id = pico2hsm_core::key::KeyId::sc_hsm(0, key_id_proto).0;
+        let in_ec = state.keys.iter().any(|k| k.key_id == full_key_id);
         let in_ef = state.ef_files.iter().any(|e| e.file_id == fid);
         #[cfg(feature = "rsa")]
-        let in_rsa = state.rsa_keys.iter().any(|k| k.key_id == key_id);
+        let in_rsa = state.rsa_keys.iter().any(|k| k.key_id == full_key_id);
         #[cfg(not(feature = "rsa"))]
         let in_rsa = false;
         if !in_ec && !in_ef && !in_rsa {

@@ -23,7 +23,7 @@ use heapless::{String, Vec};
 use pico2hsm_core::{
     apdu::{ApduCommand, ApduResponse, SW_INS_NOT_SUPPORTED, SW_OK},
     error::HsmError,
-    key::{KeyId, KeyType as CoreKeyType},
+    key::{AppletId, KeyId, KeyType as CoreKeyType},
     protocol::HsmProtocol,
 };
 
@@ -40,13 +40,16 @@ impl crate::storage::KeyStore for LocalNullStore {
     fn save_key(&mut self, _: &crate::security::key_management::KeyObject) -> Result<(), HsmError> {
         Ok(())
     }
-    fn fetch_key(&mut self, _: u8) -> Result<Option<crate::security::key_management::KeyObject>, HsmError> {
+    fn fetch_key(&mut self, _: KeyId) -> Result<Option<crate::security::key_management::KeyObject>, HsmError> {
         Ok(None)
     }
-    fn erase_key(&mut self, _: u8) -> Result<(), HsmError> {
+    fn erase_key(&mut self, _: KeyId) -> Result<(), HsmError> {
         Ok(())
     }
     fn wipe_all(&mut self) -> Result<(), HsmError> {
+        Ok(())
+    }
+    fn wipe_by_owner(&mut self, _: AppletId) -> Result<(), HsmError> {
         Ok(())
     }
     fn enumerate_keys(&self) -> heapless::Vec<KeyId, 512> {
@@ -65,6 +68,9 @@ pub const MAX_SO_PIN_LEN: usize = 16;
 
 /// Maximum number of in-memory EC key slots.
 pub const MAX_IN_MEMORY_KEYS: usize = 16;
+
+/// Maximum number of in-memory symmetric key slots.
+pub const MAX_IN_MEMORY_SYM_KEYS: usize = 8;
 
 /// Maximum number of in-memory RSA key slots (feature-gated).
 #[cfg(feature = "rsa")]
@@ -86,6 +92,18 @@ pub struct EfEntry {
     pub data: heapless::Vec<u8, MAX_EF_DATA>,
 }
 
+/// An in-memory (volatile) symmetric key slot.
+///
+/// Holds a raw AES key (16, 24, or 32 bytes for AES-128/192/256).
+/// Keys are volatile — they are lost on reset and cleared on INITIALIZE.
+#[derive(Debug)]
+pub struct InMemorySymKey {
+    /// Full u32 internal key ID (structured: partition | applet | reserved | proto_ref).
+    pub key_id: u32,
+    /// Raw key bytes: 16 (AES-128), 24 (AES-192), or 32 (AES-256).
+    pub raw_key: heapless::Vec<u8, 32>,
+}
+
 /// An in-memory (volatile) RSA key slot.
 ///
 /// Separate from `InMemoryKey` because RSA private keys are ~1200–2350 bytes
@@ -93,8 +111,8 @@ pub struct EfEntry {
 /// which is sized for the largest EC key (66 bytes for P-521).
 #[cfg(feature = "rsa")]
 pub struct RsaInMemoryKey {
-    /// SC-HSM key identifier (0x01–0xFE).
-    pub key_id: u8,
+    /// Full u32 internal key ID (structured: partition | applet | reserved | proto_ref).
+    pub key_id: u32,
     /// Key type: `RsaPrivate2048` or `RsaPrivate4096`.
     pub key_type: CoreKeyType,
     /// SC-HSM AlgorithmId byte used during keygen (e.g. 0x05 = RSA-2048, 0x07 = RSA-4096).
@@ -111,9 +129,10 @@ pub struct RsaInMemoryKey {
 ///
 /// Keys are held in RAM and lost on reset; flash persistence is a future
 /// storage layer concern. This is sufficient for integration testing.
+#[derive(Debug)]
 pub struct InMemoryKey {
-    /// SC-HSM key identifier (0x01–0xFE).
-    pub key_id: u8,
+    /// Full u32 internal key ID (structured: partition | applet | reserved | proto_ref).
+    pub key_id: u32,
     /// Key type used by the `crypto::asymmetric` functions.
     pub key_type: CoreKeyType,
     /// SC-HSM AlgorithmId byte (e.g. 0x13 = EcdsaP256, 0x23 = EcdhP256).
@@ -206,6 +225,9 @@ pub struct ScHsmState {
     /// 8-byte random challenge issued by GET CHALLENGE.
     pub challenge: Option<[u8; 8]>,
 
+    /// One-time session PIN (raw 8 bytes). Cleared after first use.
+    pub session_pin: Option<[u8; 8]>,
+
     /// True after INITIALIZE has been called at least once.
     pub initialized: bool,
 
@@ -225,11 +247,18 @@ pub struct ScHsmState {
     /// Stored SO-PIN hash (SHA-256, 32 bytes). None if not set.
     pub so_pin_hash: Option<[u8; 32]>,
 
+    /// Stored PUK hash (SHA-256). None if no PUK is configured.
+    pub puk_hash: Option<[u8; 32]>,
+    /// Remaining PUK retry attempts (0 = blocked).
+    pub puk_retry_count: u8,
+
     /// In-memory (volatile) EC key store. Cleared on INITIALIZE.
     pub keys: heapless::Vec<InMemoryKey, MAX_IN_MEMORY_KEYS>,
     /// In-memory (volatile) RSA key store. Cleared on INITIALIZE.
     #[cfg(feature = "rsa")]
     pub rsa_keys: heapless::Vec<RsaInMemoryKey, MAX_RSA_IN_MEMORY_KEYS>,
+    /// In-memory (volatile) symmetric key store. Cleared on INITIALIZE.
+    pub sym_keys: heapless::Vec<InMemorySymKey, MAX_IN_MEMORY_SYM_KEYS>,
     /// In-memory (volatile) EF store (written via WRITE DATA INS=0xD7).
     pub ef_files: heapless::Vec<EfEntry, MAX_EF_FILES>,
 
@@ -252,6 +281,7 @@ impl ScHsmState {
             current_algo: None,
             current_se_op: None,
             challenge: None,
+            session_pin: None,
             initialized: false,
             hsm_label: String::new(),
             options: 0,
@@ -259,9 +289,12 @@ impl ScHsmState {
             dkek_shares_imported: 0,
             user_pin_hash: None,
             so_pin_hash: None,
+            puk_hash: None,
+            puk_retry_count: 10,
             keys: heapless::Vec::new(),
             #[cfg(feature = "rsa")]
             rsa_keys: heapless::Vec::new(),
+            sym_keys: heapless::Vec::new(),
             ef_files: heapless::Vec::new(),
             write_target_file: None,
         }
@@ -292,6 +325,7 @@ impl ScHsm {
                 generate_keypair::handle(&mut self.state, store, cmd)
             }
             delete_file::INS_DELETE_FILE => delete_file::handle(&mut self.state, store, cmd),
+            generate_key::INS_GENERATE_KEY => generate_key::handle(&mut self.state, store, cmd),
             // All other commands fall through to the stateless dispatch.
             _ => self.dispatch(cmd),
         }
@@ -309,12 +343,17 @@ impl ScHsm {
             external_auth::INS_EXTERNAL_AUTH => external_auth::handle(&mut self.state, cmd),
             general_auth::INS_GENERAL_AUTH => general_auth::handle(&mut self.state, cmd),
             generate_keypair::INS_GENERATE_KEYPAIR => generate_keypair::handle(&mut self.state, &mut LocalNullStore, cmd),
-            generate_key::INS_GENERATE_KEY => generate_key::handle(&mut self.state, cmd),
+            generate_key::INS_GENERATE_KEY => generate_key::handle(&mut self.state, &mut LocalNullStore, cmd),
             sign::INS_SIGN => sign::handle(&mut self.state, cmd),
-            // INS 0x62: DECIPHER (ECDH). P1 = key_reference, P2 = algo.
-            // DERIVE_ASYM (pico2hsm extension) would also be INS=0x62 but
-            // conflicts with user key IDs starting at 1; route all to decrypt.
-            decrypt::INS_DECRYPT => decrypt::handle(&mut self.state, cmd),
+            // INS 0x62: shared between DECIPHER (P1 = key_reference) and
+            // DERIVE_ASYM (P1 = 0x01). Route by P1.
+            decrypt::INS_DECRYPT => {
+                if cmd.p1 == derive_asym::P1_DERIVE {
+                    derive_asym::handle(&mut self.state, cmd)
+                } else {
+                    decrypt::handle(&mut self.state, cmd)
+                }
+            }
             // INS 0x58 shared between LIST_KEYS (P2=0x00) and IMPORT_KEY (P2=0x93)
             list_keys::INS_LIST_KEYS => {
                 if cmd.p2 == import_key::P2_IMPORT {
