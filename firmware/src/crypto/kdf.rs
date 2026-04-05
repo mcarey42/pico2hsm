@@ -838,19 +838,13 @@ mod tests {
         assert_eq!(&chain, expected_chain.as_slice());
     }
 
-    // TODO: slip10_child_key child-key derivation produces a value that
-    // diverges from the SLIP-0010 reference test vector for m/0'.
-    // Master-key derivation (test above) is correct. The discrepancy
-    // is in scalar_add_mod or the HMAC data construction for the
-    // child step. Needs investigation and fix before enabling.
     #[test]
-    #[ignore]
     fn test_slip10_secp256k1_child_hardened() {
         let seed = hex::decode("000102030405060708090a0b0c0d0e0f").unwrap();
         let (master_key, master_chain) =
             slip10_master_key(&seed, Slip10Curve::Secp256k1).unwrap();
 
-        // m/0'
+        // m/0' — SLIP-0010 test vector 1
         let (child_key, child_chain) = slip10_child_key(
             &master_key,
             &master_chain,
@@ -860,10 +854,91 @@ mod tests {
         .unwrap();
 
         let expected_key =
-            hex::decode("abe74a98f6c7eabee0428f53798f0ab8aa1bd37873999041703970f28c7f0c18")
+            hex::decode("edb2e14f9ee77d26dd93b4ecede8d16ed408ce149b6cd80b0715a2d911a0afea")
                 .unwrap();
         let expected_chain =
-            hex::decode("08904b1eb3d8f8e61eee9b03a695073c5cae87d9fe22c9abe08e8b8c8a5c4c02")
+            hex::decode("47fdacbd0f1097043b78c63c20c34ef4ed9a111d980047ad16282c7ae6236141")
+                .unwrap();
+
+        assert_eq!(&child_key, expected_key.as_slice());
+        assert_eq!(&child_chain, expected_chain.as_slice());
+    }
+
+    #[test]
+    fn test_slip10_secp256k1_child_normal() {
+        // SLIP-0010 test vector 1: m/0'/1 (normal child of hardened)
+        let seed = hex::decode("000102030405060708090a0b0c0d0e0f").unwrap();
+        let (master_key, master_chain) =
+            slip10_master_key(&seed, Slip10Curve::Secp256k1).unwrap();
+
+        // Derive m/0'
+        let (key_0h, chain_0h) = slip10_child_key(
+            &master_key,
+            &master_chain,
+            0x8000_0000,
+            Slip10Curve::Secp256k1,
+        )
+        .unwrap();
+
+        // Derive m/0'/1 (normal, index = 1)
+        let (child_key, child_chain) = slip10_child_key(
+            &key_0h,
+            &chain_0h,
+            1,
+            Slip10Curve::Secp256k1,
+        )
+        .unwrap();
+
+        let expected_key =
+            hex::decode("3c6cb8d0f6a264c91ea8b5030fadaa8e538b020f0a387421a12de9319dc93368")
+                .unwrap();
+        let expected_chain =
+            hex::decode("2a7857631386ba23dacac34180dd1983734e444fdbf774041578e9b6adb37c19")
+                .unwrap();
+
+        assert_eq!(&child_key, expected_key.as_slice());
+        assert_eq!(&child_chain, expected_chain.as_slice());
+    }
+
+    #[test]
+    fn test_slip10_secp256k1_child_hardened_depth2() {
+        // SLIP-0010 test vector 1: m/0'/1/2' (hardened child at depth 2)
+        let seed = hex::decode("000102030405060708090a0b0c0d0e0f").unwrap();
+        let (master_key, master_chain) =
+            slip10_master_key(&seed, Slip10Curve::Secp256k1).unwrap();
+
+        // Derive m/0'
+        let (key_0h, chain_0h) = slip10_child_key(
+            &master_key,
+            &master_chain,
+            0x8000_0000,
+            Slip10Curve::Secp256k1,
+        )
+        .unwrap();
+
+        // Derive m/0'/1
+        let (key_0h_1, chain_0h_1) = slip10_child_key(
+            &key_0h,
+            &chain_0h,
+            1,
+            Slip10Curve::Secp256k1,
+        )
+        .unwrap();
+
+        // Derive m/0'/1/2' (hardened, index = 0x80000002)
+        let (child_key, child_chain) = slip10_child_key(
+            &key_0h_1,
+            &chain_0h_1,
+            0x8000_0002,
+            Slip10Curve::Secp256k1,
+        )
+        .unwrap();
+
+        let expected_key =
+            hex::decode("cbce0d719ecf7431d88e6a89fa1483e02e35092af60c042b1df2ff59fa424dca")
+                .unwrap();
+        let expected_chain =
+            hex::decode("04466b9cc8e161e966409ca52986c584f07e9dc81f735db683c3ff6ec7b1503f")
                 .unwrap();
 
         assert_eq!(&child_key, expected_key.as_slice());

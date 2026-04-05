@@ -51,30 +51,6 @@ item 1 but are needed for full SC-HSM compatibility.
 Stub should call `crypto::kdf::bip32_derive()` or `slip10_derive()`.
 Note: the SLIP-10 child key derivation has a known bug (see item 4).
 
-**2f. Asymmetric key derivation (`commands/derive_asym.rs`) — DONE**
-INS=0x62/P1=0x01 dispatched via P1 check in mod.rs. Looks up EC or sym key by
-MSE key_id; HKDF-SHA256(ikm=private_key, salt=[], info=cmd.data) → 32-byte output.
-6 unit tests pass.
-
-**2g. Session PIN (`commands/session_pin.rs`) — DONE**
-INS=0x26 generates 8 random bytes, stores in `state.session_pin`, returns to host.
-`verify.rs` P2=0x82 verifies constant-time, clears after any attempt (one-time use).
-8 unit tests pass.
-
-**2h. External auth (`commands/external_auth.rs`) — DONE**
-HMAC-SHA256(so_pin_hash, challenge) → 32-byte expected response. Constant-time
-compare; clears challenge always; sets `so_pin_verified=true` on success.
-5 unit tests pass.
-
-**2i. General auth (`commands/general_auth.rs`) — DONE**
-Parses 0x7C(0x81=challenge) TLV; SHA-256 hashes challenge; ECDSA-signs with
-MSE-selected key; returns 0x7C(0x82=signature). 6 unit tests pass.
-
-**2j. PUK auth and PIN unblock (`commands/puk_auth.rs`) — DONE**
-`puk_hash`/`puk_retry_count` added to ScHsmState; tag 0x93 in INITIALIZE sets PUK.
-Constant-time SHA-256 compare; on success resets pin_retry_count=3, pin_verified=true.
-7 unit tests pass.
-
 ---
 
 ## 3. Brainpool curves — Blocked on upstream crate
@@ -97,27 +73,12 @@ context compatible with `elliptic-curve 0.13`.
 
 ---
 
-## 4. SLIP-10 child key derivation bug
+## 4. SLIP-10 child key derivation bug — DONE (2026-04-04)
 
-**Current state:**
-`firmware/src/crypto/kdf.rs:828` has a disabled test:
-> "slip10_child_key child-key derivation produces a value that diverges from the
-> SLIP-0010 reference test vector for m/0'.  Master-key derivation is correct.
-> The discrepancy is in `scalar_add_mod` or the HMAC data construction for the
-> child step.  Needs investigation and fix before enabling."
-
-The master key derivation unit test passes; only the child step is wrong.  Because
-`commands/bip_slip.rs` is also stubbed (item 3e), this bug is not yet
-user-visible, but it will block any correct BIP-32 / SLIP-10 operation once that
-command is wired up.
-
-**What needs to happen:**
-- Re-enable the failing unit test in `kdf.rs` and compare intermediate values
-  against a reference implementation (e.g., the Python `slip10` package or the
-  reference vectors in the SLIP-0010 spec).
-- The most likely culprits are: wrong byte ordering in the HMAC input for hardened
-  vs normal child derivation, or an off-by-one in `scalar_add_mod`.
-- Fix the implementation until all reference vectors pass.
+The disabled test had wrong expected values (not from the spec).  The implementation
+was correct.  Fixed by replacing test expected values with SLIP-0010 test vector 1
+values for m/0', and adding two additional tests (m/0'/1 normal, m/0'/1/2' hardened).
+All 132 unit tests pass.
 
 ---
 
@@ -224,10 +185,6 @@ identical to the old u8 value, just stored as u32 LE in flash.
 **Note: flash format change.** Existing stored keys become unreadable — re-INITIALIZE
 after firmware update.  Bump `KEY_MAGIC` to `*b"P2K2"` to surface the incompatibility.
 
-**u32 key ID refactor — DONE** (2026-04-04): All files updated; flash format bumped
-to `P2K2`; `AppletId` enum added; `KeyId::sc_hsm/piv/openpgp` constructors in place;
-`wipe_by_owner(AppletId::ScHsm)` in INITIALIZE; all key lookups use `KeyId::sc_hsm(0, ref).0`.
-
 **Still required:**
 - Add per-applet PIN slots to flash (SC-HSM already has one; PIV needs its own;
   OpenPGP needs PW1 + PW3).
@@ -247,12 +204,6 @@ in `Cargo.toml`, pulled in by `applet-piv = ["dep:des"]`.  The `applet-openpgp` 
   all existing cipher crates pinned to `0.4`.
 - 3DES is **not** added to the SC-HSM service descriptor (no DES3 PKCS#11 mechanisms
   in sc-hsm driver); these functions are PIV-only.
-
-**Pre-requisite: 3DES backing functions — DONE**
-`tdes_ecb_encrypt(key: &[u8; 24], block: &[u8; 8]) -> [u8; 8]` and
-`tdes_ecb_decrypt` added to `firmware/src/crypto/symmetric.rs` gated on
-`#[cfg(feature = "applet-piv")]`.  Round-trip unit test passes.
-Uses `des::TdesEde3` with `cipher::{BlockEncrypt, BlockDecrypt, KeyInit}`.
 
 Commands to implement: SELECT, GET DATA, PUT DATA, VERIFY, CHANGE REFERENCE DATA,
 RESET RETRY COUNTER, GENERAL AUTHENTICATE, GENERATE KEY PAIR.
