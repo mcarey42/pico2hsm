@@ -110,22 +110,6 @@ reference passed to the RNG module (see `rng.rs:38`).
 
 ---
 
-## 6. Board bringup — Hardware peripherals not driven
-
-**6a. WS2812 LED on rp2350_one (`board/rp2350_one.rs:88`)**
-`Ws2812Led::set_color()` stores the colour value but does not write to the LED.
-The comment says "Wire up PIO0 / DMA0 in `init()` and replace the `_current`
-field with a real `PioWs2812<PIO0, 0, 1>` handle."  Until fixed, the status LED
-on the Pico One board is always off regardless of device state.
-
-**6b. ST7789 LCD on rp2350_geek (`board/rp2350_geek.rs`)**
-`init_lcd()` logs a warning and returns; `update_status_display()` is a no-op.
-The `LcdDisplay::set_status()` method also does nothing except log via defmt.
-Full implementation requires: store SPI + D/C + RST pin handles, implement the
-ST7789 hardware reset + init command sequence, and render a status screen using
-`embedded-graphics`.  All display-facing code is tagged `// TODO (display agent)`.
-
----
 
 ## 7. PIV and OpenPGP applets
 

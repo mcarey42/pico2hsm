@@ -101,6 +101,43 @@ Reserved key ID ranges (to be enforced in `storage/keystore.rs`):
 PIN storage in flash likewise needs per-applet slots.  **This namespace design must be
 implemented before any PIV or OpenPGP command handler is written.**
 
+## Reference documentation
+
+The `docs/` directory contains generated reference documents:
+
+| File | Contents |
+|---|---|
+| `SC_HSM_APDU_REFERENCE.md` | All 28 SC-HSM commands — INS bytes, TLV tags, algo IDs, pico2hsm deviations |
+| `PIV_APDU_REFERENCE.md` | Full NIST SP 800-73-4 command set, 3DES GENERAL AUTHENTICATE, key slots |
+| `OPENPGP_APDU_REFERENCE.md` | OpenPGP Card 3.4 — PSO:CDS/DECIPHER, Ed25519/X25519 algo attrs, PW1/PW3 |
+| `BOARD_RP2350_ONE.md` | GPIO pinout, WS2812B PIO timing, external SD card wiring |
+| `BOARD_RP2350_GEEK.md` | ST7789 pin table, init sequence, SD card wiring (single + dual) |
+| `BOARD_WAVESHARE_LCD_1_47.md` | ST7789V3 + WS2812B, SD card topology, dual-SD wiring |
+| `SD_CARD_WIRING.md` | Per-board SD card wiring tables, embedded-sdmmc integration notes |
+| `BUILD_CONFIGURATIONS.md` | All feature flag combinations with exact cargo commands, flash/RAM budget |
+
+## Board peripheral implementation
+
+Each board's LED/display driver is fully implemented (not stubbed):
+
+**rp2350_one — WS2812B on GPIO16 (PIO0/SM0)**
+- `Ws2812Led::new()` steals `PIO0` and `PIN_16` via `unsafe { steal() }`.
+  `main.rs` must **not** claim `p.PIO0` or `p.PIN_16` — they are exclusively
+  owned by the LED driver after board init.
+- Clock divider is written via `PAC::PIO0.sm(0).clkdiv()` directly (avoids
+  `fixed` crate dep); int=18, frac=192 at 150 MHz → 8 MHz PIO clock.
+- Write is synchronous (spin-wait on TX FIFO); no DMA or async required.
+
+**rp2350_geek — ST7789 240×135 on SPI1 (GPIO8/9/10/11/12/25)**
+- `St7789StatusDisplay::new(spi1)` steals DC=GPIO8, CS=GPIO9, RST=GPIO12,
+  BL=GPIO25 via `AnyPin::steal()`.  `main.rs` must not claim those four pins.
+- Fills entire screen with a solid RGB565 colour per `LedStatus` variant.
+- Delays use `cortex_m::asm::delay` (cycle-counted; no embassy-time needed).
+
+**waveshare_rp2350_lcd — ST7789V3 172×320 on SPI0 + WS2812B on GPIO22**
+- LCD driven via async `init_lcd()` / `update_status_display()` free functions.
+- Both LCD colour and WS2812B GRB are set simultaneously via `status_to_colors()`.
+
 ## Known pitfalls
 
 ### Core1 stack overflow (silent hang)
