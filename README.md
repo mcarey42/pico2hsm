@@ -24,6 +24,8 @@ The firmware provides hardware-backed key storage with:
 | Waveshare RP2350-Geek 16MB | 16MB | 14MB internal | SPI LCD |
 | Waveshare RP2350-Geek + SDCard | 16MB | 14MB + SDCard | SPI LCD, SDCard |
 | Waveshare RP2350-Geek + dual SDCard | 16MB | 14MB + 2× SDCard | SPI LCD, RAID SDCard |
+| Waveshare RP2350-LCD-1.47-B | 16MB | 14MB internal | ST7789V3 LCD, WS2812B LED |
+| Waveshare RP2350-LCD-1.47-B + SDCard | 16MB | 14MB + 2× SDCard | ST7789V3 LCD, RAID SDCard |
 | RP2354 (embedded flash) | Built-in | External SPI only | Forward-looking |
 
 ## Build Requirements
@@ -67,6 +69,8 @@ cargo test -p pico2hsm-integration-tests
 - `rp2350_geek_16m` — Waveshare RP2350-Geek 16MB
 - `rp2350_geek_sdcard` — Waveshare RP2350-Geek with SDCard
 - `rp2350_geek_sdcard_dual` — Waveshare RP2350-Geek with dual SDCard
+- `waveshare_rp2350_lcd_16m` — Waveshare RP2350-LCD-1.47-B 16MB
+- `waveshare_rp2350_lcd_sdcard_dual` — Waveshare RP2350-LCD-1.47-B with dual SDCard
 - `rp2354_embedded` — RP2354 with embedded flash
 - `pico2_4m` — Raspberry Pi Pico 2 (stock RP2350A, GPIO 25 LED, 4MB flash)
 
