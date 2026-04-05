@@ -257,6 +257,25 @@ At no point is the raw private key material written to any host-visible channel.
 
 ---
 
+## 10a. Storage Namespace / Applet Ownership
+
+Keys stored in the flash keystore carry applet ownership via the `KeyId` u32 encoding (in `pico2hsm-core/src/key.rs`):
+
+```
+bits 31–24: partition_id  (u8)  — 0 = default partition
+bits 23–16: applet_id     (u8)  — 0=SC-HSM, 1=PIV, 2=OpenPGP  (AppletId enum)
+bits 15–8:  reserved            — always 0
+bits  7–0:  proto_ref     (u8)  — protocol-level key reference
+```
+
+`KeyStore::wipe_by_owner(AppletId)` erases only keys whose `applet_id` byte matches the given owner. SC-HSM `INITIALIZE` calls `wipe_by_owner(AppletId::ScHsm)` so PIV and OpenPGP keys are not affected.
+
+Flash magic `"P2K2"` was bumped from the older single-byte scheme; on-flash data from a pre-u32 build is rejected and surfaced as incompatible (re-INITIALIZE required).
+
+Per-applet PIN slots are not yet implemented.
+
+---
+
 ## 10. Protocol Pluggability
 
 The firmware supports multiple card protocols behind a single USB CCID interface. The `HsmProtocol` trait (defined in `pico2hsm-core`) is the plugin interface:

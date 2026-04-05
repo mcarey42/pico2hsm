@@ -38,6 +38,41 @@ impl zeroize::Zeroize for AppletId {
     }
 }
 
+/// Per-applet PIN slot identifier.
+///
+/// Each slot maps to a distinct flash region so that each applet stores its
+/// PIN credential independently.  Slot indices are stable — do not reorder.
+///
+/// `ScHsmUser` and `ScHsmSo` are currently backed by in-RAM state in
+/// `ScHsmState`.  `PivPin`, `OpenPgpPw1`, and `OpenPgpPw3` are placeholders
+/// pending their respective applet implementations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum PinSlot {
+    ScHsmUser  = 0,
+    ScHsmSo    = 1,
+    PivPin     = 2,
+    OpenPgpPw1 = 3,
+    OpenPgpPw3 = 4,
+}
+
+impl PinSlot {
+    /// Return the `AppletId` that owns this PIN slot.
+    pub fn owner(self) -> AppletId {
+        match self {
+            PinSlot::ScHsmUser | PinSlot::ScHsmSo => AppletId::ScHsm,
+            PinSlot::PivPin => AppletId::Piv,
+            PinSlot::OpenPgpPw1 | PinSlot::OpenPgpPw3 => AppletId::OpenPgp,
+        }
+    }
+
+    /// Returns `true` if this slot has real flash backing today.
+    /// PIV and OpenPGP slots are placeholders until their applets are implemented.
+    pub fn is_implemented(self) -> bool {
+        matches!(self, PinSlot::ScHsmUser | PinSlot::ScHsmSo)
+    }
+}
+
 impl KeyId {
     /// SC-HSM key on the given partition (partition=0 for default).
     pub fn sc_hsm(partition: u8, key_ref: u8) -> Self {

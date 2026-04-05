@@ -17,7 +17,7 @@ pub mod storage;
 pub use apdu::{ApduCommand, ApduResponse};
 pub use error::{AuthError, CryptoError, HsmError, ProtocolError, StorageError};
 pub use flash::{FlashChip, MAX_CHIPS, PAGE_SIZE, SECTOR_SIZE};
-pub use key::{KeyId, KeyMaterial, KeyRecord, KeyType, MAX_KEY_BYTES};
+pub use key::{AppletId, KeyId, KeyMaterial, KeyRecord, KeyType, PinSlot, MAX_KEY_BYTES};
 pub use protocol::HsmProtocol;
 pub use storage::{
     ChipState, DirectoryEntry, MirrorPair, MirrorState, ObjectHeader, DATA_START_SECTOR,

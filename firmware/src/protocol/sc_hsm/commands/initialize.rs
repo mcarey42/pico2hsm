@@ -47,10 +47,12 @@ fn find_tlv<'a>(data: &'a [u8], tag: u8) -> Option<&'a [u8]> {
 /// TODO (Agent 7): replace with proper zeroizing hash call.
 fn hash_pin(pin: &[u8], out: &mut [u8; 32]) {
     use sha2::{Digest, Sha256};
+    use zeroize::Zeroize;
     let mut h = Sha256::new();
     h.update(pin);
-    let result = h.finalize();
+    let mut result = h.finalize();
     out.copy_from_slice(&result);
+    result.zeroize();
 }
 
 /// Handle an INITIALIZE DEVICE APDU command.

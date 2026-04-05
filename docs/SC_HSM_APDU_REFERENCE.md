@@ -876,6 +876,8 @@ INS `0x62` is shared between two operations, disambiguated by P1:
 
 **Response notes:** For `P2 = 0x80`, pico2hsm prepends `0x04` to the X-coordinate. OpenSC's `sc_hsm_decipher` strips this prefix to recover the field-size X bytes. For explicit ECDH codes (`0x23/0x25/0x27/0x29`), the raw X-coordinate is returned without the prefix.
 
+**Known issue — ECDH1-COFACTOR-DERIVE (PUNCHOUT item 9):** PKCS#11 mechanism `ECDH1-COFACTOR-DERIVE` (0x1051) causes `pkcs11-tool` / the OpenSC sc-hsm driver to send a different `algo_ref` byte than plain ECDH. The firmware does not recognise this algo_ref and returns `CKR_GENERAL_ERROR`. For P-256/P-384/P-521/K-256 the cofactor is h=1 so the result is mathematically identical to plain ECDH; the fix is to add the cofactor algo_ref as an alias in the DECIPHER dispatch match arm. Standard `ECDH1-DERIVE` (0x1050) works correctly.
+
 **Status words:**
 
 | SW | Meaning |
@@ -1341,3 +1343,5 @@ MF  (3F00)
 9. **EXTERNAL AUTHENTICATE:** Uses `HMAC-SHA256(so_pin_hash, challenge)` rather than a hardware-stored key pair. This is a pico2hsm simplification.
 
 10. **DEBUG DUMP (INS=0xFE):** Only compiled in `#[cfg(feature = "debug")]` builds. The stub currently returns `SW_WRONG_DATA`. Never enable the `debug` feature in production.
+
+11. **ECDH1-COFACTOR-DERIVE not handled:** PKCS#11 mechanism 0x1051 (`ECDH1-COFACTOR-DERIVE`) is not yet aliased to the ECDH handler. Requests using this mechanism return `CKR_GENERAL_ERROR`. Standard `ECDH1-DERIVE` (0x1050) works correctly. See PUNCHOUT item 9.

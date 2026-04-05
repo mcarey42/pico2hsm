@@ -104,6 +104,11 @@ async fn dispatcher_task(
     // Core1 must not call defmt: embassy-rp's critical_section uses Spinlock31; if Core1
     // holds it while spinning for RTT buffer space, Core0 blocks with interrupts disabled
     // and USB processing stalls entirely.
+
+    // Seed the software CSPRNG from hardware TRNG before any crypto operations.
+    // reseed() does not call defmt, so it is safe to call here on Core1.
+    let _ = pico2hsm_firmware::crypto::rng::reseed();
+
     let dispatcher: &'static mut Dispatcher = DISPATCHER_CELL.init(Dispatcher::new());
     dispatcher.load_keys_from_store(store);
     loop {
@@ -769,6 +774,7 @@ async fn run_pico2_board(p: embassy_rp::Peripherals) {
         Ok(()) => defmt::info!("KeyStore: initialized (pico2_4m internal flash)"),
         Err(_) => defmt::warn!("KeyStore: init failed — degraded mode (blank flash?)"),
     }
+    debug_dump_storage(&ks);
     let store: &'static mut _ = KEYSTORE_CELL.init(ks);
 
     // ── USB CCID transport ───────────────────────────────────────────────────
@@ -1002,6 +1008,34 @@ async fn run_waveshare_lcd_board(p: embassy_rp::Peripherals) {
     };
 
     join(usb_fut, ccid_fut).await;
+}
+
+// ─── Storage namespace debug dump ────────────────────────────────────────────
+
+/// Dump a summary of keystore contents to RTT at startup.
+///
+/// Logs: total key count, and for each key the u32 ID broken down into
+/// partition/applet/proto_ref fields.  Runs on core0 before core1 is spawned,
+/// so defmt is safe here.
+///
+/// This is a debug diagnostic; it never logs raw key material.
+#[cfg(target_arch = "arm")]
+fn debug_dump_storage(
+    ks: &pico2hsm_firmware::storage::FlashKeyStore<pico2hsm_firmware::storage::BoardChip>,
+) {
+    use pico2hsm_firmware::storage::KeyStore;
+    let keys = ks.enumerate_keys();
+    defmt::info!("=== storage namespace dump: {} key(s) ===", keys.len());
+    for kid in keys.iter() {
+        let partition = kid.partition();
+        let applet   = kid.applet_byte();
+        let proto    = kid.proto_ref();
+        defmt::info!(
+            "  KeyId(0x{:08X}): partition={} applet={} proto_ref=0x{:02X}",
+            kid.0, partition, applet, proto,
+        );
+    }
+    defmt::info!("=== end storage namespace dump ===");
 }
 
 // ─── Host stub ────────────────────────────────────────────────────────────────

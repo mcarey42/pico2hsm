@@ -87,12 +87,12 @@ context compatible with `elliptic-curve 0.13`.
 
 ## 5. Security hardening — Several stubs awaiting hardware/crate API
 
-**5a. PIN hash not zeroized (`commands/initialize.rs:46`)**
-`hash_pin()` calls `Sha256::new()` / `finalize()` and copies the result, but the
-`Sha256` state on the stack is not explicitly zeroized.  The comment says
-"replace with proper zeroizing hash call."  Fix: use `sha2::Sha256` via the
-`zeroize` crate's `ZeroizeOnDrop` wrapper or call `Zeroize::zeroize()` on the
-digest object after copying.
+**5a. PIN hash not zeroized (`commands/initialize.rs:46`)** — RESOLVED
+`hash_pin()` now calls `result.zeroize()` (via `zeroize::Zeroize`) on the
+`GenericArray<u8, U32>` returned by `h.finalize()` immediately after
+`copy_from_slice`, clearing the intermediate hash copy from the stack.
+`generic-array` 0.14 implements `Zeroize` for `GenericArray<u8, N>` and is
+already in the dependency graph with the `zeroize` feature enabled.
 
 **5b. Anti-glitch detector not armed (`security/anti_glitch.rs:153`)**
 `arm_glitch_detector()` is a no-op stub.  The POWMAN VREG register fields
@@ -121,13 +121,19 @@ serial number from OTP as the HKDF `info` parameter.  Currently it likely uses a
 empty or default info string, making the SMK the same across all devices with the
 same key material.
 
-**5f. CSPRNG reseed hook not wired (`crypto/rng.rs:244`)**
-`reseed()` exists as a hook for a future ChaCha20-based CSPRNG but currently does
-nothing — the TRNG is used directly for every call.  A CSPRNG would allow
-reseeding from TRNG periodically, improving performance for bulk random generation
-and providing forward-secrecy properties.  The interrupt binding for the `Rng`
-peripheral singleton also needs to be established in `main.rs` and a shared
-reference passed to the RNG module (see `rng.rs:38`).
+**5f. CSPRNG reseed wired (`crypto/rng.rs`)** — RESOLVED (core functionality)
+`reseed()` now reads a fresh 32-byte key and 12-byte nonce from the hardware TRNG
+via direct PAC register access and installs a new `ChaCha20` instance in a global
+`CSPRNG` cell.  `fill_random()` draws from the ChaCha20 keystream when the CSPRNG
+is seeded, falling back to direct PAC TRNG reads before the first `reseed()` call.
+A shared `pac_fill_bytes()` helper is used by both paths.  `reseed()` is called
+once from the core1 dispatcher task at startup (before the first APDU).  Provides
+forward secrecy: a future CSPRNG state compromise does not reveal earlier outputs.
+
+**Remaining (not blocking):** The embassy-rp interrupt-bound `Trng` peripheral
+singleton is not yet integrated; the `Rng` struct (`rng.rs`) still uses the PAC
+fallback.  Periodic re-seeding (e.g. every N operations) is not yet wired.  See
+`rng.rs` TODO comment.
 
 ---
 
@@ -144,16 +150,20 @@ firmware targets.  All three applets coexist in one binary and are selected at
 runtime by `SELECT AID`.  See CLAUDE.md §"Multi-applet feature flag architecture"
 for the full design including flash/RAM budget and feature flag usage.
 
-**7a. Storage namespace — prerequisite for both applets**
+**7a. Storage namespace — prerequisite for both applets** — PARTIALLY DONE
 
-This must be done before any command handler is written.  The flash keystore
-currently has no concept of applet ownership; SC-HSM `INITIALIZE` would wipe PIV
-and OpenPGP keys.
+**Implemented (already in codebase):**
+- `KeyId` is a `u32` with partition/applet/proto_ref encoding (in `pico2hsm-core/src/key.rs`)
+- `AppletId` enum (`ScHsm=0`, `Piv=1`, `OpenPgp=2`) in `pico2hsm-core/src/key.rs`
+- `KeyId::sc_hsm()`, `KeyId::piv()`, `KeyId::openpgp()` helper constructors
+- `KeyStore::wipe_by_owner(AppletId)` in `firmware/src/storage/keystore.rs`
+- `INITIALIZE` calls `wipe_by_owner(AppletId::ScHsm)` — only SC-HSM keys are wiped
+- Flash magic `"P2K2"` — existing pre-u32 keystore data is surfaced as incompatible
+- `debug_dump_storage()` in `firmware/src/main.rs` — core0-only, `#[cfg(target_arch = "arm")]`,
+  logs all stored key IDs (partition / applet / proto_ref) via defmt RTT at startup.
+  Verified on hardware: boots clean, 0 keys on fresh flash, USB enumerates correctly.
 
-**Key ID scheme — u32 internal key ID:**
-
-The internal key ID is a `u32` with the following layout:
-
+**Key ID scheme (u32):**
 ```
 bits 31–24: partition_id  (u8)  — 0 = default; extended by item 8
 bits 23–16: applet_id     (u8)  — 0=SC-HSM, 1=PIV, 2=OpenPGP
@@ -161,20 +171,10 @@ bits 15–8:  reserved            — always 0
 bits  7–0:  proto_ref     (u8)  — protocol-level key reference
 ```
 
-Helper constructors:
-- `KeyId::sc_hsm(partition, key_ref)` → `(partition<<24) | key_ref`
-- `KeyId::piv(key_ref)` → `(1<<16) | key_ref`
-- `KeyId::openpgp(slot)` → `(2<<16) | slot`
-
-For partition 0 SC-HSM keys (current), `KeyId(proto_ref as u32)` — numerically
-identical to the old u8 value, just stored as u32 LE in flash.
-
-**Note: flash format change.** Existing stored keys become unreadable — re-INITIALIZE
-after firmware update.  Bump `KEY_MAGIC` to `*b"P2K2"` to surface the incompatibility.
-
-**Still required:**
-- Add per-applet PIN slots to flash (SC-HSM already has one; PIV needs its own;
-  OpenPGP needs PW1 + PW3).
+**Still required before PIV/OpenPGP command handlers:**
+- Per-applet PIN slots in flash: SC-HSM already has a PIN slot; PIV needs its own;
+  OpenPGP needs PW1 + PW3.  A `PinSlot` enum with `owner()` and `is_implemented()`
+  methods is planned but not yet implemented.
 
 **7b. PIV (`applet-piv` feature)**
 
@@ -261,3 +261,58 @@ layer can hold thousands of keys limited only by flash capacity.
 - Implement the four management APDUs behind SO-PIN gate on partition 0.
 - Design partition metadata storage (active partitions list, per-partition label/flags).
 - Write integration tests covering multi-partition round-trip.
+
+---
+
+## 9. ECDH cofactor derive — `ECDH1-COFACTOR-DERIVE` returns `CKR_GENERAL_ERROR`
+
+**Current state:**
+Integration tests `test_ecdh_returns_correct_length`, `test_ecdh_cross_check`, and
+`test_ecdh_different_peers_give_different_secrets` all fail for P-256 when the test
+harness requests mechanism `ECDH1-COFACTOR-DERIVE` (0x1051).  The firmware returns
+`CKR_GENERAL_ERROR`; the standard `ECDH1-DERIVE` (0x1050) path is not exercised by
+these tests and is believed to work.
+
+**Root cause (to confirm):**
+Mechanism `ECDH1-COFACTOR-DERIVE` multiplies the shared point by the curve cofactor
+(h=1 for P-256, so it is mathematically identical to plain ECDH on this curve).
+The OpenSC sc-hsm driver likely maps this mechanism to a different INS byte or a
+different `algo_ref` than plain ECDH.  The firmware dispatch in
+`protocol/sc_hsm/commands/ecdh.rs` (or equivalent) may not recognise the cofactor
+algo ID and falls through to a generic error.
+
+**What needs to happen:**
+- Trace the ECDH1-COFACTOR-DERIVE APDU on hardware to identify the `algo_ref` byte
+  the driver sends.
+- Add the cofactor algo_ref as an alias for the standard ECDH handler in the dispatch
+  match arm (for P-256/P-384/P-521 cofactor h=1, the result is identical).
+- Add the three ECDH tests to the passing baseline.
+
+---
+
+## 10. PKCS#15 applet — Low priority, revisit if deployment need surfaces
+
+**Background:**
+PKCS#15 (ISO/IEC 7816-15) is a data-format standard defining how keys, certificates,
+and PINs are laid out on a smart card filesystem.  A generic PKCS#15 driver (OpenSC,
+Windows Base Smart Card CSP) can operate any conformant card without a card-specific
+module.
+
+**Why deferred:**
+pico2hsm already exposes crypto through SC-HSM → `opensc-pkcs11.so`, PIV (native OS
+drivers), and OpenPGP (GnuPG).  PKCS#15 would duplicate the PKCS#11 surface area for
+most use cases.  The primary scenario where it adds value is legacy enterprise middleware
+or Windows CNG without OpenSC installed.
+
+**Design sketch (for when this is revisited):**
+- Feature flag: `applet-pkcs15`
+- AID: `A0 00 00 00 63 50 4B 43 53 2D 31 35` (standard PKCS#15 AID)
+- Implement a read-only EF filesystem view (`EF.DIR`, `EF.ODF`, `EF.PrKDF`, `EF.CDF`)
+  that mirrors keys already stored by SC-HSM on partition 0.
+- No new key storage — PKCS#15 is a presentation layer over the existing keystore.
+- PUT DATA / write commands optional; read-only is sufficient for most middleware.
+
+**Prerequisites:**
+- Item 7a (u32 key IDs + applet owner field) — must land first so PKCS#15 can
+  enumerate only SC-HSM-owned keys.
+- Item 7b (PIV) and 7c (OpenPGP) should land first; PKCS#15 is lower priority than both.

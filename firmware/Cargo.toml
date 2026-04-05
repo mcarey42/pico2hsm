@@ -121,6 +121,9 @@ cortex-m = { version = "0.7", features = ["critical-section-single-core"] }
 cortex-m-rt = { version = "0.7" }
 panic-probe = { version = "0.3", features = ["print-defmt"] }
 
+# ChaCha20 stream cipher — used as CSPRNG state in crypto::rng (reseed hook)
+chacha20 = { version = "0.9", default-features = false }
+
 # Noise Protocol Framework (DKEK exchange — not yet used on x86_64 tests)
 snow = { version = "0.10", default-features = false }
 

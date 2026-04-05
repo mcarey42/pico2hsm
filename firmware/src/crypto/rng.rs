@@ -39,6 +39,9 @@
 //! replace the PAC fallback with a reference to the shared `Rng` instance
 //! passed through an Embassy channel or a global mutex.
 
+use chacha20::{ChaCha20, Key, Nonce};
+use chacha20::cipher::{KeyIvInit, StreamCipher};
+use core::cell::UnsafeCell;
 use pico2hsm_core::error::CryptoError;
 use sha2::{Digest, Sha256};
 
@@ -49,6 +52,23 @@ const ADC_POOL_SAMPLES: usize = 256;
 
 /// Number of low-noise bits taken from each 12-bit ADC sample.
 const ADC_NOISY_BITS: u16 = 0x07; // low 3 bits
+
+// ─── Global CSPRNG state ─────────────────────────────────────────────────────
+//
+// A ChaCha20 stream cipher instance used as a software CSPRNG.  Seeded (and
+// periodically re-seeded) from the hardware TRNG by `reseed()`.
+//
+// # Safety invariant
+// This module is only compiled for `target_arch = "arm"` (see crypto/mod.rs).
+// `fill_random` and `reseed` are *only* called from Core1's single dispatcher
+// task.  Core0 never calls either function.  Therefore there is no concurrent
+// access across tasks or cores and the `UnsafeCell` is sound.
+struct CsprngCell(UnsafeCell<Option<ChaCha20>>);
+
+// SAFETY: single-core access as documented above.
+unsafe impl Sync for CsprngCell {}
+
+static CSPRNG: CsprngCell = CsprngCell(UnsafeCell::new(None));
 
 // ─── Rng struct ───────────────────────────────────────────────────────────────
 
@@ -198,6 +218,21 @@ fn pac_trng_read_word() -> Result<u32, CryptoError> {
     }
 }
 
+/// Fill `buf` from the hardware TRNG via `pac_trng_read_word`.
+///
+/// Shared by [`fill_random`]'s fallback path and [`reseed`]'s seed collection.
+fn pac_fill_bytes(buf: &mut [u8]) -> Result<(), CryptoError> {
+    let mut i = 0;
+    while i < buf.len() {
+        let word = pac_trng_read_word()?;
+        let bytes = word.to_le_bytes();
+        let to_copy = (buf.len() - i).min(4);
+        buf[i..i + to_copy].copy_from_slice(&bytes[..to_copy]);
+        i += to_copy;
+    }
+    Ok(())
+}
+
 // ─── Free-function API (legacy / pre-init fallback) ───────────────────────────
 
 /// Fill `buf` with cryptographically secure random bytes.
@@ -212,14 +247,17 @@ fn pac_trng_read_word() -> Result<u32, CryptoError> {
 /// Returns `Err(CryptoError::RngFailure)` if the TRNG hardware times out
 /// (should not happen on functional silicon).
 pub fn fill_random(buf: &mut [u8]) -> Result<(), CryptoError> {
-    let mut i = 0;
-    while i < buf.len() {
-        let word = pac_trng_read_word()?;
-        let bytes = word.to_le_bytes();
-        let remaining = buf.len() - i;
-        let to_copy = remaining.min(4);
-        buf[i..i + to_copy].copy_from_slice(&bytes[..to_copy]);
-        i += to_copy;
+    // SAFETY: only called from Core1 dispatcher task; no concurrent access.
+    let csprng_opt = unsafe { &mut *CSPRNG.0.get() };
+    if let Some(csprng) = csprng_opt {
+        // Use the software CSPRNG (ChaCha20 keystream over zeroed buffer).
+        // This is faster than repeated PAC TRNG polls and provides
+        // forward secrecy after each reseed().
+        buf.fill(0);
+        csprng.apply_keystream(buf);
+    } else {
+        // CSPRNG not yet seeded — fall back to direct TRNG reads.
+        pac_fill_bytes(buf)?;
     }
     Ok(())
 }
@@ -238,16 +276,37 @@ pub fn get_random_bytes(n: usize) -> Result<heapless::Vec<u8, 256>, CryptoError>
 
 /// Trigger an immediate CSPRNG reseed from the hardware TRNG.
 ///
-/// Fills a 32-byte scratch buffer from the TRNG; the buffer can be used
-/// to re-key an application-level CSPRNG if one is added in future.
+/// Reads a fresh 32-byte key and 12-byte nonce from the hardware TRNG via
+/// direct PAC register access (bypassing the CSPRNG so the seed is always
+/// fresh hardware entropy) and installs a new `ChaCha20` instance in the
+/// global CSPRNG state.  Subsequent calls to `fill_random` will draw from
+/// the newly-keyed ChaCha20 keystream until the next reseed.
 ///
-/// TODO (crypto agent): wire up a ChaCha20-based CSPRNG and reseed it here.
+/// Provides forward secrecy: compromise of the CSPRNG state after a reseed
+/// does not reveal outputs generated before it.
+///
+/// # When to call
+/// Call once during early boot (after peripherals are up) and then
+/// periodically — e.g. every N operations or after significant time elapses.
 pub fn reseed() -> Result<(), CryptoError> {
-    let mut scratch = [0u8; 32];
-    fill_random(&mut scratch)?;
-    // Currently there is no CSPRNG state to update — the TRNG is used
-    // directly.  This function exists as a hook for the crypto agent.
-    zeroize_slice(&mut scratch);
+    // Read key and nonce directly from TRNG (not via CSPRNG — we need
+    // fresh hardware entropy for the seed, not CSPRNG-derived bytes).
+    let mut key_bytes = [0u8; 32];
+    let mut nonce_bytes = [0u8; 12];
+    pac_fill_bytes(&mut key_bytes)?;
+    pac_fill_bytes(&mut nonce_bytes)?;
+
+    let new_csprng = ChaCha20::new(Key::from_slice(&key_bytes), Nonce::from_slice(&nonce_bytes));
+
+    // Install new CSPRNG state.
+    // SAFETY: only called from Core1 dispatcher task; no concurrent access.
+    let csprng_opt = unsafe { &mut *CSPRNG.0.get() };
+    *csprng_opt = Some(new_csprng);
+
+    // Zeroize seed material.
+    zeroize_slice(&mut key_bytes);
+    zeroize_slice(&mut nonce_bytes);
+
     Ok(())
 }
 

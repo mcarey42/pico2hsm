@@ -86,20 +86,27 @@ cargo build --release --no-default-features \
 Flash is not a concern.  RAM is the metric to watch; the 128 KB core1 stack and the
 SC-HSM key caches dominate; applet state structs are small by comparison.
 
-**Storage namespace — design constraint for any new applet:**
+**Storage namespace — implemented:**
 
-All three applets share one flash keystore.  Each `KeyObject` must carry an `owner` tag
-so that SC-HSM `INITIALIZE` only wipes SC-HSM-owned slots, not PIV or OpenPGP keys.
-Reserved key ID ranges (to be enforced in `storage/keystore.rs`):
+All three applets share one flash keystore.  Ownership is encoded in the `KeyId` u32
+via the `applet_id` byte (bits 23–16); SC-HSM `INITIALIZE` calls
+`wipe_by_owner(AppletId::ScHsm)` and leaves PIV and OpenPGP keys untouched.
 
-| Key ID range | Owner |
-|---|---|
-| `0x01–0x7F` | SC-HSM |
-| `0x80–0x8F` | PIV (9A→0x80, 9C→0x81, 9D→0x82, 9E→0x83, retired→0x84–0x8F) |
-| `0x90–0x92` | OpenPGP (SIG→0x90, DEC→0x91, AUTH→0x92) |
+`KeyId` u32 encoding (in `pico2hsm-core/src/key.rs`):
+```
+bits 31–24: partition_id  (u8)  — 0 = default partition
+bits 23–16: applet_id     (u8)  — 0=SC-HSM, 1=PIV, 2=OpenPGP
+bits 15–8:  reserved            — always 0
+bits  7–0:  proto_ref     (u8)  — protocol-level key reference
+```
 
-PIN storage in flash likewise needs per-applet slots.  **This namespace design must be
-implemented before any PIV or OpenPGP command handler is written.**
+Constructors: `KeyId::sc_hsm(partition, key_ref)`, `KeyId::piv(key_ref)`,
+`KeyId::openpgp(slot)`.  Flash magic `"P2K2"` surfaces old pre-u32 data as
+incompatible (re-INITIALIZE required after firmware update from older builds).
+
+**Still required before PIV/OpenPGP command handlers:**
+Per-applet PIN slots in flash.  SC-HSM already has a PIN slot; PIV needs its own;
+OpenPGP needs PW1 + PW3.  A `PinSlot` enum is planned but not yet implemented.
 
 ## Reference documentation
 
