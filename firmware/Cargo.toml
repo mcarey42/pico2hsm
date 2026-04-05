@@ -112,10 +112,6 @@ embedded-hal = { version = "1.0" }
 embedded-hal-async = { version = "1.0" }
 embedded-sdmmc = { version = "0.9" }
 
-# PIO assembler + fixed-point arithmetic (used by WS2812B PIO driver)
-pio = { version = "0.3" }
-fixed = { version = "1" }
-
 # Logging / diagnostics
 defmt = { version = "0.3" }
 defmt-rtt = { version = "0.4" }

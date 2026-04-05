@@ -234,7 +234,6 @@ impl Ws2812Led {
         use embassy_rp::pio::{
             Config, FifoJoin, Pio, ShiftConfig, ShiftDirection,
         };
-        use fixed::types::U24F8;
         use embassy_rp::clocks::clk_sys_freq;
 
         // ── Steal PIO0 and PIN_16 ─────────────────────────────────────────────
@@ -318,9 +317,26 @@ impl Ws2812Led {
         cfg.use_program(&loaded, &[&out_pin]);
 
         // Clock divider: target 8 MHz PIO clock (= 800 kHz × 10 cycles/bit).
-        let clock_khz  = U24F8::from_num(clk_sys_freq() / 1_000);
-        let target_khz = U24F8::from_num(timing::FREQ_HZ / 1_000 * timing::CYCLES_PER_BIT);
-        cfg.clock_divider = clock_khz / target_khz;
+        //
+        // We avoid a direct `fixed` crate dependency (it's only a transitive
+        // dep via embassy-rp) by computing the divider using integer arithmetic
+        // and writing the PIO SM CLKDIV register through the PAC directly after
+        // sm.set_config() leaves it at the default of 1.
+        //
+        // Formula: divider = clk_sys_freq / (FREQ_HZ × CYCLES_PER_BIT)
+        //   int_part = divider (integer)
+        //   frac_part = (remainder * 256) / divisor   (8-bit fraction)
+        //
+        // At 150 MHz: divisor = 8_000_000, int = 18, rem = 6_000_000
+        //             frac = (6_000_000 * 256) / 8_000_000 = 192 → divider ≈ 18.75
+        //
+        // The clock_divider field in Config uses the `fixed` crate which is only
+        // a transitive dep; we leave it at default (1.0) and override via PAC.
+        // The override is applied immediately after sm.set_config() below.
+        let pio_divisor = timing::FREQ_HZ * timing::CYCLES_PER_BIT; // 8_000_000
+        let sys_freq    = clk_sys_freq();
+        let clkdiv_int  = sys_freq / pio_divisor;
+        let clkdiv_frac = ((sys_freq % pio_divisor) as u64 * 256 / pio_divisor as u64) as u8;
 
         // TX FIFO only; 24-bit auto-shift left.
         cfg.fifo_join = FifoJoin::TxOnly;
@@ -332,6 +348,18 @@ impl Ws2812Led {
 
         let mut sm0 = sm0;
         sm0.set_config(&cfg);
+
+        // Override the clock divider computed above.
+        // The PAC CLKDIV register layout: bits[31:16] = INT, bits[15:8] = FRAC.
+        // `set_config` leaves CLKDIV at 1.0; we now write the real value.
+        // SAFETY: We own SM0 exclusively; no concurrent access to this register.
+        unsafe {
+            embassy_rp::pac::PIO0.sm(0).clkdiv().write(|w| {
+                w.set_int(clkdiv_int as u16);
+                w.set_frac(clkdiv_frac);
+            });
+        }
+
         sm0.set_enable(true);
 
         // ── Keep Common and LoadedProgram alive in StaticCells ────────────────
