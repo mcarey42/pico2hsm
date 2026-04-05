@@ -223,6 +223,22 @@ async fn main(_spawner: Spawner) {
         run_geek_board(p).await;
     }
 
+    // ── Waveshare RP2350-LCD-1.47-B ──────────────────────────────────────────
+    #[cfg(feature = "waveshare_rp2350_lcd_16m")]
+    {
+        pico2hsm_firmware::security::boot::security_checks();
+        pico2hsm_firmware::allocator::init();
+
+        let otp = pico2hsm_firmware::security::otp::Otp::new();
+        defmt::info!("OTP: provisioned={} production={}", otp.is_provisioned(), otp.is_production_mode());
+        match pico2hsm_firmware::security::otp::derive_smk() {
+            Ok(_) => defmt::info!("OTP: SMK derived"),
+            Err(_) => defmt::warn!("OTP: derive_smk failed — unprovisioned?"),
+        }
+
+        run_waveshare_lcd_board(p).await;
+    }
+
     // ── Fallback ─────────────────────────────────────────────────────────────
     #[cfg(not(any(
         feature = "rp2350_one_4m",
@@ -232,6 +248,7 @@ async fn main(_spawner: Spawner) {
         feature = "rp2350_geek_sdcard_dual",
         feature = "rp2354_embedded",
         feature = "pico2_4m",
+        feature = "waveshare_rp2350_lcd_16m",
     )))]
     {
         defmt::error!("No board feature flag set — spinning forever");
@@ -738,6 +755,147 @@ async fn run_pico2_board(p: embassy_rp::Peripherals) {
                         // No defmt logging here — the RTT buffer fills from trace-level
                         // embassy_rp USB logs; any defmt call here blocks Core0 before
                         // the APDU reaches Core1, causing a permanent hang.
+                        let _ = APDU_CHANNEL.send(apdu_bytes).await;
+                        let response = {
+                            use embassy_futures::select::{select, Either};
+                            loop {
+                                match select(RESP_CHANNEL.receive(), embassy_time::Timer::after_millis(1500)).await {
+                                    Either::First(r) => break r,
+                                    Either::Second(_) => {
+                                        if let Err(CcidError::UsbDisconnected) = ccid.send_time_extension().await {
+                                            let _ = RESP_CHANNEL.receive().await;
+                                            break heapless::Vec::new();
+                                        }
+                                    }
+                                }
+                            }
+                        };
+                        match ccid.send_response(&response).await {
+                            Ok(()) => {}
+                            Err(CcidError::UsbDisconnected) => {
+                                let _ = APDU_CHANNEL.send(heapless::Vec::new()).await;
+                                let _ = RESP_CHANNEL.receive().await;
+                                break;
+                            }
+                            Err(_) => {}
+                        }
+                        board.led().set_status(LedStatus::Ready);
+                    }
+                    Err(CcidError::UsbDisconnected) => {
+                        let _ = APDU_CHANNEL.send(heapless::Vec::new()).await;
+                        let _ = RESP_CHANNEL.receive().await;
+                        board.led().set_status(LedStatus::Ready);
+                        break;
+                    }
+                    Err(_) => {}
+                }
+            }
+        }
+    };
+
+    join(usb_fut, ccid_fut).await;
+}
+
+// ─── Waveshare RP2350-LCD-1.47-B main function ───────────────────────────────
+
+#[cfg(all(target_arch = "arm", feature = "waveshare_rp2350_lcd_16m"))]
+async fn run_waveshare_lcd_board(p: embassy_rp::Peripherals) {
+    use embassy_futures::join::join;
+    use embassy_rp::spi::{Config as SpiConfig, Phase, Polarity, Spi};
+    use embassy_rp::usb::Driver as UsbDriver;
+    use embassy_usb::{Builder as UsbBuilder, Config as UsbConfig};
+
+    use pico2hsm_firmware::board::waveshare_rp2350_lcd::{WaveshareRp2350LcdBoard, SPI_FREQ_HZ};
+    use pico2hsm_firmware::board::{Board, LedController, LedStatus};
+    use pico2hsm_firmware::transport::ccid::CcidError;
+    use pico2hsm_firmware::transport::CcidTransport;
+
+    defmt::info!("Board: Waveshare RP2350-LCD-1.47-B initialising");
+
+    // ── SPI0: LCD bus (SCK=GPIO18, MOSI=GPIO19, MISO=GPIO4) ─────────────────
+    // The ST7789V3 is write-only; MISO (GPIO4) is defined in the hardware
+    // netlist but the display never drives it.
+    let mut spi0_cfg = SpiConfig::default();
+    spi0_cfg.frequency = SPI_FREQ_HZ;
+    spi0_cfg.phase = Phase::CaptureOnFirstTransition;
+    spi0_cfg.polarity = Polarity::IdleLow;
+    // Pins: SCK=GPIO18, MOSI=GPIO19, MISO=GPIO4
+    let spi0 = Spi::new_blocking(p.SPI0, p.PIN_18, p.PIN_19, p.PIN_4, spi0_cfg);
+
+    // ── SPI1: SD card bus (SCK=GPIO10, MOSI=GPIO11, MISO=GPIO12) ─────────────
+    let mut spi1_cfg = SpiConfig::default();
+    spi1_cfg.frequency = SPI_FREQ_HZ;
+    spi1_cfg.phase = Phase::CaptureOnFirstTransition;
+    spi1_cfg.polarity = Polarity::IdleLow;
+    // Pins: SCK=GPIO10, MOSI=GPIO11, MISO=GPIO12
+    let spi1 = Spi::new_blocking(p.SPI1, p.PIN_10, p.PIN_11, p.PIN_12, spi1_cfg);
+
+    let mut board = WaveshareRp2350LcdBoard::new(spi0, spi1);
+    board.led().set_status(LedStatus::Busy);
+
+    // ── Storage initialisation (degraded — QMI flash not wired yet) ─────────
+    // The RP2350-LCD-1.47-B has a 16 MB W25Q128JVSIQ on QSPI.  The embassy-rp
+    // Flash peripheral accesses it via the QMI interface (same as pico2_4m).
+    // TODO (board-storage wiring): add QmiFlash via p.FLASH the same way
+    // pico2_4m does in run_pico2_board().  For now initialise with no chips.
+    let smk_bytes = pico2hsm_firmware::security::otp::derive_smk()
+        .unwrap_or([0u8; 32]);
+    let smk = zeroize::Zeroizing::new(smk_bytes);
+    let fs = pico2hsm_firmware::storage::filesystem::KeyFilesystem::new();
+    let sm = pico2hsm_firmware::storage::StorageManager::new(fs);
+    let mut ks = pico2hsm_firmware::storage::FlashKeyStore::new(sm, smk);
+    match ks.init() {
+        Ok(()) => defmt::info!("KeyStore: initialized (waveshare_rp2350_lcd_16m — degraded, no chips)"),
+        Err(_) => defmt::warn!("KeyStore: init failed — degraded mode"),
+    }
+    let store: &'static mut _ = KEYSTORE_CELL.init(ks);
+
+    // ── USB CCID transport ───────────────────────────────────────────────────
+    let usb_driver = UsbDriver::new(p.USB, Irqs);
+
+    let mut usb_config = UsbConfig::new(USB_VID, USB_PID);
+    usb_config.manufacturer = Some("pico2hsm");
+    usb_config.product = Some("pico2hsm SC-HSM");
+    usb_config.serial_number = Some("0001");
+    usb_config.max_power = 100;
+
+    let mut config_descriptor_buf = [0u8; 256];
+    let mut bos_descriptor_buf = [0u8; 256];
+    let mut msos_descriptor_buf = [0u8; 256];
+    let mut control_buf = [0u8; 64];
+
+    let mut builder = UsbBuilder::new(
+        usb_driver,
+        usb_config,
+        &mut config_descriptor_buf,
+        &mut bos_descriptor_buf,
+        &mut msos_descriptor_buf,
+        &mut control_buf,
+    );
+
+    let mut ccid = CcidTransport::new(&mut builder);
+    let mut usb = builder.build();
+
+    defmt::info!("pico2hsm (RP2350-LCD-1.47-B): USB CCID ready, entering main loop");
+    board.led().set_status(LedStatus::Ready);
+
+    // ── Spawn APDU dispatcher on core1 ───────────────────────────────────────
+    spawn_core1(p.CORE1, unsafe { &mut *addr_of_mut!(CORE1_STACK) }, move || {
+        let executor = CORE1_EXECUTOR.init(embassy_executor::Executor::new());
+        executor.run(|spawner| spawner.spawn(dispatcher_task(store).expect("dispatcher task")));
+    });
+
+    // ── Concurrent USB + CCID command loop (core0) ───────────────────────────
+    let usb_fut = usb.run();
+    let ccid_fut = async {
+        loop {
+            ccid.wait_connected().await;
+            defmt::info!("RP2350-LCD-1.47-B: USB connected");
+
+            loop {
+                match ccid.recv_apdu().await {
+                    Ok(apdu_bytes) => {
+                        board.led().set_status(LedStatus::Busy);
                         let _ = APDU_CHANNEL.send(apdu_bytes).await;
                         let response = {
                             use embassy_futures::select::{select, Either};

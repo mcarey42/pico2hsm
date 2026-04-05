@@ -38,6 +38,8 @@ fn main() {
         "rp2354_embedded"
     } else if cfg!(feature = "pico2_4m") {
         "pico2_4m"
+    } else if cfg!(feature = "waveshare_rp2350_lcd_16m") {
+        "waveshare_rp2350_lcd_16m"
     } else {
         // Fallback — should not happen with workspace defaults.
         "rp2350_one_4m"

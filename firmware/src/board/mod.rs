@@ -4,22 +4,25 @@
 //! selected at compile time via feature flags.
 //!
 //! # Board variants
-//! - `rp2350_one`  — Waveshare RP2350-One (4MB and 16MB): WS2812B LED on GPIO16
-//! - `rp2350_geek` — Waveshare RP2350-Geek (16MB, SDCard): SPI LCD + SDCard pins
-//! - `pico2`       — Stock Raspberry Pi Pico 2 (RP2350A, 4MB): GPIO25 LED
+//! - `rp2350_one`          — Waveshare RP2350-One (4MB and 16MB): WS2812B LED on GPIO16
+//! - `rp2350_geek`         — Waveshare RP2350-Geek (16MB, SDCard): SPI LCD + SDCard pins
+//! - `pico2`               — Stock Raspberry Pi Pico 2 (RP2350A, 4MB): GPIO25 LED
+//! - `waveshare_rp2350_lcd`— Waveshare RP2350-LCD-1.47-B (16MB, SD card, LCD, RGB LED)
 //!
 //! # Feature flags
-//! - `rp2350_one_4m`           → RP2350-One with 4 MB flash
-//! - `rp2350_one_16m`          → RP2350-One with 16 MB flash
-//! - `rp2350_geek_16m`         → RP2350-Geek with 16 MB flash, no SDCard
-//! - `rp2350_geek_sdcard`      → RP2350-Geek with SDCard slot
-//! - `rp2350_geek_sdcard_dual` → RP2350-Geek with dual SDCard slots
-//! - `rp2354_embedded`         → RP2354 with embedded flash
-//! - `pico2_4m`                → Stock Pico 2 with 4 MB flash, GPIO25 LED
+//! - `rp2350_one_4m`             → RP2350-One with 4 MB flash
+//! - `rp2350_one_16m`            → RP2350-One with 16 MB flash
+//! - `rp2350_geek_16m`           → RP2350-Geek with 16 MB flash, no SDCard
+//! - `rp2350_geek_sdcard`        → RP2350-Geek with SDCard slot
+//! - `rp2350_geek_sdcard_dual`   → RP2350-Geek with dual SDCard slots
+//! - `rp2354_embedded`           → RP2354 with embedded flash
+//! - `pico2_4m`                  → Stock Pico 2 with 4 MB flash, GPIO25 LED
+//! - `waveshare_rp2350_lcd_16m`  → Waveshare RP2350-LCD-1.47-B with 16 MB external flash
 
 pub mod pico2;
 pub mod rp2350_geek;
 pub mod rp2350_one;
+pub mod waveshare_rp2350_lcd;
 
 /// LED status codes understood by all board variants.
 ///

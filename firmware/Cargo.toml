@@ -24,6 +24,7 @@ rp2350_geek_sdcard = []
 rp2350_geek_sdcard_dual = []
 rp2354_embedded = []
 pico2_4m = []
+waveshare_rp2350_lcd_16m = []
 rsa = ["dep:rsa", "dep:embedded-alloc"]  # RSA support — adds ~1MB to binary; disabled by default
 debug = []         # Debug mode: enables memory dump APDUs, disables secure boot enforcement
 applet-piv = ["dep:des"]                 # PIV applet (NIST SP 800-73-4); adds 3DES (~10 KB)
