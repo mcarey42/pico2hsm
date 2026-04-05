@@ -115,14 +115,27 @@ const ST7789_COLMOD: u8  = 0x3A;
 /// The ST7789 in the RP2350-Geek is a 240×135 panel mounted landscape.
 /// CASET range: 52..(52+240-1) = 52..291
 /// RASET range: 40..(40+135-1) = 40..174
-const LCD_WIDTH: u16  = 240;
-const LCD_HEIGHT: u16 = 135;
+pub const LCD_WIDTH: u16  = 240;
+pub const LCD_HEIGHT: u16 = 135;
 const LCD_COL_OFFSET: u16 = 52;
 const LCD_ROW_OFFSET: u16 = 40;
 
 /// Cortex-M33 at 150 MHz: ~150_000 cycles per millisecond.
 /// Using a generous constant to ensure minimum timing even if clock is lower.
 const CYCLES_PER_MS: u32 = 150_000;
+
+// ─── Software framebuffer ─────────────────────────────────────────────────────
+
+/// 240×135 RGB565 framebuffer — 2 bytes per pixel, row-major, big-endian.
+/// Owned exclusively by `St7789StatusDisplay::flush()` and the `DrawTarget` impl.
+///
+/// # Safety
+/// `FRAMEBUF` is only ever accessed from core0 display code (the `DrawTarget`
+/// impl and `flush()`).  No other task or core touches this buffer, so there is
+/// no concurrent mutation.
+#[cfg(target_arch = "arm")]
+static mut FRAMEBUF: [u8; (LCD_WIDTH as usize) * (LCD_HEIGHT as usize) * 2] =
+    [0u8; (LCD_WIDTH as usize) * (LCD_HEIGHT as usize) * 2];
 
 // ─── LED / display driver ─────────────────────────────────────────────────────
 
@@ -200,6 +213,49 @@ impl St7789StatusDisplay {
         display
     }
 
+    /// Turn the display backlight on (wake from screensaver).
+    pub fn backlight_on(&mut self) {
+        self.bl.set_high();
+    }
+
+    /// Turn the display backlight off (screensaver).
+    pub fn backlight_off(&mut self) {
+        self.bl.set_low();
+    }
+
+    /// Send the entire framebuffer to the ST7789 display.
+    ///
+    /// Call this once after `render()` completes to push the composed frame
+    /// to the display in a single SPI burst.  The display only transitions
+    /// from the old frame to the new frame during this call — no intermediate
+    /// blank-screen state is ever visible.
+    pub fn flush(&mut self) {
+        // Re-assert the visible window before RAMWR.
+        let col_start = LCD_COL_OFFSET;
+        let col_end   = LCD_COL_OFFSET + LCD_WIDTH - 1;
+        let row_start = LCD_ROW_OFFSET;
+        let row_end   = LCD_ROW_OFFSET + LCD_HEIGHT - 1;
+        self.write_command_data(ST7789_CASET, &[
+            (col_start >> 8) as u8, (col_start & 0xFF) as u8,
+            (col_end   >> 8) as u8, (col_end   & 0xFF) as u8,
+        ]);
+        self.write_command_data(ST7789_RASET, &[
+            (row_start >> 8) as u8, (row_start & 0xFF) as u8,
+            (row_end   >> 8) as u8, (row_end   & 0xFF) as u8,
+        ]);
+
+        self.dc.set_low();
+        self.cs_assert();
+        let _ = self.spi.blocking_write(&[ST7789_RAMWR]);
+        self.dc.set_high();
+
+        // SAFETY: FRAMEBUF is only accessed from core0; no concurrent mutation.
+        // SAFETY: FRAMEBUF is a plain byte array; we only read it here.
+        let _ = self.spi.blocking_write(unsafe { &*(&raw const FRAMEBUF) });
+
+        self.cs_deassert();
+    }
+
     // ── Low-level SPI helpers ────────────────────────────────────────────────
 
     /// Busy-wait for approximately `ms` milliseconds.
@@ -246,6 +302,35 @@ impl St7789StatusDisplay {
 
     // ── ST7789 initialisation ────────────────────────────────────────────────
 
+    /// Clear the entire ST7789 controller RAM (320 × 240 pixels) to black.
+    ///
+    /// The ST7789 has a 320 × 240 internal framebuffer.  After MADCTL = 0x70,
+    /// our visible window is CASET(52..291) × RASET(40..174) — only 240 × 135
+    /// of those pixels.  The remaining controller pixels (left columns 0..51,
+    /// bottom rows 175..239) map to physical border areas of the panel and show
+    /// as garbage until explicitly cleared.  This must be called once during
+    /// init, after MADCTL is set.
+    fn clear_full_controller_ram(&mut self) {
+        // With MADCTL = 0x70 the full addressable range is
+        //   CASET  0 .. 319   (320 columns in the rotated landscape frame)
+        //   RASET  0 .. 239   (240 rows   in the rotated landscape frame)
+        self.write_command_data(ST7789_CASET, &[0x00, 0x00, 0x01, 0x3F]); // 0..319
+        self.write_command_data(ST7789_RASET, &[0x00, 0x00, 0x00, 0xEF]); // 0..239
+
+        self.dc.set_low();
+        self.cs_assert();
+        let _ = self.spi.blocking_write(&[ST7789_RAMWR]);
+        self.dc.set_high();
+
+        // 320 × 240 = 76 800 pixels.  Write in 320-pixel (640-byte) row chunks.
+        let row_buf = [0u8; 640]; // all zeros = black
+        for _ in 0..240u16 {
+            let _ = self.spi.blocking_write(&row_buf);
+        }
+
+        self.cs_deassert();
+    }
+
     /// Run the full ST7789 hardware-reset + init sequence.
     ///
     /// Sequence:
@@ -254,11 +339,12 @@ impl St7789StatusDisplay {
     /// 3. SLPOUT + 255 ms
     /// 4. COLMOD = 0x55 (16-bit RGB565)
     /// 5. MADCTL = 0x70 (landscape, MX+MV, BGR colour order for ST7789)
-    /// 6. CASET = 52..291  (column window for 240 px wide display)
-    /// 7. RASET = 40..174  (row window for 135 px tall display)
-    /// 8. INVON (colour inversion — required for correct colours on ST7789)
-    /// 9. NORON (normal display mode)
-    /// 10. DISPON (display on) + backlight enable
+    /// 6. Full controller RAM clear (320 × 240 black pixels — eliminates border garbage)
+    /// 7. CASET = 52..291  (column window for 240 px wide display)
+    /// 8. RASET = 40..174  (row window for 135 px tall display)
+    /// 9. INVON (colour inversion — required for correct colours on ST7789)
+    /// 10. NORON (normal display mode)
+    /// 11. DISPON (display on) + backlight enable
     fn st7789_init(&mut self) {
         defmt::info!("ST7789: hardware reset...");
 
@@ -287,6 +373,10 @@ impl St7789StatusDisplay {
         // This puts the display in landscape orientation (240 wide × 135 tall).
         defmt::info!("ST7789: MADCTL 0x70 (landscape)...");
         self.write_command_data(ST7789_MADCTL, &[0x70]);
+
+        // Clear full controller RAM (320 × 240) to remove border garbage pixels.
+        defmt::info!("ST7789: clearing full controller RAM (320x240)...");
+        self.clear_full_controller_ram();
 
         // Column address set: 52 to 291 (52 + 240 - 1)
         let col_start = LCD_COL_OFFSET;
@@ -415,6 +505,111 @@ impl LedController for St7789StatusDisplay {
     }
 }
 
+// ─── embedded-graphics DrawTarget implementation (ARM) ────────────────────────
+
+#[cfg(target_arch = "arm")]
+use embedded_graphics::{
+    draw_target::DrawTarget,
+    geometry::{OriginDimensions, Size},
+    pixelcolor::{Rgb565, raw::{RawData, RawU16}},
+    primitives::Rectangle,
+    Pixel,
+};
+
+#[cfg(target_arch = "arm")]
+impl OriginDimensions for St7789StatusDisplay {
+    fn size(&self) -> Size {
+        Size::new(LCD_WIDTH as u32, LCD_HEIGHT as u32)
+    }
+}
+
+#[cfg(target_arch = "arm")]
+impl DrawTarget for St7789StatusDisplay {
+    type Color = Rgb565;
+    type Error = core::convert::Infallible;
+
+    fn draw_iter<I>(&mut self, pixels: I) -> Result<(), Self::Error>
+    where
+        I: IntoIterator<Item = Pixel<Self::Color>>,
+    {
+        // SAFETY: FRAMEBUF is only accessed from core0 display code; no concurrent access.
+        let fb = unsafe { &mut *(&raw mut FRAMEBUF) };
+        for Pixel(coord, color) in pixels {
+            if coord.x < 0
+                || coord.y < 0
+                || coord.x >= LCD_WIDTH as i32
+                || coord.y >= LCD_HEIGHT as i32
+            {
+                continue;
+            }
+            let raw: u16 = RawU16::from(color).into_inner();
+            let idx = (coord.y as usize * LCD_WIDTH as usize + coord.x as usize) * 2;
+            fb[idx]     = (raw >> 8) as u8;
+            fb[idx + 1] = (raw & 0xFF) as u8;
+        }
+        Ok(())
+    }
+
+    fn fill_contiguous<I>(&mut self, area: &Rectangle, colors: I) -> Result<(), Self::Error>
+    where
+        I: IntoIterator<Item = Self::Color>,
+    {
+        use embedded_graphics::geometry::Point;
+        let disp = Rectangle::new(Point::zero(), Size::new(LCD_WIDTH as u32, LCD_HEIGHT as u32));
+        let area = area.intersection(&disp);
+        if area.size.width == 0 || area.size.height == 0 {
+            return Ok(());
+        }
+
+        // SAFETY: FRAMEBUF is only accessed from core0 display code; no concurrent access.
+        let fb = unsafe { &mut *(&raw mut FRAMEBUF) };
+        let x0 = area.top_left.x as usize;
+        let y0 = area.top_left.y as usize;
+        let w  = area.size.width as usize;
+
+        let mut col = 0usize;
+        let mut row = 0usize;
+        for color in colors {
+            if row >= area.size.height as usize { break; }
+            let raw: u16 = RawU16::from(color).into_inner();
+            let idx = ((y0 + row) * LCD_WIDTH as usize + (x0 + col)) * 2;
+            fb[idx]     = (raw >> 8) as u8;
+            fb[idx + 1] = (raw & 0xFF) as u8;
+            col += 1;
+            if col >= w { col = 0; row += 1; }
+        }
+        Ok(())
+    }
+
+    fn fill_solid(&mut self, area: &Rectangle, color: Self::Color) -> Result<(), Self::Error> {
+        use embedded_graphics::geometry::Point;
+        let disp = Rectangle::new(Point::zero(), Size::new(LCD_WIDTH as u32, LCD_HEIGHT as u32));
+        let area = area.intersection(&disp);
+        if area.size.width == 0 || area.size.height == 0 {
+            return Ok(());
+        }
+
+        let raw: u16 = RawU16::from(color).into_inner();
+        let hi = (raw >> 8) as u8;
+        let lo = (raw & 0xFF) as u8;
+
+        // SAFETY: FRAMEBUF is only accessed from core0 display code; no concurrent access.
+        let fb = unsafe { &mut *(&raw mut FRAMEBUF) };
+        let x0 = area.top_left.x as usize;
+        let y0 = area.top_left.y as usize;
+        let w  = area.size.width as usize;
+        let h  = area.size.height as usize;
+        for row in y0..(y0 + h) {
+            let base = (row * LCD_WIDTH as usize + x0) * 2;
+            for col in 0..w {
+                fb[base + col * 2]     = hi;
+                fb[base + col * 2 + 1] = lo;
+            }
+        }
+        Ok(())
+    }
+}
+
 // ─── Non-ARM stub ─────────────────────────────────────────────────────────────
 
 #[cfg(not(target_arch = "arm"))]
@@ -528,36 +723,4 @@ impl Board for Rp2350GeekBoard {
     fn spi1_cs_pins(&self) -> &[u8] {
         &SPI1_CS
     }
-}
-
-// ─── Summary of HSM state for the LCD status display ─────────────────────────
-
-/// Summary of HSM state rendered on the LCD status screen.
-#[derive(Debug, Clone, Copy)]
-pub struct DisplayState {
-    /// Number of stored key objects.
-    pub key_count: u8,
-    /// Whether a PIN session is active.
-    pub authenticated: bool,
-    /// RAID health indicator (`true` = both mirrors healthy).
-    pub storage_ok: bool,
-}
-
-// ─── Legacy free functions (kept for source compat with old stubs) ─────────────
-
-/// Initialise the ST7789 LCD controller over SPI.
-///
-/// On the RP2350-Geek, the LCD is initialised inside `Rp2350GeekBoard::new()`;
-/// this free function is retained for source compatibility with any code that
-/// calls `rp2350_geek::init_lcd()` directly.
-pub async fn init_lcd() {
-    defmt::info!("init_lcd(): ST7789 init is handled by Rp2350GeekBoard::new()");
-}
-
-/// Update the LCD status display.
-///
-/// Full colour-coded status screens are rendered by `LedController::set_status()`.
-/// This free function is retained for source compatibility.
-pub async fn update_status_display(_state: DisplayState) {
-    defmt::trace!("update_status_display(): use Board::led().set_status() instead");
 }

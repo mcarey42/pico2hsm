@@ -6,6 +6,27 @@ state of the firmware and test suite.
 
 ---
 
+## 0. Display — Key count not updating on screen
+
+**Current state:**
+`display_state.key_count` is initialised to 0 at boot and never updated.  The
+CCID loop in `run_geek_board` does not inspect `apdu_bytes[1]` (INS), so it
+cannot detect when a `GENERATE KEY PAIR` (INS=0x46) or `DELETE FILE`
+(INS=0xE4) completes.
+
+**What needs to happen:**
+- After `RESP_CHANNEL.receive()` returns, peek at the saved INS byte.
+- On INS=0x46 (GENERATE KEY) with SW=0x9000: increment `display_state.key_count`.
+- On INS=0xE4 (DELETE FILE) with SW=0x9000: decrement `display_state.key_count`
+  (saturating at 0).
+- Alternatively, expose a `Dispatcher::key_count() -> u8` accessor and call it
+  after any mutating command — this is more robust than tracking increments.
+- Also update `display_state.authenticated` on VERIFY (INS=0x20) success/failure.
+- Also update `display_state.last_op` with the correct `LastOperation` variant
+  (currently always left as `None` — the INS→LastOperation mapping is trivial).
+
+---
+
 ## 1. DKEK — Key backup/restore is fully stubbed
 
 **Current state:**

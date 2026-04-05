@@ -29,3 +29,5 @@ pub mod image_def;
 pub mod storage;
 #[cfg(target_arch = "arm")]
 pub mod transport;
+#[cfg(target_arch = "arm")]
+pub mod display;

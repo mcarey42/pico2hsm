@@ -124,6 +124,10 @@ panic-probe = { version = "0.3", features = ["print-defmt"] }
 # Noise Protocol Framework (DKEK exchange — not yet used on x86_64 tests)
 snow = { version = "0.10", default-features = false }
 
+# Display rendering — embedded-graphics provides DrawTarget trait + text rendering
+# mono_font feature enables MonoTextStyle + built-in ASCII font data (FONT_6X10, FONT_8X13)
+embedded-graphics = { version = "0.8" }
+
 [dev-dependencies]
 hex = { version = "0.4" }
 heapless = { version = "0.9" }

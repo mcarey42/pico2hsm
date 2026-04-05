@@ -597,21 +597,46 @@ async fn run_geek_board(p: embassy_rp::Peripherals) {
     });
 
     let usb_fut = usb.run();
+
+    use pico2hsm_firmware::display::{DisplayState, LastOperation, ScreenLayout, ScreensaverState, SCREENSAVER_TIMEOUT_SECS, LAST_OP_DISPLAY_SECS};
+    let layout = ScreenLayout::geek_240x135();
+
+    let mut display_state = DisplayState::new();
+    display_state.status = LedStatus::Ready;
+    let mut uptime_secs: u32 = 0_u32;
+    let mut last_activity_secs: u32 = 0_u32;
+    let mut screensaver = ScreensaverState::Active;
+
     let ccid_fut = async {
-        let mut apdu_count: u32 = 0;
         loop {
             serial_ln!("waiting for USB connect...");
             ccid.wait_connected().await;
             serial_ln!("USB connected");
+            display_state.status = LedStatus::Ready;
+            pico2hsm_firmware::display::render(board.led(), &display_state, &layout);
+            board.led().flush();
 
             loop {
-                match ccid.recv_apdu().await {
-                    Ok(apdu_bytes) => {
-                        apdu_count += 1;
-                        board.led().set_status(LedStatus::Busy);
+                use embassy_futures::select::{select, Either};
+
+                match select(ccid.recv_apdu(), embassy_time::Timer::after_secs(1)).await {
+                    // ── APDU received ─────────────────────────────────────────────
+                    Either::First(Ok(apdu_bytes)) => {
+                        // Wake screensaver if sleeping
+                        if screensaver == ScreensaverState::Sleeping {
+                            screensaver = ScreensaverState::Active;
+                            board.led().backlight_on();
+                        }
+                        last_activity_secs = uptime_secs;
+
+                        display_state.status = LedStatus::Busy;
+                        pico2hsm_firmware::display::render(board.led(), &display_state, &layout);
+                        board.led().flush();
+
                         let _ = APDU_CHANNEL.send(apdu_bytes).await;
+
+                        // Wait for core1 response (with time extensions every 1.5s)
                         let response = {
-                            use embassy_futures::select::{select, Either};
                             loop {
                                 match select(RESP_CHANNEL.receive(), embassy_time::Timer::after_millis(1500)).await {
                                     Either::First(r) => break r,
@@ -624,24 +649,66 @@ async fn run_geek_board(p: embassy_rp::Peripherals) {
                                 }
                             }
                         };
+
                         match ccid.send_response(&response).await {
-                            Ok(()) => {}
+                            Ok(()) => {
+                                display_state.status = LedStatus::Ready;
+                                // Expire stale last_op
+                                if let Some((_, op_time)) = display_state.last_op {
+                                    if uptime_secs.saturating_sub(op_time) >= LAST_OP_DISPLAY_SECS {
+                                        display_state.last_op = None;
+                                    }
+                                }
+                                pico2hsm_firmware::display::render(board.led(), &display_state, &layout);
+                                board.led().flush();
+                            }
                             Err(CcidError::UsbDisconnected) => {
                                 let _ = APDU_CHANNEL.send(heapless::Vec::new()).await;
                                 let _ = RESP_CHANNEL.receive().await;
+                                display_state.status = LedStatus::Ready;
                                 break;
                             }
                             Err(_) => {}
                         }
-                        board.led().set_status(LedStatus::Ready);
                     }
-                    Err(CcidError::UsbDisconnected) => {
+
+                    // ── APDU error (disconnect) ───────────────────────────────────
+                    Either::First(Err(CcidError::UsbDisconnected)) => {
                         let _ = APDU_CHANNEL.send(heapless::Vec::new()).await;
                         let _ = RESP_CHANNEL.receive().await;
-                        board.led().set_status(LedStatus::Ready);
+                        display_state.status = LedStatus::Ready;
                         break;
                     }
-                    Err(_) => {}
+
+                    Either::First(Err(_)) => {}
+
+                    // ── 1-second uptime tick ──────────────────────────────────────
+                    Either::Second(()) => {
+                        uptime_secs = uptime_secs.wrapping_add(1);
+                        display_state.uptime_secs = uptime_secs;
+
+                        let idle = uptime_secs.saturating_sub(last_activity_secs);
+                        match screensaver {
+                            ScreensaverState::Active => {
+                                if idle >= SCREENSAVER_TIMEOUT_SECS {
+                                    screensaver = ScreensaverState::Sleeping;
+                                    board.led().backlight_off();
+                                } else {
+                                    // Expire last_op label
+                                    if let Some((_, op_time)) = display_state.last_op {
+                                        if uptime_secs.saturating_sub(op_time) >= LAST_OP_DISPLAY_SECS {
+                                            display_state.last_op = None;
+                                        }
+                                    }
+                                    pico2hsm_firmware::display::render(board.led(), &display_state, &layout);
+                                    board.led().flush();
+                                }
+                            }
+                            ScreensaverState::Sleeping => {
+                                // Stay blank; don't render
+                            }
+                        }
+                    }
                 }
             }
         }
