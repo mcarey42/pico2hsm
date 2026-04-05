@@ -108,18 +108,24 @@ OTP_DATA_RAW permission bits or the ROM `otp_access` function with a lock flag.
 Currently non-fatal: provisioning proceeds but OTP rows are not read- or
 write-locked after programming.
 
-**5d. JTAG disable OTP row unverified (`security/otp.rs:222`)**
-`disable_jtag_permanent()` uses row `0x110` bit 0 as the JTAG disable fuse, but
-the comment notes this is the user-land flag and the hardware JTAG fuse may be at
-a different row in OTP page 0.  Cross-reference RP2350 TRM §5.1 "OTP Boot Flags"
-to confirm the correct row before this function is called in production
-provisioning.
+**5d. JTAG disable incomplete — CRIT0 row never written (`security/otp.rs:222`)** — PRE-PRODUCTION BLOCKER
+`disable_jtag_permanent()` only sets the pico2hsm user-land bookkeeping flag at
+OTP row `0x110` bit 0.  The actual hardware JTAG lockdown requires writing CRIT0
+(OTP row `0x18`); this is never done anywhere in the firmware.  Per
+`docs/SECURE_PROVISIONING_PLAN.md` §4, CRIT0 must be written by the factory
+provisioning tool only (not by runtime firmware), after all other OTP rows are
+confirmed correct.  Exact CRIT0 JTAG-disable bit position is ESTIMATED — confirm
+against RP2350 TRM §5.1 "OTP Boot Flags" before burning.
 
-**5e. SMK derivation missing device serial (`security/otp.rs:364`)**
-`derive_smk()` (Storage Master Key derivation) has a TODO to pass the device
-serial number from OTP as the HKDF `info` parameter.  Currently it likely uses an
-empty or default info string, making the SMK the same across all devices with the
-same key material.
+**5e. SMK reads wrong OTP rows — all devices share same key (`security/otp.rs:364`)** — PRE-PRODUCTION BLOCKER
+`derive_smk()` calls `read_root_secret()` which reads legacy rows `0x20–0x3F`.
+Those rows overlap with the boot signing public key hash range and are NOT the
+per-device key material.  The correct IKM source is `read_storage_key_material()`
+at rows `0x100–0x11F` (per-device random bytes written at factory).  Until fixed,
+all devices programmed with the same firmware derive the same SMK, making flash
+encryption trivially bypassed.  Fix: replace the `read_root_secret()` call in
+`derive_smk()` with `read_storage_key_material()` and add the device serial from
+OTP as the HKDF `info` parameter (original intent of the TODO comment).
 
 **5f. CSPRNG reseed wired (`crypto/rng.rs`)** — RESOLVED (core functionality)
 `reseed()` now reads a fresh 32-byte key and 12-byte nonce from the hardware TRNG
