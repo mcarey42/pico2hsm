@@ -12,7 +12,11 @@ This script:
 - Builds with `DEFMT_LOG=trace` (required for defmt log output to survive optimisation)
 - Uses the debug profile so `#[cfg(debug_assertions)]` sentinels are active
 - Includes `applet-piv` and `applet-openpgp` features (required for PIV/OpenPGP integration tests)
-- Flashes via `probe-rs run --chip RP235x`
+- **Signs the ELF with `picotool seal --hash --sign` if `ec_firmware_signing_key.pem` is present**
+  - Signed output → `dist/pico2hsm-<feat>-debug-signed.elf`
+  - OTP configuration → `dist/pico2hsm-<feat>-debug-otp.json`
+  - If no key is present, flashes unsigned (warns but continues)
+- Flashes via `probe-rs run --chip RP235x` (uses signed ELF if signing occurred)
 - Streams RTT output to the terminal until Ctrl+C
 
 The connected hardware is a **Raspberry Pi Pico 2 (pico2_4m feature)** with a Debugprobe (CMSIS-DAP) on the SWD port.

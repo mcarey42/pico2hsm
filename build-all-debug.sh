@@ -58,6 +58,7 @@ cd "$SCRIPT_DIR"
 
 ELF="target/thumbv8m.main-none-eabihf/debug/pico2hsm"
 CHIP="RP235x"
+KEY_FILE="ec_firmware_signing_key.pem"
 
 # ── Build (debug profile) ─────────────────────────────────────────────────────
 section "Debug build: $FEAT"
@@ -73,10 +74,43 @@ cargo build \
 ok "Build complete: $ELF"
 arm-none-eabi-size "$ELF" 2>/dev/null || true
 
+# ── Firmware signing ───────────────────────────────────────────────────────────
+# Sign the debug ELF if a signing key is present.
+# The RP2350 bootrom only enforces the signature when secure_boot_enable is
+# set in OTP. Signing debug builds is safe and ensures the same artifact
+# pipeline is exercised in both debug and production.
+FLASH_ELF="$ELF"
+if [[ -f "$KEY_FILE" ]]; then
+    if ! command -v picotool >/dev/null 2>&1; then
+        die "ec_firmware_signing_key.pem found but picotool is not installed — cannot sign"
+    fi
+    mkdir -p dist
+    SIGNED_ELF="dist/pico2hsm-${FEAT}-debug-signed.elf"
+    OTP_JSON="dist/pico2hsm-${FEAT}-debug-otp.json"
+    section "Signing debug build: $FEAT"
+    info "picotool seal --hash --sign $ELF → $SIGNED_ELF"
+    if picotool seal --hash --sign \
+            "$ELF" \
+            "$SIGNED_ELF" \
+            "$KEY_FILE" \
+            "$OTP_JSON" \
+            >/dev/null 2>&1; then
+        ok "Signed → $SIGNED_ELF"
+        ok "OTP config → $OTP_JSON"
+        FLASH_ELF="$SIGNED_ELF"
+    else
+        die "picotool seal failed — aborting"
+    fi
+else
+    warn "No signing key found (ec_firmware_signing_key.pem) — flashing unsigned debug build"
+    warn "Run ./generate_firmware_signing_keys.sh to create the key pair"
+fi
+
 # ── Flash + run ───────────────────────────────────────────────────────────────
 section "Flash + RTT monitor: $FEAT"
 info "Flashing with probe-rs run --chip $CHIP ..."
+[[ "$FLASH_ELF" != "$ELF" ]] && info "Using signed ELF: $FLASH_ELF"
 info "RTT output will appear below.  Press Ctrl+C to stop monitoring."
 echo ""
 
-probe-rs run --chip "$CHIP" "$ELF"
+probe-rs run --chip "$CHIP" "$FLASH_ELF"

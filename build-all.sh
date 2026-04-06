@@ -81,6 +81,20 @@ if [[ $SKIP_ARM -eq 0 ]]; then
     fi
 fi
 
+# ── Firmware signing key ─────────────────────────────────────────────────────
+KEY_FILE="ec_firmware_signing_key.pem"
+if [[ -f "$KEY_FILE" ]]; then
+    if ! command -v picotool >/dev/null 2>&1; then
+        die "ec_firmware_signing_key.pem found but picotool is not installed — cannot sign"
+    fi
+    ok "Signing key present — all firmware outputs will be signed (picotool seal --hash --sign)"
+    SIGN=1
+else
+    warn "No signing key found (ec_firmware_signing_key.pem) — outputs will NOT be signed"
+    warn "Run ./generate_firmware_signing_keys.sh to create the key pair"
+    SIGN=0
+fi
+
 # ── Board variant table ───────────────────────────────────────────────────────
 # (feature flag, human name, probe-rs chip id)
 declare -a VARIANTS=(
@@ -160,6 +174,26 @@ if [[ $SKIP_ARM -eq 0 ]]; then
             # Stash a per-variant copy of the ELF for UF2 conversion and flashing
             mkdir -p dist
             cp -f "$ELF" "dist/pico2hsm-${FEAT}.elf"
+
+            # Sign the firmware if a signing key is present.
+            # picotool seal --hash --sign embeds both a hash and an EC P-256
+            # signature. The OTP JSON records what must be burned into RP2350
+            # OTP for the bootrom to accept this firmware.
+            if [[ $SIGN -eq 1 ]]; then
+                SIGNED_ELF="dist/pico2hsm-${FEAT}-signed.elf"
+                OTP_JSON="dist/pico2hsm-${FEAT}-otp.json"
+                if picotool seal --hash --sign \
+                        "dist/pico2hsm-${FEAT}.elf" \
+                        "$SIGNED_ELF" \
+                        "$KEY_FILE" \
+                        "$OTP_JSON" \
+                        >/dev/null 2>&1; then
+                    ok "  Signed → $SIGNED_ELF"
+                    ok "  OTP config → $OTP_JSON"
+                else
+                    die "picotool seal failed for $NAME — aborting"
+                fi
+            fi
         else
             BUILD_STATUS[$FEAT]="OK (size unavailable)"
         fi
@@ -173,7 +207,12 @@ if [[ $SKIP_ARM -eq 0 ]]; then
         for variant in "${VARIANTS[@]}"; do
             FEAT=$(feature_of "$variant")
             NAME=$(name_of  "$variant")
-            ELF_COPY="dist/pico2hsm-${FEAT}.elf"
+            # Use signed ELF for UF2 if signing was performed; unsigned otherwise.
+            if [[ $SIGN -eq 1 && -f "dist/pico2hsm-${FEAT}-signed.elf" ]]; then
+                ELF_COPY="dist/pico2hsm-${FEAT}-signed.elf"
+            else
+                ELF_COPY="dist/pico2hsm-${FEAT}.elf"
+            fi
             UF2_OUT="dist/pico2hsm-${FEAT}.uf2"
 
             if [[ ! -f "$ELF_COPY" ]]; then
@@ -239,7 +278,13 @@ if [[ -n "$FLASH_TARGET" ]]; then
     [[ $VALID -eq 1 ]] || die "Unknown board variant '$FLASH_TARGET'." \
         "Valid: $(for v in "${VARIANTS[@]}"; do feature_of "$v"; done | tr '\n' ' ')"
 
-    ELF="target/thumbv8m.main-none-eabihf/release/pico2hsm"
+    # Use the signed ELF for flashing if signing was performed.
+    if [[ $SIGN -eq 1 && -f "dist/pico2hsm-${FLASH_TARGET}-signed.elf" ]]; then
+        ELF="dist/pico2hsm-${FLASH_TARGET}-signed.elf"
+        info "Using signed ELF: $ELF"
+    else
+        ELF="target/thumbv8m.main-none-eabihf/release/pico2hsm"
+    fi
     [[ -f "$ELF" ]] || die "ELF not found — run without --test-only first"
 
     info "Connecting to probe (chip: $CHIP)..."
@@ -258,7 +303,7 @@ if [[ -n "$FLASH_TARGET" ]]; then
     timeout 5 probe-rs run \
         --chip "$CHIP" \
         --no-location \
-        "$ELF" 2>&1 | tee "$RTT_LOG" || true   # timeout exit is expected
+        "$ELF" 2>&1 | tee "$RTT_LOG" || true   # timeout exit expected; $ELF is signed if key present
 
     section "RTT smoke-test results"
     PASS=1
