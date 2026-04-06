@@ -68,6 +68,9 @@ brew install arm-none-eabi-binutils
 | Feature | Effect |
 |---|---|
 | `rsa` | Enable RSA key operations (adds ~1 MB; requires 48 KB heap) |
+| `applet-piv` | Enable PIV applet (NIST SP 800-73-4); slots 9A/9C/9D/9E |
+| `applet-openpgp` | Enable OpenPGP Card 3.4 applet; NIST ECC (P-256/384/521) |
+| `applet-openpgp-curve25519` | Add Ed25519/X25519 to OpenPGP (implies `applet-openpgp`) |
 | `debug` | Enable RAM dump APDUs; disable secure-boot enforcement |
 
 ---

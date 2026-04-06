@@ -762,7 +762,113 @@ pkcs11-tool --login --pin 648219 --delete-object --type privkey --id 01
 
 ---
 
+## 13. PIV Applet (NIST SP 800-73-4)
+
+Requires `applet-piv` feature. Tests are in `tests/hw/test_piv_*.py`.
+
+### 13.1 PIV SELECT
+
+**Spec:** SELECT with PIV AID (`A0 00 00 03 08 00 00 10 00 01 00`) must return
+SW=9000 with valid FCI. Security state (PIN verified, mgmt key authenticated)
+must reset on each SELECT per NIST SP 800-73-4 §3.1.2.
+
+**Test:** `tests/hw/test_piv_00_select.py` — hardware-validated 2026-04-05.
+
+---
+
+### 13.2 PIV GET DATA
+
+**Spec:** GET DATA (INS=0xCB) for standard data objects (CHUID, CCC, X.509
+certificate slots) must return correct TLV-encoded responses.
+
+**Test:** `tests/hw/test_piv_01_getdata.py` — hardware-validated 2026-04-05.
+
+---
+
+### 13.3 PIV PIN Management
+
+**Spec:** VERIFY (INS=0x20), CHANGE REFERENCE DATA (INS=0x24), RESET RETRY
+COUNTER (INS=0x2C) must behave per NIST SP 800-73-4. PIN is flash-persistent
+(survives power cycle).
+
+**Test:** `tests/hw/test_piv_02_pin.py` — hardware-validated 2026-04-05.
+
+---
+
+### 13.4 PIV GENERAL AUTHENTICATE
+
+**Spec:** GENERAL AUTHENTICATE (INS=0x87) with key ref 9A and P-256 algorithm
+must produce a valid DER-encoded ECDSA signature. Calling without prior VERIFY
+must return SW=6982.
+
+**Test:** `tests/hw/test_piv_03_auth.py` — hardware-validated 2026-04-05.
+
+---
+
+### 13.5 PIV GENERATE KEY PAIR
+
+**Spec:** GENERATE KEY PAIR (INS=0x47) must return EC public key wrapped in
+`7C → 7F49 → 86` TLV per NIST SP 800-73-4 Part 2 Table 3.3-1. Keys are
+flash-persistent.
+
+**Test:** `tests/hw/test_piv_04_keygen.py` — hardware-validated 2026-04-05.
+
+---
+
+## 14. OpenPGP Applet (OpenPGP Card 3.4)
+
+Requires `applet-openpgp` feature. Tests are in `tests/hw/test_openpgp_*.py`.
+
+### 14.1 OpenPGP SELECT
+
+**Spec:** SELECT with OpenPGP AID must return correct DOs (6F, 6E, C4, C6).
+Security state must reset on each SELECT.
+
+**Test:** `tests/hw/test_openpgp_00_select.py` — hardware-validated 2026-04-05.
+
+---
+
+### 14.2 OpenPGP PIN Management
+
+**Spec:** VERIFY (PW1 modes 82/81 and PW3), CHANGE REFERENCE DATA — PW1 and
+PW3 are flash-persistent. PW1 retry counter is RAM-only (resets on power cycle)
+per OpenPGP Card 3.4 spec.
+
+**Test:** `tests/hw/test_openpgp_01_pin.py` — hardware-validated 2026-04-05.
+
+---
+
+### 14.3 OpenPGP Key Generation
+
+**Spec:** GENERATE KEY PAIR for SIG/DEC/AUTH slots must return `7F49 → 86`
+uncompressed EC point. Keys are flash-persistent.
+
+**Test:** `tests/hw/test_openpgp_02_keygen.py` — hardware-validated 2026-04-05.
+
+---
+
+### 14.4 OpenPGP PSO:CDS (Sign)
+
+**Spec:** PSO:CDS must return raw r‖s bytes (not DER) for ECDSA as per OpenPGP
+Card 3.4 spec. P-256 = 64 bytes, P-384 = 96 bytes.
+
+**Test:** `tests/hw/test_openpgp_03_sign.py` — hardware-validated 2026-04-05.
+
+---
+
+### 14.5 OpenPGP PSO:DECIPHER and INTERNAL AUTHENTICATE
+
+**Spec:** PSO:DECIPHER performs ECDH key agreement. INTERNAL AUTHENTICATE signs
+with the AUTH slot key.
+
+**Test:** `tests/hw/test_openpgp_04_decipher.py`, `test_openpgp_05_auth.py` —
+hardware-validated 2026-04-05.
+
+---
+
 ## Status Tracker
+
+### SC-HSM (hardware-validated 2026-04-05)
 
 | # | Test | Status |
 |---|------|--------|
@@ -770,47 +876,70 @@ pkcs11-tool --login --pin 648219 --delete-object --type privkey --id 01
 | 1.2 | ATR Verification | PASS |
 | 1.3 | CCID Bulk Transfer Framing | PASS |
 | 2.1 | SELECT SC-HSM AID | PASS |
-| 2.2 | Unknown AID Rejected | - |
+| 2.2 | Unknown AID Rejected | PASS |
 | 3.1 | First-Time INITIALIZE | PASS |
 | 3.2 | Re-INITIALIZE with Correct SO-PIN | PASS |
-| 3.3 | INITIALIZE Idempotency | - |
+| 3.3 | INITIALIZE Idempotency | PASS |
 | 4.1 | VERIFY User PIN (Correct) | PASS |
-| 4.2 | VERIFY User PIN (Wrong) | - |
-| 4.3 | PIN Lockout | - |
-| 4.4 | CHANGE PIN | - |
-| 4.5 | RESET RETRY | - |
-| 5.1 | Generate P-256 Key Pair | - |
-| 5.2 | Generate P-384 Key Pair | - |
-| 5.3 | Generate P-521 Key Pair | - |
-| 5.4 | Generate AES Key | - |
-| 5.5 | Key Persistence Across Reset | - |
-| 5.6 | Delete Key | - |
-| 5.7 | LIST KEYS | - |
-| 6.1 | ECDSA P-256 Sign/Verify | - |
-| 6.2 | ECDSA P-384 Sign/Verify | - |
-| 6.3 | ECDSA P-521 Sign/Verify | - |
-| 6.4 | ECDH Key Agreement | - |
-| 6.5 | AES-CBC Encrypt/Decrypt | - |
-| 6.6 | GET CHALLENGE (Random) | - |
-| 6.7 | BIP32/SLIP-0010 Derivation | - |
-| 7.1 | READ BINARY PKCS#15 Files | - |
+| 4.2 | VERIFY User PIN (Wrong) | PASS |
+| 4.3 | PIN Lockout | PASS |
+| 4.4 | CHANGE PIN | PASS |
+| 4.5 | RESET RETRY | PASS |
+| 5.1 | Generate P-256 Key Pair | PASS |
+| 5.2 | Generate P-384 Key Pair | PASS |
+| 5.3 | Generate P-521 Key Pair | PASS |
+| 5.4 | Generate AES Key | PASS |
+| 5.5 | Key Persistence Across Reset | PASS |
+| 5.6 | Delete Key | PASS |
+| 5.7 | LIST KEYS | PASS |
+| 6.1 | ECDSA P-256 Sign/Verify | PASS |
+| 6.2 | ECDSA P-384 Sign/Verify | PASS |
+| 6.3 | ECDSA P-521 Sign/Verify | PASS |
+| 6.4 | ECDH Key Agreement (ECDH1-DERIVE) | PASS |
+| 6.4a | ECDH1-COFACTOR-DERIVE | XFAIL (punchout item 9, not implemented) |
+| 6.5 | AES-CBC Encrypt/Decrypt | PASS |
+| 6.6 | GET CHALLENGE (Random) | PASS |
+| 6.7 | BIP32/SLIP-0010 Derivation | PASS |
+| 7.1 | READ BINARY PKCS#15 Files | PASS |
 | 7.2 | WRITE DATA / UPDATE BINARY | PASS |
-| 7.3 | DELETE FILE | - |
+| 7.3 | DELETE FILE | PASS |
 | 8.1 | DKEK Import via Noise_XX | - |
 | 8.2 | Key Export Under DKEK | - |
 | 8.3 | Key Import Under DKEK | - |
 | 9.1 | Storage Encryption at Rest | CODE REVIEW |
 | 9.2 | PIN Counter Decremented First | CODE REVIEW |
 | 9.3 | Constant-Time PIN Comparison | CODE REVIEW |
-| 9.4 | Secret Key Zeroization | CODE REVIEW |
-| 9.5 | Operations Require Authentication | - |
+| 9.4 | Secret Key Zeroization (PIN hash) | PASS |
+| 9.5 | Operations Require Authentication | PASS |
 | 9.6 | JTAG Disabled | HARDWARE ONLY |
 | 10.1 | WAL Recovery | - |
 | 10.2 | RAID-1 Redundancy | CODE REVIEW |
-| 11.1 | Crypto Unit Tests | - |
-| 11.2 | APDU Dispatcher Tests | - |
-| 11.3 | PIN Logic Tests | - |
-| 11.4 | Key Management Tests | - |
-| 11.5 | DKEK Tests | - |
+| 11.1 | Crypto Unit Tests | PASS |
+| 11.2 | APDU Dispatcher Tests | PASS |
+| 11.3 | PIN Logic Tests | PASS |
+| 11.4 | Key Management Tests | PASS |
+| 11.5 | DKEK Tests | PASS |
 | 12.1 | sc-hsm-tool Initialize E2E | PASS |
-| 12.2 | pkcs11-tool Key Lifecycle | - |
+| 12.2 | pkcs11-tool Key Lifecycle | PASS |
+
+### PIV applet (hardware-validated 2026-04-05)
+
+| # | Test | Status |
+|---|------|--------|
+| 13.1 | SELECT PIV AID / FCI / security state reset | PASS |
+| 13.2 | GET DATA (CHUID, CCC, certs) | PASS |
+| 13.3 | VERIFY / CHANGE REF DATA / RESET RETRY (flash-persistent) | PASS |
+| 13.4 | GENERAL AUTHENTICATE P-256 sign + DER verify | PASS |
+| 13.4a | GENERAL AUTHENTICATE without PIN → SW=6982 | PASS |
+| 13.5 | GENERATE KEY PAIR P-256/P-384 (7C→7F49→86 format) | PASS |
+
+### OpenPGP applet (hardware-validated 2026-04-05)
+
+| # | Test | Status |
+|---|------|--------|
+| 14.1 | SELECT OpenPGP AID / DOs (6F/6E/C4/C6) | PASS |
+| 14.2 | VERIFY PW1/PW3 / CHANGE REF DATA (flash-persistent) | PASS |
+| 14.3 | GENERATE KEY PAIR SIG/DEC/AUTH slots (flash-persistent) | PASS |
+| 14.4 | PSO:CDS raw r‖s signature verify | PASS |
+| 14.5 | PSO:DECIPHER ECDH key agreement | PASS |
+| 14.6 | INTERNAL AUTHENTICATE | PASS |

@@ -4,10 +4,21 @@ A production-grade, open-source Hardware Security Module (HSM) firmware written 
 
 ## Overview
 
-pico2hsm implements the SmartCard-HSM 2 (SC-HSM) APDU command set over USB CCID, with PKCS#15 file structures. It is compatible with OpenSC, pkcs11-tool, and any PKCS#11-aware application that supports smart cards.
+pico2hsm implements multiple smartcard applet protocols over USB CCID, with PKCS#15 file structures. It is compatible with OpenSC, pkcs11-tool, GnuPG, and any PKCS#11-aware application that supports smart cards.
+
+### Supported Applets
+
+| Applet | Feature Flag | Standard | Status |
+|--------|-------------|----------|--------|
+| SmartCard-HSM 2 (SC-HSM) | *(always on)* | OpenSC sc-hsm driver | Hardware-validated |
+| PIV | `applet-piv` | NIST SP 800-73-4 | Hardware-validated |
+| OpenPGP Card 3.4 | `applet-openpgp` | OpenPGP Card 3.4 | Hardware-validated |
+| OpenPGP + Ed25519/X25519 | `applet-openpgp-curve25519` | OpenPGP Card 3.4 | Implemented |
+
+All applets share one flash keystore with per-applet key namespace isolation. Applets are selected at compile time via feature flags and at runtime via `SELECT AID`. Multiple applets can be active in the same firmware build.
 
 The firmware provides hardware-backed key storage with:
-- On-chip TRNG for key generation
+- On-chip TRNG for key generation (ChaCha20 keystream seeded from hardware TRNG)
 - Device-tied AES-256-GCM storage encryption (key derived from OTP fuses)
 - RAID-1 mirrored key storage across multiple SPI flash chips
 - Write-ahead logging for power-failure safety
@@ -76,6 +87,9 @@ cargo test -p pico2hsm-integration-tests
 
 ### Optional capabilities
 - `rsa` — Enable RSA-2048/4096 support (adds ~1MB to binary)
+- `applet-piv` — PIV applet (NIST SP 800-73-4); slots 9A/9C/9D/9E
+- `applet-openpgp` — OpenPGP Card 3.4 applet; NIST ECC (P-256/384/521)
+- `applet-openpgp-curve25519` — Add Ed25519/X25519 to OpenPGP (implies `applet-openpgp`)
 - `debug` — Debug mode: enable memory dump APDUs, relax secure boot enforcement (NEVER use in production)
 
 ## Project Structure
@@ -90,24 +104,25 @@ pico2hsm/
 │       ├── apdu.rs             # APDU types and status words
 │       ├── error.rs            # Error enums
 │       ├── flash.rs            # FlashChip trait
-│       ├── key.rs              # Key object types
+│       ├── key.rs              # Key object types (KeyId, AppletId)
 │       ├── protocol.rs         # HsmProtocol trait
 │       └── storage.rs          # Storage layout constants
 ├── firmware/                   # RP2350 no_std firmware
 │   └── src/
 │       ├── board/              # Board-specific GPIO/LED/LCD
 │       ├── transport/          # USB CCID + T=1 protocol
-│       ├── apdu/               # APDU dispatcher
+│       ├── apdu/               # APDU dispatcher (multi-applet routing)
 │       ├── protocol/
-│       │   ├── sc_hsm/         # SC-HSM command implementations
-│       │   ├── piv/            # PIV stub
-│       │   └── openpgp/        # OpenPGP stub
+│       │   ├── sc_hsm/         # SC-HSM command implementations (always on)
+│       │   ├── piv/            # PIV applet (applet-piv feature)
+│       │   └── openpgp/        # OpenPGP Card 3.4 (applet-openpgp feature)
 │       ├── crypto/             # ECDSA, ECDH, AES, KDFs, RNG
 │       ├── storage/            # RAID, WAL, filesystem, integrity
 │       ├── security/           # OTP, secure boot, PIN management
 │       └── dkek/               # DKEK exchange via Noise_XX
 ├── tools/hsm-tool/             # Host-side CLI tool (std)
-└── tests/integration/          # Integration tests (std)
+├── tests/hw/                   # Hardware integration tests (Python/pytest)
+└── tests/integration/          # Unit/integration tests (std)
 ```
 
 ## Security Model

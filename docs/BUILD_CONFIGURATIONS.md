@@ -184,6 +184,12 @@ dominate; applet state structs are small by comparison. Current worst-case
 large code. It is only recommended for boards with 16 MB flash
 (`rp2350_one_16m`, `rp2350_geek_16m`, `rp2350_geek_sdcard`, etc.).
 
+**RSA debug build speed**: Without optimization, RSA-4096 keygen takes >30
+minutes on Cortex-M33 in debug builds. The workspace `Cargo.toml` adds
+`opt-level = 3` overrides for `num-bigint-dig` and `rsa` packages under
+`[profile.dev.package.*]`, cutting keygen to ~2 minutes. This is already
+present in the repo and applies automatically to all debug builds.
+
 ---
 
 ## Debug builds (hardware flash + RTT streaming)
@@ -234,14 +240,21 @@ pkill -9 -f "probe-rs"
 
 ### Debug + applets
 
-The `build-all-debug.sh` script accepts a second argument for extra features:
+`build-all-debug.sh` always includes `applet-piv` and `applet-openpgp` in every
+build. This is required for the integration test suite (`run_tests.sh`) to pass —
+PIV and OpenPGP tests will receive SW=6D00 if those applets are not compiled in.
 
 ```sh
-# SC-HSM + PIV debug build on Pico 2
-./build-all-debug.sh pico2_4m applet-piv
+# Pico 2 — always builds SC-HSM + RSA + PIV + OpenPGP
+./build-all-debug.sh pico2_4m
+```
 
-# All applets debug build on Waveshare LCD
-./build-all-debug.sh waveshare_rp2350_lcd_16m "applet-piv,applet-openpgp,applet-openpgp-curve25519"
+To add `applet-openpgp-curve25519` (Ed25519/X25519), edit the `FEAT` line in
+`build-all-debug.sh` to include that feature, or build manually:
+
+```sh
+cargo build --no-default-features \
+  --features pico2_4m,rsa,applet-piv,applet-openpgp,applet-openpgp-curve25519
 ```
 
 ---

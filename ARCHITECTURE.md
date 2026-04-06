@@ -272,7 +272,16 @@ bits  7–0:  proto_ref     (u8)  — protocol-level key reference
 
 Flash magic `"P2K2"` was bumped from the older single-byte scheme; on-flash data from a pre-u32 build is rejected and surfaced as incompatible (re-INITIALIZE required).
 
-Per-applet PIN slots are not yet implemented.
+Per-applet PIN slots are fully implemented. Each applet stores its PIN(s) as
+sentinel `KeyObject` entries in the shared flash keystore under their own
+`AppletId` namespace:
+
+| Applet | PIN storage |
+|--------|-------------|
+| SC-HSM | `KeyId::sc_hsm(0, 0xFF)` — 101-byte sentinel |
+| PIV    | `KeyId::piv(0xFF)` — 101-byte sentinel (same format) |
+| OpenPGP | `KeyId::openpgp(0xFE)` — PW1 (35-byte sentinel) |
+|         | `KeyId::openpgp(0xFF)` — PW3 (35-byte sentinel) |
 
 ---
 
@@ -290,13 +299,36 @@ pub trait HsmProtocol {
 
 The APDU dispatcher (`firmware/src/apdu/dispatcher.rs`) holds an array of registered protocol implementations. On `SELECT AID` (INS=0xA4, P1=0x04), it iterates the array and activates the first implementation that returns `true` from `handles_aid()`.
 
+**Security state is reset on every SELECT AID.** The dispatcher unconditionally
+clears the active protocol's session state (e.g. `pin_verified`,
+`mgmt_key_authenticated`) whenever a client re-selects an applet, as required
+by NIST SP 800-73-4 §3.1.2 and the OpenPGP Card 3.4 specification.
+
 ### Currently registered protocols
 
-1. **SC-HSM** (primary) — SmartCard-HSM 2 command set. Fully implemented.
-2. **PIV** (stub) — NIST SP 800-73-4. AID registered; no commands implemented.
-3. **OpenPGP** (stub) — OpenPGP Card 3.4. AID registered; no commands implemented.
+1. **SC-HSM** (primary) — SmartCard-HSM 2 command set. Fully implemented and hardware-validated.
+2. **PIV** — NIST SP 800-73-4. Fully implemented (`applet-piv` feature). Hardware-validated 2026-04-05.
+3. **OpenPGP** — OpenPGP Card 3.4. Fully implemented (`applet-openpgp` feature). Hardware-validated 2026-04-05.
+4. **OpenPGP + Ed25519/X25519** — (`applet-openpgp-curve25519` feature). Implemented; awaiting hardware validation.
 
 Adding a new protocol requires only: implementing `HsmProtocol`, registering it in the dispatcher array, and defining the AID.
+
+### PIV implementation details (NIST SP 800-73-4)
+
+- Supported commands: SELECT, GET DATA, VERIFY, CHANGE REFERENCE DATA, RESET RETRY COUNTER, GENERAL AUTHENTICATE, GENERATE KEY PAIR
+- Slots: 9A (Authentication), 9C (Digital Signature), 9D (Key Management), 9E (Card Authentication)
+- Algorithms: P-256, P-384 ECDSA; 3DES management key authentication
+- GENERATE KEY PAIR response wraps EC point in `7C → 7F49 → 86` TLV per Table 3.3-1
+- Keys and PIN are flash-persistent via the shared keystore (`AppletId::Piv`)
+
+### OpenPGP implementation details (OpenPGP Card 3.4)
+
+- Supported commands: SELECT, GET DATA, VERIFY, CHANGE REFERENCE DATA, PSO:CDS, PSO:DECIPHER, INTERNAL AUTHENTICATE, GENERATE KEY PAIR, GET CHALLENGE
+- Slots: SIG, DEC, AUTH
+- Algorithms: P-256, P-384, P-521 ECDSA/ECDH; Ed25519/X25519 via `applet-openpgp-curve25519`
+- PSO:CDS returns raw r‖s (not DER) for ECDSA as per OpenPGP Card spec
+- PW1 (sign mode 82) and PW3 (admin) are independently flash-persistent
+- PW1 retry counter is RAM-only per the spec; it resets on power cycle
 
 ---
 
