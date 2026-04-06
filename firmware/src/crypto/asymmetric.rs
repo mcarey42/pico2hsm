@@ -186,8 +186,114 @@ pub fn generate_ec_keypair(
             // See module-level doc comment for tracking details.
             Err(CryptoError::UnsupportedAlgorithm)
         }
+        #[cfg(feature = "applet-openpgp-curve25519")]
+        KeyType::Ed25519 => {
+            use ed25519_dalek::SigningKey;
+            let mut seed = [0u8; 32];
+            rng.fill_bytes(&mut seed);
+            let signing_key = SigningKey::from_bytes(&seed);
+            let verifying_key = signing_key.verifying_key();
+            let private_bytes = signing_key.to_bytes();
+            let public_bytes = verifying_key.to_bytes(); // 32 bytes (compressed)
+
+            let mut pair = EcKeyPair {
+                key_type,
+                private_key: Vec::new(),
+                public_key: Vec::new(),
+            };
+            pair.private_key
+                .extend_from_slice(&private_bytes)
+                .map_err(|_| CryptoError::BufferTooSmall)?;
+            pair.public_key
+                .extend_from_slice(&public_bytes)
+                .map_err(|_| CryptoError::BufferTooSmall)?;
+            Ok(pair)
+        }
+        #[cfg(feature = "applet-openpgp-curve25519")]
+        KeyType::X25519 => {
+            use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
+            let mut seed = [0u8; 32];
+            rng.fill_bytes(&mut seed);
+            let secret = StaticSecret::from(seed);
+            let public = X25519PublicKey::from(&secret);
+            let private_bytes = secret.to_bytes();
+            let public_bytes = public.to_bytes(); // 32 bytes
+
+            let mut pair = EcKeyPair {
+                key_type,
+                private_key: Vec::new(),
+                public_key: Vec::new(),
+            };
+            pair.private_key
+                .extend_from_slice(&private_bytes)
+                .map_err(|_| CryptoError::BufferTooSmall)?;
+            pair.public_key
+                .extend_from_slice(&public_bytes)
+                .map_err(|_| CryptoError::BufferTooSmall)?;
+            Ok(pair)
+        }
         _ => Err(CryptoError::UnsupportedAlgorithm),
     }
+}
+
+/// Sign a message with an Ed25519 private key (OpenPGP EdDSA path).
+///
+/// `private_key` must be a 32-byte Ed25519 seed.
+/// `message` is the pre-hashed digest (OpenPGP sends the hash to the card).
+///
+/// Returns a 64-byte raw signature (`r || s`, each 32 bytes).
+#[cfg(feature = "applet-openpgp-curve25519")]
+pub fn ed25519_sign(
+    private_key: &[u8],
+    message: &[u8],
+) -> Result<heapless::Vec<u8, 64>, CryptoError> {
+    use ed25519_dalek::{Signature, Signer, SigningKey};
+
+    if private_key.len() != 32 {
+        return Err(CryptoError::WrongKeyLength);
+    }
+    let mut key_bytes = [0u8; 32];
+    key_bytes.copy_from_slice(private_key);
+    let signing_key = SigningKey::from_bytes(&key_bytes);
+
+    // Ed25519 signs the raw message (not a prehash for EdDSA).
+    // OpenPGP sends the digest for EdDSA sign (RFC 4880bis).
+    let sig: Signature = signing_key.sign(message);
+    let sig_bytes = sig.to_bytes(); // 64 bytes (R || S = 32 || 32)
+
+    let mut out: heapless::Vec<u8, 64> = heapless::Vec::new();
+    out.extend_from_slice(&sig_bytes)
+        .map_err(|_| CryptoError::BufferTooSmall)?;
+    Ok(out)
+}
+
+/// Perform X25519 Diffie-Hellman key agreement.
+///
+/// `private_key` must be a 32-byte X25519 static secret.
+/// `peer_public_key` must be a 32-byte X25519 public key.
+///
+/// Returns the 32-byte shared secret.
+#[cfg(feature = "applet-openpgp-curve25519")]
+pub fn x25519_ecdh(
+    private_key: &[u8],
+    peer_public_key: &[u8],
+) -> Result<[u8; 32], CryptoError> {
+    use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
+
+    if private_key.len() != 32 || peer_public_key.len() != 32 {
+        return Err(CryptoError::WrongKeyLength);
+    }
+
+    let mut priv_bytes = [0u8; 32];
+    priv_bytes.copy_from_slice(private_key);
+    let secret = StaticSecret::from(priv_bytes);
+
+    let mut pub_bytes = [0u8; 32];
+    pub_bytes.copy_from_slice(peer_public_key);
+    let peer_pub = X25519PublicKey::from(pub_bytes);
+
+    let shared = secret.diffie_hellman(&peer_pub);
+    Ok(*shared.as_bytes())
 }
 
 /// Generate an RSA key pair.

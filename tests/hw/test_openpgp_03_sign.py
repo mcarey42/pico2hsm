@@ -12,8 +12,6 @@ Authentication requirement: PW1 verified in mode 0x81 (signing mode) before
 each PSO:CDS invocation.  The sign-once flag means PW1 must be re-presented
 before each signature unless the card is set to "multiple signatures" mode.
 
-All tests are marked xfail because the OpenPGP applet is not yet implemented.
-Remove the xfail mark as each feature is completed.
 """
 
 from __future__ import annotations
@@ -31,6 +29,10 @@ from cryptography.hazmat.primitives.asymmetric.ec import (
     EllipticCurvePublicKey,
     EllipticCurvePublicNumbers,
     SECP256R1,
+)
+from cryptography.hazmat.primitives.asymmetric.utils import (
+    Prehashed,
+    encode_dss_signature,
 )
 
 from helpers import trace, sw_from_output, last_response_hex
@@ -56,7 +58,6 @@ _READ_PUB_SIG  = "0047810002B600".replace(" ", "")
 _TEST_MESSAGE  = b"pico2hsm OpenPGP PSO:CDS hardware test message"
 _TEST_HASH     = hashlib.sha256(_TEST_MESSAGE).digest()  # 32 bytes
 
-_XFAIL = pytest.mark.xfail(reason="OpenPGP not yet implemented", strict=False)
 
 
 # ---------------------------------------------------------------------------
@@ -99,18 +100,29 @@ def _build_pso_cds_apdu(hash_bytes: bytes) -> str:
 
 
 def _extract_signature_from_pso_cds_response(resp_hex: str) -> bytes | None:
-    """Extract the DER ECDSA signature from a PSO:CDS response.
+    """Extract and return a DER-encoded ECDSA signature from a PSO:CDS response.
 
-    OpenPGP PSO:CDS for EC keys returns a DER SEQUENCE { INTEGER r, INTEGER s }
-    directly (no enclosing TLV wrapper beyond the response buffer).
-    The response starts with 0x30 (ASN.1 SEQUENCE).
+    OpenPGP PSO:CDS for EC keys returns raw r||s (not DER).
+    For P-256, this is exactly 64 bytes (32 bytes r, 32 bytes s).
+    This function converts raw r||s to DER for use with the cryptography library.
+    If the response already starts with 0x30 (DER), it is returned as-is.
     """
     data = bytes.fromhex(resp_hex.replace(" ", ""))
     if not data:
         return None
-    # DER SEQUENCE starts with 0x30
+    # Already DER-encoded
     if data[0] == 0x30:
         return data
+    # Raw r||s for P-256: exactly 64 bytes
+    if len(data) == 64:
+        r = int.from_bytes(data[:32], "big")
+        s = int.from_bytes(data[32:64], "big")
+        return encode_dss_signature(r, s)
+    # Raw r||s for P-384: exactly 96 bytes
+    if len(data) == 96:
+        r = int.from_bytes(data[:48], "big")
+        s = int.from_bytes(data[48:96], "big")
+        return encode_dss_signature(r, s)
     return None
 
 
@@ -141,7 +153,7 @@ def _get_or_generate_sig_pubkey(runner: CLIRunner) -> EllipticCurvePublicKey | N
     result_read = _send_apdus(runner, _SELECT_OPENPGP, _READ_PUB_SIG, timeout=30)
     read_sw = _sw_from_output(result_read.stdout + result_read.stderr)
     if read_sw == "9000":
-        resp_hex = result_read.stdout.replace(" ", "").replace("\n", "").strip()
+        resp_hex = last_response_hex(result_read.stdout)
         ec_point = _extract_ec_point_from_7f49(resp_hex)
         if ec_point and len(ec_point) == 65 and ec_point[0] == 0x04:
             x = int.from_bytes(ec_point[1:33], "big")
@@ -160,7 +172,7 @@ def _get_or_generate_sig_pubkey(runner: CLIRunner) -> EllipticCurvePublicKey | N
     if gen_sw != "9000":
         return None
 
-    gen_resp = result_gen.stdout.replace(" ", "").replace("\n", "").strip()
+    gen_resp = last_response_hex(result_gen.stdout)
     ec_point = _extract_ec_point_from_7f49(gen_resp)
     if not ec_point or len(ec_point) != 65 or ec_point[0] != 0x04:
         return None
@@ -178,7 +190,6 @@ def _get_or_generate_sig_pubkey(runner: CLIRunner) -> EllipticCurvePublicKey | N
 # Tests
 # ---------------------------------------------------------------------------
 
-@_XFAIL
 def test_openpgp_pso_cds_returns_signature(runner: CLIRunner, run_dir: Path) -> None:
     """PSO:CDS after VERIFY PW1(81) must return SW=9000 and a non-empty DER signature."""
     pub_key = _get_or_generate_sig_pubkey(runner)
@@ -228,7 +239,6 @@ def test_openpgp_pso_cds_returns_signature(runner: CLIRunner, run_dir: Path) -> 
     log.info("Signature extracted: %d bytes", len(sig))
 
 
-@_XFAIL
 def test_openpgp_pso_cds_signature_verifies(runner: CLIRunner, run_dir: Path) -> None:
     """The ECDSA signature from PSO:CDS must verify against the device SIG public key."""
     pub_key = _get_or_generate_sig_pubkey(runner)
@@ -262,7 +272,7 @@ def test_openpgp_pso_cds_signature_verifies(runner: CLIRunner, run_dir: Path) ->
         pub_key.verify(
             sig,
             _TEST_HASH,
-            ec.ECDSA(hashes.Prehashed(hashes.SHA256())),
+            ec.ECDSA(Prehashed(hashes.SHA256())),
         )
         log.info("Signature verified OK.")
     except InvalidSignature:
@@ -273,7 +283,6 @@ def test_openpgp_pso_cds_signature_verifies(runner: CLIRunner, run_dir: Path) ->
         )
 
 
-@_XFAIL
 def test_openpgp_pso_cds_requires_pw1_verify(runner: CLIRunner) -> None:
     """PSO:CDS without prior VERIFY PW1(81) must fail with SW=6982 or 6984.
 
@@ -298,7 +307,6 @@ def test_openpgp_pso_cds_requires_pw1_verify(runner: CLIRunner) -> None:
     log.info("Correctly rejected PSO:CDS without PW1 (SW=%s)", sw)
 
 
-@_XFAIL
 def test_openpgp_pso_cds_two_signatures_both_valid(runner: CLIRunner) -> None:
     """Two consecutive PSO:CDS calls (each with fresh VERIFY PW1) must both produce valid signatures.
 
@@ -336,7 +344,7 @@ def test_openpgp_pso_cds_two_signatures_both_valid(runner: CLIRunner) -> None:
             pub_key.verify(
                 sig,
                 _TEST_HASH,
-                ec.ECDSA(hashes.Prehashed(hashes.SHA256())),
+                ec.ECDSA(Prehashed(hashes.SHA256())),
             )
         except InvalidSignature:
             pytest.fail(
@@ -349,7 +357,6 @@ def test_openpgp_pso_cds_two_signatures_both_valid(runner: CLIRunner) -> None:
     )
 
 
-@_XFAIL
 def test_openpgp_pso_cds_verify_with_openssl(
     runner: CLIRunner, run_dir: Path,
 ) -> None:

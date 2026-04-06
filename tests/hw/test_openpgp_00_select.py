@@ -8,8 +8,6 @@ Verifies:
 - `gpg --no-tty --card-status` can parse the card without error (returncode 0)
   and stdout contains the string "OpenPGP" confirming GnuPG found the applet.
 
-All tests are marked xfail because the OpenPGP applet is not yet implemented.
-Remove the xfail mark as each feature is completed.
 """
 
 from __future__ import annotations
@@ -36,7 +34,6 @@ _SELECT_OPENPGP_CLEAN = "00A40400 06" + OPENPGP_AID_PREFIX + "00"
 # Command: 00 CA 00 6E 00
 _GET_DATA_006E = "00CA006E00"
 
-_XFAIL = pytest.mark.xfail(reason="OpenPGP not yet implemented", strict=False)
 
 
 # ---------------------------------------------------------------------------
@@ -113,7 +110,6 @@ def _parse_fci_6f(resp_hex: str) -> dict:
 # Tests
 # ---------------------------------------------------------------------------
 
-@_XFAIL
 def test_openpgp_select_succeeds(runner: CLIRunner, run_dir: Path) -> None:
     """SELECT OpenPGP AID must return SW=9000."""
     result = _send_apdus(
@@ -146,7 +142,6 @@ def test_openpgp_select_succeeds(runner: CLIRunner, run_dir: Path) -> None:
     )
 
 
-@_XFAIL
 def test_openpgp_select_returns_fci_6f(runner: CLIRunner) -> None:
     """SELECT OpenPGP FCI must be well-formed (outer tag 0x6F)."""
     result = _send_apdus(runner, _SELECT_OPENPGP_CLEAN.replace(" ", ""), timeout=30)
@@ -164,7 +159,6 @@ def test_openpgp_select_returns_fci_6f(runner: CLIRunner) -> None:
     )
 
 
-@_XFAIL
 def test_openpgp_select_fci_contains_aid(runner: CLIRunner) -> None:
     """FCI tag 84 (Application AID) must start with the OpenPGP AID prefix."""
     result = _send_apdus(runner, _SELECT_OPENPGP_CLEAN.replace(" ", ""), timeout=30)
@@ -173,7 +167,7 @@ def test_openpgp_select_fci_contains_aid(runner: CLIRunner) -> None:
     if sw != "9000":
         pytest.skip(f"SELECT returned SW={sw!r}.")
 
-    resp_hex = result.stdout.replace(" ", "").replace("\n", "").strip()
+    resp_hex = last_response_hex(result.stdout)
     fci = _parse_fci_6f(resp_hex)
     returned_aid = fci.get("aid", "")
     log.info("FCI AID (tag 84): %s", returned_aid)
@@ -187,7 +181,6 @@ def test_openpgp_select_fci_contains_aid(runner: CLIRunner) -> None:
     )
 
 
-@_XFAIL
 def test_openpgp_get_data_006e_returns_data(runner: CLIRunner, run_dir: Path) -> None:
     """GET DATA for DO 006E (Application Related Data) must return a non-empty response.
 
@@ -237,7 +230,6 @@ def test_openpgp_get_data_006e_returns_data(runner: CLIRunner, run_dir: Path) ->
     )
 
 
-@_XFAIL
 def test_openpgp_gpg_card_status(runner: CLIRunner, run_dir: Path) -> None:
     """gpg --no-tty --card-status must exit 0 and mention 'OpenPGP' in output.
 
@@ -275,6 +267,10 @@ def test_openpgp_gpg_card_status(runner: CLIRunner, run_dir: Path) -> None:
         f"returncode: {proc.returncode}\n\nSTDOUT:\n{stdout}\n\nSTDERR:\n{stderr}",
         encoding="utf-8",
     )
+
+    # Skip if scdaemon is not available or not running
+    if proc.returncode != 0 and "scdaemon" in (stdout + stderr).lower():
+        pytest.skip(f"scdaemon not available: {(stdout + stderr).strip()}")
 
     assert proc.returncode == 0, (
         f"gpg --card-status exited with rc={proc.returncode}.\n"

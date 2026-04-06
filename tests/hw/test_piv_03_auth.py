@@ -20,8 +20,6 @@ PIV GENERAL AUTHENTICATE sign flow:
            82 [len] <DER sig>  -- Signature
 
 All tests depend on slot 9A having a P-256 key; they skip if no key is present.
-All tests are marked xfail because the PIV applet is not yet implemented.
-Remove the xfail mark as each feature is completed.
 """
 
 from __future__ import annotations
@@ -39,7 +37,7 @@ from cryptography.hazmat.primitives.asymmetric.ec import (
     EllipticCurvePublicNumbers,
     SECP256R1,
 )
-from cryptography.hazmat.primitives.asymmetric.utils import decode_dss_signature
+from cryptography.hazmat.primitives.asymmetric.utils import decode_dss_signature, Prehashed
 
 from helpers import trace, sw_from_output, last_response_hex
 from helpers.cli import CLIRunner
@@ -61,7 +59,6 @@ _GENKEY_9A_P256 = "0047009A05AC0380011100"
 _TEST_MESSAGE = b"pico2hsm PIV GENERAL AUTHENTICATE test message"
 _TEST_HASH = hashlib.sha256(_TEST_MESSAGE).digest()  # 32 bytes
 
-_XFAIL = pytest.mark.xfail(reason="PIV not yet implemented", strict=False)
 
 
 # ---------------------------------------------------------------------------
@@ -194,7 +191,6 @@ def _get_or_generate_p256_pubkey(runner: CLIRunner) -> ec.EllipticCurvePublicKey
 # Tests
 # ---------------------------------------------------------------------------
 
-@_XFAIL
 def test_piv_general_authenticate_sign_returns_data(
     runner: CLIRunner, run_dir: Path,
 ) -> None:
@@ -245,7 +241,6 @@ def test_piv_general_authenticate_sign_returns_data(
     log.info("Signature extracted: %d bytes", len(sig))
 
 
-@_XFAIL
 def test_piv_general_authenticate_signature_is_valid_ecdsa(
     runner: CLIRunner, run_dir: Path,
 ) -> None:
@@ -284,7 +279,7 @@ def test_piv_general_authenticate_signature_is_valid_ecdsa(
         pub_key.verify(
             sig,
             _TEST_HASH,
-            ec.ECDSA(hashes.Prehashed(hashes.SHA256())),
+            ec.ECDSA(Prehashed(hashes.SHA256())),
         )
         log.info("Signature verified OK.")
     except InvalidSignature:
@@ -295,7 +290,6 @@ def test_piv_general_authenticate_signature_is_valid_ecdsa(
         )
 
 
-@_XFAIL
 def test_piv_general_authenticate_without_pin_fails(runner: CLIRunner) -> None:
     """GENERAL AUTHENTICATE without prior VERIFY must fail with SW=6982 or 6984.
 
@@ -320,7 +314,6 @@ def test_piv_general_authenticate_without_pin_fails(runner: CLIRunner) -> None:
     log.info("Correctly rejected GENERAL AUTHENTICATE without PIN (SW=%s)", sw)
 
 
-@_XFAIL
 def test_piv_general_authenticate_two_signatures_both_valid(
     runner: CLIRunner,
 ) -> None:
@@ -354,7 +347,7 @@ def test_piv_general_authenticate_two_signatures_both_valid(
             pub_key.verify(
                 sig,
                 _TEST_HASH,
-                ec.ECDSA(hashes.Prehashed(hashes.SHA256())),
+                ec.ECDSA(Prehashed(hashes.SHA256())),
             )
         except InvalidSignature:
             pytest.fail(

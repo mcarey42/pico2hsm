@@ -163,7 +163,7 @@ and flash/RAM budget.
 - Per-applet PIN slots implemented: `PinSlot::Piv`, `PinSlot::OpenPgpPw1`, `PinSlot::OpenPgpPw3`
 - Key ID scheme: `bits 31–24: partition_id | bits 23–16: applet_id | bits 7–0: proto_ref`
 
-**7b. PIV (`applet-piv` feature)** — IMPLEMENTED, hardware-validated
+**7b. PIV (`applet-piv` feature)** — DONE, hardware-validated, flash-persistent
 
 Commands implemented: SELECT (FCI tag 61), GET DATA, VERIFY (PIN/PUK),
 CHANGE REFERENCE DATA, RESET RETRY COUNTER, GENERAL AUTHENTICATE (3DES
@@ -172,32 +172,45 @@ management key + EC witness/challenge), GENERATE KEY PAIR (P-256, P-384).
 Key slots: 9A (PIV Auth), 9C (Digital Sig), 9D (Key Mgmt), 9E (Card Auth).
 Retired slots 82–95 not yet implemented.
 
-PIN state: RAM-only (no flash persistence yet — resets to defaults on power cycle).
+Flash persistence: EC keys stored as `KeyObject` with `AppletId::Piv` owner.
+PIN state stored as 101-byte sentinel record at `KeyId::piv(0xFF)` (PBKDF2 hash
++ salt + retry counters). Security state (PIN verified) reset on each SELECT per
+NIST SP 800-73-4.
 Default PIN: `123456`, default PUK: `12345678`, default management key: 24-byte 3DES default.
 
-Passing integration tests (after `probe-rs reset`): all `test_piv_*` xpass.
+Passing integration tests: all 12 `test_piv_*` tests pass (0 failures, 0 xfail).
 
-**7c. OpenPGP (`applet-openpgp` feature)** — IMPLEMENTED, hardware-validated
+**7c. OpenPGP (`applet-openpgp` feature)** — DONE, hardware-validated, flash-persistent
 
 Commands implemented: SELECT (DO 6F, 6E, C4, C6), GET DATA (all standard DOs),
-VERIFY (PW1 mode 81/82, PW3), CHANGE REFERENCE DATA, PSO:CDS (ECDSA sign),
-PSO:DECIPHER (ECDH), INTERNAL AUTHENTICATE, GENERATE KEY PAIR (P-256, P-384,
-P-521), GET CHALLENGE.
+VERIFY (PW1 mode 81/82, PW3), CHANGE REFERENCE DATA, PSO:CDS (ECDSA sign,
+returns raw r||s per OpenPGP spec), PSO:DECIPHER (ECDH), INTERNAL AUTHENTICATE,
+GENERATE KEY PAIR (P-256, P-384, P-521), GET CHALLENGE.
 
 Key slots: SIG (0x90), DEC (0x91), AUTH (0x92).
 
-PIN state: RAM-only (no flash persistence yet).
+Flash persistence: EC keys stored with `AppletId::OpenPgp` owner. PW1 and PW3
+PIN hashes stored as 35-byte sentinel records at `KeyId::openpgp(0xFE)` and
+`KeyId::openpgp(0xFF)` respectively. Security state reset on each SELECT.
 Default PW1: `123456`, default PW3: `12345678`.
 
-Note: Test ordering sensitivity — OpenPGP PW1 retry counter is in RAM and
-shared across the test session.  Run `probe-rs reset --chip RP235x` before
-the test suite to ensure a clean counter state.  Confirmed XPASS in isolation.
+Passing integration tests: all `test_openpgp_*` tests pass (2 skipped for
+`gpg --card-status` requiring scdaemon, 2 xfailed for curve25519 feature).
 
-**7d. Ed25519 / X25519 (`applet-openpgp-curve25519` feature)** — TODO
+**7d. Ed25519 / X25519 (`applet-openpgp-curve25519` feature)** — IMPLEMENTED
 
-Adds `curve25519-dalek` (~45–60 KB release flash) for EdDSA signing and
-X25519 key agreement — the modern OpenPGP key defaults preferred by GnuPG.
-Gated behind its own sub-flag; NIST-ECC-only builds don't pay the cost.
+Adds `ed25519-dalek v2` and `x25519-dalek v2` for EdDSA signing and X25519
+key agreement — the modern OpenPGP key defaults preferred by GnuPG.
+Gated behind `applet-openpgp-curve25519` feature; NIST-ECC-only builds don't
+pay the cost (~45–60 KB flash for curve25519-dalek).
+
+New `KeyType` variants: `Ed25519` (32-byte key), `X25519` (32-byte key).
+New `AlgorithmId` variants: `Ed25519 = 0x20`, `X25519 = 0x21`.
+PSO:CDS with Ed25519 returns raw 64-byte signature (r||s).
+PSO:DECIPHER with X25519 expects 32-byte peer key, returns 32-byte shared secret.
+
+Tests gated with `@pytest.mark.xfail(strict=False)` in `test_openpgp_04_curve25519.py`
+pending hardware validation with curve25519-enabled firmware build.
 
 ---
 

@@ -19,8 +19,6 @@ Key slot 9A maps to key reference 0x9A.  The response is:
       7F 49 [len]         — Public Key template
         86 [len] <point>  — EC public key (uncompressed: 04 <X> <Y>)
 
-All tests are marked xfail because the PIV applet is not yet implemented.
-Remove the xfail mark as each feature is completed.
 """
 
 from __future__ import annotations
@@ -53,7 +51,6 @@ _VERIFY_PIN = "0020008008" + _DEFAULT_PIN
 # APDU: 00 47 00 9A 05 AC 03 80 01 11 00
 _GENKEY_9A_P256 = "0047009A05AC03800111 00".replace(" ", "")
 
-_XFAIL = pytest.mark.xfail(reason="PIV not yet implemented", strict=False)
 
 
 # ---------------------------------------------------------------------------
@@ -128,7 +125,6 @@ def _decode_length(data: bytes, idx: int) -> tuple[int, int]:
 # Tests
 # ---------------------------------------------------------------------------
 
-@_XFAIL
 def test_piv_genkey_9a_p256_succeeds(runner: CLIRunner, run_dir: Path) -> None:
     """GENERATE KEY PAIR for slot 9A (P-256) must return SW=9000."""
     result = _send_apdus(
@@ -165,7 +161,6 @@ def test_piv_genkey_9a_p256_succeeds(runner: CLIRunner, run_dir: Path) -> None:
     )
 
 
-@_XFAIL
 def test_piv_genkey_9a_returns_public_key_tlv(runner: CLIRunner) -> None:
     """GENERATE KEY PAIR response must contain a 7C→7F49→86 public key TLV."""
     result = _send_apdus(
@@ -198,7 +193,6 @@ def test_piv_genkey_9a_returns_public_key_tlv(runner: CLIRunner) -> None:
     log.info("Extracted EC point: %d bytes", len(ec_point))
 
 
-@_XFAIL
 def test_piv_genkey_9a_public_key_is_valid_p256(runner: CLIRunner) -> None:
     """The public key returned by GENKEY must be a valid uncompressed P-256 point."""
     result = _send_apdus(
@@ -246,7 +240,6 @@ def test_piv_genkey_9a_public_key_is_valid_p256(runner: CLIRunner) -> None:
     log.info("P-256 public key validated: x=%064x", x)
 
 
-@_XFAIL
 def test_piv_genkey_key_persists_after_reselect(runner: CLIRunner, run_dir: Path) -> None:
     """A key generated in slot 9A must survive a deselect + re-SELECT cycle.
 

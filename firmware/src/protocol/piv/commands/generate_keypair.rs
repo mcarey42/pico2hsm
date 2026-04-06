@@ -60,8 +60,8 @@ pub fn handle(state: &mut PivState, cmd: &ApduCommand<'_>) -> ApduResponse {
         return ApduResponse::err(0x6A86); // incorrect P2
     }
 
-    // Require management key authentication
-    if !state.mgmt_key_authenticated {
+    // Require management key authentication OR PIN verification.
+    if !state.mgmt_key_authenticated && !state.pin_verified {
         return ApduResponse::err(0x6982); // security status not satisfied
     }
 
@@ -107,36 +107,89 @@ pub fn handle(state: &mut PivState, cmd: &ApduCommand<'_>) -> ApduResponse {
         return ApduResponse::err(0x6A84); // not enough memory
     }
 
-    // Build response: 7F49 <len> 86 <point_len> <point>
+    // Build response per NIST SP 800-73-4 Part 2 Table 3.3-1:
+    //   7C [len]  Dynamic Authentication Template
+    //     7F49 [len]  Public Key
+    //       86 [len]  EC Point (uncompressed)
     let pub_key_bytes = &keypair.public_key;
-    let mut resp = heapless::Vec::<u8, 256>::new();
 
-    // 7F49 tag (2-byte tag)
-    let _ = resp.push(0x7F);
-    let _ = resp.push(0x49);
-
-    // Inner content: 86 <len> <point>
-    let inner_len = 2 + pub_key_bytes.len(); // tag(1) + len(1) + data
-
-    // Use BER-TLV length encoding for 7F49
-    if inner_len < 128 {
-        let _ = resp.push(inner_len as u8);
-    } else {
-        let _ = resp.push(0x81);
-        let _ = resp.push(inner_len as u8);
-    }
-
-    // 86: uncompressed EC point
-    let _ = resp.push(0x86);
+    // Build inner 7F49 content: 86 <len> <point>
+    let mut inner_7f49 = heapless::Vec::<u8, 128>::new();
+    let _ = inner_7f49.push(0x86);
     if pub_key_bytes.len() < 128 {
-        let _ = resp.push(pub_key_bytes.len() as u8);
+        let _ = inner_7f49.push(pub_key_bytes.len() as u8);
+    } else {
+        let _ = inner_7f49.push(0x81);
+        let _ = inner_7f49.push(pub_key_bytes.len() as u8);
+    }
+    let _ = inner_7f49.extend_from_slice(pub_key_bytes);
+
+    // Build 7F49 TLV: 7F 49 <len> <inner>
+    let mut tag_7f49 = heapless::Vec::<u8, 160>::new();
+    let _ = tag_7f49.push(0x7F);
+    let _ = tag_7f49.push(0x49);
+    if inner_7f49.len() < 128 {
+        let _ = tag_7f49.push(inner_7f49.len() as u8);
+    } else {
+        let _ = tag_7f49.push(0x81);
+        let _ = tag_7f49.push(inner_7f49.len() as u8);
+    }
+    let _ = tag_7f49.extend_from_slice(&inner_7f49);
+
+    // Wrap in 7C Dynamic Authentication Template
+    let mut resp = heapless::Vec::<u8, 256>::new();
+    let _ = resp.push(0x7C);
+    if tag_7f49.len() < 128 {
+        let _ = resp.push(tag_7f49.len() as u8);
     } else {
         let _ = resp.push(0x81);
-        let _ = resp.push(pub_key_bytes.len() as u8);
+        let _ = resp.push(tag_7f49.len() as u8);
     }
-    let _ = resp.extend_from_slice(pub_key_bytes);
+    let _ = resp.extend_from_slice(&tag_7f49);
 
     ApduResponse::ok(&resp)
+}
+
+/// Handle GENERATE KEY PAIR and persist the result to flash.
+pub fn handle_with_store(
+    state: &mut PivState,
+    store: &mut dyn crate::storage::KeyStore,
+    cmd: &ApduCommand<'_>,
+) -> ApduResponse {
+    let resp = handle(state, cmd);
+
+    // Only persist on success (SW=9000).
+    if resp.sw == 0x9000 {
+        let key_ref = cmd.p2;
+        let key_id = KeyId::piv(key_ref);
+
+        if let Some(entry) = state.keys.iter().find(|k| k.key_id == key_id.0) {
+            use crate::security::key_management::{AlgorithmId, KeyObject, KeyType as KmKeyType};
+            use pico2hsm_core::key::AppletId;
+
+            let algorithm = match entry.key_type {
+                CoreKeyType::EcPrivateP256 => AlgorithmId::EcdsaP256,
+                CoreKeyType::EcPrivateP384 => AlgorithmId::EcdsaP384,
+                _ => return resp,
+            };
+
+            let mut obj = KeyObject {
+                key_type: KmKeyType::Ec,
+                key_id: key_id.0,
+                owner: AppletId::Piv,
+                algorithm,
+                key_domain: 0,
+                use_count: 0,
+                private_key: heapless::Vec::new(),
+                public_key: heapless::Vec::new(),
+            };
+            let _ = obj.private_key.extend_from_slice(&entry.private_key);
+            let _ = obj.public_key.extend_from_slice(&entry.public_key);
+            let _ = store.save_key(&obj);
+        }
+    }
+
+    resp
 }
 
 /// Parse the AC template to extract the algorithm ID.

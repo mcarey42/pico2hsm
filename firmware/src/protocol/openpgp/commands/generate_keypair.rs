@@ -19,6 +19,19 @@ use crate::protocol::openpgp::OpenPgpState;
 /// INS byte for GENERATE KEY PAIR.
 pub const INS_GENERATE_KEYPAIR: u8 = 0x47;
 
+/// Resolve an ECDH OID that wasn't matched by the NIST P-curve checks.
+/// Returns Some(X25519) for the X25519 OID when the feature is enabled.
+fn ecdh_oid_to_key_type(_oid: &[u8]) -> Option<KeyType> {
+    #[cfg(feature = "applet-openpgp-curve25519")]
+    {
+        // X25519 OID: 1.3.6.1.4.1.3029.1.5.1 = 2B 06 01 04 01 97 55 01 05 01
+        if _oid.starts_with(&[0x2B, 0x06, 0x01, 0x04, 0x01, 0x97, 0x55, 0x01, 0x05, 0x01]) {
+            return Some(KeyType::X25519);
+        }
+    }
+    None
+}
+
 /// Map algorithm attributes to a KeyType for keygen.
 fn algo_attrs_to_key_type(attrs: &[u8]) -> Option<KeyType> {
     if attrs.is_empty() {
@@ -28,8 +41,8 @@ fn algo_attrs_to_key_type(attrs: &[u8]) -> Option<KeyType> {
     let oid = &attrs[1..];
 
     match algo_id {
-        // ECDSA (0x13) or ECDH (0x12)
-        0x12 | 0x13 => {
+        // ECDSA (0x13)
+        0x13 => {
             // P-256: 2A 86 48 CE 3D 03 01 07
             if oid.starts_with(&[0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07]) {
                 Some(KeyType::EcPrivateP256)
@@ -41,6 +54,34 @@ fn algo_attrs_to_key_type(attrs: &[u8]) -> Option<KeyType> {
             // P-521: 2B 81 04 00 23
             else if oid.starts_with(&[0x2B, 0x81, 0x04, 0x00, 0x23]) {
                 Some(KeyType::EcPrivateP521)
+            } else {
+                None
+            }
+        }
+        // ECDH (0x12)
+        0x12 => {
+            // P-256: 2A 86 48 CE 3D 03 01 07
+            if oid.starts_with(&[0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07]) {
+                Some(KeyType::EcPrivateP256)
+            }
+            // P-384: 2B 81 04 00 22
+            else if oid.starts_with(&[0x2B, 0x81, 0x04, 0x00, 0x22]) {
+                Some(KeyType::EcPrivateP384)
+            }
+            // P-521: 2B 81 04 00 23
+            else if oid.starts_with(&[0x2B, 0x81, 0x04, 0x00, 0x23]) {
+                Some(KeyType::EcPrivateP521)
+            } else {
+                // X25519: 2B 06 01 04 01 97 55 01 05 01
+                ecdh_oid_to_key_type(oid)
+            }
+        }
+        // EdDSA (0x16) — Ed25519
+        #[cfg(feature = "applet-openpgp-curve25519")]
+        0x16 => {
+            // Ed25519 OID: 2B 06 01 04 01 DA 47 0F 01
+            if oid.starts_with(&[0x2B, 0x06, 0x01, 0x04, 0x01, 0xDA, 0x47, 0x0F, 0x01]) {
+                Some(KeyType::Ed25519)
             } else {
                 None
             }
@@ -129,6 +170,78 @@ pub fn handle(state: &mut OpenPgpState, cmd: &ApduCommand<'_>) -> ApduResponse {
 
         _ => ApduResponse::err(SW_WRONG_DATA),
     }
+}
+
+/// Handle GENERATE KEY PAIR and persist the result to flash.
+pub fn handle_with_store(
+    state: &mut OpenPgpState,
+    store: &mut dyn crate::storage::KeyStore,
+    cmd: &ApduCommand<'_>,
+) -> ApduResponse {
+    let resp = handle(state, cmd);
+
+    // Only persist new key generation (P1=0x80) on success.
+    if cmd.p1 != 0x80 || resp.sw != 0x9000 {
+        return resp;
+    }
+
+    if cmd.data.len() < 1 {
+        return resp;
+    }
+    let crt_tag = cmd.data[0];
+
+    use crate::protocol::openpgp::{SLOT_AUTH, SLOT_DEC, SLOT_SIG};
+    use crate::security::key_management::{AlgorithmId, KeyObject, KeyType as KmKeyType};
+    use pico2hsm_core::key::{AppletId, KeyId, KeyType as CoreKeyType};
+
+    let (slot, priv_opt, pub_opt, key_type_opt) = match crt_tag {
+        0xB6 => (SLOT_SIG, &state.sig_private, &state.sig_public, &state.sig_key_type),
+        0xB8 => (SLOT_DEC, &state.dec_private, &state.dec_public, &state.dec_key_type),
+        0xA4 => (SLOT_AUTH, &state.auth_private, &state.auth_public, &state.auth_key_type),
+        _ => return resp,
+    };
+
+    let (priv_bytes, pub_bytes, key_type) = match (priv_opt, pub_opt, key_type_opt) {
+        (Some(pr), Some(pu), Some(kt)) => (pr, pu, kt),
+        _ => return resp,
+    };
+
+    let algorithm = match key_type {
+        CoreKeyType::EcPrivateP256 => match crt_tag {
+            0xB8 => AlgorithmId::EcdhP256,
+            _ => AlgorithmId::EcdsaP256,
+        },
+        CoreKeyType::EcPrivateP384 => match crt_tag {
+            0xB8 => AlgorithmId::EcdhP384,
+            _ => AlgorithmId::EcdsaP384,
+        },
+        CoreKeyType::EcPrivateP521 => match crt_tag {
+            0xB8 => AlgorithmId::EcdhP521,
+            _ => AlgorithmId::EcdsaP521,
+        },
+        #[cfg(feature = "applet-openpgp-curve25519")]
+        CoreKeyType::Ed25519 => AlgorithmId::Ed25519,
+        #[cfg(feature = "applet-openpgp-curve25519")]
+        CoreKeyType::X25519 => AlgorithmId::X25519,
+        _ => return resp,
+    };
+
+    let key_id = KeyId::openpgp(slot);
+    let mut obj = KeyObject {
+        key_type: KmKeyType::Ec,
+        key_id: key_id.0,
+        owner: AppletId::OpenPgp,
+        algorithm,
+        key_domain: 0,
+        use_count: 0,
+        private_key: heapless::Vec::new(),
+        public_key: heapless::Vec::new(),
+    };
+    let _ = obj.private_key.extend_from_slice(priv_bytes);
+    let _ = obj.public_key.extend_from_slice(pub_bytes);
+    let _ = store.save_key(&obj);
+
+    resp
 }
 
 /// Build the public key response TLV: 7F49 [ 86 [len] <point> ]

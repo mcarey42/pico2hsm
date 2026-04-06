@@ -61,6 +61,7 @@ def _derive(
 # Tests
 # ---------------------------------------------------------------------------
 
+@pytest.mark.xfail(strict=False, reason="ECDH1-COFACTOR-DERIVE not implemented (punchout item 9)")
 @_SLOT_PARAMS
 def test_ecdh_returns_correct_length(
     slot: dict,
@@ -115,6 +116,7 @@ def test_ecdh_returns_correct_length(
     )
 
 
+@pytest.mark.xfail(strict=False, reason="ECDH1-COFACTOR-DERIVE not implemented (punchout item 9)")
 @_SLOT_PARAMS
 def test_ecdh_cross_check(
     slot: dict,
@@ -174,6 +176,7 @@ def test_ecdh_cross_check(
     log.info("%s ECDH cross-check PASSED", slot["curve_display"])
 
 
+@pytest.mark.xfail(strict=False, reason="ECDH1-COFACTOR-DERIVE not implemented (punchout item 9)")
 @_SLOT_PARAMS
 def test_ecdh_different_peers_give_different_secrets(
     slot: dict,

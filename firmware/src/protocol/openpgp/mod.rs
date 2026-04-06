@@ -60,6 +60,26 @@ pub const DEFAULT_ECDH_ALGO_ATTRS: &[u8] = &[
     0x12, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07,
 ];
 
+/// Ed25519 OID: 1.3.6.1.4.1.11591.15.1
+#[cfg(feature = "applet-openpgp-curve25519")]
+pub const ED25519_OID: &[u8] = &[0x2B, 0x06, 0x01, 0x04, 0x01, 0xDA, 0x47, 0x0F, 0x01];
+
+/// X25519 OID: 1.3.6.1.4.1.3029.1.5.1
+#[cfg(feature = "applet-openpgp-curve25519")]
+pub const X25519_OID: &[u8] = &[0x2B, 0x06, 0x01, 0x04, 0x01, 0x97, 0x55, 0x01, 0x05, 0x01];
+
+/// Default algorithm attributes for EdDSA (SIG/AUTH): `16` + Ed25519 OID.
+#[cfg(feature = "applet-openpgp-curve25519")]
+pub const DEFAULT_EDDSA_ALGO_ATTRS: &[u8] = &[
+    0x16, 0x2B, 0x06, 0x01, 0x04, 0x01, 0xDA, 0x47, 0x0F, 0x01,
+];
+
+/// Default algorithm attributes for X25519 (DEC): `12` + X25519 OID.
+#[cfg(feature = "applet-openpgp-curve25519")]
+pub const DEFAULT_X25519_ALGO_ATTRS: &[u8] = &[
+    0x12, 0x2B, 0x06, 0x01, 0x04, 0x01, 0x97, 0x55, 0x01, 0x05, 0x01,
+];
+
 /// OpenPGP key slot indices (stored in the low byte of `KeyId::openpgp(slot)`).
 pub const SLOT_SIG: u8 = 0x90;
 pub const SLOT_DEC: u8 = 0x91;
@@ -216,6 +236,11 @@ impl OpenPgpState {
     }
 }
 
+/// KeyId for the OpenPGP PW1 record sentinel.
+pub const OPENPGP_PW1_KEY_ID: pico2hsm_core::key::KeyId = pico2hsm_core::key::KeyId(0x000200FE);
+/// KeyId for the OpenPGP PW3 record sentinel.
+pub const OPENPGP_PW3_KEY_ID: pico2hsm_core::key::KeyId = pico2hsm_core::key::KeyId(0x000200FF);
+
 /// OpenPGP Card protocol implementation.
 pub struct OpenPgp {
     pub state: OpenPgpState,
@@ -246,6 +271,207 @@ impl OpenPgp {
             authenticate::INS_AUTHENTICATE => authenticate::handle(&mut self.state, cmd),
             challenge::INS_CHALLENGE => challenge::handle(&mut self.state, cmd),
             _ => ApduResponse::err(SW_INS_NOT_SUPPORTED),
+        }
+    }
+
+    /// Dispatch an APDU using the store-aware path for mutations.
+    fn dispatch_with_store(
+        &mut self,
+        cmd: &ApduCommand<'_>,
+        store: &mut dyn crate::storage::KeyStore,
+    ) -> ApduResponse {
+        match cmd.ins {
+            generate_keypair::INS_GENERATE_KEYPAIR => {
+                generate_keypair::handle_with_store(&mut self.state, store, cmd)
+            }
+            verify::INS_VERIFY => {
+                verify::handle_with_store(&mut self.state, store, cmd)
+            }
+            change_pin::INS_CHANGE_PIN => {
+                change_pin::handle_with_store(&mut self.state, store, cmd)
+            }
+            _ => self.dispatch(cmd),
+        }
+    }
+
+    /// Process a raw APDU with access to persistent storage.
+    pub fn process_apdu_with_store(
+        &mut self,
+        apdu: &[u8],
+        store: &mut dyn crate::storage::KeyStore,
+    ) -> Vec<u8, 4096> {
+        let resp = match pico2hsm_core::apdu::ApduCommand::parse(apdu) {
+            Ok(cmd) => self.dispatch_with_store(&cmd, store),
+            Err(_) => ApduResponse::err(SW_INS_NOT_SUPPORTED),
+        };
+        let serialized = resp.serialize();
+        let mut out: Vec<u8, 4096> = Vec::new();
+        let _ = out.extend_from_slice(&serialized[..serialized.len().min(4096)]);
+        out
+    }
+
+    /// Serialize and persist PW1 state to flash.
+    ///
+    /// Layout (35 bytes):
+    ///   [0..32] pw1_hash (32 bytes; all zeros if None)
+    ///   [32]    has_pw1_hash (1 if Some, 0 if None)
+    ///   [33]    pw1_retries
+    ///   [34]    pw1_blocked as u8
+    pub fn save_pw1_to_store(state: &OpenPgpState, store: &mut dyn crate::storage::KeyStore) {
+        use crate::security::key_management::{AlgorithmId, KeyObject, KeyType as KmKeyType};
+        use pico2hsm_core::key::AppletId;
+
+        let mut buf: heapless::Vec<u8, 64> = heapless::Vec::new();
+        let (hash_bytes, has_hash) = match &state.pw1_hash {
+            Some(h) => (*h, 1u8),
+            None => ([0u8; 32], 0u8),
+        };
+        let _ = buf.extend_from_slice(&hash_bytes);
+        let _ = buf.push(has_hash);
+        let _ = buf.push(state.pw1_retries);
+        let blocked = if state.pw1_retries == 0 { 1u8 } else { 0u8 };
+        let _ = buf.push(blocked);
+
+        let mut obj = KeyObject {
+            key_type: KmKeyType::Generic,
+            key_id: OPENPGP_PW1_KEY_ID.0,
+            owner: AppletId::OpenPgp,
+            algorithm: AlgorithmId::AesGcm,
+            key_domain: 0,
+            use_count: 0,
+            private_key: heapless::Vec::new(),
+            public_key: heapless::Vec::new(),
+        };
+        let _ = obj.private_key.extend_from_slice(&buf);
+        let _ = store.save_key(&obj);
+    }
+
+    /// Serialize and persist PW3 state to flash.
+    ///
+    /// Layout (35 bytes):
+    ///   [0..32] pw3_hash (32 bytes; all zeros if None)
+    ///   [32]    has_pw3_hash (1 if Some, 0 if None)
+    ///   [33]    pw3_retries
+    ///   [34]    pw3_blocked as u8
+    pub fn save_pw3_to_store(state: &OpenPgpState, store: &mut dyn crate::storage::KeyStore) {
+        use crate::security::key_management::{AlgorithmId, KeyObject, KeyType as KmKeyType};
+        use pico2hsm_core::key::AppletId;
+
+        let mut buf: heapless::Vec<u8, 64> = heapless::Vec::new();
+        let (hash_bytes, has_hash) = match &state.pw3_hash {
+            Some(h) => (*h, 1u8),
+            None => ([0u8; 32], 0u8),
+        };
+        let _ = buf.extend_from_slice(&hash_bytes);
+        let _ = buf.push(has_hash);
+        let _ = buf.push(state.pw3_retries);
+        let blocked = if state.pw3_retries == 0 { 1u8 } else { 0u8 };
+        let _ = buf.push(blocked);
+
+        let mut obj = KeyObject {
+            key_type: KmKeyType::Generic,
+            key_id: OPENPGP_PW3_KEY_ID.0,
+            owner: AppletId::OpenPgp,
+            algorithm: AlgorithmId::AesGcm,
+            key_domain: 0,
+            use_count: 0,
+            private_key: heapless::Vec::new(),
+            public_key: heapless::Vec::new(),
+        };
+        let _ = obj.private_key.extend_from_slice(&buf);
+        let _ = store.save_key(&obj);
+    }
+
+    /// Load persisted OpenPGP keys and PIN state from flash.
+    pub fn load_from_store(&mut self, store: &mut dyn crate::storage::KeyStore) {
+        use crate::security::key_management::{AlgorithmId, KeyType as KmKeyType};
+        use pico2hsm_core::key::{AppletId, KeyType as CoreKeyType};
+
+        // Load PW1 state.
+        if let Ok(Some(obj)) = store.fetch_key(OPENPGP_PW1_KEY_ID) {
+            let b = &obj.private_key;
+            if b.len() >= 35 {
+                let has_hash = b[32] != 0;
+                if has_hash {
+                    let mut h = [0u8; 32];
+                    h.copy_from_slice(&b[0..32]);
+                    self.state.pw1_hash = Some(h);
+                } else {
+                    self.state.pw1_hash = None;
+                }
+                self.state.pw1_retries = b[33];
+                // b[34] is pw1_blocked but we derive it from retries
+            }
+        }
+
+        // Load PW3 state.
+        if let Ok(Some(obj)) = store.fetch_key(OPENPGP_PW3_KEY_ID) {
+            let b = &obj.private_key;
+            if b.len() >= 35 {
+                let has_hash = b[32] != 0;
+                if has_hash {
+                    let mut h = [0u8; 32];
+                    h.copy_from_slice(&b[0..32]);
+                    self.state.pw3_hash = Some(h);
+                } else {
+                    self.state.pw3_hash = None;
+                }
+                self.state.pw3_retries = b[33];
+            }
+        }
+
+        // Load key objects for OpenPGP slots.
+        let ids = store.enumerate_keys();
+        for kid in ids.iter() {
+            // Only OpenPGP keys (applet byte == 2), skip PIN sentinels.
+            if kid.applet_byte() != AppletId::OpenPgp as u8 {
+                continue;
+            }
+            let slot = kid.proto_ref();
+            if slot == 0xFE || slot == 0xFF {
+                continue; // PIN records
+            }
+
+            if let Ok(Some(obj)) = store.fetch_key(*kid) {
+                if !matches!(obj.key_type, KmKeyType::Ec) {
+                    continue;
+                }
+
+                let key_type = match obj.algorithm {
+                    AlgorithmId::EcdsaP256 | AlgorithmId::EcdhP256 => CoreKeyType::EcPrivateP256,
+                    AlgorithmId::EcdsaP384 | AlgorithmId::EcdhP384 => CoreKeyType::EcPrivateP384,
+                    AlgorithmId::EcdsaP521 | AlgorithmId::EcdhP521 => CoreKeyType::EcPrivateP521,
+                    #[cfg(feature = "applet-openpgp-curve25519")]
+                    AlgorithmId::Ed25519 => CoreKeyType::Ed25519,
+                    #[cfg(feature = "applet-openpgp-curve25519")]
+                    AlgorithmId::X25519 => CoreKeyType::X25519,
+                    _ => continue,
+                };
+
+                let mut priv_vec: heapless::Vec<u8, 66> = heapless::Vec::new();
+                let _ = priv_vec.extend_from_slice(&obj.private_key);
+                let mut pub_vec: heapless::Vec<u8, 133> = heapless::Vec::new();
+                let _ = pub_vec.extend_from_slice(&obj.public_key);
+
+                match slot {
+                    s if s == SLOT_SIG => {
+                        self.state.sig_private = Some(priv_vec);
+                        self.state.sig_public = Some(pub_vec);
+                        self.state.sig_key_type = Some(key_type);
+                    }
+                    s if s == SLOT_DEC => {
+                        self.state.dec_private = Some(priv_vec);
+                        self.state.dec_public = Some(pub_vec);
+                        self.state.dec_key_type = Some(key_type);
+                    }
+                    s if s == SLOT_AUTH => {
+                        self.state.auth_private = Some(priv_vec);
+                        self.state.auth_public = Some(pub_vec);
+                        self.state.auth_key_type = Some(key_type);
+                    }
+                    _ => {}
+                }
+            }
         }
     }
 }

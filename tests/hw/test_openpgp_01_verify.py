@@ -19,8 +19,6 @@ CHANGE REFERENCE DATA APDU:
     00 24 00 <P2> Lc <old PIN> <new PIN>
     (concatenated without padding; lengths determined by Lc)
 
-All tests are marked xfail because the OpenPGP applet is not yet implemented.
-Remove the xfail mark as each feature is completed.
 """
 
 from __future__ import annotations
@@ -57,7 +55,6 @@ _WRONG_PIN_HEX = "4445414442454546"  # "DEADBEEF"
 _VERIFY_QUERY_PW1_81 = "00200081"
 _VERIFY_QUERY_PW3    = "00200083"
 
-_XFAIL = pytest.mark.xfail(reason="OpenPGP not yet implemented", strict=False)
 
 
 # ---------------------------------------------------------------------------
@@ -95,7 +92,6 @@ def _build_change_pin(p2: int, old_hex: str, new_hex: str) -> str:
 # Tests
 # ---------------------------------------------------------------------------
 
-@_XFAIL
 def test_openpgp_verify_pw1_81_accepted(runner: CLIRunner, run_dir: Path) -> None:
     """VERIFY PW1 (P2=0x81) with default '123456' must return SW=9000."""
     result = _send_apdus(
@@ -131,7 +127,6 @@ def test_openpgp_verify_pw1_81_accepted(runner: CLIRunner, run_dir: Path) -> Non
     )
 
 
-@_XFAIL
 def test_openpgp_verify_pw1_82_accepted(runner: CLIRunner, run_dir: Path) -> None:
     """VERIFY PW1 (P2=0x82) with default '123456' must return SW=9000."""
     result = _send_apdus(
@@ -150,7 +145,6 @@ def test_openpgp_verify_pw1_82_accepted(runner: CLIRunner, run_dir: Path) -> Non
     )
 
 
-@_XFAIL
 def test_openpgp_verify_pw3_accepted(runner: CLIRunner, run_dir: Path) -> None:
     """VERIFY PW3 (P2=0x83) with default '12345678' must return SW=9000."""
     result = _send_apdus(
@@ -177,7 +171,6 @@ def test_openpgp_verify_pw3_accepted(runner: CLIRunner, run_dir: Path) -> None:
     )
 
 
-@_XFAIL
 def test_openpgp_verify_wrong_pin_returns_63cx(runner: CLIRunner) -> None:
     """VERIFY with a wrong PIN must return SW=63Cx with a plausible retry count."""
     wrong_verify = _build_verify(0x81, _WRONG_PIN_HEX)
@@ -203,7 +196,6 @@ def test_openpgp_verify_wrong_pin_returns_63cx(runner: CLIRunner) -> None:
         assert 0 <= retries <= 15, f"Implausible retry counter: {retries}"
 
 
-@_XFAIL
 def test_openpgp_verify_query_returns_retry_count(runner: CLIRunner) -> None:
     """VERIFY query (no data) must return 63Cx or 9000 (already verified)."""
     result = _send_apdus(
@@ -223,7 +215,6 @@ def test_openpgp_verify_query_returns_retry_count(runner: CLIRunner) -> None:
     )
 
 
-@_XFAIL
 def test_openpgp_change_pw1_succeeds(runner: CLIRunner, run_dir: Path) -> None:
     """CHANGE REFERENCE DATA for PW1 must update the PIN and accept the new value.
 
@@ -280,7 +271,6 @@ def test_openpgp_change_pw1_succeeds(runner: CLIRunner, run_dir: Path) -> None:
     log.info("PW1 change round-trip completed successfully.")
 
 
-@_XFAIL
 def test_openpgp_verify_pw3_wrong_returns_63cx(runner: CLIRunner) -> None:
     """VERIFY PW3 with a wrong value must return SW=63Cx."""
     wrong_verify_pw3 = _build_verify(0x83, _WRONG_PIN_HEX)

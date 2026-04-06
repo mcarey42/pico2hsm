@@ -27,6 +27,19 @@ fn sw_retry(remaining: u8) -> u16 {
     0x63C0 | (remaining as u16 & 0x0F)
 }
 
+/// Handle CHANGE REFERENCE DATA and persist updated PIN/PUK state to flash.
+pub fn handle_with_store(
+    state: &mut PivState,
+    store: &mut dyn crate::storage::KeyStore,
+    cmd: &ApduCommand<'_>,
+) -> ApduResponse {
+    let resp = handle(state, cmd);
+    if resp.sw == 0x9000 {
+        crate::protocol::piv::Piv::save_pin_to_store(state, store);
+    }
+    resp
+}
+
 /// Handle a CHANGE REFERENCE DATA APDU command.
 pub fn handle(state: &mut PivState, cmd: &ApduCommand<'_>) -> ApduResponse {
     if cmd.p1 != 0x00 {

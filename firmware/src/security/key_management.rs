@@ -143,6 +143,9 @@ pub enum AlgorithmId {
     AesCbc               = 0x61,
     AesCtr               = 0x62,
     AesGcm               = 0x63,
+    // Curve25519
+    Ed25519              = 0x20,
+    X25519               = 0x21,
 }
 
 impl AlgorithmId {
@@ -168,6 +171,8 @@ impl AlgorithmId {
             0x61 => Some(AlgorithmId::AesCbc),
             0x62 => Some(AlgorithmId::AesCtr),
             0x63 => Some(AlgorithmId::AesGcm),
+            0x20 => Some(AlgorithmId::Ed25519),
+            0x21 => Some(AlgorithmId::X25519),
             _ => None,
         }
     }

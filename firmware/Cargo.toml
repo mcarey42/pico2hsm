@@ -35,7 +35,7 @@ rsa = ["dep:rsa", "dep:embedded-alloc"]  # RSA support — adds ~1MB to binary; 
 debug = []         # Debug mode: enables memory dump APDUs, disables secure boot enforcement
 applet-piv = ["dep:des"]                 # PIV applet (NIST SP 800-73-4); adds 3DES (~10 KB)
 applet-openpgp = []                      # OpenPGP Card 3.4 applet (RSA + NIST ECC)
-applet-openpgp-curve25519 = ["applet-openpgp"]  # Adds Ed25519/X25519 (~50 KB, not yet implemented)
+applet-openpgp-curve25519 = ["applet-openpgp", "dep:ed25519-dalek", "dep:x25519-dalek"]  # Adds Ed25519/X25519 (~50 KB)
 
 # ─── Platform-agnostic dependencies ──────────────────────────────────────────
 # All of these compile on both x86_64 (for tests) and thumbv8m.main-none-eabihf
@@ -82,6 +82,10 @@ k256 = { version = "0.13", default-features = false, features = ["ecdsa", "ecdh"
 ecdsa = { version = "0.16", default-features = false, features = ["hazmat", "der"] }
 elliptic-curve = { version = "0.13", default-features = false, features = ["arithmetic", "sec1", "ecdh"] }
 rand_core = { version = "0.6", default-features = false }
+
+# Curve25519 — feature-gated (applet-openpgp-curve25519)
+ed25519-dalek = { version = "2", default-features = false, features = ["rand_core"], optional = true }
+x25519-dalek  = { version = "2", default-features = false, features = ["static_secrets"], optional = true }
 
 # RSA — feature-gated because it adds ~1MB to the binary
 rsa = { version = "0.9", default-features = false, features = ["hazmat"], optional = true }

@@ -80,6 +80,11 @@ impl Dispatcher {
         let ids = store.enumerate_keys();
         let mut loaded = 0usize;
         for kid in ids.iter() {
+            // Only load SC-HSM keys (applet byte == 0) here.
+            // PIV and OpenPGP are loaded via their own load_from_store methods below.
+            if kid.applet_byte() != 0 {
+                continue;
+            }
             match store.fetch_key(*kid) {
                 Ok(Some(obj)) => {
                     push_key_object_to_state(&mut self.sc_hsm.state, obj);
@@ -90,6 +95,13 @@ impl Dispatcher {
             }
         }
         let _ = loaded;
+
+        // Load PIV keys and PIN state.
+        #[cfg(feature = "applet-piv")]
+        self.piv.load_from_store(store);
+
+        // Load OpenPGP keys and PIN state.
+        self.openpgp.load_from_store(store);
     }
 
     /// Dispatch a raw APDU byte slice with access to persistent storage.
@@ -119,13 +131,11 @@ impl Dispatcher {
             return resp.serialize();
         }
 
-        // For the active ScHsm protocol use the storage-aware path.
-        // All other protocols (Piv, OpenPgp) are stateless and use the
-        // existing path.
+        // Route all active protocols through the storage-aware path.
         let raw_resp: Vec<u8, 4096> = match self.active {
             ActiveProtocol::ScHsm => self.sc_hsm.process_apdu_with_store(raw_apdu, store),
-            ActiveProtocol::Piv => self.piv.process_apdu(raw_apdu),
-            ActiveProtocol::OpenPgp => self.openpgp.process_apdu(raw_apdu),
+            ActiveProtocol::Piv => self.piv.process_apdu_with_store(raw_apdu, store),
+            ActiveProtocol::OpenPgp => self.openpgp.process_apdu_with_store(raw_apdu, store),
             ActiveProtocol::None => {
                 return pico2hsm_core::apdu::ApduResponse::err(
                     pico2hsm_core::apdu::SW_INS_NOT_SUPPORTED,
@@ -186,6 +196,10 @@ impl Dispatcher {
         // PIV AID
         if aid == PIV_AID {
             self.active = ActiveProtocol::Piv;
+            // Reset security state on each SELECT (per NIST SP 800-73-4)
+            self.piv.state.pin_verified = false;
+            self.piv.state.mgmt_key_authenticated = false;
+            self.piv.state.mgmt_challenge = None;
             return build_piv_fci();
         }
 
@@ -228,6 +242,8 @@ fn km_algo_to_core_key_type(
         | AlgorithmId::AesCbc
         | AlgorithmId::AesCtr
         | AlgorithmId::AesGcm => CoreKeyType::Aes256,
+        AlgorithmId::Ed25519 => CoreKeyType::Ed25519,
+        AlgorithmId::X25519 => CoreKeyType::X25519,
     }
 }
 

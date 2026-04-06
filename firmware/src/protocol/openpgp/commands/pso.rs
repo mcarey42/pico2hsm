@@ -62,6 +62,24 @@ fn handle_cds(state: &mut OpenPgpState, cmd: &ApduCommand<'_>) -> ApduResponse {
     priv_buf[..priv_len].copy_from_slice(priv_key);
 
     // Sign: input is the pre-hashed digest (raw hash bytes, no DigestInfo for ECC)
+
+    // Ed25519 path: sign directly with ed25519-dalek (returns raw 64-byte r||s)
+    #[cfg(feature = "applet-openpgp-curve25519")]
+    if key_type == KeyType::Ed25519 {
+        let raw_sig = match crate::crypto::asymmetric::ed25519_sign(
+            &priv_buf[..priv_len],
+            cmd.data,
+        ) {
+            Ok(s) => s,
+            Err(_) => return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
+        };
+
+        state.sig_counter = state.sig_counter.saturating_add(1);
+        state.pw1_verified_sign = false;
+
+        return ApduResponse::ok(&raw_sig);
+    }
+
     let mut rng = crate::protocol::sc_hsm::FwRng;
     let der_sig = match crate::crypto::asymmetric::ecdsa_sign(
         key_type,
@@ -110,17 +128,37 @@ fn handle_decipher(state: &mut OpenPgpState, cmd: &ApduCommand<'_>) -> ApduRespo
         return ApduResponse::err(SW_WRONG_DATA);
     }
 
+    // Copy private key
+    let mut priv_buf = [0u8; 66];
+    let priv_len = priv_key.len();
+    priv_buf[..priv_len].copy_from_slice(priv_key);
+
+    // X25519 path: peer key is 32 bytes, shared secret is 32 bytes
+    #[cfg(feature = "applet-openpgp-curve25519")]
+    if key_type == KeyType::X25519 {
+        let peer_pubkey = match parse_ecdh_input(cmd.data) {
+            Some(pk) => pk,
+            None => return ApduResponse::err(SW_WRONG_DATA),
+        };
+        if peer_pubkey.len() != 32 {
+            return ApduResponse::err(SW_WRONG_DATA);
+        }
+        let shared = match crate::crypto::asymmetric::x25519_ecdh(
+            &priv_buf[..priv_len],
+            peer_pubkey,
+        ) {
+            Ok(s) => s,
+            Err(_) => return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
+        };
+        return ApduResponse::ok(&shared);
+    }
+
     // Parse ECDH input: A6 [ 7F49 [ 86 [len] <peer_public_point> ] ]
     // Or simpler: just extract the peer public key from the TLV structure
     let peer_pubkey = match parse_ecdh_input(cmd.data) {
         Some(pk) => pk,
         None => return ApduResponse::err(SW_WRONG_DATA),
     };
-
-    // Copy private key
-    let mut priv_buf = [0u8; 66];
-    let priv_len = priv_key.len();
-    priv_buf[..priv_len].copy_from_slice(priv_key);
 
     // Perform ECDH
     let shared_secret = match crate::crypto::asymmetric::ecdh_agree(

@@ -6,8 +6,6 @@ Verifies the PIN authentication lifecycle:
 - The retry counter value in SW is plausible (>0 and <=15).
 - CHANGE REFERENCE DATA (INS=0x24, P2=0x80) successfully updates the PIN.
 
-All tests are marked xfail because the PIV applet is not yet implemented.
-Remove the xfail mark as each feature is completed.
 """
 
 from __future__ import annotations
@@ -42,7 +40,6 @@ _VERIFY_WRONG_PIN = "0020008008" + _WRONG_PIN_CLEAN
 # VERIFY query (Lc absent): 00 20 00 80 — returns 63Cx without consuming attempt
 _VERIFY_QUERY = "00200080"
 
-_XFAIL = pytest.mark.xfail(reason="PIV not yet implemented", strict=False)
 
 
 # ---------------------------------------------------------------------------
@@ -65,7 +62,6 @@ def _sw_from_output(output: str) -> str | None:
 # Tests
 # ---------------------------------------------------------------------------
 
-@_XFAIL
 def test_piv_verify_default_pin_accepted(runner: CLIRunner, run_dir: Path) -> None:
     """VERIFY with the default PIN '123456' must return SW=9000."""
     result = _send_apdus(
@@ -102,7 +98,6 @@ def test_piv_verify_default_pin_accepted(runner: CLIRunner, run_dir: Path) -> No
     )
 
 
-@_XFAIL
 def test_piv_verify_wrong_pin_returns_63cx(runner: CLIRunner, run_dir: Path) -> None:
     """VERIFY with a wrong PIN must return SW=63Cx (x = retries remaining)."""
     result = _send_apdus(
@@ -131,7 +126,6 @@ def test_piv_verify_wrong_pin_returns_63cx(runner: CLIRunner, run_dir: Path) -> 
         assert 0 <= retries <= 15, f"Implausible retry counter value: {retries}"
 
 
-@_XFAIL
 def test_piv_verify_retry_counter_decrements(runner: CLIRunner) -> None:
     """Submitting a wrong PIN twice must decrement the retry counter by 2.
 
@@ -195,7 +189,6 @@ def test_piv_verify_retry_counter_decrements(runner: CLIRunner) -> None:
     log.info("Restore verify SW: %s", sw)
 
 
-@_XFAIL
 def test_piv_change_pin_succeeds(runner: CLIRunner, run_dir: Path) -> None:
     """CHANGE REFERENCE DATA must accept the current PIN and set a new one.
 

@@ -16,8 +16,6 @@ Response (for EC keys):
 After key generation, `gpg --card-status` should show a non-empty key
 fingerprint in the "Signature key" line.
 
-All tests are marked xfail because the OpenPGP applet is not yet implemented.
-Remove the xfail mark as each feature is completed.
 """
 
 from __future__ import annotations
@@ -54,7 +52,6 @@ _VERIFY_PW3  = f"002000830 8{_PW3_DEFAULT}".replace(" ", "")
 _GENKEY_SIG   = "00478000 02B60000".replace(" ", "")
 _READ_PUB_SIG = "0047810002B600".replace(" ", "")
 
-_XFAIL = pytest.mark.xfail(reason="OpenPGP not yet implemented", strict=False)
 
 
 # ---------------------------------------------------------------------------
@@ -117,7 +114,6 @@ def _extract_ec_point_from_7f49(resp_hex: str) -> bytes | None:
 # Tests
 # ---------------------------------------------------------------------------
 
-@_XFAIL
 def test_openpgp_genkey_sig_succeeds(runner: CLIRunner, run_dir: Path) -> None:
     """GENERATE KEY PAIR for the SIG slot (B6) must return SW=9000."""
     result = _send_apdus(
@@ -154,7 +150,6 @@ def test_openpgp_genkey_sig_succeeds(runner: CLIRunner, run_dir: Path) -> None:
     )
 
 
-@_XFAIL
 def test_openpgp_genkey_sig_returns_7f49_tlv(runner: CLIRunner) -> None:
     """GENERATE KEY PAIR response must contain a 7F49 Public Key template."""
     result = _send_apdus(
@@ -185,7 +180,6 @@ def test_openpgp_genkey_sig_returns_7f49_tlv(runner: CLIRunner) -> None:
     log.info("Extracted EC point: %d bytes", len(ec_point))
 
 
-@_XFAIL
 def test_openpgp_genkey_sig_public_key_is_valid_p256(runner: CLIRunner) -> None:
     """The SIG slot public key must be a valid uncompressed P-256 point."""
     result = _send_apdus(
@@ -227,7 +221,6 @@ def test_openpgp_genkey_sig_public_key_is_valid_p256(runner: CLIRunner) -> None:
     log.info("P-256 SIG public key validated: x=%064x", x)
 
 
-@_XFAIL
 def test_openpgp_read_pubkey_sig_after_genkey(runner: CLIRunner) -> None:
     """READ PUBLIC KEY (P1=0x81) for SIG slot must return the same key as GENKEY."""
     # Generate key and capture the point
@@ -238,7 +231,7 @@ def test_openpgp_read_pubkey_sig_after_genkey(runner: CLIRunner) -> None:
     if gen_sw != "9000":
         pytest.skip(f"Key generation failed (SW={gen_sw!r}).")
 
-    gen_resp = result_gen.stdout.replace(" ", "").replace("\n", "").strip()
+    gen_resp = last_response_hex(result_gen.stdout)
     gen_point = _extract_ec_point_from_7f49(gen_resp)
     if gen_point is None:
         pytest.skip("Could not extract EC point from GENKEY response.")
@@ -252,7 +245,7 @@ def test_openpgp_read_pubkey_sig_after_genkey(runner: CLIRunner) -> None:
         f"READ PUBLIC KEY for SIG slot returned SW={read_sw!r}."
     )
 
-    read_resp = result_read.stdout.replace(" ", "").replace("\n", "").strip()
+    read_resp = last_response_hex(result_read.stdout)
     read_point = _extract_ec_point_from_7f49(read_resp)
     assert read_point is not None, (
         f"Could not extract EC point from READ PUBLIC KEY response.\nRaw: {read_resp[:80]}"
@@ -266,7 +259,6 @@ def test_openpgp_read_pubkey_sig_after_genkey(runner: CLIRunner) -> None:
     log.info("READ PUBLIC KEY matches GENKEY response: OK (%d bytes)", len(read_point))
 
 
-@_XFAIL
 def test_openpgp_gpg_card_status_shows_sig_fingerprint(
     runner: CLIRunner, run_dir: Path
 ) -> None:
@@ -301,6 +293,10 @@ def test_openpgp_gpg_card_status_shows_sig_fingerprint(
         f"returncode: {proc.returncode}\n\nSTDOUT:\n{stdout}\n\nSTDERR:\n{stderr}",
         encoding="utf-8",
     )
+
+    # Skip if scdaemon is not available
+    if proc.returncode != 0 and "scdaemon" in (stdout + stderr).lower():
+        pytest.skip(f"scdaemon not available: {(stdout + stderr).strip()}")
 
     assert proc.returncode == 0, (
         f"gpg --card-status failed (rc={proc.returncode}):\n{stdout}\n{stderr}"

@@ -11,6 +11,7 @@ Always use the debug script to build and flash firmware. Do not run `cargo build
 This script:
 - Builds with `DEFMT_LOG=trace` (required for defmt log output to survive optimisation)
 - Uses the debug profile so `#[cfg(debug_assertions)]` sentinels are active
+- Includes `applet-piv` and `applet-openpgp` features (required for PIV/OpenPGP integration tests)
 - Flashes via `probe-rs run --chip RP235x`
 - Streams RTT output to the terminal until Ctrl+C
 

@@ -7,8 +7,6 @@ Verifies that:
 - pkcs11-tool --list-slots via the OpenSC PIV driver shows the PIV slot after
   SELECT, confirming that the PKCS#11 layer can find the applet.
 
-All tests are marked xfail because the PIV applet is not yet implemented in
-the firmware.  Remove the xfail mark as each feature is completed.
 """
 
 from __future__ import annotations
@@ -32,7 +30,6 @@ PIV_AID_BYTES = bytes.fromhex(PIV_AID)
 # SELECT APDU: 00 A4 04 00 0B <AID> 00
 _SELECT_PIV_APDU = "00A404000B" + PIV_AID + "00"
 
-_XFAIL = pytest.mark.xfail(reason="PIV not yet implemented", strict=False)
 
 
 # ---------------------------------------------------------------------------
@@ -103,7 +100,6 @@ def _parse_fci_application_template(response_hex: str) -> dict:
 # Tests
 # ---------------------------------------------------------------------------
 
-@_XFAIL
 def test_piv_select_succeeds(runner: CLIRunner, run_dir: Path) -> None:
     """SELECT PIV AID must return SW=9000."""
     result = _send_apdu(runner, _SELECT_PIV_APDU, save_as="piv_00_select")
@@ -133,7 +129,6 @@ def test_piv_select_succeeds(runner: CLIRunner, run_dir: Path) -> None:
     )
 
 
-@_XFAIL
 def test_piv_select_returns_fci(runner: CLIRunner, run_dir: Path) -> None:
     """SELECT PIV AID response must contain a well-formed FCI template (tag 61)."""
     result = _send_apdu(runner, _SELECT_PIV_APDU, save_as="piv_00_select_fci")
@@ -155,7 +150,6 @@ def test_piv_select_returns_fci(runner: CLIRunner, run_dir: Path) -> None:
     )
 
 
-@_XFAIL
 def test_piv_select_fci_contains_aid(runner: CLIRunner, run_dir: Path) -> None:
     """FCI tag 4F (Application Identifier) must match the PIV AID."""
     result = _send_apdu(runner, _SELECT_PIV_APDU, save_as="piv_00_select_aid_check")
@@ -179,7 +173,6 @@ def test_piv_select_fci_contains_aid(runner: CLIRunner, run_dir: Path) -> None:
     )
 
 
-@_XFAIL
 def test_piv_list_slots_via_pkcs11(runner: CLIRunner, run_dir: Path) -> None:
     """pkcs11-tool --list-slots must show a PIV-compatible slot after SELECT.
 
@@ -208,7 +201,6 @@ def test_piv_list_slots_via_pkcs11(runner: CLIRunner, run_dir: Path) -> None:
     log.info("Slot listing output:\n%s", result.stdout.strip())
 
 
-@_XFAIL
 def test_piv_select_clears_session(runner: CLIRunner) -> None:
     """Sending SELECT PIV a second time must succeed (session reset must be idempotent)."""
     for attempt in range(1, 3):

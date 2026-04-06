@@ -226,5 +226,8 @@ fn algo_to_core_key_type(algo: AlgorithmId) -> CoreKeyType {
         | AlgorithmId::AesCbc
         | AlgorithmId::AesCtr
         | AlgorithmId::AesGcm => CoreKeyType::Aes256,
+        // Curve25519
+        AlgorithmId::Ed25519 => CoreKeyType::Ed25519,
+        AlgorithmId::X25519 => CoreKeyType::X25519,
     }
 }

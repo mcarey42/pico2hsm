@@ -67,9 +67,8 @@ impl PinSlot {
     }
 
     /// Returns `true` if this slot has real flash backing today.
-    /// PIV and OpenPGP slots are placeholders until their applets are implemented.
     pub fn is_implemented(self) -> bool {
-        matches!(self, PinSlot::ScHsmUser | PinSlot::ScHsmSo)
+        true
     }
 }
 
@@ -129,6 +128,10 @@ pub enum KeyType {
     Aes256,
     /// BIP32/SLIP-0010 master key (32-byte seed + 32-byte chain code).
     Bip32Master,
+    /// Ed25519 private key (32-byte seed).
+    Ed25519,
+    /// X25519 private key (32 bytes).
+    X25519,
 }
 
 impl KeyType {
@@ -148,6 +151,8 @@ impl KeyType {
             KeyType::Aes192 => 24,
             KeyType::Aes256 => 32,
             KeyType::Bip32Master => 64, // 32-byte seed + 32-byte chain code
+            KeyType::Ed25519 => 32,
+            KeyType::X25519 => 32,
         }
     }
 }
