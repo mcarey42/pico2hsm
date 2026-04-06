@@ -190,6 +190,11 @@ impl Dispatcher {
         // SC-HSM AID
         if aid == SC_HSM_AID {
             self.active = ActiveProtocol::ScHsm;
+            // Reset security state on each SELECT (mirrors PIV and OpenPGP
+            // behaviour). A new SELECT must not inherit authentication from
+            // a prior session — HIGH-1 security audit finding.
+            self.sc_hsm.state.so_pin_verified = false;
+            self.sc_hsm.state.pin_verified = false;
             return build_sc_hsm_fci();
         }
 

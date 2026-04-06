@@ -4,15 +4,21 @@
 //! cause a processor to skip instructions or corrupt register values. These
 //! countermeasures increase the cost of such attacks by:
 //!
-//! 1. Arming the RP2350 hardware voltage-glitch detector (POWMAN)
+//! 1. Arming the RP2350 hardware voltage-glitch detector (GLITCH_DETECTOR peripheral)
 //! 2. Providing software double-check patterns for critical comparisons
 //! 3. Detecting stack corruption via a canary word
 //!
 //! # RP2350 hardware glitch detector
-//! The RP2350 Power Management (POWMAN) block includes a voltage glitch
-//! detector that can trigger a reset if the core supply voltage deviates
-//! unexpectedly (RP2350 datasheet §7.6 "Power Management").
-//! The `arm_glitch_detector()` function enables this feature.
+//! The RP2350 has a dedicated GLITCH_DETECTOR peripheral (at 0x4015_8000)
+//! separate from POWMAN. When armed, any detector trigger causes an immediate
+//! reset of the switched core power domain. The peripheral has:
+//! - `arm` register: write `Arm::YES` (0x0000) to arm; `Arm::NO` (0x5BAD) to not arm
+//! - `sensitivity` register: 4 detector pairs (det0-det3 + det0_inv-det3_inv);
+//!   `_inv` fields must be bitwise complement of their matching detector field
+//! - `lock` register: write any nonzero value to prevent further changes
+//!
+//! The `arm_glitch_detector()` function configures all 4 detectors to maximum
+//! sensitivity and locks the configuration.
 //!
 //! # Software double-check pattern
 //! For security-critical boolean decisions (e.g., PIN verification result,
@@ -29,7 +35,8 @@
 //! ```
 //!
 //! # References
-//! - RP2350 datasheet §7.6 "POWMAN"
+//! - RP2350 datasheet §12.5 "Glitch Detector"
+//! - rp-pac GLITCH_DETECTOR peripheral (0x4015_8000)
 //! - "Fault Attacks on Secure Embedded Software", Riscure (2020)
 
 use core::sync::atomic::{AtomicU32, Ordering, compiler_fence};
@@ -124,39 +131,86 @@ pub fn reset_stack_canary() {
 
 /// Arm the RP2350 hardware voltage-glitch detector.
 ///
-/// The RP2350 POWMAN block includes a voltage glitch detector that monitors
-/// the core supply rail. When a glitch is detected, POWMAN can trigger an
-/// immediate system reset.
+/// Uses the dedicated GLITCH_DETECTOR peripheral (at 0x4015_8000, separate
+/// from POWMAN). Configures all 4 detector pairs to maximum sensitivity (3),
+/// arms the detector, and locks the configuration to prevent tampering.
 ///
-/// # Current implementation status
-/// The POWMAN glitch detector configuration registers are not yet fully
-/// exposed by the `rp_pac` version used by embassy-rp 0.10.  This function
-/// is a documented stub that records the intent. It will be completed when
-/// `pac::POWMAN.vreg()` gains stable field accessors for `GLITCH_DETECT_ENABLE`
-/// and `GLITCH_DETECT_SENS` (RP2350 datasheet §7.6.4 "VREG register").
+/// When armed, any individual detector trigger causes an immediate reset of
+/// the switched core power domain. The reset reason is recorded in
+/// POWMAN_CHIP_RESET.
 ///
-/// # TODO
-/// When `rp_pac` exposes POWMAN VREG fields:
-/// ```ignore
-/// unsafe {
-///     let powman = embassy_rp::pac::POWMAN;
-///     powman.vreg().modify(|w| {
-///         w.set_glitch_detect_disable(false); // enable detector
-///         w.set_glitch_detect_sens(3);        // maximum sensitivity
-///     });
-/// }
-/// ```
+/// # Sensitivity register layout
+/// Each detector pair consists of a 2-bit `detN` field and a 2-bit `detN_inv`
+/// field. The `_inv` field MUST be the bitwise complement of the `detN` field
+/// (hardware design requirement); if they don't match, the hardware falls
+/// back to the OTP default sensitivity instead.
 ///
-/// Until then, software double-checks (`double_check()`) provide the primary
-/// fault-injection countermeasure layer.
+/// Maximum sensitivity = 3 (0b11), so `detN_inv` = bitwise NOT of 3 within
+/// 2 bits = 0 (0b00).
+///
+/// # Lock register
+/// Writing any nonzero value to the `lock` register permanently prevents
+/// further writes to ARM, DISARM, SENSITIVITY, and LOCK until the next
+/// power-on reset.
+///
+/// # Safety
+/// Uses `unsafe` to access MMIO registers via the rp-pac PAC. This is safe
+/// because:
+/// 1. The GLITCH_DETECTOR peripheral address (0x4015_8000) is a well-known
+///    RP2350 hardware register block.
+/// 2. These writes configure security-critical hardware exactly once at boot.
+/// 3. The lock register prevents any further modification.
+/// 4. No other code accesses these registers (single-owner at boot time).
+#[cfg(target_arch = "arm")]
 pub fn arm_glitch_detector() {
-    // TODO: implement via embassy_rp::pac::POWMAN VREG register when the
-    // rp_pac crate exposes the GLITCH_DETECT_DISABLE and GLITCH_DETECT_SENS
-    // fields. Tracked as a known limitation.
-    //
-    // Reference: RP2350 datasheet §7.6.4 "POWMAN: VREG register"
-    //   Bits [31:16] = GLITCH_DETECT_SENS (sensitivity, 0=off, 3=max)
-    //   Bit  [0]     = GLITCH_DETECT_DISABLE (0 = detector enabled)
-    #[cfg(feature = "debug")]
-    defmt::warn!("anti_glitch: arm_glitch_detector() not yet implemented — rp_pac PAC stub");
+    use embassy_rp::pac::GLITCH_DETECTOR;
+
+    // SAFETY: Single-owner MMIO access at boot time to well-known RP2350
+    // GLITCH_DETECTOR registers. No other code accesses these registers.
+    // The lock at the end prevents any further modification.
+    unsafe {
+        // Step 1: Set all 4 detectors to maximum sensitivity (3).
+        // The _inv fields must be the 2-bit bitwise complement of the
+        // sensitivity value: NOT(3) & 0x03 = 0.
+        GLITCH_DETECTOR.sensitivity().write(|w| {
+            w.set_det0(3);       // max sensitivity
+            w.set_det1(3);
+            w.set_det2(3);
+            w.set_det3(3);
+            w.set_det0_inv(0);   // bitwise complement of 3 within 2 bits
+            w.set_det1_inv(0);
+            w.set_det2_inv(0);
+            w.set_det3_inv(0);
+            // Override OTP defaults — use register values instead.
+            w.set_default(
+                embassy_rp::pac::glitch_detector::vals::Default::NO,
+            );
+        });
+
+        // Step 2: Arm the glitch detector.
+        // Arm::YES = 0x0000 (any value other than 0x5BAD arms the detector).
+        GLITCH_DETECTOR.arm().write(|w| {
+            w.set_arm(embassy_rp::pac::glitch_detector::vals::Arm::YES);
+        });
+
+        // Step 3: Lock the configuration to prevent tampering.
+        // Any nonzero value disables further writes to ARM, DISARM,
+        // SENSITIVITY, and LOCK registers until next power-on reset.
+        GLITCH_DETECTOR.lock().write(|w| {
+            w.set_lock(1);
+        });
+    }
+}
+
+/// Check whether the glitch detector is currently armed.
+///
+/// Reads the ARM register and returns `true` if the value is not
+/// `Arm::NO` (0x5BAD), meaning the detector is armed.
+#[cfg(target_arch = "arm")]
+pub fn is_glitch_detector_armed() -> bool {
+    use embassy_rp::pac::GLITCH_DETECTOR;
+    unsafe {
+        let val = GLITCH_DETECTOR.arm().read().arm();
+        val != embassy_rp::pac::glitch_detector::vals::Arm::NO
+    }
 }

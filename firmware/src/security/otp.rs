@@ -308,27 +308,27 @@ pub fn write_row(row: u8, data: [u8; 3]) -> Result<(), StorageError> {
 
 /// Permanently lock a range of OTP rows for reading.
 ///
-/// TODO: embassy-rp 0.10 does not expose a `lock_read()` API.  This
-/// function is a stub; full implementation requires PAC access to the
-/// OTP_DATA_RAW permission bits or the ROM `otp_access` function with
-/// a lock flag.  Filed as a known limitation.
+/// OTP row read-locking is not yet implemented.
+///
+/// Returns `Err` to prevent callers from falsely assuming the rows are locked.
+/// Full implementation requires PAC access to the OTP_DATA_RAW permission
+/// bits or the ROM `otp_access` function with a lock flag.
 pub fn lock_read(_row_start: u8, _row_count: u8) -> Result<(), StorageError> {
     defmt::warn!(
-        "OTP: lock_read() not yet implemented — embassy-rp 0.10 lacks lock API"
+        "OTP: lock_read/lock_write not yet implemented — returning Err to prevent false assumption of locked state"
     );
-    // TODO: Use ROM otp_access with LOCK flag or direct PAC write to
-    // OTP_DATA_RAW permission bits once the API is available.
-    Ok(()) // Non-fatal: returns Ok so provisioning can proceed.
+    Err(StorageError::WriteError)
 }
 
-/// Permanently lock a range of OTP rows against further writes.
+/// OTP row write-locking is not yet implemented.
 ///
-/// TODO: Same limitation as `lock_read()` — see above.
+/// Returns `Err` to prevent callers from falsely assuming the rows are locked.
+/// See `lock_read()` for rationale.
 pub fn lock_write(_row_start: u8, _row_count: u8) -> Result<(), StorageError> {
     defmt::warn!(
-        "OTP: lock_write() not yet implemented — embassy-rp 0.10 lacks lock API"
+        "OTP: lock_read/lock_write not yet implemented — returning Err to prevent false assumption of locked state"
     );
-    Ok(())
+    Err(StorageError::WriteError)
 }
 
 /// Read the 32-byte device root secret from OTP rows 0x20–0x3F (legacy layout).
@@ -361,12 +361,19 @@ pub fn read_root_secret() -> Result<[u8; 32], StorageError> {
 /// The derived key is returned as a 32-byte array and MUST be zeroized
 /// by the caller after use.
 ///
+/// BREAKING CHANGE: This function now reads from OTP rows 0x100-0x11F
+/// (correct per-device key material). Any device provisioned before this
+/// change will have its keystore irrecoverably encrypted under the old SMK
+/// derived from rows 0x20-0x3F. Re-initialization is required after
+/// upgrading from earlier firmware.
+///
 /// TODO (crypto agent): pass the device serial number from OTP as `info`.
 pub fn derive_smk() -> Result<[u8; 32], StorageError> {
     use hkdf::Hkdf;
     use sha2::Sha256;
 
-    let ikm = read_root_secret()?;
+    let ikm = read_ecc_bytes_64(OTP_STORAGE_KEY_ROW_START as usize)
+        .map_err(otp_err_to_storage)?;
     let salt = b"pico2hsm-smk";
 
     let hk = Hkdf::<Sha256>::new(Some(salt), &ikm);

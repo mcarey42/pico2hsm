@@ -214,52 +214,46 @@ pending hardware validation with curve25519-enabled firmware build.
 
 ---
 
-## 8. Multi-partition key store — thousands of keys via separate AID instances
+## 8. Multi-partition key store — DEFERRED (hardware limitations)
 
-**Motivation:**
-A single SC-HSM AID session can address at most 254 keys (1-byte protocol key
-reference).  The partition architecture breaks through this limit by presenting
-each partition as a separate AID instance; clients SELECT the desired partition AID
-before operating on its keys.  With u32 internal key IDs (item 7a), the storage
-layer can hold thousands of keys limited only by flash capacity.
+**Status: FULLY DEFERRED — revisit only if a concrete multi-tenant deployment need
+surfaces on more capable hardware.**
 
-**Design:**
-- Each partition registers a distinct AID: last byte encodes partition index.
-  Partition 0 = existing AID (backward compatible).
-  Partition N = `E8 2B 06 01 04 01 81 C3 1F 02 [N+1]`.
-- u32 key ID `partition_id << 24 | applet_id << 16 | proto_ref` unambiguously
-  identifies every key in flash across all partitions.
-- Each partition has its own independent PIN, session state, and key namespace.
-- Dispatcher already does AID-based routing — adding partitions is a new entry
-  per partition in the routing table, not a new code path.
+**Why deferred (2026-04-06):**
 
-**Management APDUs (vendor extension, gated on partition 0 + SO-PIN):**
-- `INS=0xD0` CREATE PARTITION — allocate partition, set SO-PIN
-- `INS=0xD1` DELETE PARTITION — wipe all partition keys
-- `INS=0xD2` LIST PARTITIONS — return count + AID bytes for active partitions
-- `INS=0xD3` PARTITION STATS — key count, auth attempts, storage used (TLV response)
+1. **RAM ceiling** — each `ScHsmState` instance costs ~32 KB RAM (inline
+   `Vec<u8, 2048>` EF storage × 16 entries).  The RP2350 has 520 KB SRAM total
+   with ~338 KB already committed (BSS + core1 stack).  ~5 additional ScHsm
+   instances exhaust remaining RAM, so meaningful partition counts are impossible
+   without a hardware change.
 
-**PKCS#11 integration:**
-- Custom PKCS#11 provider enumerates partitions via `LIST PARTITIONS` on connect,
-  then presents each as a separate PKCS#11 slot/token.
-- Standard OpenSC / pkcs11-tool will see only partition 0 (existing AID).
+2. **No physical isolation** — RP2350 provides no hardware enforcement between
+   logical partitions.  All partitions share the same flash, core, and RAM; this
+   renders the security model equivalent to software namespacing, not true HSM
+   partitioning.  Tamper-evident isolation requires dedicated silicon (e.g. Arm
+   TrustZone SE or a discrete secure element).
 
-**Capacity (pico2_4m, 2 MB keystore region):**
-- EC key: ~200 bytes → ~10,000 EC keys total
-- RSA-2048: ~1.5 KB → ~1,300 RSA-2048 keys total
-- 40 partitions × 254 keys = 10,160 addressable slots
+3. **No standard tooling path** — accessing any partition beyond partition 0
+   requires a custom PKCS#11 provider.  Standard OpenSC, pkcs11-tool, macOS
+   CryptoTokenKit, and Windows CNG see only partition 0.
 
-**Prerequisites:**
-- Item 7a (u32 key IDs + AppletId owner field) — must land first.
-- Item 7a PIN-slot design extended to per-partition PIN storage.
+4. **254 keys/session is not a binding constraint in practice** — realistic
+   workloads (personal crypto, small PKI, lab testing) top out well below 254.
 
-**What needs to happen:**
-- Extend `Dispatcher` to instantiate up to N `ScHsm` instances, one per partition.
-- Register N AIDs (one per partition) in the AID routing table.
-- Add `wipe_by_partition(partition_id: u8)` to `KeyStore` trait.
-- Implement the four management APDUs behind SO-PIN gate on partition 0.
-- Design partition metadata storage (active partitions list, per-partition label/flags).
-- Write integration tests covering multi-partition round-trip.
+5. **DKEK is still fully stubbed** — shipping a "10,000-key HSM" with no key
+   backup/export path is a liability, not a feature.  Item 1 must land first.
+
+6. **Future direction** — if the key-scale use case is ever real, the correct
+   path is more capable hardware: FPGA-assisted key generation, a discrete
+   secure element with hardware partition isolation, or an RP2350 paired with
+   an external crypto accelerator.  Stretching this firmware further on
+   Cortex-M33 is not the right lever.
+
+**Flash layout decision (adopted in place of this item):**
+All boards use a fixed firmware / keystore split.  For the RP2354 embedded-flash
+variant (2 MB total), the canonical split is **1 MB firmware / 1 MB keystore**
+(see `boards/rp2354_embedded.x`).  The 254-key addressable limit per session is
+documented as a known protocol constraint, not a target for workaround.
 
 ---
 

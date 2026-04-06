@@ -23,8 +23,13 @@
 //!
 //! # RP2350 OTP references
 //! - BOOT_FLAGS0 is OTP row 0x30 (RP2350 datasheet §5.6.6 "OTP Registers")
-//! - CRIT0 (row 0x18) bit 1 = GLITCH_DETECTOR_ENABLE
-//! - CRIT0 (row 0x18) bit 2 = GLITCH_DETECTOR_SENS_x
+//! - CRIT0 (row 0x18) bit layout (per rp-pac):
+//!   - bit 0: secure_boot_enable
+//!   - bit 1: secure_debug_disable
+//!   - bit 2: debug_disable (JTAG disable)
+//!   - bit 3: default_archsel
+//!   - bit 4: glitch_detector_enable
+//!   - bits 5-6: glitch_detector_sens
 //! - The pico2hsm boot flags are stored in OTP row 0x110 (see otp.rs)
 
 use embassy_rp::watchdog::Watchdog;
@@ -48,6 +53,13 @@ pub const WATCHDOG_PERIOD_MS: u32 = 5000;
 /// 3. Reject debugger attachment in production mode
 /// 4. Flash integrity marker check (via OTP boot flags)
 pub fn security_checks() {
+    // Arm the hardware glitch detector FIRST, before any other security check,
+    // to protect the checks themselves from voltage-glitch fault injection.
+    // Only arm in production mode to avoid false resets during development.
+    if is_production_mode_otp() {
+        crate::security::anti_glitch::arm_glitch_detector();
+    }
+
     #[cfg(not(feature = "debug"))]
     {
         // Only halt on debugger attachment if the device is in production mode

@@ -377,6 +377,10 @@ impl ScHsm {
             bip_slip::INS_BIP_SLIP => bip_slip::handle(&mut self.state, cmd),
             extras::INS_EXTRAS => extras::handle(&mut self.state, cmd),
             select::INS_SELECT => select::handle(&mut self.state, cmd),
+            provisioning::INS_PROV_GET_STATUS => provisioning::handle_get_status(&mut self.state, cmd),
+            provisioning::INS_PROV_SET_PRODUCTION => provisioning::handle_set_production_mode(&mut self.state, cmd),
+            provisioning::INS_PROV_LOCK_OTP_ROWS => provisioning::handle_lock_otp_rows(&mut self.state, cmd),
+            provisioning::INS_PROV_WRITE_CRIT0 => provisioning::handle_write_crit0(&mut self.state, cmd),
             #[cfg(feature = "debug")]
             debug_dump::INS_DEBUG_DUMP => debug_dump::handle(cmd),
             _ => ApduResponse::err(SW_INS_NOT_SUPPORTED),

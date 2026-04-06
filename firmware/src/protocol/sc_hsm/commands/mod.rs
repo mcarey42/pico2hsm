@@ -28,6 +28,7 @@ pub mod initialize;
 pub mod key_domain;
 pub mod list_keys;
 pub mod mse;
+pub mod provisioning;
 pub mod pso;
 pub mod puk_auth;
 pub mod read_binary;

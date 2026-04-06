@@ -5,3 +5,5 @@ tests/hw/reports/
 tests/hw/__pycache__/
 tests/hw/helpers/__pycache__/
 .claude/
+ec_firmware_signing_key.pem
+ec_firmware_signing_key.pub
