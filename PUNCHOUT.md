@@ -1,12 +1,11 @@
 # pico2hsm — Punchout List
 
-Items identified by mechanism audit (2026-04-03).  Each section describes what
-is advertised by `pkcs11-tool -M` / the opensc sc-hsm driver and the current
-state of the firmware and test suite.
+Open items identified during mechanism and security audits.  Deferred items
+are at the bottom.
 
 ---
 
-## 0. Display — Key count not updating on screen
+## 1. Display — Key count not updating on screen
 
 **Current state:**
 `display_state.key_count` is initialised to 0 at boot and never updated.  The
@@ -27,7 +26,7 @@ cannot detect when a `GENERATE KEY PAIR` (INS=0x46) or `DELETE FILE`
 
 ---
 
-## 1. DKEK — Key backup/restore is fully stubbed
+## 2. DKEK — Key backup/restore is fully stubbed
 
 **Current state:**
 Three layers are all unimplemented:
@@ -63,7 +62,6 @@ Three layers are all unimplemented:
 
 ---
 
-
 ## 3. Brainpool curves — Blocked on upstream crate
 
 **Current state:**
@@ -84,137 +82,63 @@ context compatible with `elliptic-curve 0.13`.
 
 ---
 
+## 4. Security hardening — Remaining stubs
 
-## 5. Security hardening — Several stubs awaiting hardware/crate API
+**4a. OTP row locking not yet wired (`security/otp.rs`)**
+`Otp::lock_read()` and `Otp::lock_write()` return `Err(StorageError::WriteError)`
+as a safe sentinel (changed from the previous silent `Ok(())`) but do not perform
+actual OTP hardware row locking.  Real locking requires PAC access to
+`OTP_DATA_RAW` permission bits or the ROM `otp_access` function with a lock flag.
+Until wired: provisioning writes the correct key material to OTP rows but those
+rows remain erasable / re-writable by an attacker with physical access and a
+flash programmer.  Blocking for production deployments that require row-level
+tamper evidence.
 
-**5a. PIN hash not zeroized (`commands/initialize.rs:46`)** — RESOLVED
-`hash_pin()` now calls `result.zeroize()` (via `zeroize::Zeroize`) on the
-`GenericArray<u8, U32>` returned by `h.finalize()` immediately after
-`copy_from_slice`, clearing the intermediate hash copy from the stack.
-`generic-array` 0.14 implements `Zeroize` for `GenericArray<u8, N>` and is
-already in the dependency graph with the `zeroize` feature enabled.
+**4b. CRIT0 / JTAG disable — provisioning APDU exists, tooling confirmation pending**
+`INS=0xF3` (PROV_WRITE_CRIT0) writes `CRIT0 = 0x74` (bit 2 = debug_disable/JTAG,
+bit 4 = glitch_detector_enable, bits 5–6 = sensitivity 3).  This is an
+irreversible OTP write and is gated behind SO-PIN authentication and confirmed
+production mode.  Before any device is deployed:
+- Confirm the exact CRIT0 bit positions against RP2350 TRM §5.1 "OTP Boot Flags"
+  using `picotool otp get`.
+- Run the provisioning sequence on a sacrificial board and verify JTAG is
+  disabled and glitch detector fires as expected.
+- Only then run on production devices.
 
-**5b. Anti-glitch detector not armed (`security/anti_glitch.rs:153`)**
-`arm_glitch_detector()` is a no-op stub.  The POWMAN VREG register fields
-`GLITCH_DETECT_DISABLE` and `GLITCH_DETECT_SENS` are documented in the RP2350
-TRM but not yet exposed by `embassy-rp` / `rp-pac`.  Software double-checks
-(`double_check()`) are the current primary countermeasure.  Track the
-`embassy-rp` / `rp-pac` crates for POWMAN VREG support.
-
-**5c. OTP lock operations stubbed (`security/otp.rs:311, 326`)**
-`Otp::lock_read()` and `Otp::lock_write()` return `Ok(())` without doing anything
-because `embassy-rp 0.10` does not expose a lock API.  Fix requires PAC access to
-OTP_DATA_RAW permission bits or the ROM `otp_access` function with a lock flag.
-Currently non-fatal: provisioning proceeds but OTP rows are not read- or
-write-locked after programming.
-
-**5d. JTAG disable incomplete — CRIT0 row never written (`security/otp.rs:222`)** — PRE-PRODUCTION BLOCKER
-`disable_jtag_permanent()` only sets the pico2hsm user-land bookkeeping flag at
-OTP row `0x110` bit 0.  The actual hardware JTAG lockdown requires writing CRIT0
-(OTP row `0x18`); this is never done anywhere in the firmware.  Per
-`docs/SECURE_PROVISIONING_PLAN.md` §4, CRIT0 must be written by the factory
-provisioning tool only (not by runtime firmware), after all other OTP rows are
-confirmed correct.  Exact CRIT0 JTAG-disable bit position is ESTIMATED — confirm
-against RP2350 TRM §5.1 "OTP Boot Flags" before burning.
-
-**5e. SMK reads wrong OTP rows — all devices share same key (`security/otp.rs:364`)** — PRE-PRODUCTION BLOCKER
-`derive_smk()` calls `read_root_secret()` which reads legacy rows `0x20–0x3F`.
-Those rows overlap with the boot signing public key hash range and are NOT the
-per-device key material.  The correct IKM source is `read_storage_key_material()`
-at rows `0x100–0x11F` (per-device random bytes written at factory).  Until fixed,
-all devices programmed with the same firmware derive the same SMK, making flash
-encryption trivially bypassed.  Fix: replace the `read_root_secret()` call in
-`derive_smk()` with `read_storage_key_material()` and add the device serial from
-OTP as the HKDF `info` parameter (original intent of the TODO comment).
-
-**5f. CSPRNG reseed wired (`crypto/rng.rs`)** — RESOLVED (core functionality)
-`reseed()` now reads a fresh 32-byte key and 12-byte nonce from the hardware TRNG
-via direct PAC register access and installs a new `ChaCha20` instance in a global
-`CSPRNG` cell.  `fill_random()` draws from the ChaCha20 keystream when the CSPRNG
-is seeded, falling back to direct PAC TRNG reads before the first `reseed()` call.
-A shared `pac_fill_bytes()` helper is used by both paths.  `reseed()` is called
-once from the core1 dispatcher task at startup (before the first APDU).  Provides
-forward secrecy: a future CSPRNG state compromise does not reveal earlier outputs.
-
-**Remaining (not blocking):** The embassy-rp interrupt-bound `Trng` peripheral
-singleton is not yet integrated; the `Rng` struct (`rng.rs`) still uses the PAC
-fallback.  Periodic re-seeding (e.g. every N operations) is not yet wired.  See
-`rng.rs` TODO comment.
+**4c. Periodic CSPRNG reseed not wired**
+`reseed()` is called once at core1 startup.  Periodic re-seeding (e.g. every
+N operations) is not yet wired.  Forward secrecy is bounded by the initial seed
+interval.  See `firmware/src/crypto/rng.rs` TODO comment.
 
 ---
 
+## 5. ECDH cofactor derive — `ECDH1-COFACTOR-DERIVE` returns `CKR_GENERAL_ERROR`
 
-## 7. PIV and OpenPGP applets — IMPLEMENTED (2026-04-05)
+**Current state:**
+Integration tests `test_ecdh_returns_correct_length`, `test_ecdh_cross_check`, and
+`test_ecdh_different_peers_give_different_secrets` all fail for P-256 when the test
+harness requests mechanism `ECDH1-COFACTOR-DERIVE` (0x1051).  The firmware returns
+`CKR_GENERAL_ERROR`; the standard `ECDH1-DERIVE` (0x1050) path is not exercised by
+these tests and is believed to work.  These tests are marked `xfail` in the suite.
 
-Both applets are fully implemented and hardware-validated.  The Dispatcher
-routes by AID to all three protocols at runtime.
+**Root cause (to confirm):**
+Mechanism `ECDH1-COFACTOR-DERIVE` multiplies the shared point by the curve cofactor
+(h=1 for P-256, so it is mathematically identical to plain ECDH on this curve).
+The OpenSC sc-hsm driver likely maps this mechanism to a different INS byte or a
+different `algo_ref` than plain ECDH.  The firmware dispatch in
+`protocol/sc_hsm/commands/ecdh.rs` (or equivalent) may not recognise the cofactor
+algo ID and falls through to a generic error.
 
-**Architecture:** Cargo feature flags (`applet-piv`, `applet-openpgp`,
-`applet-openpgp-curve25519`) — all three applets coexist in one binary.
-See CLAUDE.md §"Multi-applet feature flag architecture" for build commands
-and flash/RAM budget.
-
-**7a. Storage namespace** — DONE
-
-- `KeyId` is a `u32` with partition/applet/proto_ref encoding
-- `AppletId` enum (`ScHsm=0`, `Piv=1`, `OpenPgp=2`) with per-applet key ID constructors
-- `KeyStore::wipe_by_owner(AppletId)` — `INITIALIZE` only wipes SC-HSM keys
-- Flash magic `"P2K2"` — pre-u32 keystore data detected and rejected at boot
-- Per-applet PIN slots implemented: `PinSlot::Piv`, `PinSlot::OpenPgpPw1`, `PinSlot::OpenPgpPw3`
-- Key ID scheme: `bits 31–24: partition_id | bits 23–16: applet_id | bits 7–0: proto_ref`
-
-**7b. PIV (`applet-piv` feature)** — DONE, hardware-validated, flash-persistent
-
-Commands implemented: SELECT (FCI tag 61), GET DATA, VERIFY (PIN/PUK),
-CHANGE REFERENCE DATA, RESET RETRY COUNTER, GENERAL AUTHENTICATE (3DES
-management key + EC witness/challenge), GENERATE KEY PAIR (P-256, P-384).
-
-Key slots: 9A (PIV Auth), 9C (Digital Sig), 9D (Key Mgmt), 9E (Card Auth).
-Retired slots 82–95 not yet implemented.
-
-Flash persistence: EC keys stored as `KeyObject` with `AppletId::Piv` owner.
-PIN state stored as 101-byte sentinel record at `KeyId::piv(0xFF)` (PBKDF2 hash
-+ salt + retry counters). Security state (PIN verified) reset on each SELECT per
-NIST SP 800-73-4.
-Default PIN: `123456`, default PUK: `12345678`, default management key: 24-byte 3DES default.
-
-Passing integration tests: all 12 `test_piv_*` tests pass (0 failures, 0 xfail).
-
-**7c. OpenPGP (`applet-openpgp` feature)** — DONE, hardware-validated, flash-persistent
-
-Commands implemented: SELECT (DO 6F, 6E, C4, C6), GET DATA (all standard DOs),
-VERIFY (PW1 mode 81/82, PW3), CHANGE REFERENCE DATA, PSO:CDS (ECDSA sign,
-returns raw r||s per OpenPGP spec), PSO:DECIPHER (ECDH), INTERNAL AUTHENTICATE,
-GENERATE KEY PAIR (P-256, P-384, P-521), GET CHALLENGE.
-
-Key slots: SIG (0x90), DEC (0x91), AUTH (0x92).
-
-Flash persistence: EC keys stored with `AppletId::OpenPgp` owner. PW1 and PW3
-PIN hashes stored as 35-byte sentinel records at `KeyId::openpgp(0xFE)` and
-`KeyId::openpgp(0xFF)` respectively. Security state reset on each SELECT.
-Default PW1: `123456`, default PW3: `12345678`.
-
-Passing integration tests: all `test_openpgp_*` tests pass (2 skipped for
-`gpg --card-status` requiring scdaemon, 2 xfailed for curve25519 feature).
-
-**7d. Ed25519 / X25519 (`applet-openpgp-curve25519` feature)** — IMPLEMENTED
-
-Adds `ed25519-dalek v2` and `x25519-dalek v2` for EdDSA signing and X25519
-key agreement — the modern OpenPGP key defaults preferred by GnuPG.
-Gated behind `applet-openpgp-curve25519` feature; NIST-ECC-only builds don't
-pay the cost (~45–60 KB flash for curve25519-dalek).
-
-New `KeyType` variants: `Ed25519` (32-byte key), `X25519` (32-byte key).
-New `AlgorithmId` variants: `Ed25519 = 0x20`, `X25519 = 0x21`.
-PSO:CDS with Ed25519 returns raw 64-byte signature (r||s).
-PSO:DECIPHER with X25519 expects 32-byte peer key, returns 32-byte shared secret.
-
-Tests gated with `@pytest.mark.xfail(strict=False)` in `test_openpgp_04_curve25519.py`
-pending hardware validation with curve25519-enabled firmware build.
+**What needs to happen:**
+- Trace the ECDH1-COFACTOR-DERIVE APDU on hardware to identify the `algo_ref` byte
+  the driver sends.
+- Add the cofactor algo_ref as an alias for the standard ECDH handler in the dispatch
+  match arm (for P-256/P-384/P-521 cofactor h=1, the result is identical).
+- Add the three ECDH tests to the passing baseline and remove the `xfail` markers.
 
 ---
 
-## 8. Multi-partition key store — DEFERRED (hardware limitations)
+## Deferred: Multi-partition key store
 
 **Status: FULLY DEFERRED — revisit only if a concrete multi-tenant deployment need
 surfaces on more capable hardware.**
@@ -241,7 +165,7 @@ surfaces on more capable hardware.**
    workloads (personal crypto, small PKI, lab testing) top out well below 254.
 
 5. **DKEK is still fully stubbed** — shipping a "10,000-key HSM" with no key
-   backup/export path is a liability, not a feature.  Item 1 must land first.
+   backup/export path is a liability, not a feature.  Item 2 (DKEK) must land first.
 
 6. **Future direction** — if the key-scale use case is ever real, the correct
    path is more capable hardware: FPGA-assisted key generation, a discrete
@@ -257,33 +181,9 @@ documented as a known protocol constraint, not a target for workaround.
 
 ---
 
-## 9. ECDH cofactor derive — `ECDH1-COFACTOR-DERIVE` returns `CKR_GENERAL_ERROR`
+## Deferred: PKCS#15 applet
 
-**Current state:**
-Integration tests `test_ecdh_returns_correct_length`, `test_ecdh_cross_check`, and
-`test_ecdh_different_peers_give_different_secrets` all fail for P-256 when the test
-harness requests mechanism `ECDH1-COFACTOR-DERIVE` (0x1051).  The firmware returns
-`CKR_GENERAL_ERROR`; the standard `ECDH1-DERIVE` (0x1050) path is not exercised by
-these tests and is believed to work.
-
-**Root cause (to confirm):**
-Mechanism `ECDH1-COFACTOR-DERIVE` multiplies the shared point by the curve cofactor
-(h=1 for P-256, so it is mathematically identical to plain ECDH on this curve).
-The OpenSC sc-hsm driver likely maps this mechanism to a different INS byte or a
-different `algo_ref` than plain ECDH.  The firmware dispatch in
-`protocol/sc_hsm/commands/ecdh.rs` (or equivalent) may not recognise the cofactor
-algo ID and falls through to a generic error.
-
-**What needs to happen:**
-- Trace the ECDH1-COFACTOR-DERIVE APDU on hardware to identify the `algo_ref` byte
-  the driver sends.
-- Add the cofactor algo_ref as an alias for the standard ECDH handler in the dispatch
-  match arm (for P-256/P-384/P-521 cofactor h=1, the result is identical).
-- Add the three ECDH tests to the passing baseline.
-
----
-
-## 10. PKCS#15 applet — Low priority, revisit if deployment need surfaces
+**Status: LOW PRIORITY — revisit if legacy enterprise middleware deployment need surfaces.**
 
 **Background:**
 PKCS#15 (ISO/IEC 7816-15) is a data-format standard defining how keys, certificates,
@@ -304,8 +204,3 @@ or Windows CNG without OpenSC installed.
   that mirrors keys already stored by SC-HSM on partition 0.
 - No new key storage — PKCS#15 is a presentation layer over the existing keystore.
 - PUT DATA / write commands optional; read-only is sufficient for most middleware.
-
-**Prerequisites:**
-- Item 7a (u32 key IDs + applet owner field) — must land first so PKCS#15 can
-  enumerate only SC-HSM-owned keys.
-- Item 7b (PIV) and 7c (OpenPGP) should land first; PKCS#15 is lower priority than both.
