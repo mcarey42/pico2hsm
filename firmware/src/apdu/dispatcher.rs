@@ -201,10 +201,14 @@ impl Dispatcher {
         // PIV AID
         if aid == PIV_AID {
             self.active = ActiveProtocol::Piv;
-            // Reset security state on each SELECT (per NIST SP 800-73-4)
-            self.piv.state.pin_verified = false;
-            self.piv.state.mgmt_key_authenticated = false;
-            self.piv.state.mgmt_challenge = None;
+            // Reset security state on each SELECT (per NIST SP 800-73-4).
+            // Gated on applet-piv: PivState fields don't exist without the feature.
+            #[cfg(feature = "applet-piv")]
+            {
+                self.piv.state.pin_verified = false;
+                self.piv.state.mgmt_key_authenticated = false;
+                self.piv.state.mgmt_challenge = None;
+            }
             return build_piv_fci();
         }
 
