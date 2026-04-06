@@ -62,13 +62,13 @@ KEY_FILE="ec_firmware_signing_key.pem"
 
 # ── Build (debug profile) ─────────────────────────────────────────────────────
 section "Debug build: $FEAT"
-info "cargo build --no-default-features --features $FEAT,rsa,applet-piv,applet-openpgp"
+info "cargo build --no-default-features --features $FEAT,rsa,applet-piv,applet-openpgp-curve25519"
 
 DEFMT_LOG=trace \
 cargo build \
     --manifest-path firmware/Cargo.toml \
     --no-default-features \
-    --features "$FEAT,rsa,applet-piv,applet-openpgp"
+    --features "$FEAT,rsa,applet-piv,applet-openpgp-curve25519"
 
 [[ -f "$ELF" ]] || die "ELF not found at $ELF"
 ok "Build complete: $ELF"

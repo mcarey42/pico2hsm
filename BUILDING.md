@@ -65,13 +65,79 @@ brew install arm-none-eabi-binutils
 
 ### Optional feature flags (combine with any board)
 
-| Feature | Effect |
-|---|---|
-| `rsa` | Enable RSA key operations (adds ~1 MB; requires 48 KB heap) |
-| `applet-piv` | Enable PIV applet (NIST SP 800-73-4); slots 9A/9C/9D/9E |
-| `applet-openpgp` | Enable OpenPGP Card 3.4 applet; NIST ECC (P-256/384/521) |
-| `applet-openpgp-curve25519` | Add Ed25519/X25519 to OpenPGP (implies `applet-openpgp`) |
-| `debug` | Enable RAM dump APDUs; disable secure-boot enforcement |
+| Feature | Effect | Default? |
+|---|---|---|
+| `rsa` | Enable RSA key operations (adds ~1 MB; requires 48 KB heap) | **Yes** |
+| `applet-piv` | Enable PIV applet (NIST SP 800-73-4); slots 9A/9C/9D/9E | **Yes** |
+| `applet-openpgp` | Enable OpenPGP Card 3.4 applet; NIST ECC (P-256/384/521) | implied by curve25519 |
+| `applet-openpgp-curve25519` | Add Ed25519/X25519 to OpenPGP (implies `applet-openpgp`) | **Yes** |
+| `debug` | Enable RAM dump APDUs; disable secure-boot enforcement | No — never in production |
+
+All four non-debug capabilities are on by default. Use `--no-default-features`
+plus explicit `--features` to opt out of specific capabilities for size-constrained builds.
+
+---
+
+## Default build — all features enabled
+
+The default build includes all three applets (SC-HSM, PIV, OpenPGP with
+Ed25519/X25519) plus RSA support. This is the recommended configuration for
+production use. You do not need to specify any extra flags:
+
+```sh
+# Build for Waveshare RP2350-One 4MB (the default board)
+cargo build --release --manifest-path firmware/Cargo.toml
+```
+
+To build for a different board, always use `--no-default-features` (board flags
+are mutually exclusive) and explicitly list the capabilities you want:
+
+```sh
+# Pico 2 — all features
+cargo build --release \
+    --manifest-path firmware/Cargo.toml \
+    --no-default-features \
+    --features pico2_4m,rsa,applet-piv,applet-openpgp-curve25519
+
+# RP2350-One 16MB — all features
+cargo build --release \
+    --manifest-path firmware/Cargo.toml \
+    --no-default-features \
+    --features rp2350_one_16m,rsa,applet-piv,applet-openpgp-curve25519
+```
+
+`applet-openpgp-curve25519` implies `applet-openpgp`; you do not need to list
+both.
+
+---
+
+## Firmware signing
+
+**All firmware outputs should be signed before deployment.** The build scripts
+do this automatically if `ec_firmware_signing_key.pem` exists in the project
+root. Generate the key pair once:
+
+```sh
+./generate_firmware_signing_keys.sh
+```
+
+This creates `ec_firmware_signing_key.pem` (private — keep it safe) and
+`ec_firmware_signing_key.pub` (public — safe to share). Both are gitignored.
+
+After generating the key, every `./build-all.sh` or `./build-all-debug.sh` run
+will produce signed outputs in `dist/`:
+
+```
+dist/pico2hsm-<board>-signed.elf    ← flash this (or the UF2)
+dist/pico2hsm-<board>-otp.json      ← burn this to lock the device
+dist/pico2hsm-<board>.uf2           ← generated from the signed ELF
+```
+
+> The RP2350 bootrom only enforces the signature when `secure_boot_enable` is
+> burned into OTP. Signing debug builds is safe — unsigned devices boot
+> normally; locked devices reject unsigned images.
+
+See `docs/SECURE_PROVISIONING_PLAN.md` for the OTP programming procedure.
 
 ---
 
@@ -84,19 +150,24 @@ cd /path/to/pico2hsm
 ./build-all.sh --test-only
 ```
 
-### Build all board variants
+### Build all board variants (with signing)
 
 ```sh
+# Generate key first (once only)
+./generate_firmware_signing_keys.sh
+
+# Build everything — signs if key is present
 ./build-all.sh
 ```
 
-### Build a single variant
+### Build a single variant manually
 
 ```sh
+# All features — recommended
 cargo build --release \
     --manifest-path firmware/Cargo.toml \
     --no-default-features \
-    --features rp2350_one_4m
+    --features rp2350_one_4m,rsa,applet-piv,applet-openpgp-curve25519
 ```
 
 The ELF is written to:
@@ -105,13 +176,15 @@ The ELF is written to:
 target/thumbv8m.main-none-eabihf/release/pico2hsm
 ```
 
-### Build with RSA support
+### Minimal build (SC-HSM only, no RSA, no extra applets)
+
+For constrained builds or quick iteration:
 
 ```sh
 cargo build --release \
     --manifest-path firmware/Cargo.toml \
     --no-default-features \
-    --features rp2350_one_16m,rsa
+    --features rp2350_one_4m
 ```
 
 ---

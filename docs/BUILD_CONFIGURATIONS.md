@@ -5,27 +5,64 @@ with exact cargo commands and flash/RAM budget estimates.
 
 ---
 
-## Quick reference: default features warning
+## Quick reference: default features
 
-`Cargo.toml` sets `default = ["rp2350_one_4m"]`. Adding `--features X` without
-`--no-default-features` activates both the default board and your specified
-board simultaneously, causing a compile error. **Always use
-`--no-default-features` when specifying a non-default board target.**
+`Cargo.toml` sets:
+```toml
+default = ["rp2350_one_4m", "rsa", "applet-piv", "applet-openpgp-curve25519"]
+```
+
+This means `cargo build --release --manifest-path firmware/Cargo.toml` (no
+extra flags) builds the Waveshare RP2350-One 4MB with all applets and RSA
+enabled — the recommended production configuration.
+
+**When changing the board target, always pass `--no-default-features`.**
+Board feature flags are mutually exclusive. Adding `--features other_board`
+without `--no-default-features` activates both `rp2350_one_4m` and the new
+board simultaneously, causing a compile error.
 
 ```sh
-# Correct
-cargo build --release --no-default-features --features rp2350_geek_sdcard
+# Correct — explicit board, re-add capabilities manually
+cargo build --release --no-default-features \
+    --features rp2350_geek_sdcard,rsa,applet-piv,applet-openpgp-curve25519
 
 # Wrong — activates rp2350_one_4m AND rp2350_geek_sdcard simultaneously
 cargo build --release --features rp2350_geek_sdcard
 ```
 
-The `build-all-debug.sh` script handles this correctly and is the recommended
-way to build and flash firmware in development.
+The `build-all-debug.sh` and `build-all.sh` scripts handle this correctly.
 
 ---
 
-## Board-only builds (SC-HSM applet only)
+## Recommended full-featured builds
+
+All three applets plus RSA. These are the configurations `build-all.sh` produces.
+
+```sh
+# Raspberry Pi Pico 2
+cargo build --release --no-default-features \
+    --features pico2_4m,rsa,applet-piv,applet-openpgp-curve25519
+
+# Waveshare RP2350-One 4MB
+cargo build --release --no-default-features \
+    --features rp2350_one_4m,rsa,applet-piv,applet-openpgp-curve25519
+
+# Waveshare RP2350-One 16MB
+cargo build --release --no-default-features \
+    --features rp2350_one_16m,rsa,applet-piv,applet-openpgp-curve25519
+
+# Waveshare RP2350-Geek 16MB
+cargo build --release --no-default-features \
+    --features rp2350_geek_16m,rsa,applet-piv,applet-openpgp-curve25519
+
+# Waveshare RP2350-Geek with SD card
+cargo build --release --no-default-features \
+    --features rp2350_geek_sdcard,rsa,applet-piv,applet-openpgp-curve25519
+```
+
+---
+
+## Board-only builds (SC-HSM applet only, minimal size)
 
 ### Raspberry Pi Pico 2 (development board)
 
@@ -240,21 +277,24 @@ pkill -9 -f "probe-rs"
 
 ### Debug + applets
 
-`build-all-debug.sh` always includes `applet-piv` and `applet-openpgp` in every
-build. This is required for the integration test suite (`run_tests.sh`) to pass —
-PIV and OpenPGP tests will receive SW=6D00 if those applets are not compiled in.
+`build-all-debug.sh` builds with all applets and RSA enabled, matching the
+production default. This is required for the integration test suite
+(`run_tests.sh`) to pass — PIV and OpenPGP tests will receive SW=6D00 if those
+applets are not compiled in.
 
 ```sh
-# Pico 2 — always builds SC-HSM + RSA + PIV + OpenPGP
+# Pico 2 — builds SC-HSM + RSA + PIV + OpenPGP + Ed25519/X25519
 ./build-all-debug.sh pico2_4m
 ```
 
-To add `applet-openpgp-curve25519` (Ed25519/X25519), edit the `FEAT` line in
-`build-all-debug.sh` to include that feature, or build manually:
+The features included are: `rsa,applet-piv,applet-openpgp-curve25519`
+(`applet-openpgp-curve25519` implies `applet-openpgp`).
+
+To build manually with the same set:
 
 ```sh
 cargo build --no-default-features \
-  --features pico2_4m,rsa,applet-piv,applet-openpgp,applet-openpgp-curve25519
+  --features pico2_4m,rsa,applet-piv,applet-openpgp-curve25519
 ```
 
 ---

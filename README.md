@@ -41,36 +41,44 @@ The firmware provides hardware-backed key storage with:
 
 ## Build Requirements
 
-- Rust stable (1.75+)
-- `thumbv8m.main-none-eabihf` target: `rustup target add thumbv8m.main-none-eabihf`
-- `probe-rs` for flashing: `cargo install probe-rs-tools`
+- Rust stable (1.75+): `rustup target add thumbv8m.main-none-eabihf`
+- `picotool` ≥ 2.1 for UF2 generation and firmware signing
+- `probe-rs` for SWD flashing: `cargo install probe-rs-tools`
+
+**New to embedded development?** See [QUICKSTART.md](QUICKSTART.md) for a
+step-by-step guide written for first-time builders.
 
 ## Build Instructions
 
-```bash
-# Clone the repository
-git clone https://github.com/example/pico2hsm
-cd pico2hsm
+The default build includes all three applets (SC-HSM, PIV, OpenPGP with
+Ed25519/X25519) and RSA support. Generate your signing key first, then build:
 
-# Add the embedded target
+```bash
+git clone https://github.com/yourorg/pico2hsm
+cd pico2hsm
 rustup target add thumbv8m.main-none-eabihf
 
-# Build for Waveshare RP2350-One 4MB (default)
-cargo build --release -p pico2hsm-firmware
+# Generate firmware signing key (once — keep it safe)
+./generate_firmware_signing_keys.sh
 
-# Build for a specific board
-cargo build --release -p pico2hsm-firmware --no-default-features --features rp2350_geek_sdcard
+# Build all board variants, sign outputs, generate UF2 files
+./build-all.sh
 
-# Build with RSA support (adds ~1MB to binary)
-cargo build --release -p pico2hsm-firmware --features rsa
-
-# Flash to device
-cargo run --release -p pico2hsm-firmware
-
-# Run host tests
-cargo test -p pico2hsm-core
-cargo test -p pico2hsm-integration-tests
+# Flash via BOOTSEL: hold button, plug USB, copy the right UF2:
+cp dist/pico2hsm-rp2350_one_4m.uf2 /media/$USER/RPI-RP2/
 ```
+
+To build for a specific board manually (always use `--no-default-features`
+because board flags are mutually exclusive):
+
+```bash
+cargo build --release \
+    --manifest-path firmware/Cargo.toml \
+    --no-default-features \
+    --features rp2350_one_4m,rsa,applet-piv,applet-openpgp-curve25519
+```
+
+See [BUILDING.md](BUILDING.md) for the full reference.
 
 ## Feature Flags
 

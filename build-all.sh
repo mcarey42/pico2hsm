@@ -95,6 +95,11 @@ else
     SIGN=0
 fi
 
+# ── Capability features included in every build ──────────────────────────────
+# These are added to every board variant. --no-default-features strips them
+# from Cargo.toml defaults, so we re-add them explicitly here.
+COMMON_FEATURES="rsa,applet-piv,applet-openpgp-curve25519"
+
 # ── Board variant table ───────────────────────────────────────────────────────
 # (feature flag, human name, probe-rs chip id)
 declare -a VARIANTS=(
@@ -146,7 +151,7 @@ if [[ $SKIP_ARM -eq 0 ]]; then
         if cargo build --release \
             --manifest-path firmware/Cargo.toml \
             --no-default-features \
-            --features "$FEAT" \
+            --features "$FEAT,$COMMON_FEATURES" \
             >"$BUILD_LOG" 2>&1; then
             : # success handled below
         else
