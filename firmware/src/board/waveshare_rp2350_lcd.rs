@@ -331,7 +331,7 @@ pub struct St7789V3StatusDisplay {
 }
 
 impl St7789V3StatusDisplay {
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self { current_status: LedStatus::Off }
     }
 }
@@ -472,9 +472,15 @@ pub type WaveshareRp2350LcdSpi1 =
 // ─── Board struct ─────────────────────────────────────────────────────────────
 
 /// Concrete board representation for the Waveshare RP2350-LCD-1.47-B.
+///
+/// When the `waveshare_rp2350_lcd_sdcard` feature is active, SPI1 is consumed
+/// by the SD card keystore and is NOT part of the board struct.  The `spi1`
+/// field is only present for the `waveshare_rp2350_lcd_16m` and
+/// `waveshare_rp2350_lcd_sdcard_dual` variants.
 pub struct WaveshareRp2350LcdBoard {
     display: St7789V3StatusDisplay,
     pub spi0: WaveshareRp2350LcdSpi0,
+    #[cfg(not(feature = "waveshare_rp2350_lcd_sdcard"))]
     pub spi1: WaveshareRp2350LcdSpi1,
 }
 
@@ -486,6 +492,7 @@ impl WaveshareRp2350LcdBoard {
     /// `init_lcd()` and `update_status_display()` in this module.  Call those
     /// functions from `run_waveshare_lcd_board()` in `main.rs` after creating
     /// the board.
+    #[cfg(not(feature = "waveshare_rp2350_lcd_sdcard"))]
     pub fn new(spi0: WaveshareRp2350LcdSpi0, spi1: WaveshareRp2350LcdSpi1) -> Self {
         defmt::info!(
             "RP2350-LCD-1.47-B: board created (SPI0 LCD @ {} Hz, SPI1 SD @ {} Hz)",
@@ -496,6 +503,22 @@ impl WaveshareRp2350LcdBoard {
             display: St7789V3StatusDisplay::new(),
             spi0,
             spi1,
+        }
+    }
+
+    /// Create an LCD-only board — SPI1 is consumed by the SD card keystore.
+    ///
+    /// Used when `waveshare_rp2350_lcd_sdcard` is active: the SD card owns
+    /// SPI1 exclusively, so the board struct only holds SPI0 (LCD bus).
+    #[cfg(feature = "waveshare_rp2350_lcd_sdcard")]
+    pub fn new_lcd_only(spi0: WaveshareRp2350LcdSpi0) -> Self {
+        defmt::info!(
+            "RP2350-LCD-1.47-B: board created (SPI0 LCD @ {} Hz, SPI1 → SD keystore)",
+            SPI_FREQ_HZ,
+        );
+        Self {
+            display: St7789V3StatusDisplay::new(),
+            spi0,
         }
     }
 

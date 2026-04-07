@@ -39,6 +39,7 @@
 
 pub mod keystore;
 pub use keystore::KeyStore;
+pub use keystore::HybridKeyStore;
 
 #[cfg(not(target_arch = "arm"))]
 pub use keystore::NullKeyStore;
@@ -64,6 +65,8 @@ pub mod wal;
 pub use keystore::FlashKeyStore;
 #[cfg(target_arch = "arm")]
 pub use board_chips::BoardChip;
+#[cfg(target_arch = "arm")]
+pub use board_chips::BoardKeyStore;
 
 #[cfg(target_arch = "arm")]
 use filesystem::{Directory, KeyFilesystem, ScrubReport};

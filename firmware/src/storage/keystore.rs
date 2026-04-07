@@ -212,6 +212,253 @@ impl KeyStore for NullKeyStore {
     }
 }
 
+// ─── HybridKeyStore<P, S> — RAID-1 mirror (primary flash + secondary SD) ─────
+
+/// RAID-1 keystore that mirrors writes between a primary store (flash) and a
+/// secondary store (SD card).
+///
+/// **Write**: primary first, then secondary. If primary succeeds but secondary
+/// fails, the write is considered successful but the mirror is marked degraded.
+///
+/// **Read**: primary first. If primary fails or key is not found, falls back to
+/// secondary and attempts a best-effort write-back to primary.
+///
+/// **Wipe**: both stores. Only a primary wipe failure is propagated.
+///
+/// **Enumerate**: delegates to primary (authoritative).
+pub struct HybridKeyStore<P: KeyStore, S: KeyStore> {
+    primary: P,
+    secondary: S,
+    /// `true` when the SD mirror is stale (a secondary write has failed).
+    degraded: bool,
+    /// `true` when the primary flash has experienced a read or write error.
+    /// Flash errors are fatal — the HSM cannot safely operate.
+    flash_error: bool,
+}
+
+impl<P: KeyStore, S: KeyStore> HybridKeyStore<P, S> {
+    /// Create a new hybrid keystore with the given primary and secondary stores.
+    pub fn new(primary: P, secondary: S) -> Self {
+        HybridKeyStore {
+            primary,
+            secondary,
+            degraded: false,
+            flash_error: false,
+        }
+    }
+
+    /// `true` when the SD mirror is stale (a secondary write failed).
+    /// Clears automatically after a successful resync.
+    pub fn is_degraded(&self) -> bool {
+        self.degraded
+    }
+
+    /// `true` when the primary flash has NOT experienced a read or write error.
+    /// Flash errors are fatal — the HSM cannot safely operate without its
+    /// primary store.
+    pub fn is_flash_healthy(&self) -> bool {
+        !self.flash_error
+    }
+
+    /// Attempt to resync all keys from primary to secondary.
+    ///
+    /// Enumerates all key IDs from primary, reads each key, and writes it to
+    /// secondary. If any key fails to sync, returns `Err` but continues
+    /// syncing the remaining keys.
+    pub fn resync(&mut self) -> Result<(), HsmError> {
+        let key_ids = self.primary.enumerate_keys();
+        let mut any_failed = false;
+
+        for key_id in key_ids.iter() {
+            match self.primary.fetch_key(*key_id) {
+                Ok(Some(obj)) => {
+                    if self.secondary.save_key(&obj).is_err() {
+                        #[cfg(target_arch = "arm")]
+                        defmt::warn!("HybridKeyStore: resync failed for key 0x{:08x}", key_id.0);
+                        any_failed = true;
+                    }
+                }
+                Ok(None) => {
+                    // Key vanished between enumerate and fetch — skip.
+                }
+                Err(_) => {
+                    #[cfg(target_arch = "arm")]
+                    defmt::warn!("HybridKeyStore: resync read failed for key 0x{:08x}", key_id.0);
+                    self.flash_error = true;
+                    any_failed = true;
+                }
+            }
+        }
+
+        if any_failed {
+            Err(HsmError::Storage(pico2hsm_core::error::StorageError::WriteError))
+        } else {
+            self.degraded = false;
+            Ok(())
+        }
+    }
+
+    /// Poll for SD card recovery. Call this periodically (e.g. every few
+    /// seconds from the core1 dispatcher idle loop).
+    ///
+    /// If currently degraded, attempts a probe read on the secondary store.
+    /// If that succeeds, triggers a full resync. If resync succeeds, clears
+    /// the degraded flag.
+    ///
+    /// If not degraded, this is a no-op.
+    pub fn poll_recovery(&mut self) -> Result<(), HsmError> {
+        if !self.degraded {
+            return Ok(());
+        }
+
+        // Probe the secondary by enumerating keys — this exercises the SD
+        // card read path without writing. If the card is removed or broken,
+        // enumerate_keys will typically return an empty list or the underlying
+        // driver will error (caught by the resync attempt below).
+        let _ = self.secondary.enumerate_keys();
+
+        // Attempt a full resync. If it succeeds, degraded is cleared inside resync().
+        match self.resync() {
+            Ok(()) => {
+                #[cfg(target_arch = "arm")]
+                defmt::info!("HybridKeyStore: SD card recovered — resync complete");
+                Ok(())
+            }
+            Err(e) => {
+                // Still degraded — SD is not back yet.
+                self.degraded = true;
+                Err(e)
+            }
+        }
+    }
+
+    /// Mutable reference to the primary store (for init, etc.).
+    pub fn primary_mut(&mut self) -> &mut P {
+        &mut self.primary
+    }
+
+    /// Mutable reference to the secondary store (for init, etc.).
+    pub fn secondary_mut(&mut self) -> &mut S {
+        &mut self.secondary
+    }
+}
+
+impl<P: KeyStore, S: KeyStore> KeyStore for HybridKeyStore<P, S> {
+    fn save_key(&mut self, obj: &KeyObject) -> Result<(), HsmError> {
+        // Write to primary first — primary failure is fatal.
+        if let Err(e) = self.primary.save_key(obj) {
+            self.flash_error = true;
+            return Err(e);
+        }
+
+        // Write to secondary — failure is non-fatal but marks degraded.
+        if let Err(_e) = self.secondary.save_key(obj) {
+            #[cfg(target_arch = "arm")]
+            defmt::warn!("HybridKeyStore: secondary write failed — marking degraded");
+            self.degraded = true;
+        } else if self.degraded {
+            // Secondary write succeeded while degraded — trigger full resync.
+            #[cfg(target_arch = "arm")]
+            defmt::info!("HybridKeyStore: secondary write OK while degraded — triggering resync");
+            let _ = self.resync();
+        }
+
+        Ok(())
+    }
+
+    fn fetch_key(&mut self, key_id: KeyId) -> Result<Option<KeyObject>, HsmError> {
+        // Try primary first.
+        match self.primary.fetch_key(key_id) {
+            Ok(Some(obj)) => return Ok(Some(obj)),
+            Ok(None) => {
+                // Key not found in primary — fall through to secondary.
+            }
+            Err(_) => {
+                // Primary read error — flag it, fall through to secondary.
+                self.flash_error = true;
+                #[cfg(target_arch = "arm")]
+                defmt::warn!("HybridKeyStore: primary read error for key 0x{:08x}, falling back to secondary", key_id.0);
+            }
+        }
+
+        // Fall back to secondary.
+        match self.secondary.fetch_key(key_id) {
+            Ok(Some(obj)) => {
+                // Resync: best-effort write-back to primary.
+                if let Err(_e) = self.primary.save_key(&obj) {
+                    #[cfg(target_arch = "arm")]
+                    defmt::warn!("HybridKeyStore: write-back to primary failed for key 0x{:08x}", key_id.0);
+                    // Don't propagate — we have the key from secondary.
+                }
+                Ok(Some(obj))
+            }
+            Ok(None) => Ok(None),
+            Err(_) => {
+                #[cfg(target_arch = "arm")]
+                defmt::warn!("HybridKeyStore: secondary read also failed for key 0x{:08x}", key_id.0);
+                // Both stores failed — key is gone.
+                Ok(None)
+            }
+        }
+    }
+
+    fn erase_key(&mut self, key_id: KeyId) -> Result<(), HsmError> {
+        // Erase from primary — failure is fatal.
+        if let Err(e) = self.primary.erase_key(key_id) {
+            self.flash_error = true;
+            return Err(e);
+        }
+
+        // Erase from secondary — failure is non-fatal.
+        if let Err(_e) = self.secondary.erase_key(key_id) {
+            #[cfg(target_arch = "arm")]
+            defmt::warn!("HybridKeyStore: secondary erase failed for key 0x{:08x}", key_id.0);
+            self.degraded = true;
+        }
+
+        Ok(())
+    }
+
+    fn wipe_all(&mut self) -> Result<(), HsmError> {
+        // Wipe primary — failure is fatal.
+        if let Err(e) = self.primary.wipe_all() {
+            self.flash_error = true;
+            return Err(e);
+        }
+
+        // Wipe secondary — failure is non-fatal.
+        if let Err(_e) = self.secondary.wipe_all() {
+            #[cfg(target_arch = "arm")]
+            defmt::warn!("HybridKeyStore: secondary wipe_all failed — marking degraded");
+            self.degraded = true;
+        }
+
+        Ok(())
+    }
+
+    fn wipe_by_owner(&mut self, owner: AppletId) -> Result<(), HsmError> {
+        // Wipe primary — failure is fatal.
+        if let Err(e) = self.primary.wipe_by_owner(owner) {
+            self.flash_error = true;
+            return Err(e);
+        }
+
+        // Wipe secondary — failure is non-fatal.
+        if let Err(_e) = self.secondary.wipe_by_owner(owner) {
+            #[cfg(target_arch = "arm")]
+            defmt::warn!("HybridKeyStore: secondary wipe_by_owner failed — marking degraded");
+            self.degraded = true;
+        }
+
+        Ok(())
+    }
+
+    fn enumerate_keys(&self) -> Vec<KeyId, 512> {
+        // Primary is authoritative.
+        self.primary.enumerate_keys()
+    }
+}
+
 // ─── Helper: AlgorithmId → core KeyType ──────────────────────────────────────
 
 /// Map a `security::key_management::AlgorithmId` to the `pico2hsm_core::key::KeyType`

@@ -16,6 +16,10 @@
 #   rp2350_geek_16m        Waveshare RP2350-Geek 16MB
 #   rp2350_geek_sdcard     Waveshare RP2350-Geek SDCard
 #   rp2350_geek_sdcard_dual  Waveshare RP2350-Geek Dual-SDCard
+#   waveshare_rp2350_lcd_16m           Waveshare RP2350-LCD-1.47-B 16MB
+#   waveshare_rp2350_lcd_sdcard_dual   Waveshare RP2350-LCD-1.47-B Dual-SDCard
+#   waveshare_rp2350_lcd_sdcard        Waveshare RP2350-LCD-1.47-B SD-only keystore
+#   waveshare_rp2350_lcd_sdcard_hybrid Waveshare RP2350-LCD-1.47-B Flash+SD RAID-1
 #   rp2354_embedded        RP2354 Embedded
 #
 # Unlike build-all.sh this uses the dev (debug) profile so that:
@@ -46,7 +50,9 @@ VALID_FEATURES=(
     rp2350_geek_sdcard
     rp2350_geek_sdcard_dual
     waveshare_rp2350_lcd_16m
+    waveshare_rp2350_lcd_sdcard
     waveshare_rp2350_lcd_sdcard_dual
+    waveshare_rp2350_lcd_sdcard_hybrid
     rp2354_embedded
 )
 VALID=0

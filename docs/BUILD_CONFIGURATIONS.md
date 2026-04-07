@@ -111,7 +111,41 @@ cargo build --release --no-default-features --features waveshare_rp2350_lcd_16m
 
 # 16 MB flash + built-in SD (GPIO15 CS) + second external SD (GPIO13 CS)
 cargo build --release --no-default-features --features waveshare_rp2350_lcd_sdcard_dual
+
+# SD card as sole keystore (replaces QMI flash)
+cargo build --release --no-default-features --features waveshare_rp2350_lcd_sdcard
+
+# QMI flash (primary) + SD card (secondary) RAID-1 hybrid
+cargo build --release --no-default-features --features waveshare_rp2350_lcd_sdcard_hybrid
 ```
+
+#### SD-only keystore (`waveshare_rp2350_lcd_sdcard`)
+
+Replaces QMI flash with a single microSD card as the sole keystore. Raw block I/O — no filesystem. Requires a microSD card in the SPI1 slot (GPIO10/11/12, CS=GPIO15).
+
+```sh
+cargo build --release --no-default-features \
+    --features waveshare_rp2350_lcd_sdcard,rsa,applet-piv,applet-openpgp-curve25519
+```
+
+**Flash budget**: Same as `waveshare_rp2350_lcd_16m`.
+**RAM budget**: Same as `waveshare_rp2350_lcd_16m`; no framebuffer change.
+**Keystore**: SD card raw blocks. Keys do not survive SD card removal without the hybrid variant.
+
+#### Hybrid Flash+SD RAID-1 (`waveshare_rp2350_lcd_sdcard_hybrid`)
+
+QMI flash (primary) mirrored to a single microSD card (secondary). Every write goes to both; reads prefer flash; SD failure degrades gracefully (flash remains authoritative). Periodic polling detects SD reinsertion and triggers automatic resync.
+
+```sh
+cargo build --release --no-default-features \
+    --features waveshare_rp2350_lcd_sdcard_hybrid,rsa,applet-piv,applet-openpgp-curve25519
+```
+
+**Primary store**: Internal RP2350 QMI flash (same as `waveshare_rp2350_lcd_16m`).
+**Secondary store**: SD card raw blocks (mirrored copy).
+**Degraded mode**: SD write failure → `LedStatus::Degraded`; HSM remains operational via flash.
+**Flash error**: Primary flash failure → `LedStatus::Error`; HSM halts (flash is authoritative).
+**SD recovery**: Polling detects card reinsertion → automatic resync from flash to SD card → `LedStatus::Ready`.
 
 ### RP2354 with embedded flash
 
@@ -260,6 +294,12 @@ code paths), and streams RTT output via probe-rs.
 
 # Waveshare RP2350-LCD-1.47-B with dual SD cards
 ./build-all-debug.sh waveshare_rp2350_lcd_sdcard_dual
+
+# Waveshare RP2350-LCD-1.47-B — SD card as sole keystore
+./build-all-debug.sh waveshare_rp2350_lcd_sdcard
+
+# Waveshare RP2350-LCD-1.47-B — Flash+SD RAID-1 hybrid
+./build-all-debug.sh waveshare_rp2350_lcd_sdcard_hybrid
 ```
 
 The script blocks on RTT streaming. To run the integration test suite, start

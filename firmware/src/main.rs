@@ -78,9 +78,16 @@ static RESP_CHANNEL: Channel<SpinlockRawMutex<30>, heapless::Vec<u8, 4098>, 1> =
 /// Owned by core1 dispatcher task; initialised by the board run function before
 /// spawning core1.
 #[cfg(target_arch = "arm")]
-static KEYSTORE_CELL: StaticCell<
-    pico2hsm_firmware::storage::FlashKeyStore<pico2hsm_firmware::storage::BoardChip>
-> = StaticCell::new();
+static KEYSTORE_CELL: StaticCell<pico2hsm_firmware::storage::BoardKeyStore> = StaticCell::new();
+
+/// Hybrid keystore health status — cross-core atomic flags read by core0 for
+/// LED status, written by core1 after each APDU dispatch.
+#[cfg(all(target_arch = "arm", feature = "waveshare_rp2350_lcd_sdcard_hybrid"))]
+static HYBRID_DEGRADED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+#[cfg(all(target_arch = "arm", feature = "waveshare_rp2350_lcd_sdcard_hybrid"))]
+static HYBRID_FLASH_ERROR: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
 
 /// Dispatcher — stored in BSS outside the async task state machine so that
 /// the `dispatcher_task` pool does not need to hold the full 50 KB Dispatcher
@@ -97,9 +104,7 @@ static DISPATCHER_CELL: StaticCell<pico2hsm_firmware::apdu::dispatcher::Dispatch
 #[cfg(target_arch = "arm")]
 #[embassy_executor::task]
 async fn dispatcher_task(
-    store: &'static mut pico2hsm_firmware::storage::FlashKeyStore<
-        pico2hsm_firmware::storage::BoardChip,
-    >,
+    store: &'static mut pico2hsm_firmware::storage::BoardKeyStore,
 ) {
     use pico2hsm_firmware::apdu::dispatcher::Dispatcher;
     // Core1 must not call defmt: embassy-rp's critical_section uses Spinlock31; if Core1
@@ -112,6 +117,48 @@ async fn dispatcher_task(
 
     let dispatcher: &'static mut Dispatcher = DISPATCHER_CELL.init(Dispatcher::new());
     dispatcher.load_keys_from_store(store);
+
+    // ── Hybrid variant: poll_recovery on 5-second timer between APDUs ────────
+    #[cfg(feature = "waveshare_rp2350_lcd_sdcard_hybrid")]
+    {
+        use embassy_futures::select::{select, Either};
+        use embassy_time::Timer;
+        loop {
+            match select(APDU_CHANNEL.receive(), Timer::after_secs(5)).await {
+                Either::First(apdu_bytes) => {
+                    if apdu_bytes.is_empty() {
+                        *dispatcher = Dispatcher::new();
+                        dispatcher.load_keys_from_store(store);
+                        let _ = RESP_CHANNEL.send(heapless::Vec::new()).await;
+                    } else {
+                        let response = dispatcher.dispatch_with_store(&apdu_bytes, store);
+                        let _ = RESP_CHANNEL.send(response).await;
+                    }
+                    // Update cross-core health status atomics.
+                    HYBRID_DEGRADED.store(
+                        store.is_degraded(),
+                        core::sync::atomic::Ordering::Relaxed,
+                    );
+                    HYBRID_FLASH_ERROR.store(
+                        !store.is_flash_healthy(),
+                        core::sync::atomic::Ordering::Relaxed,
+                    );
+                }
+                Either::Second(_) => {
+                    if store.is_degraded() {
+                        let _ = store.poll_recovery();
+                        HYBRID_DEGRADED.store(
+                            store.is_degraded(),
+                            core::sync::atomic::Ordering::Relaxed,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    // ── Non-hybrid variants: plain receive loop ──────────────────────────────
+    #[cfg(not(feature = "waveshare_rp2350_lcd_sdcard_hybrid"))]
     loop {
         let apdu_bytes = APDU_CHANNEL.receive().await;
         // No defmt logging inside the receive loop.  All embassy_rp TRACE logs
@@ -234,8 +281,12 @@ async fn main(_spawner: Spawner) {
         run_geek_board(p).await;
     }
 
-    // ── Waveshare RP2350-LCD-1.47-B (single SD and dual-SD variants) ─────────
-    #[cfg(any(feature = "waveshare_rp2350_lcd_16m", feature = "waveshare_rp2350_lcd_sdcard_dual"))]
+    // ── Waveshare RP2350-LCD-1.47-B (QMI, single SD, and dual-SD variants) ──
+    #[cfg(any(
+        feature = "waveshare_rp2350_lcd_16m",
+        feature = "waveshare_rp2350_lcd_sdcard",
+        feature = "waveshare_rp2350_lcd_sdcard_dual",
+    ))]
     {
         pico2hsm_firmware::security::boot::security_checks();
         pico2hsm_firmware::allocator::init();
@@ -250,6 +301,22 @@ async fn main(_spawner: Spawner) {
         run_waveshare_lcd_board(p).await;
     }
 
+    // ── Waveshare RP2350-LCD-1.47-B hybrid RAID-1 (QMI flash + SD card) ─────
+    #[cfg(feature = "waveshare_rp2350_lcd_sdcard_hybrid")]
+    {
+        pico2hsm_firmware::security::boot::security_checks();
+        pico2hsm_firmware::allocator::init();
+
+        let otp = pico2hsm_firmware::security::otp::Otp::new();
+        defmt::info!("OTP: provisioned={} production={}", otp.is_provisioned(), otp.is_production_mode());
+        match pico2hsm_firmware::security::otp::derive_smk() {
+            Ok(_) => defmt::info!("OTP: SMK derived"),
+            Err(_) => defmt::warn!("OTP: derive_smk failed — unprovisioned?"),
+        }
+
+        run_waveshare_lcd_hybrid_board(p).await;
+    }
+
     // ── Fallback ─────────────────────────────────────────────────────────────
     #[cfg(not(any(
         feature = "rp2350_one_4m",
@@ -260,7 +327,9 @@ async fn main(_spawner: Spawner) {
         feature = "rp2354_embedded",
         feature = "pico2_4m",
         feature = "waveshare_rp2350_lcd_16m",
+        feature = "waveshare_rp2350_lcd_sdcard",
         feature = "waveshare_rp2350_lcd_sdcard_dual",
+        feature = "waveshare_rp2350_lcd_sdcard_hybrid",
     )))]
     {
         defmt::error!("No board feature flag set — spinning forever");
@@ -878,7 +947,11 @@ async fn run_pico2_board(p: embassy_rp::Peripherals) {
 
 // ─── Waveshare RP2350-LCD-1.47-B main function ───────────────────────────────
 
-#[cfg(all(target_arch = "arm", any(feature = "waveshare_rp2350_lcd_16m", feature = "waveshare_rp2350_lcd_sdcard_dual")))]
+#[cfg(all(target_arch = "arm", any(
+    feature = "waveshare_rp2350_lcd_16m",
+    feature = "waveshare_rp2350_lcd_sdcard",
+    feature = "waveshare_rp2350_lcd_sdcard_dual",
+)))]
 async fn run_waveshare_lcd_board(p: embassy_rp::Peripherals) {
     use embassy_futures::join::join;
     use embassy_rp::gpio::{Level, Output};
@@ -909,13 +982,22 @@ async fn run_waveshare_lcd_board(p: embassy_rp::Peripherals) {
     let spi0 = Spi::new_blocking(p.SPI0, p.PIN_18, p.PIN_19, p.PIN_4, spi0_cfg);
 
     // ── SPI1: SD card bus (SCK=GPIO10, MOSI=GPIO11, MISO=GPIO12) ─────────────
-    let mut spi1_cfg = SpiConfig::default();
-    spi1_cfg.frequency = SPI_FREQ_HZ;
-    spi1_cfg.phase = Phase::CaptureOnFirstTransition;
-    spi1_cfg.polarity = Polarity::IdleLow;
-    let spi1 = Spi::new_blocking(p.SPI1, p.PIN_10, p.PIN_11, p.PIN_12, spi1_cfg);
+    // For waveshare_rp2350_lcd_sdcard, SPI1 is consumed by the SD card keystore
+    // and is NOT passed to the board struct.
+    #[cfg(not(feature = "waveshare_rp2350_lcd_sdcard"))]
+    let spi1 = {
+        let mut spi1_cfg = SpiConfig::default();
+        spi1_cfg.frequency = SPI_FREQ_HZ;
+        spi1_cfg.phase = Phase::CaptureOnFirstTransition;
+        spi1_cfg.polarity = Polarity::IdleLow;
+        Spi::new_blocking(p.SPI1, p.PIN_10, p.PIN_11, p.PIN_12, spi1_cfg)
+    };
 
+    #[cfg(not(feature = "waveshare_rp2350_lcd_sdcard"))]
     let mut board = WaveshareRp2350LcdBoard::new(spi0, spi1);
+
+    #[cfg(feature = "waveshare_rp2350_lcd_sdcard")]
+    let mut board = WaveshareRp2350LcdBoard::new_lcd_only(spi0);
 
     // ── LCD control GPIO pins ─────────────────────────────────────────────────
     // DC=GPIO16, CS=GPIO17, RST=GPIO20, BL=GPIO21 per board schematic.
@@ -941,18 +1023,71 @@ async fn run_waveshare_lcd_board(p: embassy_rp::Peripherals) {
         update_status_display(disp, spi, &mut dc, &mut cs, &mut ws2812_writer, &display_state).await;
     }
 
-    // ── Storage initialisation (degraded — QMI flash not wired yet) ─────────
+    // ── Storage initialisation ─────────────────────────────────────────────
+
+    // Common: derive SMK from OTP.
     let smk_bytes = pico2hsm_firmware::security::otp::derive_smk()
         .unwrap_or([0u8; 32]);
     let smk = zeroize::Zeroizing::new(smk_bytes);
-    let fs = pico2hsm_firmware::storage::filesystem::KeyFilesystem::new();
-    let sm = pico2hsm_firmware::storage::StorageManager::new(fs);
-    let mut ks = pico2hsm_firmware::storage::FlashKeyStore::new(sm, smk);
-    match ks.init() {
-        Ok(()) => defmt::info!("KeyStore: initialized (waveshare_rp2350_lcd — degraded, no chips)"),
-        Err(_) => defmt::warn!("KeyStore: init failed — degraded mode"),
-    }
-    let store: &'static mut _ = KEYSTORE_CELL.init(ks);
+
+    // waveshare_rp2350_lcd_sdcard: single SD card keystore on SPI1.
+    #[cfg(feature = "waveshare_rp2350_lcd_sdcard")]
+    let store: &'static mut _ = {
+        use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+        use embassy_sync::blocking_mutex::Mutex;
+        use static_cell::StaticCell;
+
+        // SPI1 bus at 25 MHz for SD card (independent from LCD on SPI0).
+        let mut spi1_cfg = SpiConfig::default();
+        spi1_cfg.frequency = 25_000_000;
+        spi1_cfg.phase = Phase::CaptureOnFirstTransition;
+        spi1_cfg.polarity = Polarity::IdleLow;
+        let spi1_bus = Spi::new_blocking(p.SPI1, p.PIN_10, p.PIN_11, p.PIN_12, spi1_cfg);
+
+        // Wrap SPI1 bus in a shared-bus SpiDevice with CS=GPIO15.
+        // The shared_bus SpiDevice wrapper requires Mutex<M, RefCell<BUS>>.
+        static SPI1_BUS: StaticCell<
+            Mutex<
+                CriticalSectionRawMutex,
+                core::cell::RefCell<
+                    embassy_rp::spi::Spi<'static, embassy_rp::peripherals::SPI1, embassy_rp::spi::Blocking>,
+                >,
+            >,
+        > = StaticCell::new();
+        let spi1_bus_ref = SPI1_BUS.init(Mutex::new(core::cell::RefCell::new(spi1_bus)));
+        let sd_cs = Output::new(p.PIN_15, Level::High);
+        let spi_device = embassy_embedded_hal::shared_bus::blocking::spi::SpiDevice::new(
+            spi1_bus_ref, sd_cs,
+        );
+
+        // Construct SdCardFlash and add to filesystem.
+        let delay = embassy_time::Delay;
+        let sd_chip = pico2hsm_firmware::storage::sdcard::SdCardFlash::new(spi_device, delay)
+            .expect("SD card init failed");
+
+        let mut fs = pico2hsm_firmware::storage::filesystem::KeyFilesystem::new();
+        fs.add_chip(sd_chip).expect("add SD chip");
+        let sm = pico2hsm_firmware::storage::StorageManager::new(fs);
+        let mut ks = pico2hsm_firmware::storage::FlashKeyStore::new(sm, smk);
+        match ks.init() {
+            Ok(()) => defmt::info!("KeyStore: initialized (waveshare_rp2350_lcd — SD card)"),
+            Err(_) => defmt::warn!("KeyStore: init failed — SD card degraded"),
+        }
+        KEYSTORE_CELL.init(ks)
+    };
+
+    // waveshare_rp2350_lcd_16m / waveshare_rp2350_lcd_sdcard_dual: degraded QMI.
+    #[cfg(not(feature = "waveshare_rp2350_lcd_sdcard"))]
+    let store: &'static mut _ = {
+        let fs = pico2hsm_firmware::storage::filesystem::KeyFilesystem::new();
+        let sm = pico2hsm_firmware::storage::StorageManager::new(fs);
+        let mut ks = pico2hsm_firmware::storage::FlashKeyStore::new(sm, smk);
+        match ks.init() {
+            Ok(()) => defmt::info!("KeyStore: initialized (waveshare_rp2350_lcd — degraded, no chips)"),
+            Err(_) => defmt::warn!("KeyStore: init failed — degraded mode"),
+        }
+        KEYSTORE_CELL.init(ks)
+    };
 
     // ── USB CCID transport ───────────────────────────────────────────────────
     let usb_driver = UsbDriver::new(p.USB, Irqs);
@@ -1114,6 +1249,298 @@ async fn run_waveshare_lcd_board(p: embassy_rp::Peripherals) {
     join(usb_fut, ccid_fut).await;
 }
 
+// ─── Waveshare RP2350-LCD-1.47-B hybrid RAID-1 main function ────────────────
+
+#[cfg(all(target_arch = "arm", feature = "waveshare_rp2350_lcd_sdcard_hybrid"))]
+async fn run_waveshare_lcd_hybrid_board(p: embassy_rp::Peripherals) {
+    use embassy_futures::join::join;
+    use embassy_rp::gpio::{Level, Output};
+    use embassy_rp::pio::Pio;
+    use embassy_rp::pio_programs::ws2812::{PioWs2812, PioWs2812Program};
+    use embassy_rp::spi::{Config as SpiConfig, Phase, Polarity, Spi};
+    use embassy_rp::usb::Driver as UsbDriver;
+    use embassy_usb::{Builder as UsbBuilder, Config as UsbConfig};
+
+    use pico2hsm_firmware::board::waveshare_rp2350_lcd::{
+        init_lcd, update_status_display, PioWs2812Writer,
+    };
+    use pico2hsm_firmware::board::LedStatus;
+    use pico2hsm_firmware::display::{DisplayState, ScreensaverState, SCREENSAVER_TIMEOUT_SECS, LAST_OP_DISPLAY_SECS};
+    use pico2hsm_firmware::transport::ccid::CcidError;
+    use pico2hsm_firmware::transport::CcidTransport;
+
+    defmt::info!("Board: Waveshare RP2350-LCD-1.47-B hybrid (QMI + SD) initialising");
+
+    // ── SPI0: LCD bus (SCK=GPIO18, MOSI=GPIO19, MISO=GPIO4) ─────────────────
+    let mut spi0_cfg = SpiConfig::default();
+    spi0_cfg.frequency = pico2hsm_firmware::board::waveshare_rp2350_lcd::SPI_FREQ_HZ;
+    spi0_cfg.phase = Phase::CaptureOnFirstTransition;
+    spi0_cfg.polarity = Polarity::IdleLow;
+    let mut spi0 = Spi::new_blocking(p.SPI0, p.PIN_18, p.PIN_19, p.PIN_4, spi0_cfg);
+
+    // ── SPI1: SD card bus (SCK=GPIO10, MOSI=GPIO11, MISO=GPIO12) ─────────────
+    // SPI1 is consumed entirely by the SD card driver — NOT passed to the board struct.
+    let mut spi1_cfg = SpiConfig::default();
+    spi1_cfg.frequency = 25_000_000; // 25 MHz for SD card
+    spi1_cfg.phase = Phase::CaptureOnFirstTransition;
+    spi1_cfg.polarity = Polarity::IdleLow;
+    let spi1 = Spi::new_blocking(p.SPI1, p.PIN_10, p.PIN_11, p.PIN_12, spi1_cfg);
+
+    // Wrap SPI1 in a shared-bus Mutex for the SpiDevice wrapper.
+    use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+    use embassy_sync::blocking_mutex::Mutex;
+    static SPI1_BUS: StaticCell<Mutex<CriticalSectionRawMutex, core::cell::RefCell<
+        embassy_rp::spi::Spi<'static, embassy_rp::peripherals::SPI1, embassy_rp::spi::Blocking>,
+    >>> = StaticCell::new();
+    let spi1_bus: &'static Mutex<CriticalSectionRawMutex, core::cell::RefCell<
+        embassy_rp::spi::Spi<'static, embassy_rp::peripherals::SPI1, embassy_rp::spi::Blocking>,
+    >> = SPI1_BUS.init(Mutex::new(core::cell::RefCell::new(spi1)));
+
+    let sd_cs = Output::new(p.PIN_15, Level::High);
+    let spi_device = embassy_embedded_hal::shared_bus::blocking::spi::SpiDevice::new(
+        spi1_bus, sd_cs,
+    );
+
+    // ── LCD control GPIO pins ─────────────────────────────────────────────────
+    let mut dc  = Output::new(p.PIN_16, Level::Low);
+    let mut cs  = Output::new(p.PIN_17, Level::High);
+    let mut rst = Output::new(p.PIN_20, Level::High);
+    let mut bl  = Output::new(p.PIN_21, Level::Low);
+
+    // ── WS2812B on GPIO22 via PIO0 SM0 / DMA_CH0 ────────────────────────────
+    let Pio { mut common, sm0, .. } = Pio::new(p.PIO0, Irqs);
+    let ws2812_program = PioWs2812Program::new(&mut common);
+    let ws2812 = PioWs2812::new(
+        &mut common, sm0, p.DMA_CH0, Irqs, p.PIN_22, &ws2812_program,
+    );
+    let mut ws2812_writer = PioWs2812Writer::new(ws2812);
+
+    use pico2hsm_firmware::board::waveshare_rp2350_lcd::St7789V3StatusDisplay;
+    let mut display = St7789V3StatusDisplay::new();
+
+    // ── LCD hardware init ───────────────────────────────────────────────────
+    let mut display_state = DisplayState::new();
+    display_state.status = LedStatus::Busy;
+    init_lcd(&mut spi0, &mut dc, &mut cs, &mut rst, &mut bl).await;
+    update_status_display(&mut display, &mut spi0, &mut dc, &mut cs, &mut ws2812_writer, &display_state).await;
+
+    // ── Primary storage: QMI flash ──────────────────────────────────────────
+    let smk_bytes = pico2hsm_firmware::security::otp::derive_smk()
+        .unwrap_or([0u8; 32]);
+    let smk = zeroize::Zeroizing::new(smk_bytes);
+
+    let qmi_raw = embassy_rp::flash::Flash::<
+        _,
+        embassy_rp::flash::Blocking,
+        { pico2hsm_firmware::storage::flash_chip::QMI_FLASH_SIZE },
+    >::new_blocking(p.FLASH);
+    let qmi_flash = pico2hsm_firmware::storage::flash_chip::QmiFlash::new(qmi_raw);
+    let mut qmi_fs = pico2hsm_firmware::storage::filesystem::KeyFilesystem::new();
+    let _ = qmi_fs.add_chip(qmi_flash);
+    let qmi_sm = pico2hsm_firmware::storage::StorageManager::new(qmi_fs);
+    let flash_ks = pico2hsm_firmware::storage::FlashKeyStore::new(qmi_sm, smk.clone());
+
+    // ── Secondary storage: SD card on SPI1 ──────────────────────────────────
+    let sd_result = pico2hsm_firmware::storage::sdcard::SdCardFlash::new(
+        spi_device,
+        embassy_time::Delay,
+    );
+
+    let hybrid_degraded_at_init;
+    let sd_ks = match sd_result {
+        Ok(sd_flash) => {
+            defmt::info!("Hybrid: SD card initialised successfully");
+            hybrid_degraded_at_init = false;
+            let mut sd_fs = pico2hsm_firmware::storage::filesystem::KeyFilesystem::new();
+            let _ = sd_fs.add_chip(sd_flash);
+            let sd_sm = pico2hsm_firmware::storage::StorageManager::new(sd_fs);
+            pico2hsm_firmware::storage::FlashKeyStore::new(sd_sm, smk.clone())
+        }
+        Err(_) => {
+            defmt::warn!("Hybrid: SD card init failed — starting in degraded mode");
+            hybrid_degraded_at_init = true;
+            // Create an empty FlashKeyStore with no chips — it will fail all ops.
+            let sd_fs: pico2hsm_firmware::storage::filesystem::KeyFilesystem<
+                pico2hsm_firmware::storage::board_chips::HybridSdChip,
+            > = pico2hsm_firmware::storage::filesystem::KeyFilesystem::new();
+            let sd_sm = pico2hsm_firmware::storage::StorageManager::new(sd_fs);
+            pico2hsm_firmware::storage::FlashKeyStore::new(sd_sm, smk.clone())
+        }
+    };
+
+    // ── Build HybridKeyStore ────────────────────────────────────────────────
+    let mut ks = pico2hsm_firmware::storage::HybridKeyStore::new(flash_ks, sd_ks);
+
+    // Init primary (QMI flash).
+    match ks.primary_mut().init() {
+        Ok(()) => defmt::info!("Hybrid: QMI flash keystore initialised"),
+        Err(_) => defmt::warn!("Hybrid: QMI flash keystore init failed"),
+    }
+
+    // Init secondary (SD card) — non-fatal.
+    match ks.secondary_mut().init() {
+        Ok(()) => defmt::info!("Hybrid: SD card keystore initialised"),
+        Err(_) => defmt::warn!("Hybrid: SD card keystore init failed — degraded"),
+    }
+
+    // Initial resync from flash → SD (non-fatal).
+    if !hybrid_degraded_at_init {
+        let _ = ks.resync();
+    }
+
+    let store: &'static mut _ = KEYSTORE_CELL.init(ks);
+
+    // ── USB CCID transport ───────────────────────────────────────────────────
+    let usb_driver = UsbDriver::new(p.USB, Irqs);
+
+    let mut usb_config = UsbConfig::new(USB_VID, USB_PID);
+    usb_config.manufacturer = Some("pico2hsm");
+    usb_config.product = Some("pico2hsm SC-HSM");
+    usb_config.serial_number = Some("0001");
+    usb_config.max_power = 100;
+
+    let mut config_descriptor_buf = [0u8; 256];
+    let mut bos_descriptor_buf = [0u8; 256];
+    let mut msos_descriptor_buf = [0u8; 256];
+    let mut control_buf = [0u8; 64];
+
+    let mut builder = UsbBuilder::new(
+        usb_driver,
+        usb_config,
+        &mut config_descriptor_buf,
+        &mut bos_descriptor_buf,
+        &mut msos_descriptor_buf,
+        &mut control_buf,
+    );
+
+    let mut ccid = CcidTransport::new(&mut builder);
+    let mut usb = builder.build();
+
+    defmt::info!("pico2hsm (RP2350-LCD-1.47-B hybrid): USB CCID ready, entering main loop");
+    display_state.status = LedStatus::Ready;
+    update_status_display(&mut display, &mut spi0, &mut dc, &mut cs, &mut ws2812_writer, &display_state).await;
+
+    // ── Spawn APDU dispatcher on core1 ───────────────────────────────────────
+    spawn_core1(p.CORE1, unsafe { &mut *addr_of_mut!(CORE1_STACK) }, move || {
+        let executor = CORE1_EXECUTOR.init(embassy_executor::Executor::new());
+        executor.run(|spawner| spawner.spawn(dispatcher_task(store).expect("dispatcher task")));
+    });
+
+    // ── Concurrent USB + CCID command loop (core0) ───────────────────────────
+    let usb_fut = usb.run();
+
+    let mut uptime_secs: u32 = 0_u32;
+    let mut last_activity_secs: u32 = 0_u32;
+    let mut screensaver = ScreensaverState::Active;
+
+    let ccid_fut = async {
+        loop {
+            ccid.wait_connected().await;
+            defmt::info!("RP2350-LCD-1.47-B hybrid: USB connected");
+            display_state.status = LedStatus::Ready;
+            update_status_display(&mut display, &mut spi0, &mut dc, &mut cs, &mut ws2812_writer, &display_state).await;
+
+            loop {
+                use embassy_futures::select::{select3, Either3};
+                match select3(
+                    ccid.recv_apdu(),
+                    RESP_CHANNEL.receive(),
+                    embassy_time::Timer::after_secs(1),
+                ).await {
+                    Either3::First(Ok(apdu_bytes)) => {
+                        last_activity_secs = uptime_secs;
+                        screensaver = ScreensaverState::Active;
+                        display_state.status = LedStatus::Busy;
+                        update_status_display(&mut display, &mut spi0, &mut dc, &mut cs, &mut ws2812_writer, &display_state).await;
+                        let _ = APDU_CHANNEL.send(apdu_bytes).await;
+                        // Wait for response with time-extension support.
+                        let response = {
+                            use embassy_futures::select::{select, Either};
+                            loop {
+                                match select(RESP_CHANNEL.receive(), embassy_time::Timer::after_millis(1500)).await {
+                                    Either::First(r) => break r,
+                                    Either::Second(_) => {
+                                        if let Err(CcidError::UsbDisconnected) = ccid.send_time_extension().await {
+                                            let _ = RESP_CHANNEL.receive().await;
+                                            break heapless::Vec::new();
+                                        }
+                                    }
+                                }
+                            }
+                        };
+                        match ccid.send_response(&response).await {
+                            Ok(()) => {
+                                // Check hybrid health via cross-core atomics.
+                                if HYBRID_FLASH_ERROR.load(core::sync::atomic::Ordering::Relaxed) {
+                                    display_state.status = LedStatus::Error;
+                                } else if HYBRID_DEGRADED.load(core::sync::atomic::Ordering::Relaxed) {
+                                    display_state.status = LedStatus::Degraded;
+                                } else {
+                                    display_state.status = LedStatus::Ready;
+                                }
+                                if let Some((_, op_time)) = display_state.last_op {
+                                    if uptime_secs.saturating_sub(op_time) >= LAST_OP_DISPLAY_SECS {
+                                        display_state.last_op = None;
+                                    }
+                                }
+                                update_status_display(&mut display, &mut spi0, &mut dc, &mut cs, &mut ws2812_writer, &display_state).await;
+                            }
+                            Err(CcidError::UsbDisconnected) => {
+                                let _ = APDU_CHANNEL.send(heapless::Vec::new()).await;
+                                let _ = RESP_CHANNEL.receive().await;
+                                display_state.status = LedStatus::Ready;
+                                break;
+                            }
+                            Err(_) => {}
+                        }
+                    }
+                    Either3::First(Err(CcidError::UsbDisconnected)) => {
+                        let _ = APDU_CHANNEL.send(heapless::Vec::new()).await;
+                        let _ = RESP_CHANNEL.receive().await;
+                        display_state.status = LedStatus::Ready;
+                        break;
+                    }
+                    Either3::First(Err(_)) => {}
+                    // Stray RESP_CHANNEL message with no pending APDU — discard.
+                    Either3::Second(_) => {}
+                    // 1-second tick — update uptime and screensaver.
+                    Either3::Third(()) => {
+                        uptime_secs = uptime_secs.wrapping_add(1);
+                        display_state.uptime_secs = uptime_secs;
+                        let idle = uptime_secs.saturating_sub(last_activity_secs);
+                        match screensaver {
+                            ScreensaverState::Active => {
+                                if idle >= SCREENSAVER_TIMEOUT_SECS {
+                                    screensaver = ScreensaverState::Sleeping;
+                                    {
+                                        use pico2hsm_firmware::board::waveshare_rp2350_lcd::{Grb, Ws2812Writer};
+                                        pico2hsm_firmware::board::waveshare_rp2350_lcd::fill_screen(
+                                            &mut spi0, &mut dc, &mut cs, 0x0000,
+                                        );
+                                        ws2812_writer.write_pixel(Grb::OFF).await;
+                                    }
+                                } else {
+                                    if let Some((_, op_time)) = display_state.last_op {
+                                        if uptime_secs.saturating_sub(op_time) >= LAST_OP_DISPLAY_SECS {
+                                            display_state.last_op = None;
+                                        }
+                                    }
+                                    update_status_display(&mut display, &mut spi0, &mut dc, &mut cs, &mut ws2812_writer, &display_state).await;
+                                }
+                            }
+                            ScreensaverState::Sleeping => {
+                                // Stay blank; don't render.
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    };
+
+    join(usb_fut, ccid_fut).await;
+}
+
 // ─── Storage namespace debug dump ────────────────────────────────────────────
 
 /// Dump a summary of keystore contents to RTT at startup.
@@ -1125,7 +1552,7 @@ async fn run_waveshare_lcd_board(p: embassy_rp::Peripherals) {
 /// This is a debug diagnostic; it never logs raw key material.
 #[cfg(target_arch = "arm")]
 fn debug_dump_storage(
-    ks: &pico2hsm_firmware::storage::FlashKeyStore<pico2hsm_firmware::storage::BoardChip>,
+    ks: &pico2hsm_firmware::storage::BoardKeyStore,
 ) {
     use pico2hsm_firmware::storage::KeyStore;
     let keys = ks.enumerate_keys();

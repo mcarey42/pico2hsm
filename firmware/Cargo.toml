@@ -25,12 +25,16 @@ rp2350_geek_sdcard_dual = []
 rp2354_embedded = []
 pico2_4m = []
 waveshare_rp2350_lcd_16m = []
+# Waveshare RP2350-LCD-1.47-B: single SD card keystore on SPI1 (CS=GPIO15)
+waveshare_rp2350_lcd_sdcard = []
 # RP2350-One with one externally wired SPI SD card module (SPI1, CS=GPIO9)
 rp2350_one_sdcard = []
 # RP2350-One with two externally wired SPI SD card modules (SPI1, CS0=GPIO9 CS1=GPIO13)
 rp2350_one_sdcard_dual = []
 # Waveshare RP2350-LCD-1.47-B: built-in SD on SPI1 + second external SD card (CS=GPIO13)
 waveshare_rp2350_lcd_sdcard_dual = []
+# Waveshare RP2350-LCD-1.47-B: QMI flash (primary) + single SD card on SPI1 (secondary) RAID-1 hybrid
+waveshare_rp2350_lcd_sdcard_hybrid = []
 rsa = ["dep:rsa", "dep:embedded-alloc"]  # RSA support — adds ~1MB to binary; disabled by default
 debug = []         # Debug mode: enables memory dump APDUs, disables secure boot enforcement
 applet-piv = ["dep:des"]                 # PIV applet (NIST SP 800-73-4); adds 3DES (~10 KB)
