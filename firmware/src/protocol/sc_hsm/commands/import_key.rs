@@ -24,6 +24,7 @@ pub const P2_IMPORT: u8 = 0x93;
 
 /// Handle an IMPORT KEY APDU command.
 pub fn handle(state: &mut ScHsmState, store: &mut dyn KeyStore, cmd: &ApduCommand<'_>) -> ApduResponse {
+    crate::cdc_log!("SC-HSM IMPORT KEY start");
     // Require PIN authentication
     if !state.pin_verified {
         return ApduResponse::err(SW_SECURITY_STATUS);
@@ -90,6 +91,7 @@ pub fn handle(state: &mut ScHsmState, store: &mut dyn KeyStore, cmd: &ApduComman
         _ => {
             // RSA and symmetric keys are handled differently; for now just persist to flash.
             // The in-memory store doesn't apply to RSA/AES imports (they'd be re-loaded from flash).
+            crate::cdc_log!("SC-HSM IMPORT KEY done key=0x{:08x} algo=0x{:02x}", full_key_id.0, algo_id);
             return ApduResponse::ok(&[]);
         }
     };
@@ -108,5 +110,6 @@ pub fn handle(state: &mut ScHsmState, store: &mut dyn KeyStore, cmd: &ApduComman
     // Public key is not available from the wrapped blob; it will be derived on demand.
     let _ = state.keys.push(entry);
 
+    crate::cdc_log!("SC-HSM IMPORT KEY done key=0x{:08x} algo=0x{:02x}", full_key_id.0, algo_id);
     ApduResponse::ok(&[])
 }

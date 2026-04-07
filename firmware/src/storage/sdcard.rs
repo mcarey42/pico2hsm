@@ -36,10 +36,20 @@ const SD_SECTORS_PER_LOGICAL: u32 = 4096 / SD_SECTOR_BYTES; // 8
 
 // ─── SdCardFlash<SPI, DELAY> ─────────────────────────────────────────────────
 
+/// Number of SD sectors (512 bytes each) reserved at the start of the card for
+/// the P2HSDCARD signature block. The KeyFilesystem's sector 0 maps to SD
+/// physical sector `SD_RESERVED_SECTORS`, never touching sector 0 (signature).
+const SD_RESERVED_SECTORS: u32 = 8; // 8 × 512 = 4 096 bytes = one 4 KiB logical sector
+/// Byte offset added to every FlashChip address before issuing SD card I/O.
+const SD_BYTE_OFFSET: u32 = SD_RESERVED_SECTORS * SD_SECTOR_BYTES;
+
 /// SDCard wrapped as a `FlashChip`.
 ///
 /// `SPI` must implement `embedded_hal::spi::SpiDevice<u8>`.
 /// `DELAY` must implement `embedded_hal::delay::DelayNs`.
+///
+/// The first `SD_RESERVED_SECTORS` physical sectors are reserved for the
+/// P2HSDCARD pairing signature and are never touched by the FlashChip API.
 pub struct SdCardFlash<SPI, DELAY>
 where
     SPI: embedded_hal::spi::SpiDevice<u8>,
@@ -47,7 +57,7 @@ where
 {
     /// The underlying `embedded-sdmmc` SD card driver.
     card: SdCard<SPI, DELAY>,
-    /// Total capacity in bytes.
+    /// Usable capacity in bytes (total minus reserved region).
     capacity_bytes: u64,
     /// `true` if write errors have exceeded `BAD_WRITE_THRESHOLD`.
     degraded: bool,
@@ -67,14 +77,19 @@ where
     pub fn new(spi: SPI, delay: DELAY) -> Result<Self, StorageError> {
         let card = SdCard::new(spi, delay);
 
-        let capacity_bytes = card
+        let total_bytes = card
             .num_bytes()
             .map_err(|_| StorageError::NotFormatted)?;
 
+        // Subtract the reserved region (signature block) from usable capacity.
+        let capacity_bytes = total_bytes.saturating_sub(SD_BYTE_OFFSET as u64);
+
         defmt::info!(
-            "SdCardFlash: {} bytes ({} MiB)",
+            "SdCardFlash: total={} B usable={} B ({} MiB), reserved {} sectors for signature",
+            total_bytes,
             capacity_bytes,
             capacity_bytes / (1024 * 1024),
+            SD_RESERVED_SECTORS,
         );
 
         Ok(SdCardFlash {
@@ -100,9 +115,13 @@ where
     /// Reads one 512-byte SD sector at a time, handling any byte offset
     /// within the first sector.  For our use-case `addr` is always a
     /// multiple of 4096 and `buf.len()` is always 4096.
+    ///
+    /// `SD_BYTE_OFFSET` is added so that the filesystem never touches the
+    /// reserved signature region at the start of the card.
     fn read(&mut self, addr: u32, buf: &mut [u8]) -> Result<(), StorageError> {
-        let first_sd_sector = addr / SD_SECTOR_BYTES;
-        let byte_offset = (addr % SD_SECTOR_BYTES) as usize;
+        let physical_addr = addr + SD_BYTE_OFFSET;
+        let first_sd_sector = physical_addr / SD_SECTOR_BYTES;
+        let byte_offset = (physical_addr % SD_SECTOR_BYTES) as usize;
         let total = buf.len();
         let mut written = 0usize;
         let mut sd_sector_idx = first_sd_sector;
@@ -132,8 +151,9 @@ where
     /// 2. Overwrite the 256-byte window with `data`.
     /// 3. Write the modified 512-byte sector back.
     fn write_page(&mut self, addr: u32, data: &[u8]) -> Result<(), StorageError> {
-        let sd_sector_idx = addr / SD_SECTOR_BYTES;
-        let byte_offset = (addr % SD_SECTOR_BYTES) as usize;
+        let physical_addr = addr + SD_BYTE_OFFSET;
+        let sd_sector_idx = physical_addr / SD_SECTOR_BYTES;
+        let byte_offset = (physical_addr % SD_SECTOR_BYTES) as usize;
 
         // Step 1: read existing 512-byte sector.
         let mut block = [Block::new()];
@@ -155,7 +175,12 @@ where
                         "SdCardFlash: {} consecutive write errors — marking degraded",
                         self.write_errors,
                     );
+                    #[cfg(target_arch = "arm")]
+                    crate::cdc_error!("SD write err {} consec, sector {} — degraded", self.write_errors, sd_sector_idx);
                     self.degraded = true;
+                } else {
+                    #[cfg(target_arch = "arm")]
+                    crate::cdc_warn!("SD write err on sector {} ({}/{})", sd_sector_idx, self.write_errors, BAD_WRITE_THRESHOLD);
                 }
                 StorageError::WriteError
             })?;
@@ -170,7 +195,7 @@ where
     /// SDCards handle physical erase internally via FTL.  We write 0xFF to
     /// match the FlashChip erased-sector contract (blank = all-ones).
     fn erase_sector(&mut self, addr: u32) -> Result<(), StorageError> {
-        let first_sd_sector = addr / SD_SECTOR_BYTES;
+        let first_sd_sector = (addr + SD_BYTE_OFFSET) / SD_SECTOR_BYTES;
         let mut blank_block = Block::new();
         blank_block.contents.fill(0xFF);
         let blocks = [blank_block];
@@ -327,9 +352,14 @@ where
     ///
     /// The caller is responsible for having already called `card.num_bytes()`
     /// to initialize the card and obtain `capacity_bytes`.
-    pub fn from_card(card: SdCard<SPI, DELAY>, capacity_bytes: u64) -> Self {
+    /// `total_bytes` is the raw SD card capacity from `num_bytes()`.
+    /// The usable capacity exposed to the filesystem is reduced by the
+    /// reserved signature region.
+    pub fn from_card(card: SdCard<SPI, DELAY>, total_bytes: u64) -> Self {
+        let capacity_bytes = total_bytes.saturating_sub(SD_BYTE_OFFSET as u64);
         defmt::info!(
-            "SdCardFlash::from_card: {} bytes ({} MiB)",
+            "SdCardFlash::from_card: total={} B usable={} B ({} MiB)",
+            total_bytes,
             capacity_bytes,
             capacity_bytes / (1024 * 1024),
         );

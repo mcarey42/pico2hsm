@@ -127,9 +127,13 @@ impl<Chip: FlashChip> KeyStore for FlashKeyStore<Chip> {
         let core_key_type = algo_to_core_key_type(obj_copy.algorithm);
 
         // --- 5. Write to flash. ---
-        self.storage
+        let result = self.storage
             .write_key(KeyId(obj_copy.key_id), core_key_type, &blob, &hash)
-            .map_err(HsmError::Storage)
+            .map_err(HsmError::Storage);
+        if result.is_ok() {
+            crate::cdc_log!("FLASH save key=0x{:08x} ok", obj_copy.key_id);
+        }
+        result
     }
 
     fn fetch_key(&mut self, key_id: KeyId) -> Result<Option<KeyObject>, HsmError> {
@@ -153,13 +157,20 @@ impl<Chip: FlashChip> KeyStore for FlashKeyStore<Chip> {
     }
 
     fn erase_key(&mut self, key_id: KeyId) -> Result<(), HsmError> {
-        self.storage
+        let result = self.storage
             .delete_key(key_id)
-            .map_err(HsmError::Storage)
+            .map_err(HsmError::Storage);
+        if result.is_ok() {
+            crate::cdc_log!("FLASH erase key=0x{:08x} ok", key_id.0);
+        }
+        result
     }
 
     fn wipe_all(&mut self) -> Result<(), HsmError> {
-        self.storage.wipe_all().map_err(HsmError::Storage)
+        crate::cdc_log!("FLASH wipe_all start");
+        let result = self.storage.wipe_all().map_err(HsmError::Storage);
+        crate::cdc_log!("FLASH wipe_all done");
+        result
     }
 
     fn wipe_by_owner(&mut self, owner: AppletId) -> Result<(), HsmError> {
@@ -266,6 +277,7 @@ impl<P: KeyStore, S: KeyStore> HybridKeyStore<P, S> {
     /// secondary. If any key fails to sync, returns `Err` but continues
     /// syncing the remaining keys.
     pub fn resync(&mut self) -> Result<(), HsmError> {
+        crate::cdc_log!("HYBRID resync start");
         let key_ids = self.primary.enumerate_keys();
         let mut any_failed = false;
 
@@ -291,9 +303,11 @@ impl<P: KeyStore, S: KeyStore> HybridKeyStore<P, S> {
         }
 
         if any_failed {
+            crate::cdc_warn!("HYBRID resync partial fail");
             Err(HsmError::Storage(pico2hsm_core::error::StorageError::WriteError))
         } else {
             self.degraded = false;
+            crate::cdc_log!("HYBRID resync ok");
             Ok(())
         }
     }
@@ -322,6 +336,7 @@ impl<P: KeyStore, S: KeyStore> HybridKeyStore<P, S> {
             Ok(()) => {
                 #[cfg(target_arch = "arm")]
                 defmt::info!("HybridKeyStore: SD card recovered — resync complete");
+                crate::cdc_log!("HYBRID SD recovered, resync ok");
                 Ok(())
             }
             Err(e) => {
@@ -355,6 +370,7 @@ impl<P: KeyStore, S: KeyStore> KeyStore for HybridKeyStore<P, S> {
         if let Err(_e) = self.secondary.save_key(obj) {
             #[cfg(target_arch = "arm")]
             defmt::warn!("HybridKeyStore: secondary write failed — marking degraded");
+            crate::cdc_warn!("HYBRID secondary write failed key=0x{:08x} — degraded", obj.key_id);
             self.degraded = true;
         } else if self.degraded {
             // Secondary write succeeded while degraded — trigger full resync.
@@ -363,6 +379,7 @@ impl<P: KeyStore, S: KeyStore> KeyStore for HybridKeyStore<P, S> {
             let _ = self.resync();
         }
 
+        crate::cdc_log!("HYBRID save key=0x{:08x} ok", obj.key_id);
         Ok(())
     }
 
@@ -378,6 +395,7 @@ impl<P: KeyStore, S: KeyStore> KeyStore for HybridKeyStore<P, S> {
                 self.flash_error = true;
                 #[cfg(target_arch = "arm")]
                 defmt::warn!("HybridKeyStore: primary read error for key 0x{:08x}, falling back to secondary", key_id.0);
+                crate::cdc_warn!("HYBRID primary miss key=0x{:08x}, trying secondary", key_id.0);
             }
         }
 
@@ -416,10 +434,12 @@ impl<P: KeyStore, S: KeyStore> KeyStore for HybridKeyStore<P, S> {
             self.degraded = true;
         }
 
+        crate::cdc_log!("HYBRID erase key=0x{:08x} ok", key_id.0);
         Ok(())
     }
 
     fn wipe_all(&mut self) -> Result<(), HsmError> {
+        crate::cdc_log!("HYBRID wipe_all start");
         // Wipe primary — failure is fatal.
         if let Err(e) = self.primary.wipe_all() {
             self.flash_error = true;
@@ -433,6 +453,7 @@ impl<P: KeyStore, S: KeyStore> KeyStore for HybridKeyStore<P, S> {
             self.degraded = true;
         }
 
+        crate::cdc_log!("HYBRID wipe_all done");
         Ok(())
     }
 

@@ -2,7 +2,11 @@
 # run_tests.sh — Top-level runner for pico2hsm hardware integration tests.
 #
 # Usage:
-#   ./run_tests.sh [pytest args...]
+#   ./run_tests.sh [--no-rsa] [pytest args...]
+#
+# Flags:
+#   --no-rsa     Skip RSA key generation/signing tests (test_06, test_07, test_08).
+#                Useful during development — RSA keygen takes 2–16 min on hardware.
 #
 # Environment variables (optional overrides):
 #   HSM_PIN      — user PIN         (default: 648219)
@@ -11,6 +15,19 @@
 #   HSM_LABEL    — token label      (default: pico2hsm)
 
 set -euo pipefail
+
+# ---------------------------------------------------------------------------
+# Parse flags
+# ---------------------------------------------------------------------------
+NO_RSA=false
+PASSTHROUGH_ARGS=()
+for arg in "$@"; do
+    if [[ "$arg" == "--no-rsa" ]]; then
+        NO_RSA=true
+    else
+        PASSTHROUGH_ARGS+=("$arg")
+    fi
+done
 
 # ---------------------------------------------------------------------------
 # Locate project root (directory containing this script)
@@ -123,9 +140,22 @@ mkdir -p tests/hw/reports
 # ---------------------------------------------------------------------------
 echo ""
 echo "Running hardware integration tests..."
+if [ "$NO_RSA" = true ]; then
+    echo "  [--no-rsa] Skipping RSA tests (test_06, test_07, test_08)"
+fi
 echo "------------------------------------------------------------"
 
 REPORT_DIR="tests/hw/reports/latest"
+
+# Build ignore list for --no-rsa
+IGNORE_ARGS=()
+if [ "$NO_RSA" = true ]; then
+    IGNORE_ARGS+=(
+        "--ignore=tests/hw/test_06_rsa_keygen.py"
+        "--ignore=tests/hw/test_07_rsa_sign.py"
+        "--ignore=tests/hw/test_08_rsa_decrypt.py"
+    )
+fi
 
 # Run pytest; capture exit code without triggering set -e
 set +e
@@ -135,7 +165,8 @@ set +e
     --self-contained-html \
     --json-report \
     --json-report-file="${REPORT_DIR}/results.json" \
-    "$@"
+    "${IGNORE_ARGS[@]}" \
+    "${PASSTHROUGH_ARGS[@]}"
 PYTEST_EXIT=$?
 set -e
 

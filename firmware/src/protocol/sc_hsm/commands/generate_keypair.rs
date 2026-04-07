@@ -698,6 +698,7 @@ fn build_rsa_gakp_cvc(
 
 /// Handle a GENERATE KEY PAIR APDU command.
 pub fn handle(state: &mut ScHsmState, store: &mut dyn crate::storage::KeyStore, cmd: &ApduCommand<'_>) -> ApduResponse {
+    crate::cdc_log!("SC-HSM GENERATE KEY PAIR start");
     // Require PIN authentication
     if !state.pin_verified {
         return ApduResponse::err(SW_SECURITY_STATUS);
@@ -824,6 +825,7 @@ pub fn handle(state: &mut ScHsmState, store: &mut dyn crate::storage::KeyStore, 
             return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED);
         }
 
+        crate::cdc_log!("SC-HSM GENERATE KEY PAIR done key=0x{:08x} algo=0x{:02x}", key_id, algo);
         return ApduResponse::ok(&cvc);
     }
 
@@ -873,5 +875,6 @@ pub fn handle(state: &mut ScHsmState, store: &mut dyn crate::storage::KeyStore, 
         None => return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
     };
 
+    crate::cdc_log!("SC-HSM GENERATE KEY PAIR done key=0x{:08x} algo=0x{:02x}", key_id, algo);
     ApduResponse::ok(&cvc)
 }

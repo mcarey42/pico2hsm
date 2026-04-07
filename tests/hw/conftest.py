@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import logging
 import os
+import subprocess
+import time
 import warnings
 from datetime import datetime, timezone
 from pathlib import Path
@@ -150,6 +152,16 @@ def initialized_device(runner: CLIRunner, config: dict, run_dir: Path):
     This fixture must succeed for all subsequent tests; it is session-scoped
     so initialization happens exactly once.
     """
+    # Wait for the device to be visible to pcscd before attempting INITIALIZE.
+    # pcscd may take a few seconds after USB enumeration to list the reader.
+    log.info("Waiting for device to be visible before INITIALIZE...")
+    if not _wait_for_device(timeout=20.0):
+        pytest.fail(
+            "HSM device not found by pcscd before INITIALIZE.\n"
+            "Make sure the device is connected, pcscd is running, and the\n"
+            "USB reader appears in: opensc-tool --list-readers"
+        )
+
     result = runner.sc_hsm_tool(
         "--initialize",
         "--label",  config["label"],
@@ -170,14 +182,56 @@ def initialized_device(runner: CLIRunner, config: dict, run_dir: Path):
         len(exchanges),
     )
 
-    if result.returncode != 0:
+    # sc-hsm-tool returns rc=0 even when no card is found — check stderr too.
+    no_card = (
+        "No smart card readers found" in result.stderr
+        or "No readers found" in result.stderr
+        or "Failed to connect to card" in result.stderr
+        or "SCardListReaders failed" in result.stderr
+    )
+    if result.returncode != 0 or no_card:
         pytest.fail(
             f"HSM initialization failed (rc={result.returncode}).\n"
             f"Make sure the device is connected and pcscd is running.\n"
             f"STDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
         )
 
+    # After INITIALIZE the device resets and USB re-enumerates.
+    # Wait up to 20 s for pcscd to re-detect it before proceeding.
+    log.info("Waiting for device to re-enumerate after INITIALIZE...")
+    _wait_for_device(timeout=20.0)
+
     return result
+
+
+def _wait_for_device(timeout: float = 20.0, poll_interval: float = 0.5) -> bool:
+    """Poll opensc-tool until the HSM card is present and accessible.
+
+    Returns True once the card column shows "Yes" (card inserted and
+    recognised by pcscd), False if the timeout expired.
+
+    We check for card presence, not just reader presence, because adding
+    the CDC-ACM interface means USB re-enumeration takes slightly longer
+    and pcscd may report the reader before the card is accessible.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            r = subprocess.run(
+                ["opensc-tool", "--list-readers"],
+                capture_output=True,
+                timeout=5,
+            )
+            # The card column shows "Yes" when a card is inserted and accessible.
+            # Example line: "0    Yes             pico2hsm SC-HSM (0001) 00 00"
+            if r.returncode == 0 and b"Yes" in r.stdout:
+                log.info("Device card detected and accessible by pcscd.")
+                return True
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            pass
+        time.sleep(poll_interval)
+    log.warning("Device did not appear within %.0f s.", timeout)
+    return False
 
 
 @pytest.fixture(scope="session")

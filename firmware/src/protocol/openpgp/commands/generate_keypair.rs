@@ -124,6 +124,7 @@ pub fn handle(state: &mut OpenPgpState, cmd: &ApduCommand<'_>) -> ApduResponse {
     match cmd.p1 {
         // P1=0x80: generate new key pair
         0x80 => {
+            crate::cdc_log!("OpenPGP GENERATE KEY PAIR start slot=0x{:02x}", crt_tag);
             if !state.pw3_verified {
                 return ApduResponse::err(SW_SECURITY_STATUS);
             }
@@ -156,6 +157,7 @@ pub fn handle(state: &mut OpenPgpState, cmd: &ApduCommand<'_>) -> ApduResponse {
             }
 
             // Build response: 7F49 [ 86 [point_len] <public_point> ]
+            crate::cdc_log!("OpenPGP GENERATE KEY PAIR done slot=0x{:02x}", crt_tag);
             build_pubkey_response(&pair.public_key)
         }
 

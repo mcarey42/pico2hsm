@@ -395,7 +395,12 @@ async fn run_one_board(p: embassy_rp::Peripherals) {
     }
     let store: &'static mut _ = KEYSTORE_CELL.init(ks);
 
-    // ── USB CCID transport ───────────────────────────────────────────────────
+    // ── USB CCID + CDC-ACM serial transport ─────────────────────────────────
+    // cdc_state must be declared before the builder and descriptor buffers so
+    // that it is dropped AFTER them (Rust drops in reverse declaration order).
+    use pico2hsm_firmware::transport::cdc_serial::{CdcAcmClass, CdcAcmState};
+    let mut cdc_state = CdcAcmState::new();
+
     let usb_driver = UsbDriver::new(p.USB, Irqs);
 
     let mut usb_config = UsbConfig::new(USB_VID, USB_PID);
@@ -405,7 +410,8 @@ async fn run_one_board(p: embassy_rp::Peripherals) {
     usb_config.max_power = 100;
 
     // USB descriptor buffers — must live for the duration of run_one_board.
-    let mut config_descriptor_buf = [0u8; 256];
+    // Bumped to 512 for CDC+CCID.
+    let mut config_descriptor_buf = [0u8; 512];
     let mut bos_descriptor_buf = [0u8; 256];
     let mut msos_descriptor_buf = [0u8; 256];
     let mut control_buf = [0u8; 64];
@@ -423,10 +429,14 @@ async fn run_one_board(p: embassy_rp::Peripherals) {
     // endpoints and embeds the 54-byte CCID class descriptor.
     let mut ccid = CcidTransport::new(&mut builder);
 
+    // CDC-ACM serial logger — /dev/ttyACMx for daemon diagnostics + debug.
+    let cdc_class = CdcAcmClass::new(&mut builder, &mut cdc_state, 64);
+    let (mut cdc_sender, _) = cdc_class.split();
+
     // Finalise the USB device descriptor.
     let mut usb = builder.build();
 
-    defmt::info!("pico2hsm (RP2350-One): USB CCID ready, entering main loop");
+    defmt::info!("pico2hsm (RP2350-One): USB CCID+CDC ready, entering main loop");
     board.led().set_status(LedStatus::Ready);
 
     // ── Spawn APDU dispatcher on core1 ───────────────────────────────────────
@@ -467,7 +477,9 @@ async fn run_one_board(p: embassy_rp::Peripherals) {
                             }
                         };
                         match ccid.send_response(&response).await {
-                            Ok(()) => {}
+                            Ok(()) => {
+                                pico2hsm_firmware::transport::cdc_serial::drain_one(&mut cdc_sender).await;
+                            }
                             Err(CcidError::UsbDisconnected) => {
                                 let _ = APDU_CHANNEL.send(heapless::Vec::new()).await;
                                 let _ = RESP_CHANNEL.receive().await;
@@ -618,9 +630,15 @@ async fn run_geek_board(p: embassy_rp::Peripherals) {
     usb_config.max_power = 100;
     serial_fmt!("USB VID={:#06x} PID={:#06x}", USB_VID, USB_PID);
 
+    // ── CHECKPOINT 3.5 — CDC-ACM state (must be before descriptor buffers) ───
+    // cdc_state must be declared before the builder and descriptor buffers so
+    // that it is dropped AFTER them (Rust drops in reverse declaration order).
+    use pico2hsm_firmware::transport::cdc_serial::{CdcAcmClass, CdcAcmState};
+    let mut cdc_state = CdcAcmState::new();
+
     // ── CHECKPOINT 4 — USB descriptor builder ───────────────────────────────
     serial_ln!("USB builder init...");
-    let mut config_descriptor_buf = [0u8; 256];
+    let mut config_descriptor_buf = [0u8; 512];  // bump to 512 for CDC+CCID
     let mut bos_descriptor_buf = [0u8; 256];
     let mut msos_descriptor_buf = [0u8; 256];
     let mut control_buf = [0u8; 64];
@@ -639,6 +657,10 @@ async fn run_geek_board(p: embassy_rp::Peripherals) {
     serial_ln!("CCID class register...");
     let mut ccid = CcidTransport::new(&mut builder);
     serial_ln!("CCID class ok");
+
+    // CDC-ACM serial logger — /dev/ttyACMx for daemon diagnostics + debug.
+    let cdc_class = CdcAcmClass::new(&mut builder, &mut cdc_state, 64);
+    let (mut cdc_sender, _) = cdc_class.split();
 
     // ── CHECKPOINT 6 — finalise USB device ──────────────────────────────────
     serial_ln!("USB device build...");
@@ -769,6 +791,8 @@ async fn run_geek_board(p: embassy_rp::Peripherals) {
 
                     // ── 1-second uptime tick ──────────────────────────────────────
                     Either::Second(()) => {
+                        // Drain one buffered CDC log line per tick (non-blocking).
+                        pico2hsm_firmware::transport::cdc_serial::drain_one(&mut cdc_sender).await;
                         uptime_secs = uptime_secs.wrapping_add(1);
                         display_state.uptime_secs = uptime_secs;
 
@@ -857,7 +881,12 @@ async fn run_pico2_board(p: embassy_rp::Peripherals) {
     debug_dump_storage(&ks);
     let store: &'static mut _ = KEYSTORE_CELL.init(ks);
 
-    // ── USB CCID transport ───────────────────────────────────────────────────
+    // ── USB CCID + CDC-ACM serial transport ─────────────────────────────────
+    // cdc_state must be declared before the builder and descriptor buffers so
+    // that it is dropped AFTER them (Rust drops in reverse declaration order).
+    use pico2hsm_firmware::transport::cdc_serial::{CdcAcmClass, CdcAcmState};
+    let mut cdc_state = CdcAcmState::new();
+
     let usb_driver = UsbDriver::new(p.USB, Irqs);
 
     let mut usb_config = UsbConfig::new(USB_VID, USB_PID);
@@ -866,7 +895,7 @@ async fn run_pico2_board(p: embassy_rp::Peripherals) {
     usb_config.serial_number = Some("0001");
     usb_config.max_power = 100;
 
-    let mut config_descriptor_buf = [0u8; 256];
+    let mut config_descriptor_buf = [0u8; 512];  // bump to 512 for CDC+CCID
     let mut bos_descriptor_buf = [0u8; 256];
     let mut msos_descriptor_buf = [0u8; 256];
     let mut control_buf = [0u8; 64];
@@ -881,9 +910,14 @@ async fn run_pico2_board(p: embassy_rp::Peripherals) {
     );
 
     let mut ccid = CcidTransport::new(&mut builder);
+
+    // CDC-ACM serial logger — /dev/ttyACMx for daemon diagnostics + debug.
+    let cdc_class = CdcAcmClass::new(&mut builder, &mut cdc_state, 64);
+    let (mut cdc_sender, _) = cdc_class.split();
+
     let mut usb = builder.build();
 
-    defmt::info!("pico2hsm (Pico 2): USB CCID ready, entering main loop");
+    defmt::info!("pico2hsm (Pico 2): USB CCID+CDC ready, entering main loop");
     board.led().set_status(LedStatus::Ready);
 
     defmt::info!("core0: spawning core1");
@@ -924,7 +958,9 @@ async fn run_pico2_board(p: embassy_rp::Peripherals) {
                             }
                         };
                         match ccid.send_response(&response).await {
-                            Ok(()) => {}
+                            Ok(()) => {
+                                pico2hsm_firmware::transport::cdc_serial::drain_one(&mut cdc_sender).await;
+                            }
                             Err(CcidError::UsbDisconnected) => {
                                 let _ = APDU_CHANNEL.send(heapless::Vec::new()).await;
                                 let _ = RESP_CHANNEL.receive().await;
@@ -1096,7 +1132,12 @@ async fn run_waveshare_lcd_board(p: embassy_rp::Peripherals) {
     // Set provisioning status for display (non-hybrid boards don't track qmi_ok/sd_ok).
     display_state.provisioned = pico2hsm_firmware::security::otp::Otp::new().is_provisioned();
 
-    // ── USB CCID transport ───────────────────────────────────────────────────
+    // ── USB CCID + CDC-ACM serial transport ─────────────────────────────────
+    // cdc_state must be declared before the builder and descriptor buffers so
+    // that it is dropped AFTER them (Rust drops in reverse declaration order).
+    use pico2hsm_firmware::transport::cdc_serial::{CdcAcmClass, CdcAcmState};
+    let mut cdc_state = CdcAcmState::new();
+
     let usb_driver = UsbDriver::new(p.USB, Irqs);
 
     let mut usb_config = UsbConfig::new(USB_VID, USB_PID);
@@ -1105,7 +1146,7 @@ async fn run_waveshare_lcd_board(p: embassy_rp::Peripherals) {
     usb_config.serial_number = Some("0001");
     usb_config.max_power = 100;
 
-    let mut config_descriptor_buf = [0u8; 256];
+    let mut config_descriptor_buf = [0u8; 512];  // bump to 512 for CDC+CCID
     let mut bos_descriptor_buf = [0u8; 256];
     let mut msos_descriptor_buf = [0u8; 256];
     let mut control_buf = [0u8; 64];
@@ -1120,9 +1161,14 @@ async fn run_waveshare_lcd_board(p: embassy_rp::Peripherals) {
     );
 
     let mut ccid = CcidTransport::new(&mut builder);
+
+    // CDC-ACM serial logger — /dev/ttyACMx for daemon diagnostics + debug.
+    let cdc_class = CdcAcmClass::new(&mut builder, &mut cdc_state, 64);
+    let (mut cdc_sender, _) = cdc_class.split();
+
     let mut usb = builder.build();
 
-    defmt::info!("pico2hsm (RP2350-LCD-1.47-B): USB CCID ready, entering main loop");
+    defmt::info!("pico2hsm (RP2350-LCD-1.47-B): USB CCID+CDC ready, entering main loop");
     display_state.status = LedStatus::Ready;
     {
         let (disp, spi) = board.led_and_spi0_mut();
@@ -1214,6 +1260,8 @@ async fn run_waveshare_lcd_board(p: embassy_rp::Peripherals) {
                     Either3::Second(_) => {}
                     // 1-second tick — update uptime and screensaver.
                     Either3::Third(()) => {
+                        // Drain one buffered CDC log line per tick (non-blocking).
+                        pico2hsm_firmware::transport::cdc_serial::drain_one(&mut cdc_sender).await;
                         uptime_secs = uptime_secs.wrapping_add(1);
                         display_state.uptime_secs = uptime_secs;
                         let idle = uptime_secs.saturating_sub(last_activity_secs);
@@ -1446,7 +1494,12 @@ async fn run_waveshare_lcd_hybrid_board(p: embassy_rp::Peripherals) {
 
     let store: &'static mut _ = KEYSTORE_CELL.init(ks);
 
-    // ── USB CCID transport ───────────────────────────────────────────────────
+    // ── USB CCID + CDC-ACM serial transport ─────────────────────────────────
+    // cdc_state must be declared before the builder and descriptor buffers so
+    // that it is dropped AFTER them (Rust drops in reverse declaration order).
+    use pico2hsm_firmware::transport::cdc_serial::{CdcAcmClass, CdcAcmState};
+    let mut cdc_state = CdcAcmState::new();
+
     let usb_driver = UsbDriver::new(p.USB, Irqs);
 
     let mut usb_config = UsbConfig::new(USB_VID, USB_PID);
@@ -1455,10 +1508,10 @@ async fn run_waveshare_lcd_hybrid_board(p: embassy_rp::Peripherals) {
     usb_config.serial_number = Some("0001");
     usb_config.max_power = 100;
 
-    let mut config_descriptor_buf = [0u8; 256];
-    let mut bos_descriptor_buf = [0u8; 256];
-    let mut msos_descriptor_buf = [0u8; 256];
-    let mut control_buf = [0u8; 64];
+    let mut config_descriptor_buf = [0u8; 512];
+    let mut bos_descriptor_buf    = [0u8; 256];
+    let mut msos_descriptor_buf   = [0u8; 256];
+    let mut control_buf           = [0u8; 64];
 
     let mut builder = UsbBuilder::new(
         usb_driver,
@@ -1470,9 +1523,14 @@ async fn run_waveshare_lcd_hybrid_board(p: embassy_rp::Peripherals) {
     );
 
     let mut ccid = CcidTransport::new(&mut builder);
+
+    // CDC-ACM serial logger — /dev/ttyACMx for daemon diagnostics + debug.
+    let cdc_class = CdcAcmClass::new(&mut builder, &mut cdc_state, 64);
+    let (mut cdc_sender, mut _cdc_receiver) = cdc_class.split();
+
     let mut usb = builder.build();
 
-    defmt::info!("pico2hsm (RP2350-LCD-1.47-B hybrid): USB CCID ready, entering main loop");
+    defmt::info!("pico2hsm (RP2350-LCD-1.47-B hybrid): USB CCID+CDC ready, entering main loop");
     display_state.status = LedStatus::Ready;
     update_status_display(&mut display, &mut spi0, &mut dc, &mut cs, &mut ws2812_writer, &display_state).await;
 
@@ -1563,8 +1621,10 @@ async fn run_waveshare_lcd_hybrid_board(p: embassy_rp::Peripherals) {
                     Either3::First(Err(_)) => {}
                     // Stray RESP_CHANNEL message with no pending APDU — discard.
                     Either3::Second(_) => {}
-                    // 1-second tick — update uptime and screensaver.
+                    // 1-second tick — update uptime, screensaver, drain CDC log.
                     Either3::Third(()) => {
+                        // Drain one buffered CDC log line per tick (non-blocking).
+                        pico2hsm_firmware::transport::cdc_serial::drain_one(&mut cdc_sender).await;
                         uptime_secs = uptime_secs.wrapping_add(1);
                         display_state.uptime_secs = uptime_secs;
                         let idle = uptime_secs.saturating_sub(last_activity_secs);

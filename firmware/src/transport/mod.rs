@@ -27,6 +27,7 @@
 //! ```
 
 pub mod ccid;
+pub mod cdc_serial;
 pub mod t1;
 
 pub use ccid::CcidTransport;

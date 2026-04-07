@@ -48,6 +48,7 @@ fn key_ref_to_slot(key_ref: u8) -> Option<usize> {
 
 /// Handle a GENERATE KEY PAIR APDU command.
 pub fn handle(state: &mut PivState, cmd: &ApduCommand<'_>) -> ApduResponse {
+    crate::cdc_log!("PIV GENERATE KEY PAIR start slot=0x{:02x}", cmd.p2);
     let key_ref = cmd.p2;
 
     // Validate P1
@@ -147,6 +148,7 @@ pub fn handle(state: &mut PivState, cmd: &ApduCommand<'_>) -> ApduResponse {
     }
     let _ = resp.extend_from_slice(&tag_7f49);
 
+    crate::cdc_log!("PIV GENERATE KEY PAIR done key=0x{:08x} algo=0x{:02x}", key_id.0, alg_id);
     ApduResponse::ok(&resp)
 }
 

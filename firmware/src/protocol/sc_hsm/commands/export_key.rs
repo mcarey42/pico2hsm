@@ -24,6 +24,9 @@ pub fn handle(state: &mut ScHsmState, store: &mut dyn KeyStore, cmd: &ApduComman
         return ApduResponse::err(SW_SECURITY_STATUS);
     }
 
+    let full_key_id_logged = pico2hsm_core::key::KeyId::sc_hsm(0, cmd.p1);
+    crate::cdc_log!("SC-HSM EXPORT KEY key=0x{:08x}", full_key_id_logged.0);
+
     // Require DKEK ready
     if !state.dkek.is_ready() {
         return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED);

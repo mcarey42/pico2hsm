@@ -64,6 +64,7 @@ fn hash_pin(pin: &[u8], out: &mut [u8; 32]) {
 ///   0x91  User PIN retry counter (1 byte)
 ///   0x92  DKEK share count (1 byte, 0 = no DKEK)
 pub fn handle(state: &mut ScHsmState, store: &mut dyn crate::storage::KeyStore, cmd: &ApduCommand<'_>) -> ApduResponse {
+    crate::cdc_log!("SC-HSM INITIALIZE start");
     if cmd.p1 != 0x00 || cmd.p2 != 0x00 {
         return ApduResponse::err(SW_WRONG_DATA);
     }
@@ -226,5 +227,6 @@ pub fn handle(state: &mut ScHsmState, store: &mut dyn crate::storage::KeyStore, 
         }
     }
 
+    crate::cdc_log!("SC-HSM INITIALIZE complete");
     ApduResponse::ok(&[])
 }
