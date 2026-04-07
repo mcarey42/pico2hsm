@@ -59,6 +59,8 @@ pub mod raid;
 #[cfg(target_arch = "arm")]
 pub mod sdcard;
 #[cfg(target_arch = "arm")]
+pub use sdcard::{SdCardCheckResult, compute_device_fingerprint, check_sd_signature, write_sd_signature};
+#[cfg(target_arch = "arm")]
 pub mod wal;
 
 #[cfg(target_arch = "arm")]

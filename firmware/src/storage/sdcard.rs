@@ -205,6 +205,143 @@ where
     }
 }
 
+// ─── SD card signature block (block 0 pairing) ─────────────────────────────────
+
+/// Check/adoption result returned by `check_sd_signature`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SdCardCheckResult {
+    /// Raw block 0 has our magic + fingerprint matches this device. Proceed with RAID-1.
+    Matched,
+    /// Raw block 0 is blank (all 0x00 or 0xFF) or has no P2HSDCARD magic. Auto-adopt.
+    Blank,
+    /// Raw block 0 has valid magic but fingerprint is from a different device. Boot degraded.
+    Foreign,
+    /// Magic present but CRC invalid. Treat as Blank (overwrite safe).
+    Corrupt,
+}
+
+/// Signature stored in raw SD card block 0 (512 bytes, first 64 bytes used).
+#[allow(dead_code)]
+pub struct SdCardSignature {
+    pub device_fingerprint: [u8; 32],
+    pub pairing_timestamp: u64,
+}
+
+const SD_SIG_MAGIC: [u8; 9] = *b"P2HSDCARD";
+const SD_SIG_VERSION: u8 = 0x01;
+
+/// Compute device fingerprint: SHA-256 of the 8-byte flash chip unique ID.
+/// This is stable, hardware-unique, and works before OTP provisioning.
+pub fn compute_device_fingerprint(flash_uid: &[u8; 8]) -> [u8; 32] {
+    use sha2::{Sha256, Digest};
+    let mut h = Sha256::new();
+    h.update(flash_uid);
+    h.finalize().into()
+}
+
+/// Read raw block 0 from the SD card and classify the signature.
+/// `card` must be initialized (num_bytes() already called).
+pub fn check_sd_signature<SPI, DELAY>(
+    card: &SdCard<SPI, DELAY>,
+    our_fingerprint: &[u8; 32],
+) -> SdCardCheckResult
+where
+    SPI: embedded_hal::spi::SpiDevice<u8>,
+    DELAY: embedded_hal::delay::DelayNs,
+{
+    let mut block = [Block::new()];
+    if card.read(&mut block, BlockIdx(0)).is_err() {
+        return SdCardCheckResult::Blank;
+    }
+    let data = &block[0].contents;
+
+    // Check if block is blank (all 0x00 or all 0xFF).
+    let all_zero = data.iter().all(|&b| b == 0x00);
+    let all_ff = data.iter().all(|&b| b == 0xFF);
+    if all_zero || all_ff {
+        return SdCardCheckResult::Blank;
+    }
+
+    // Check magic.
+    if data[0..9] != SD_SIG_MAGIC {
+        return SdCardCheckResult::Blank;
+    }
+
+    // Check version.
+    if data[9] != SD_SIG_VERSION {
+        return SdCardCheckResult::Blank;
+    }
+
+    // Verify CRC32 over bytes [0..54].
+    let stored_crc = u32::from_le_bytes([data[54], data[55], data[56], data[57]]);
+    let computed_crc = crc32fast::hash(&data[0..54]);
+    if stored_crc != computed_crc {
+        return SdCardCheckResult::Corrupt;
+    }
+
+    // Compare fingerprint.
+    if data[10..42] == our_fingerprint[..] {
+        SdCardCheckResult::Matched
+    } else {
+        SdCardCheckResult::Foreign
+    }
+}
+
+/// Write our pairing signature to raw block 0.
+pub fn write_sd_signature<SPI, DELAY>(
+    card: &SdCard<SPI, DELAY>,
+    fingerprint: &[u8; 32],
+) -> Result<(), ()>
+where
+    SPI: embedded_hal::spi::SpiDevice<u8>,
+    DELAY: embedded_hal::delay::DelayNs,
+{
+    let mut block = Block::new();
+    // Fill padding with 0xFF.
+    block.contents.fill(0xFF);
+
+    // [0..9] magic
+    block.contents[0..9].copy_from_slice(&SD_SIG_MAGIC);
+    // [9] version
+    block.contents[9] = SD_SIG_VERSION;
+    // [10..42] device fingerprint
+    block.contents[10..42].copy_from_slice(fingerprint);
+    // [42..50] pairing timestamp (u64 LE) — use 0 for now (no RTC)
+    block.contents[42..50].copy_from_slice(&0u64.to_le_bytes());
+    // [50..54] reserved
+    block.contents[50..54].fill(0x00);
+    // [54..58] CRC32 over [0..54]
+    let crc = crc32fast::hash(&block.contents[0..54]);
+    block.contents[54..58].copy_from_slice(&crc.to_le_bytes());
+
+    let blocks = [block];
+    card.write(&blocks, BlockIdx(0)).map_err(|_| ())
+}
+
+impl<SPI, DELAY> SdCardFlash<SPI, DELAY>
+where
+    SPI: embedded_hal::spi::SpiDevice<u8>,
+    DELAY: embedded_hal::delay::DelayNs,
+{
+    /// Create an `SdCardFlash` from an already-initialized `SdCard`.
+    ///
+    /// The caller is responsible for having already called `card.num_bytes()`
+    /// to initialize the card and obtain `capacity_bytes`.
+    pub fn from_card(card: SdCard<SPI, DELAY>, capacity_bytes: u64) -> Self {
+        defmt::info!(
+            "SdCardFlash::from_card: {} bytes ({} MiB)",
+            capacity_bytes,
+            capacity_bytes / (1024 * 1024),
+        );
+        SdCardFlash {
+            card,
+            capacity_bytes,
+            degraded: false,
+            write_errors: 0,
+        }
+    }
+}
+
 // ─── Non-generic legacy stub (kept for source compatibility) ──────────────────
 
 /// Non-generic SDCard stub.

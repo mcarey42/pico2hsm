@@ -75,6 +75,12 @@ pub struct DisplayState {
     pub error_msg: Option<&'static str>,
     /// Seconds since firmware boot (wraps at ~136 years).
     pub uptime_secs: u32,
+    /// Health of QMI flash primary store. None = not tracked (non-hybrid boards).
+    pub qmi_ok: Option<bool>,
+    /// Health of SD card secondary store. None = not present/tracked.
+    pub sd_ok: Option<bool>,
+    /// Whether the device OTP is provisioned.
+    pub provisioned: bool,
 }
 
 impl DisplayState {
@@ -88,6 +94,9 @@ impl DisplayState {
             last_op: None,
             error_msg: None,
             uptime_secs: 0,
+            qmi_ok: None,
+            sd_ok: None,
+            provisioned: true,
         }
     }
 }
@@ -204,6 +213,10 @@ pub struct ScreenLayout {
     pub lastop_y: u16,
     /// Height of the last-op row.
     pub lastop_h: u16,
+    /// Y position for the storage health row ("QMI: OK  |  SD: DEGRAD").
+    pub storage_health_y: u16,
+    /// Y position for the keys + provisioning row.
+    pub keys_y: u16,
     /// Y of the bottom status stripe (last pixel row).
     pub stripe_y: u16,
 }
@@ -221,9 +234,11 @@ impl ScreenLayout {
             pill_h:   12,
             uptime_x: 168,
             cells_y:  21,
-            cells_h:  49,
-            lastop_y: 72,
-            lastop_h: 42,
+            cells_h:  36,
+            lastop_y: 59,
+            lastop_h: 32,
+            storage_health_y: 93,
+            keys_y: 105,
             stripe_y: 134,
         }
     }
@@ -240,9 +255,11 @@ impl ScreenLayout {
             pill_h:   14,
             uptime_x: 220,
             cells_y:  25,
-            cells_h:  62,
-            lastop_y: 90,
-            lastop_h: 52,
+            cells_h:  50,
+            lastop_y: 78,
+            lastop_h: 42,
+            storage_health_y: 123,
+            keys_y: 137,
             stripe_y: 171,
         }
     }
@@ -265,7 +282,9 @@ impl ScreenLayout {
             cells_y:  41,
             cells_h:  80,
             lastop_y: 126,
-            lastop_h: 150,
+            lastop_h: 120,
+            storage_health_y: 252,
+            keys_y: 268,
             stripe_y: 319,
         }
     }
@@ -455,7 +474,64 @@ where
             .draw(display)?;
     }
 
-    // ── 7. Status stripe (bottom 1 px) ───────────────────────────────────────
+    // ── 7. Storage health row ──────────────────────────────────────────────
+    if state.qmi_ok.is_some() || state.sd_ok.is_some() {
+        let sy = layout.storage_health_y as i32;
+        let style_green = MonoTextStyle::new(&FONT_6X10, COLOR_GREEN);
+        let style_red = MonoTextStyle::new(&FONT_6X10, COLOR_RED);
+        let style_yellow = MonoTextStyle::new(&FONT_6X10, rgb565(0xFFE0));
+        let style_gray = MonoTextStyle::new(&FONT_6X10, COLOR_TEXT_DIM);
+        let style_white = MonoTextStyle::new(&FONT_6X10, COLOR_TEXT_PRI);
+
+        let mut x = margin as i32 + 4;
+        if let Some(ok) = state.qmi_ok {
+            Text::with_text_style("QMI:", Point::new(x, sy), style_sec, text_top).draw(display)?;
+            x += 30;
+            if ok {
+                Text::with_text_style("OK", Point::new(x, sy), style_green, text_top).draw(display)?;
+            } else {
+                Text::with_text_style("FAIL", Point::new(x, sy), style_red, text_top).draw(display)?;
+            }
+            x += 30;
+        }
+
+        // Separator
+        if state.qmi_ok.is_some() && state.sd_ok.is_some() {
+            Text::with_text_style("|", Point::new(x, sy), style_white, text_top).draw(display)?;
+            x += 12;
+        }
+
+        if let Some(ok) = state.sd_ok {
+            Text::with_text_style("SD:", Point::new(x, sy), style_sec, text_top).draw(display)?;
+            x += 24;
+            if ok {
+                Text::with_text_style("OK", Point::new(x, sy), style_green, text_top).draw(display)?;
+            } else {
+                Text::with_text_style("DEGRAD", Point::new(x, sy), style_yellow, text_top).draw(display)?;
+            }
+        } else if state.qmi_ok.is_some() {
+            // Show SD as absent
+            Text::with_text_style("SD:", Point::new(x, sy), style_sec, text_top).draw(display)?;
+            x += 24;
+            let _ = x;
+            Text::with_text_style("----", Point::new(x, sy), style_gray, text_top).draw(display)?;
+        }
+    }
+
+    // ── 8. Keys + provisioning row ──────────────────────────────────────────
+    {
+        let ky = layout.keys_y as i32;
+        let mut buf: String<20> = String::new();
+        let _ = write!(&mut buf, "Keys: {}", state.key_count);
+        Text::with_text_style(&buf, Point::new(margin as i32 + 4, ky), style_pri, text_top).draw(display)?;
+        if !state.provisioned {
+            let unprov_x = margin as i32 + 4 + buf.len() as i32 * 6 + 6;
+            let style_yellow = MonoTextStyle::new(&FONT_6X10, rgb565(0xFFE0));
+            Text::with_text_style("[UNPROV]", Point::new(unprov_x, ky), style_yellow, text_top).draw(display)?;
+        }
+    }
+
+    // ── 9. Status stripe (bottom 1 px) ───────────────────────────────────────
     Rectangle::new(Point::new(0, layout.stripe_y as i32), Size::new(w, 1))
         .into_styled(PrimitiveStyle::with_fill(status_color(state.status)))
         .draw(display)?;

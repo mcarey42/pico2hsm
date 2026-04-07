@@ -669,6 +669,9 @@ async fn run_geek_board(p: embassy_rp::Peripherals) {
     }
     let store: &'static mut _ = KEYSTORE_CELL.init(ks);
 
+    // Set provisioning status for display.
+    // (qmi_ok/sd_ok left as None — geek board doesn't track individual store health yet)
+
     // ── CHECKPOINT 7 — spawn core1 dispatcher, then run USB + CCID on core0 ──
     // NOTE: CORE1_STACK and CORE1_EXECUTOR are module-level statics shared by
     // all board variants; only one board function runs per firmware build.
@@ -684,6 +687,7 @@ async fn run_geek_board(p: embassy_rp::Peripherals) {
 
     let mut display_state = DisplayState::new();
     display_state.status = LedStatus::Ready;
+    display_state.provisioned = provisioned;
     let mut uptime_secs: u32 = 0_u32;
     let mut last_activity_secs: u32 = 0_u32;
     let mut screensaver = ScreensaverState::Active;
@@ -1089,6 +1093,9 @@ async fn run_waveshare_lcd_board(p: embassy_rp::Peripherals) {
         KEYSTORE_CELL.init(ks)
     };
 
+    // Set provisioning status for display (non-hybrid boards don't track qmi_ok/sd_ok).
+    display_state.provisioned = pico2hsm_firmware::security::otp::Otp::new().is_provisioned();
+
     // ── USB CCID transport ───────────────────────────────────────────────────
     let usb_driver = UsbDriver::new(p.USB, Irqs);
 
@@ -1324,6 +1331,22 @@ async fn run_waveshare_lcd_hybrid_board(p: embassy_rp::Peripherals) {
     init_lcd(&mut spi0, &mut dc, &mut cs, &mut rst, &mut bl).await;
     update_status_display(&mut display, &mut spi0, &mut dc, &mut cs, &mut ws2812_writer, &display_state).await;
 
+    // ── Get RP2350 device ID for fingerprint (OTP CHIPID0-3, 64-bit public ID) ──
+    let device_id: [u8; 8] = {
+        let otp = unsafe { embassy_rp::pac::OTP_DATA_RAW };
+        let mut id = [0u8; 8];
+        let c0 = otp.chipid0().read() as u16;
+        let c1 = otp.chipid1().read() as u16;
+        let c2 = otp.chipid2().read() as u16;
+        let c3 = otp.chipid3().read() as u16;
+        id[0..2].copy_from_slice(&c0.to_le_bytes());
+        id[2..4].copy_from_slice(&c1.to_le_bytes());
+        id[4..6].copy_from_slice(&c2.to_le_bytes());
+        id[6..8].copy_from_slice(&c3.to_le_bytes());
+        id
+    };
+    let our_fingerprint = pico2hsm_firmware::storage::sdcard::compute_device_fingerprint(&device_id);
+
     // ── Primary storage: QMI flash ──────────────────────────────────────────
     let smk_bytes = pico2hsm_firmware::security::otp::derive_smk()
         .unwrap_or([0u8; 32]);
@@ -1340,21 +1363,49 @@ async fn run_waveshare_lcd_hybrid_board(p: embassy_rp::Peripherals) {
     let qmi_sm = pico2hsm_firmware::storage::StorageManager::new(qmi_fs);
     let flash_ks = pico2hsm_firmware::storage::FlashKeyStore::new(qmi_sm, smk.clone());
 
-    // ── Secondary storage: SD card on SPI1 ──────────────────────────────────
-    let sd_result = pico2hsm_firmware::storage::sdcard::SdCardFlash::new(
-        spi_device,
-        embassy_time::Delay,
-    );
+    // ── Secondary storage: SD card on SPI1 (with signature check) ───────────
+    use embedded_sdmmc::SdCard;
+    use pico2hsm_firmware::storage::sdcard::{check_sd_signature, write_sd_signature, SdCardCheckResult};
+
+    let sd_card = SdCard::new(spi_device, embassy_time::Delay);
+    let sd_init_result = sd_card.num_bytes();
 
     let hybrid_degraded_at_init;
-    let sd_ks = match sd_result {
-        Ok(sd_flash) => {
-            defmt::info!("Hybrid: SD card initialised successfully");
-            hybrid_degraded_at_init = false;
-            let mut sd_fs = pico2hsm_firmware::storage::filesystem::KeyFilesystem::new();
-            let _ = sd_fs.add_chip(sd_flash);
-            let sd_sm = pico2hsm_firmware::storage::StorageManager::new(sd_fs);
-            pico2hsm_firmware::storage::FlashKeyStore::new(sd_sm, smk.clone())
+    let sd_ks = match sd_init_result {
+        Ok(capacity) => {
+            let check_result = check_sd_signature(&sd_card, &our_fingerprint);
+            match check_result {
+                SdCardCheckResult::Matched => {
+                    defmt::info!("Hybrid: SD card signature matched — recognized");
+                    hybrid_degraded_at_init = false;
+                    let sd_flash = pico2hsm_firmware::storage::sdcard::SdCardFlash::from_card(sd_card, capacity);
+                    let mut sd_fs = pico2hsm_firmware::storage::filesystem::KeyFilesystem::new();
+                    let _ = sd_fs.add_chip(sd_flash);
+                    let sd_sm = pico2hsm_firmware::storage::StorageManager::new(sd_fs);
+                    pico2hsm_firmware::storage::FlashKeyStore::new(sd_sm, smk.clone())
+                }
+                SdCardCheckResult::Blank | SdCardCheckResult::Corrupt => {
+                    defmt::info!("Hybrid: SD card is blank/corrupt — auto-adopting");
+                    let _ = write_sd_signature(&sd_card, &our_fingerprint);
+                    hybrid_degraded_at_init = false;
+                    let sd_flash = pico2hsm_firmware::storage::sdcard::SdCardFlash::from_card(sd_card, capacity);
+                    let mut sd_fs = pico2hsm_firmware::storage::filesystem::KeyFilesystem::new();
+                    let _ = sd_fs.add_chip(sd_flash);
+                    let sd_sm = pico2hsm_firmware::storage::StorageManager::new(sd_fs);
+                    pico2hsm_firmware::storage::FlashKeyStore::new(sd_sm, smk.clone())
+                }
+                SdCardCheckResult::Foreign => {
+                    defmt::warn!("Hybrid: SD card from different device — booting degraded");
+                    hybrid_degraded_at_init = true;
+                    display_state.sd_ok = Some(false);
+                    // Create an empty FlashKeyStore with no chips — it will fail all ops.
+                    let sd_fs: pico2hsm_firmware::storage::filesystem::KeyFilesystem<
+                        pico2hsm_firmware::storage::board_chips::HybridSdChip,
+                    > = pico2hsm_firmware::storage::filesystem::KeyFilesystem::new();
+                    let sd_sm = pico2hsm_firmware::storage::StorageManager::new(sd_fs);
+                    pico2hsm_firmware::storage::FlashKeyStore::new(sd_sm, smk.clone())
+                }
+            }
         }
         Err(_) => {
             defmt::warn!("Hybrid: SD card init failed — starting in degraded mode");
@@ -1387,6 +1438,11 @@ async fn run_waveshare_lcd_hybrid_board(p: embassy_rp::Peripherals) {
     if !hybrid_degraded_at_init {
         let _ = ks.resync();
     }
+
+    // Populate display health fields.
+    display_state.qmi_ok = Some(true);
+    display_state.sd_ok = Some(!hybrid_degraded_at_init);
+    display_state.provisioned = pico2hsm_firmware::security::otp::Otp::new().is_provisioned();
 
     let store: &'static mut _ = KEYSTORE_CELL.init(ks);
 
@@ -1471,13 +1527,17 @@ async fn run_waveshare_lcd_hybrid_board(p: embassy_rp::Peripherals) {
                         match ccid.send_response(&response).await {
                             Ok(()) => {
                                 // Check hybrid health via cross-core atomics.
-                                if HYBRID_FLASH_ERROR.load(core::sync::atomic::Ordering::Relaxed) {
+                                let flash_err = HYBRID_FLASH_ERROR.load(core::sync::atomic::Ordering::Relaxed);
+                                let degraded = HYBRID_DEGRADED.load(core::sync::atomic::Ordering::Relaxed);
+                                if flash_err {
                                     display_state.status = LedStatus::Error;
-                                } else if HYBRID_DEGRADED.load(core::sync::atomic::Ordering::Relaxed) {
+                                } else if degraded {
                                     display_state.status = LedStatus::Degraded;
                                 } else {
                                     display_state.status = LedStatus::Ready;
                                 }
+                                display_state.qmi_ok = Some(!flash_err);
+                                display_state.sd_ok = Some(!degraded);
                                 if let Some((_, op_time)) = display_state.last_op {
                                     if uptime_secs.saturating_sub(op_time) >= LAST_OP_DISPLAY_SECS {
                                         display_state.last_op = None;
