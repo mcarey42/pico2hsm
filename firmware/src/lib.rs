@@ -31,3 +31,17 @@ pub mod storage;
 pub mod transport;
 #[cfg(target_arch = "arm")]
 pub mod display;
+
+// No-op stubs for crate::cdc_log!/cdc_warn!/cdc_error! on non-ARM (host test) builds.
+// On ARM, the real implementations live in transport::cdc_serial and are exported via
+// #[macro_export] from that module. On x86_64 the transport module is not compiled,
+// so we define the stubs here directly at the crate root.
+#[cfg(not(target_arch = "arm"))]
+#[macro_export]
+macro_rules! cdc_log   { ($($arg:tt)*) => {{}} }
+#[cfg(not(target_arch = "arm"))]
+#[macro_export]
+macro_rules! cdc_warn  { ($($arg:tt)*) => {{}} }
+#[cfg(not(target_arch = "arm"))]
+#[macro_export]
+macro_rules! cdc_error { ($($arg:tt)*) => {{}} }
