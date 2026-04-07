@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# generate_firmware_signing_keys.sh — Generate EC P-256 firmware signing keys for RP2350 secure boot
+# generate_firmware_signing_keys.sh — Generate EC secp256k1 firmware signing keys for RP2350 secure boot
 #
 # The RP2350 secure boot mechanism works as follows:
 #   1. A SHA-256 hash of the signing public key is burned into the RP2350's OTP (one-time programmable) memory.
@@ -40,11 +40,15 @@ if ! command -v openssl &>/dev/null; then
     exit 1
 fi
 
-echo "Generating EC P-256 firmware signing key pair for RP2350 secure boot..."
+echo "Generating EC secp256k1 firmware signing key pair for RP2350 secure boot..."
 echo
+# NOTE: The RP2350 bootrom uses secp256k1 (not NIST P-256) for signature
+# verification.  picotool's sign/verify pipeline also uses secp256k1.
+# Using any other curve (e.g. P-256) will produce "Signature verification
+# failed" from picotool even though the key itself is technically valid.
 
 # Generate private key (PKCS#8 PEM, unencrypted)
-openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out "$PRIVATE_KEY"
+openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:secp256k1 -out "$PRIVATE_KEY"
 chmod 600 "$PRIVATE_KEY"
 
 # Extract public key

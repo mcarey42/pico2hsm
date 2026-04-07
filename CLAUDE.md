@@ -90,6 +90,7 @@ cargo build --release --no-default-features \
 
 Flash is not a concern.  RAM is the metric to watch; the 128 KB core1 stack and the
 SC-HSM key caches dominate; applet state structs are small by comparison.
+Current BSS budget (waveshare_rp2350_lcd_16m, all applets): ~308 KB / 520 KB (59%).
 
 **Storage namespace — implemented:**
 
@@ -146,8 +147,11 @@ Each board's LED/display driver is fully implemented (not stubbed):
 - Fills entire screen with a solid RGB565 colour per `LedStatus` variant.
 - Delays use `cortex_m::asm::delay` (cycle-counted; no embassy-time needed).
 
-**waveshare_rp2350_lcd — ST7789V3 172×320 on SPI0 + WS2812B on GPIO22**
+**waveshare_rp2350_lcd — ST7789V3 320×172 landscape on SPI0 + WS2812B on GPIO22**
 - LCD driven via async `init_lcd()` / `update_status_display()` free functions.
+- MADCTL=0xA0 (MY+MV): landscape 320×172, 180°-corrected from broken 0x60 attempt.
+- RASET 34–205 (not 0–171): physical GRAM columns 34–205 map to landscape height.
+- Full 320×172 RGB565 framebuffer (110 KB in BSS); `ScreenLayout::waveshare_320x172()`.
 - Both LCD colour and WS2812B GRB are set simultaneously via `status_to_colors()`.
 
 ## Known pitfalls
@@ -158,13 +162,15 @@ Each board's LED/display driver is fully implemented (not stubbed):
 
 **Cause**: `ScHsmState` holds `ef_files: Vec<EfEntry, 16>` where each `EfEntry` contains `Vec<u8, 2048>` inline — 32 KB of fixed EF storage alone. Combined with multiple `Vec<u8, 4096>` response buffers allocated as stack temporaries across the `Dispatcher → ScHsm::process_apdu → ScHsm::dispatch → handle()` call chain (~12–16 KB), the total easily exceeds the core1 stack limit. On Cortex-M33 without MPU guard pages this is a **silent** overflow: no panic, no fault, core1 just runs garbage.
 
-**Fix**: Increase `CORE1_STACK` in `firmware/src/main.rs`:
+**Fix**: Set `CORE1_STACK` in `firmware/src/main.rs` to 128 KB.  Measured peak usage
+is ~65 KB (38 KB ScHsmState inline storage + 16 KB dispatch-chain temporaries),
+giving ~2× headroom:
 ```rust
-// Was Stack<65536> — not enough once EF storage + response bufs are counted
+// 128 KB — ~2× measured peak of ~65 KB.  Do not reduce below 96 KB.
 static mut CORE1_STACK: Stack<131072> = Stack::new();
 ```
 
-**Rule of thumb**: Any time a new large static allocation is added to `ScHsmState` (keys, files, buffers), re-evaluate core1 stack headroom. The RP2350 has 520 KB SRAM total; current BSS is ~210 KB, so there is headroom to grow further if needed.
+**Rule of thumb**: Any time a new large static allocation is added to `ScHsmState` (keys, files, buffers), re-evaluate core1 stack headroom. The RP2350 has 520 KB SRAM total; current BSS is ~308 KB (waveshare_rp2350_lcd_16m with all applets), so headroom remains if needed.
 
 ### CCID timeout on long operations (P-384 / P-521 / K-256 sign)
 

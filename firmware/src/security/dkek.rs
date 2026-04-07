@@ -57,6 +57,8 @@ use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use zeroize::{Zeroize, Zeroizing};
 
+use cmac::{Cmac, Mac as CmacMac};
+
 use aes_gcm::{
     aead::{AeadInPlace, KeyInit as GcmKeyInit},
     Aes256Gcm,
@@ -98,6 +100,13 @@ const EXCHANGE_INFO: &[u8] = b"pico2hsm-dkek-exchange-v1";
 /// HKDF info for deriving the static Noise key from the OTP identity key.
 const NOISE_STATIC_INFO: &[u8] = b"pico2hsm-noise-static-v1";
 
+/// KCV (Key Check Value) size: first 8 bytes of AES-CMAC over zeros.
+const KCV_SIZE: usize = 8;
+/// CBC IV size.
+const CBC_IV_SIZE: usize = 16;
+/// Minimum wrapped blob size: KCV(8) + IV(16) + at least one CBC block(16).
+const WRAP_MIN_SIZE: usize = KCV_SIZE + CBC_IV_SIZE + 16;
+
 // ---------------------------------------------------------------------------
 // Errors
 // ---------------------------------------------------------------------------
@@ -127,6 +136,12 @@ pub enum DkekError {
     RngFailure,
     /// Key agreement / ECC operation failed.
     EcdhFailure,
+    /// KCV (Key Check Value) mismatch on unwrap — wrong DKEK or tampered blob.
+    KcvMismatch,
+    /// Wrapped blob has invalid length (not a multiple of 16 after header, or too short).
+    InvalidWrapBlob,
+    /// PKCS#7 padding is invalid.
+    InvalidPadding,
 }
 
 // ---------------------------------------------------------------------------
@@ -489,6 +504,152 @@ impl DkekManager {
         hkdf.expand(NOISE_STATIC_INFO, out.as_mut()).expect("HKDF expand cannot fail for 32 bytes");
         out
     }
+
+    /// Compute Key Check Value: first 8 bytes of AES-256-CMAC(DKEK, zeros[16]).
+    pub fn compute_kcv(&self) -> Result<[u8; KCV_SIZE], DkekError> {
+        let dkek = self.get_dkek().ok_or(DkekError::WrongState)?;
+        let mut mac = <Cmac<Aes256> as CmacMac>::new_from_slice(dkek)
+            .map_err(|_| DkekError::EncryptFailure)?;
+        mac.update(&[0u8; 16]);
+        let result = mac.finalize().into_bytes();
+        let mut kcv = [0u8; KCV_SIZE];
+        kcv.copy_from_slice(&result[..KCV_SIZE]);
+        Ok(kcv)
+    }
+
+    /// Wrap key material in SC-HSM DKEK wrap format.
+    ///
+    /// Output format: KCV(8) || IV(16) || AES-256-CBC(DKEK, IV, padded_plaintext)
+    /// Plaintext before padding: key_material || algo_id(1) || key_flags(1)
+    /// PKCS#7 padding to 16-byte boundary.
+    pub fn wrap(
+        &self,
+        key_material: &[u8],
+        algo_id: u8,
+        key_flags: u8,
+        rng: &mut (impl rand_core::CryptoRng + rand_core::RngCore),
+    ) -> Result<heapless::Vec<u8, 2080>, DkekError> {
+        let dkek = self.get_dkek().ok_or(DkekError::WrongState)?;
+
+        // Compute KCV.
+        let kcv = self.compute_kcv()?;
+
+        // Build plaintext: key_material || algo_id || key_flags
+        let plain_data_len = key_material.len() + 2; // +2 for algo_id + key_flags
+        // PKCS#7 pad to 16-byte boundary.
+        let pad_len = 16 - (plain_data_len % 16);
+        let padded_len = plain_data_len + pad_len;
+
+        // Use a stack buffer. Max private key = 132 bytes (P-521); + 2 + up to 16 pad = 150 bytes.
+        // heapless::Vec<u8, 160> for the plaintext buffer.
+        let mut pt: heapless::Vec<u8, 160> = heapless::Vec::new();
+        pt.extend_from_slice(key_material).map_err(|_| DkekError::EncryptFailure)?;
+        pt.push(algo_id).map_err(|_| DkekError::EncryptFailure)?;
+        pt.push(key_flags).map_err(|_| DkekError::EncryptFailure)?;
+        for _ in 0..pad_len {
+            pt.push(pad_len as u8).map_err(|_| DkekError::EncryptFailure)?;
+        }
+
+        // Generate random IV.
+        let mut iv = [0u8; CBC_IV_SIZE];
+        rng.fill_bytes(&mut iv);
+
+        // AES-256-CBC encrypt in-place.
+        // The cbc encryptor needs a mutable fixed-size slice. Use a fixed stack buffer.
+        let mut ct_buf = [0u8; 160];
+        let ct_slice = &mut ct_buf[..padded_len];
+        ct_slice.copy_from_slice(&pt[..padded_len]);
+
+        let enc = <CbcEncryptor<Aes256> as KeyIvInit>::new_from_slices(dkek, &iv)
+            .map_err(|_| DkekError::EncryptFailure)?;
+        enc.encrypt_padded_mut::<NoPadding>(ct_slice, padded_len)
+            .map_err(|_| DkekError::EncryptFailure)?;
+
+        // Zeroize plaintext buffer.
+        for b in pt.iter_mut() { *b = 0; }
+
+        // Assemble output: KCV(8) || IV(16) || ciphertext(padded_len)
+        let mut out: heapless::Vec<u8, 2080> = heapless::Vec::new();
+        out.extend_from_slice(&kcv).map_err(|_| DkekError::EncryptFailure)?;
+        out.extend_from_slice(&iv).map_err(|_| DkekError::EncryptFailure)?;
+        out.extend_from_slice(ct_slice).map_err(|_| DkekError::EncryptFailure)?;
+
+        Ok(out)
+    }
+
+    /// Unwrap a DKEK-wrapped key blob.
+    ///
+    /// Verifies KCV, decrypts AES-256-CBC, removes PKCS#7 padding.
+    /// Returns: (key_material, algo_id, key_flags)
+    pub fn unwrap(
+        &self,
+        blob: &[u8],
+    ) -> Result<(heapless::Vec<u8, 2048>, u8, u8), DkekError> {
+        let dkek = self.get_dkek().ok_or(DkekError::WrongState)?;
+
+        // Validate minimum length and alignment.
+        if blob.len() < WRAP_MIN_SIZE {
+            return Err(DkekError::InvalidWrapBlob);
+        }
+        let ct_len = blob.len() - KCV_SIZE - CBC_IV_SIZE;
+        if ct_len % 16 != 0 {
+            return Err(DkekError::InvalidWrapBlob);
+        }
+
+        let kcv_received: &[u8; KCV_SIZE] = blob[..KCV_SIZE].try_into().unwrap();
+        let iv: &[u8; CBC_IV_SIZE] = blob[KCV_SIZE..KCV_SIZE + CBC_IV_SIZE].try_into().unwrap();
+        let ct = &blob[KCV_SIZE + CBC_IV_SIZE..];
+
+        // Verify KCV.
+        let kcv_expected = self.compute_kcv()?;
+        if !bool::from(kcv_expected.ct_eq(kcv_received)) {
+            return Err(DkekError::KcvMismatch);
+        }
+
+        // AES-256-CBC decrypt.
+        let mut pt_buf = [0u8; 160];
+        if ct_len > pt_buf.len() {
+            return Err(DkekError::InvalidWrapBlob);
+        }
+        let pt_slice = &mut pt_buf[..ct_len];
+        pt_slice.copy_from_slice(ct);
+
+        let dec = <CbcDecryptor<Aes256> as KeyIvInit>::new_from_slices(dkek, iv)
+            .map_err(|_| DkekError::DecryptFailure)?;
+        dec.decrypt_padded_mut::<NoPadding>(pt_slice)
+            .map_err(|_| DkekError::DecryptFailure)?;
+
+        // Remove PKCS#7 padding.
+        let pad_len = *pt_slice.last().ok_or(DkekError::InvalidPadding)? as usize;
+        if pad_len == 0 || pad_len > 16 || pad_len > ct_len {
+            return Err(DkekError::InvalidPadding);
+        }
+        // Validate all padding bytes.
+        for &b in &pt_slice[ct_len - pad_len..] {
+            if b as usize != pad_len {
+                return Err(DkekError::InvalidPadding);
+            }
+        }
+        let unpadded_len = ct_len - pad_len;
+
+        // Extract key_material, algo_id, key_flags.
+        // Layout: key_material(unpadded_len - 2) || algo_id(1) || key_flags(1)
+        if unpadded_len < 2 {
+            return Err(DkekError::InvalidWrapBlob);
+        }
+        let key_material_len = unpadded_len - 2;
+        let algo_id = pt_slice[key_material_len];
+        let key_flags = pt_slice[key_material_len + 1];
+
+        let mut key_material: heapless::Vec<u8, 2048> = heapless::Vec::new();
+        key_material.extend_from_slice(&pt_slice[..key_material_len])
+            .map_err(|_| DkekError::InvalidWrapBlob)?;
+
+        // Zeroize pt_buf.
+        pt_buf.zeroize();
+
+        Ok((key_material, algo_id, key_flags))
+    }
 }
 
 impl Drop for DkekManager {
@@ -644,6 +805,40 @@ mod tests {
          0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10]
     }
 
+    /// Deterministic RNG for tests (no OsRng in no_std firmware builds).
+    struct DeterministicRng { state: u64 }
+
+    impl DeterministicRng {
+        fn seeded(seed: u64) -> Self { DeterministicRng { state: seed | 1 } }
+    }
+
+    impl rand_core::RngCore for DeterministicRng {
+        fn next_u32(&mut self) -> u32 { self.next_u64() as u32 }
+
+        fn next_u64(&mut self) -> u64 {
+            self.state = self.state.wrapping_add(0x9e3779b97f4a7c15);
+            let mut z = self.state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
+            z ^ (z >> 31)
+        }
+
+        fn fill_bytes(&mut self, dest: &mut [u8]) {
+            for chunk in dest.chunks_mut(8) {
+                let v = self.next_u64().to_le_bytes();
+                let n = chunk.len();
+                chunk.copy_from_slice(&v[..n]);
+            }
+        }
+
+        fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), rand_core::Error> {
+            self.fill_bytes(dest);
+            Ok(())
+        }
+    }
+
+    impl rand_core::CryptoRng for DeterministicRng {}
+
     #[test]
     fn test_init_shares_transitions_state() {
         let mut mgr = DkekManager::new(test_device_id());
@@ -785,5 +980,79 @@ mod tests {
         mgr.clear();
         assert!(!mgr.is_ready());
         assert_eq!(mgr.shares_total(), 0);
+    }
+
+    #[test]
+    fn test_wrap_unwrap_roundtrip_p256() {
+        let mut mgr = DkekManager::new(test_device_id());
+        mgr.init_shares(1);
+        let share = [0x42u8; 32];
+        let iv = [0x11u8; 16];
+        let blob = encrypt_share_blob(&share, b"pw", &iv).unwrap();
+        mgr.import_share(&blob, b"pw").unwrap();
+
+        let mut rng = DeterministicRng::seeded(1);
+        let key_material = [0xABu8; 32]; // simulated P-256 private key
+        let algo_id = 0x13u8; // SC-HSM EC_P256
+        let key_flags = 0x01u8; // exportable
+
+        let wrapped = mgr.wrap(&key_material, algo_id, key_flags, &mut rng).unwrap();
+        let (recovered, recovered_algo, recovered_flags) = mgr.unwrap(&wrapped).unwrap();
+
+        assert_eq!(&*recovered, &key_material);
+        assert_eq!(recovered_algo, algo_id);
+        assert_eq!(recovered_flags, key_flags);
+    }
+
+    #[test]
+    fn test_wrap_unwrap_roundtrip_aes256() {
+        let mut mgr = DkekManager::new(test_device_id());
+        mgr.init_shares(1);
+        let share = [0x77u8; 32];
+        let iv = [0x22u8; 16];
+        let blob = encrypt_share_blob(&share, b"pw2", &iv).unwrap();
+        mgr.import_share(&blob, b"pw2").unwrap();
+
+        let mut rng = DeterministicRng::seeded(2);
+        let key_material = [0xCDu8; 32]; // AES-256 key
+        let wrapped = mgr.wrap(&key_material, 0x63u8, 0x00u8, &mut rng).unwrap();
+        let (recovered, algo, flags) = mgr.unwrap(&wrapped).unwrap();
+        assert_eq!(&*recovered, &key_material);
+        assert_eq!(algo, 0x63u8);
+        assert_eq!(flags, 0x00u8);
+    }
+
+    #[test]
+    fn test_unwrap_kcv_mismatch_fails() {
+        let mut mgr = DkekManager::new(test_device_id());
+        mgr.init_shares(1);
+        let share = [0x55u8; 32];
+        let iv = [0x33u8; 16];
+        let blob = encrypt_share_blob(&share, b"pw3", &iv).unwrap();
+        mgr.import_share(&blob, b"pw3").unwrap();
+
+        let mut rng = DeterministicRng::seeded(3);
+        let key_material = [0x10u8; 32];
+        let mut wrapped = mgr.wrap(&key_material, 0x13, 0x01, &mut rng).unwrap();
+        // Corrupt the KCV (first 8 bytes).
+        wrapped[0] ^= 0xFF;
+        let result = mgr.unwrap(&wrapped);
+        assert_eq!(result, Err(DkekError::KcvMismatch));
+    }
+
+    #[test]
+    fn test_wrap_requires_ready_dkek() {
+        let mgr = DkekManager::new(test_device_id());
+        let mut rng = DeterministicRng::seeded(4);
+        let result = mgr.wrap(&[0u8; 32], 0x13, 0x01, &mut rng);
+        assert_eq!(result, Err(DkekError::WrongState));
+    }
+
+    #[test]
+    fn test_unwrap_requires_ready_dkek() {
+        let mgr = DkekManager::new(test_device_id());
+        let dummy_blob = [0u8; 40]; // KCV(8) + IV(16) + one block(16)
+        let result = mgr.unwrap(&dummy_blob);
+        assert_eq!(result, Err(DkekError::WrongState));
     }
 }

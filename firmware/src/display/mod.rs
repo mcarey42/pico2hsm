@@ -246,6 +246,29 @@ impl ScreenLayout {
             stripe_y: 171,
         }
     }
+
+    /// Layout for the Waveshare RP2350-LCD-1.47-B (ST7789V3, 172 × 320 portrait).
+    ///
+    /// Two-row header: "pico2hsm" + uptime on the first row, status pill centred
+    /// on the second row.  The remaining 280 px is split between the info grid
+    /// and the last-op area.
+    pub const fn waveshare_172x320() -> Self {
+        Self {
+            width:    172,
+            height:   320,
+            header_h: 38,   // two text rows (2 × 19 px)
+            pill_x:   36,   // centred: (172 − 100) / 2
+            pill_y:   22,   // second header row
+            pill_w:   100,
+            pill_h:   14,
+            uptime_x: 116,  // right-aligned: 172 − 8 chars × 6 px − 8 px margin
+            cells_y:  41,
+            cells_h:  80,
+            lastop_y: 126,
+            lastop_h: 150,
+            stripe_y: 319,
+        }
+    }
 }
 
 // ── Public API ────────────────────────────────────────────────────────────────

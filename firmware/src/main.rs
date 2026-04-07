@@ -56,11 +56,12 @@ use static_cell::StaticCell;
 
 // ─── Core1 stack and executor (ARM only) ─────────────────────────────────────
 
-/// Stack for the core1 Embassy executor.  128 KB needed: ScHsmState holds
-/// 16 × 2 KB EF entries inline, plus multiple 4 KB response Vec<u8, 4096>
-/// temporaries across the dispatch call chain.
+/// Stack for the core1 Embassy executor.  Peak usage ~65 KB: ScHsmState holds
+/// 16 × 2 KB EF entries inline (~38 KB total state) plus multiple 4 KB response
+/// Vec<u8, 4096> temporaries across the dispatch call chain (~16 KB peak).
+/// 128 KB gives ~2× headroom over measured peak usage.
 #[cfg(target_arch = "arm")]
-static mut CORE1_STACK: Stack<262144> = Stack::new();
+static mut CORE1_STACK: Stack<131072> = Stack::new();
 #[cfg(target_arch = "arm")]
 static CORE1_EXECUTOR: StaticCell<embassy_executor::Executor> = StaticCell::new();
 
@@ -149,6 +150,11 @@ fn defmt_panic() -> ! {
 embassy_rp::bind_interrupts!(struct Irqs {
     TRNG_IRQ => embassy_rp::trng::InterruptHandler<embassy_rp::peripherals::TRNG>;
     USBCTRL_IRQ => embassy_rp::usb::InterruptHandler<embassy_rp::peripherals::USB>;
+    // PIO0 and DMA_CH0 are used by the WS2812B driver on the RP2350-LCD-1.47-B
+    // board.  Harmless to register on all builds — the IRQs only fire when the
+    // PIO / DMA hardware is actually used via the embassy-rp API.
+    PIO0_IRQ_0 => embassy_rp::pio::InterruptHandler<embassy_rp::peripherals::PIO0>;
+    DMA_IRQ_0 => embassy_rp::dma::InterruptHandler<embassy_rp::peripherals::DMA_CH0>;
 });
 
 // ─── USB device identity ───────────────────────────────────────────────────────
@@ -228,8 +234,8 @@ async fn main(_spawner: Spawner) {
         run_geek_board(p).await;
     }
 
-    // ── Waveshare RP2350-LCD-1.47-B ──────────────────────────────────────────
-    #[cfg(feature = "waveshare_rp2350_lcd_16m")]
+    // ── Waveshare RP2350-LCD-1.47-B (single SD and dual-SD variants) ─────────
+    #[cfg(any(feature = "waveshare_rp2350_lcd_16m", feature = "waveshare_rp2350_lcd_sdcard_dual"))]
     {
         pico2hsm_firmware::security::boot::security_checks();
         pico2hsm_firmware::allocator::init();
@@ -254,6 +260,7 @@ async fn main(_spawner: Spawner) {
         feature = "rp2354_embedded",
         feature = "pico2_4m",
         feature = "waveshare_rp2350_lcd_16m",
+        feature = "waveshare_rp2350_lcd_sdcard_dual",
     )))]
     {
         defmt::error!("No board feature flag set — spinning forever");
@@ -871,15 +878,22 @@ async fn run_pico2_board(p: embassy_rp::Peripherals) {
 
 // ─── Waveshare RP2350-LCD-1.47-B main function ───────────────────────────────
 
-#[cfg(all(target_arch = "arm", feature = "waveshare_rp2350_lcd_16m"))]
+#[cfg(all(target_arch = "arm", any(feature = "waveshare_rp2350_lcd_16m", feature = "waveshare_rp2350_lcd_sdcard_dual")))]
 async fn run_waveshare_lcd_board(p: embassy_rp::Peripherals) {
     use embassy_futures::join::join;
+    use embassy_rp::gpio::{Level, Output};
+    use embassy_rp::pio::Pio;
+    use embassy_rp::pio_programs::ws2812::{PioWs2812, PioWs2812Program};
     use embassy_rp::spi::{Config as SpiConfig, Phase, Polarity, Spi};
     use embassy_rp::usb::Driver as UsbDriver;
     use embassy_usb::{Builder as UsbBuilder, Config as UsbConfig};
 
-    use pico2hsm_firmware::board::waveshare_rp2350_lcd::{WaveshareRp2350LcdBoard, SPI_FREQ_HZ};
-    use pico2hsm_firmware::board::{Board, LedController, LedStatus};
+    use pico2hsm_firmware::board::waveshare_rp2350_lcd::{
+        WaveshareRp2350LcdBoard, SPI_FREQ_HZ,
+        init_lcd, update_status_display, PioWs2812Writer,
+    };
+    use pico2hsm_firmware::board::{Board, LedStatus};
+    use pico2hsm_firmware::display::{DisplayState, ScreensaverState, SCREENSAVER_TIMEOUT_SECS, LAST_OP_DISPLAY_SECS};
     use pico2hsm_firmware::transport::ccid::CcidError;
     use pico2hsm_firmware::transport::CcidTransport;
 
@@ -892,7 +906,6 @@ async fn run_waveshare_lcd_board(p: embassy_rp::Peripherals) {
     spi0_cfg.frequency = SPI_FREQ_HZ;
     spi0_cfg.phase = Phase::CaptureOnFirstTransition;
     spi0_cfg.polarity = Polarity::IdleLow;
-    // Pins: SCK=GPIO18, MOSI=GPIO19, MISO=GPIO4
     let spi0 = Spi::new_blocking(p.SPI0, p.PIN_18, p.PIN_19, p.PIN_4, spi0_cfg);
 
     // ── SPI1: SD card bus (SCK=GPIO10, MOSI=GPIO11, MISO=GPIO12) ─────────────
@@ -900,17 +913,35 @@ async fn run_waveshare_lcd_board(p: embassy_rp::Peripherals) {
     spi1_cfg.frequency = SPI_FREQ_HZ;
     spi1_cfg.phase = Phase::CaptureOnFirstTransition;
     spi1_cfg.polarity = Polarity::IdleLow;
-    // Pins: SCK=GPIO10, MOSI=GPIO11, MISO=GPIO12
     let spi1 = Spi::new_blocking(p.SPI1, p.PIN_10, p.PIN_11, p.PIN_12, spi1_cfg);
 
     let mut board = WaveshareRp2350LcdBoard::new(spi0, spi1);
-    board.led().set_status(LedStatus::Busy);
+
+    // ── LCD control GPIO pins ─────────────────────────────────────────────────
+    // DC=GPIO16, CS=GPIO17, RST=GPIO20, BL=GPIO21 per board schematic.
+    let mut dc  = Output::new(p.PIN_16, Level::Low);
+    let mut cs  = Output::new(p.PIN_17, Level::High);
+    let mut rst = Output::new(p.PIN_20, Level::High);
+    let mut bl  = Output::new(p.PIN_21, Level::Low);
+
+    // ── WS2812B on GPIO22 via PIO0 SM0 / DMA_CH0 ────────────────────────────
+    let Pio { mut common, sm0, .. } = Pio::new(p.PIO0, Irqs);
+    let ws2812_program = PioWs2812Program::new(&mut common);
+    let ws2812 = PioWs2812::new(
+        &mut common, sm0, p.DMA_CH0, Irqs, p.PIN_22, &ws2812_program,
+    );
+    let mut ws2812_writer = PioWs2812Writer::new(ws2812);
+
+    // ── LCD hardware init — must happen before USB enumeration ───────────────
+    let mut display_state = DisplayState::new();
+    display_state.status = LedStatus::Busy;
+    init_lcd(&mut board.spi0, &mut dc, &mut cs, &mut rst, &mut bl).await;
+    {
+        let (disp, spi) = board.led_and_spi0_mut();
+        update_status_display(disp, spi, &mut dc, &mut cs, &mut ws2812_writer, &display_state).await;
+    }
 
     // ── Storage initialisation (degraded — QMI flash not wired yet) ─────────
-    // The RP2350-LCD-1.47-B has a 16 MB W25Q128JVSIQ on QSPI.  The embassy-rp
-    // Flash peripheral accesses it via the QMI interface (same as pico2_4m).
-    // TODO (board-storage wiring): add QmiFlash via p.FLASH the same way
-    // pico2_4m does in run_pico2_board().  For now initialise with no chips.
     let smk_bytes = pico2hsm_firmware::security::otp::derive_smk()
         .unwrap_or([0u8; 32]);
     let smk = zeroize::Zeroizing::new(smk_bytes);
@@ -918,7 +949,7 @@ async fn run_waveshare_lcd_board(p: embassy_rp::Peripherals) {
     let sm = pico2hsm_firmware::storage::StorageManager::new(fs);
     let mut ks = pico2hsm_firmware::storage::FlashKeyStore::new(sm, smk);
     match ks.init() {
-        Ok(()) => defmt::info!("KeyStore: initialized (waveshare_rp2350_lcd_16m — degraded, no chips)"),
+        Ok(()) => defmt::info!("KeyStore: initialized (waveshare_rp2350_lcd — degraded, no chips)"),
         Err(_) => defmt::warn!("KeyStore: init failed — degraded mode"),
     }
     let store: &'static mut _ = KEYSTORE_CELL.init(ks);
@@ -950,7 +981,11 @@ async fn run_waveshare_lcd_board(p: embassy_rp::Peripherals) {
     let mut usb = builder.build();
 
     defmt::info!("pico2hsm (RP2350-LCD-1.47-B): USB CCID ready, entering main loop");
-    board.led().set_status(LedStatus::Ready);
+    display_state.status = LedStatus::Ready;
+    {
+        let (disp, spi) = board.led_and_spi0_mut();
+        update_status_display(disp, spi, &mut dc, &mut cs, &mut ws2812_writer, &display_state).await;
+    }
 
     // ── Spawn APDU dispatcher on core1 ───────────────────────────────────────
     spawn_core1(p.CORE1, unsafe { &mut *addr_of_mut!(CORE1_STACK) }, move || {
@@ -960,16 +995,38 @@ async fn run_waveshare_lcd_board(p: embassy_rp::Peripherals) {
 
     // ── Concurrent USB + CCID command loop (core0) ───────────────────────────
     let usb_fut = usb.run();
+
+    let mut uptime_secs: u32 = 0_u32;
+    let mut last_activity_secs: u32 = 0_u32;
+    let mut screensaver = ScreensaverState::Active;
+
     let ccid_fut = async {
         loop {
             ccid.wait_connected().await;
             defmt::info!("RP2350-LCD-1.47-B: USB connected");
+            display_state.status = LedStatus::Ready;
+            {
+                let (disp, spi) = board.led_and_spi0_mut();
+                update_status_display(disp, spi, &mut dc, &mut cs, &mut ws2812_writer, &display_state).await;
+            }
 
             loop {
-                match ccid.recv_apdu().await {
-                    Ok(apdu_bytes) => {
-                        board.led().set_status(LedStatus::Busy);
+                use embassy_futures::select::{select3, Either3};
+                match select3(
+                    ccid.recv_apdu(),
+                    RESP_CHANNEL.receive(),
+                    embassy_time::Timer::after_secs(1),
+                ).await {
+                    Either3::First(Ok(apdu_bytes)) => {
+                        last_activity_secs = uptime_secs;
+                        screensaver = ScreensaverState::Active;
+                        display_state.status = LedStatus::Busy;
+                        {
+                            let (disp, spi) = board.led_and_spi0_mut();
+                            update_status_display(disp, spi, &mut dc, &mut cs, &mut ws2812_writer, &display_state).await;
+                        }
                         let _ = APDU_CHANNEL.send(apdu_bytes).await;
+                        // Wait for response with time-extension support.
                         let response = {
                             use embassy_futures::select::{select, Either};
                             loop {
@@ -985,23 +1042,70 @@ async fn run_waveshare_lcd_board(p: embassy_rp::Peripherals) {
                             }
                         };
                         match ccid.send_response(&response).await {
-                            Ok(()) => {}
+                            Ok(()) => {
+                                display_state.status = LedStatus::Ready;
+                                if let Some((_, op_time)) = display_state.last_op {
+                                    if uptime_secs.saturating_sub(op_time) >= LAST_OP_DISPLAY_SECS {
+                                        display_state.last_op = None;
+                                    }
+                                }
+                                let (disp, spi) = board.led_and_spi0_mut();
+                                update_status_display(disp, spi, &mut dc, &mut cs, &mut ws2812_writer, &display_state).await;
+                            }
                             Err(CcidError::UsbDisconnected) => {
                                 let _ = APDU_CHANNEL.send(heapless::Vec::new()).await;
                                 let _ = RESP_CHANNEL.receive().await;
+                                display_state.status = LedStatus::Ready;
                                 break;
                             }
                             Err(_) => {}
                         }
-                        board.led().set_status(LedStatus::Ready);
                     }
-                    Err(CcidError::UsbDisconnected) => {
+                    Either3::First(Err(CcidError::UsbDisconnected)) => {
                         let _ = APDU_CHANNEL.send(heapless::Vec::new()).await;
                         let _ = RESP_CHANNEL.receive().await;
-                        board.led().set_status(LedStatus::Ready);
+                        display_state.status = LedStatus::Ready;
                         break;
                     }
-                    Err(_) => {}
+                    Either3::First(Err(_)) => {}
+                    // Stray RESP_CHANNEL message with no pending APDU — discard.
+                    Either3::Second(_) => {}
+                    // 1-second tick — update uptime and screensaver.
+                    Either3::Third(()) => {
+                        uptime_secs = uptime_secs.wrapping_add(1);
+                        display_state.uptime_secs = uptime_secs;
+                        let idle = uptime_secs.saturating_sub(last_activity_secs);
+                        match screensaver {
+                            ScreensaverState::Active => {
+                                if idle >= SCREENSAVER_TIMEOUT_SECS {
+                                    screensaver = ScreensaverState::Sleeping;
+                                    // Blank WS2812B; LCD handled by not rendering.
+                                    {
+                                        use pico2hsm_firmware::board::waveshare_rp2350_lcd::{Grb, Ws2812Writer};
+                                        let (disp, spi) = board.led_and_spi0_mut();
+                                        // Flood LCD black for screensaver.
+                                        pico2hsm_firmware::board::waveshare_rp2350_lcd::fill_screen(
+                                            spi, &mut dc, &mut cs, 0x0000,
+                                        );
+                                        ws2812_writer.write_pixel(Grb::OFF).await;
+                                        let _ = disp; // suppress unused warning
+                                    }
+                                } else {
+                                    // Expire last_op label.
+                                    if let Some((_, op_time)) = display_state.last_op {
+                                        if uptime_secs.saturating_sub(op_time) >= LAST_OP_DISPLAY_SECS {
+                                            display_state.last_op = None;
+                                        }
+                                    }
+                                    let (disp, spi) = board.led_and_spi0_mut();
+                                    update_status_display(disp, spi, &mut dc, &mut cs, &mut ws2812_writer, &display_state).await;
+                                }
+                            }
+                            ScreensaverState::Sleeping => {
+                                // Stay blank; don't render.
+                            }
+                        }
+                    }
                 }
             }
         }

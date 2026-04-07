@@ -25,8 +25,9 @@
 
 set -euo pipefail
 
-RED='\033[0;31m'; GREEN='\033[0;32m'; CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
+RED='\033[0;31m'; YELLOW='\033[0;33m'; GREEN='\033[0;32m'; CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
 info()    { echo -e "${CYAN}[info]${NC} $*"; }
+warn()    { echo -e "${YELLOW}[WARN]${NC} $*"; }
 ok()      { echo -e "${GREEN}[ ok ]${NC} $*"; }
 die()     { echo -e "${RED}[FAIL]${NC} $*" >&2; exit 1; }
 section() { echo -e "\n${BOLD}══ $* ══${NC}"; }
@@ -44,6 +45,8 @@ VALID_FEATURES=(
     rp2350_geek_16m
     rp2350_geek_sdcard
     rp2350_geek_sdcard_dual
+    waveshare_rp2350_lcd_16m
+    waveshare_rp2350_lcd_sdcard_dual
     rp2354_embedded
 )
 VALID=0
@@ -89,17 +92,21 @@ if [[ -f "$KEY_FILE" ]]; then
     OTP_JSON="dist/pico2hsm-${FEAT}-debug-otp.json"
     section "Signing debug build: $FEAT"
     info "picotool seal --hash --sign $ELF → $SIGNED_ELF"
-    if picotool seal --hash --sign \
-            "$ELF" \
-            "$SIGNED_ELF" \
+    SIGN_OUT=$(picotool seal --hash --sign \
+            "$ELF" -t elf \
+            "$SIGNED_ELF" -t elf \
             "$KEY_FILE" \
             "$OTP_JSON" \
-            >/dev/null 2>&1; then
+            2>&1)
+    SIGN_RC=$?
+    if [[ $SIGN_RC -eq 0 ]]; then
         ok "Signed → $SIGNED_ELF"
         ok "OTP config → $OTP_JSON"
         FLASH_ELF="$SIGNED_ELF"
     else
-        die "picotool seal failed — aborting"
+        echo -e "${RED}[WARN]${NC} picotool seal failed (rc=$SIGN_RC) — flashing unsigned debug build"
+        echo "       picotool output: $SIGN_OUT"
+        echo "       (Secure boot is likely disabled on this dev device; unsigned flash is safe.)"
     fi
 else
     warn "No signing key found (ec_firmware_signing_key.pem) — flashing unsigned debug build"

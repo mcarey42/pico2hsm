@@ -44,21 +44,33 @@
 //! # ST7789V3 LCD
 //!
 //! ## Init sequence (from Waveshare C reference: `LCD_1in47.c`)
-//! The sequence below is the definitive byte-accurate init derived from
-//! `LCD_1in47_Init()` in the Waveshare RP2350-LCD-1.47 C example.
+//! The sequence below is derived from `LCD_1in47_Init()` in the Waveshare
+//! RP2350-LCD-1.47 C example, with corrections for column offset and
+//! 180-degree rotation.
 //!
 //! ```text
 //! SWRESET  (01h)  software reset — 150 ms delay
 //! SLPOUT   (11h)  sleep out     — 255 ms delay
 //! COLMOD   (3Ah)  colour format — 0x05 = 16-bit RGB565
-//! MADCTL   (36h)  memory access — 0x00 normal orientation
+//! MADCTL   (36h)  memory access — 0xA0 (MY+MV, landscape 180°-corrected)
 //! INVON    (21h)  inversion on  (required for correct colours on V3 panel)
 //! NORON    (13h)  normal display mode on
-//! CASET    (2Ah)  column address: 0x0000 … 0x00AB (0–171, 172 px wide)
-//! RASET    (2Bh)  row address:    0x0000 … 0x013F (0–319, 320 px tall)
+//!                 [clear full 320×240 controller GRAM to black]
+//! CASET    (2Ah)  column address: 0x0000 … 0x013F (0–319, 320 px wide)
+//! RASET    (2Bh)  row address:    0x0022 … 0x00CD (34–205, 172 px tall)
 //! DISPON   (29h)  display on    — 255 ms delay
 //! BL high          backlight on (GPIO21 high)
 //! ```
+//!
+//! ## Row address offset (landscape)
+//! The ST7789V3 controller has 240 GRAM columns.  With MV=1 (landscape), RASET
+//! addresses physical GRAM columns — only 172 of the 240 are connected to the
+//! panel (columns 34–205).  RASET must use 34–205; addressing outside that
+//! range writes to pixels not connected to the panel, causing border artefacts.
+//!
+//! ## 180-degree landscape correction
+//! The previous landscape attempt (MADCTL=0x60, MX+MV) showed content rotated
+//! 180°.  MADCTL=0xA0 (MY+MV) is 180° opposite and produces the correct image.
 //!
 //! ## Colour encoding
 //! RGB565: 5 bits red (bits 15–11), 6 bits green (bits 10–5), 5 bits blue (bits 4–0).
@@ -105,7 +117,7 @@
 // Always import shared types — St7789V3StatusDisplay implements LedController unconditionally.
 use super::{LedController, LedStatus};
 // Board trait is only needed inside the feature-gated impl block.
-#[cfg(feature = "waveshare_rp2350_lcd_16m")]
+#[cfg(any(feature = "waveshare_rp2350_lcd_16m", feature = "waveshare_rp2350_lcd_sdcard_dual"))]
 use super::Board;
 
 // ─── GPIO pin assignments — LCD (SPI0) ────────────────────────────────────────
@@ -164,13 +176,48 @@ pub const SPI_FREQ_HZ: u32 = 40_000_000;
 
 // ─── LCD display dimensions ───────────────────────────────────────────────────
 
-/// LCD width in pixels (172).
-pub const LCD_WIDTH: u16 = 172;
-/// LCD height in pixels (320).
-pub const LCD_HEIGHT: u16 = 320;
+/// LCD width in pixels (landscape, 320).
+pub const LCD_WIDTH: u16 = 320;
+/// LCD height in pixels (landscape, 172).
+pub const LCD_HEIGHT: u16 = 172;
 
-/// Total pixel count: 172 × 320 = 55 040.
+/// Total pixel count: 320 × 172 = 55 040.
 pub const LCD_PIXEL_COUNT: u32 = LCD_WIDTH as u32 * LCD_HEIGHT as u32;
+
+/// ST7789V3 controller GRAM height (240 — becomes the landscape row axis with MV=1).
+///
+/// In landscape mode (MV=1) RASET addresses physical GRAM columns.  The
+/// controller has 240 GRAM columns; the panel occupies columns 34–205 (172 px).
+/// All 240 must be cleared during init to prevent border artefacts.
+pub const CTRL_HEIGHT: u16 = 240;
+
+/// Row offset in landscape: the 172-px panel starts at physical GRAM column 34.
+///
+/// With MV=1, RASET addresses physical GRAM columns.  The panel occupies
+/// GRAM columns 34–205; RASET must use these values to address the visible area.
+pub const LCD_ROW_OFFSET: u16 = 34;
+
+/// First active display row in controller GRAM (landscape): 34.
+pub const LCD_ROW_START: u16 = LCD_ROW_OFFSET;
+/// Last active display row in controller GRAM (landscape): 34 + 172 − 1 = 205.
+pub const LCD_ROW_END: u16 = LCD_ROW_OFFSET + LCD_HEIGHT - 1;
+
+/// MADCTL byte for corrected landscape orientation (MY + MV = 0xA0).
+///
+/// MV=1 exchanges rows↔columns (landscape transpose).
+/// MY=1 flips the transposed row direction.
+/// 0xA0 is 180° opposite to 0x60 (MX+MV), correcting the inverted image
+/// that appeared with 0x60.
+///
+/// | Bit | Name | Value | Meaning                                 |
+/// |-----|------|-------|-----------------------------------------|
+/// |  7  | MY   |  1    | Flips transposed row direction          |
+/// |  6  | MX   |  0    | Column address order: normal            |
+/// |  5  | MV   |  1    | Row/column exchange → landscape         |
+/// |  4  | ML   |  0    | Vertical refresh: top-to-bottom         |
+/// |  3  | RGB  |  0    | RGB colour order                        |
+/// |  2  | MH   |  0    | Horizontal refresh: left-to-right       |
+pub const MADCTL_LANDSCAPE: u8 = 0xA0;
 
 // ─── ST7789V3 command registers ───────────────────────────────────────────────
 
@@ -278,39 +325,136 @@ pub fn status_to_colors(status: LedStatus) -> (u16, Grb) {
 /// command + data sequence, then deasserted.  The ST7789V3 accepts SPI mode 0
 /// (CPOL=0, CPHA=0).
 pub struct St7789V3StatusDisplay {
-    /// Last status set by `set_status()` — used to suppress redundant updates.
+    /// Last status set by `set_status()` — informational only; rendering is
+    /// driven by the `DisplayState` passed to `update_status_display()`.
     current_status: LedStatus,
-    /// Desired LCD fill colour (RGB565) for the next async render cycle.
-    pub pending_rgb565: u16,
-    /// Desired WS2812B colour (GRB) for the next async render cycle.
-    pub pending_grb: Grb,
 }
 
 impl St7789V3StatusDisplay {
     fn new() -> Self {
-        Self {
-            current_status: LedStatus::Off,
-            pending_rgb565: COLOR_BLACK,
-            pending_grb: Grb::OFF,
-        }
+        Self { current_status: LedStatus::Off }
     }
 }
 
 impl LedController for St7789V3StatusDisplay {
-    /// Record the desired status.
-    ///
-    /// Updates `pending_rgb565` and `pending_grb` so that the next call to
-    /// `update_status_display()` will push the correct colour to hardware.
-    ///
-    /// LCD rendering and WS2812B writes are async — they happen in
-    /// `update_status_display()`, not here.
     fn set_status(&mut self, status: LedStatus) {
-        if self.current_status != status {
-            self.current_status = status;
-            let (rgb565, grb) = status_to_colors(status);
-            self.pending_rgb565 = rgb565;
-            self.pending_grb = grb;
+        self.current_status = status;
+    }
+}
+
+// ─── Software framebuffer (ARM only) ─────────────────────────────────────────
+
+/// Full 320×172 landscape framebuffer.
+///
+/// With CORE1_STACK reduced from 256 KB to 128 KB (actual peak ~65 KB), there
+/// is now sufficient BSS headroom for the full-resolution buffer.
+/// `flush_display()` maps this to CASET 0–319 × RASET 34–205.
+const FB_W: usize = 320;
+const FB_H: usize = 172;
+
+/// 320×172 RGB565 framebuffer — 2 bytes per pixel, row-major, big-endian.
+/// Owned exclusively by `flush_display()` and the `DrawTarget` impl.
+///
+/// # Safety
+/// `FRAMEBUF` is only ever accessed from core0 display code.  No other task
+/// or core touches this buffer, so there is no concurrent mutation.
+#[cfg(target_arch = "arm")]
+static mut FRAMEBUF: [u8; FB_W * FB_H * 2] = [0u8; FB_W * FB_H * 2];
+
+#[cfg(target_arch = "arm")]
+use embedded_graphics::{
+    draw_target::DrawTarget,
+    geometry::{OriginDimensions, Size},
+    pixelcolor::{Rgb565, raw::{RawData, RawU16}},
+    primitives::Rectangle,
+    Pixel,
+};
+
+#[cfg(target_arch = "arm")]
+impl OriginDimensions for St7789V3StatusDisplay {
+    fn size(&self) -> Size {
+        Size::new(FB_W as u32, FB_H as u32)
+    }
+}
+
+#[cfg(target_arch = "arm")]
+impl DrawTarget for St7789V3StatusDisplay {
+    type Color = Rgb565;
+    type Error = core::convert::Infallible;
+
+    fn draw_iter<I>(&mut self, pixels: I) -> Result<(), Self::Error>
+    where
+        I: IntoIterator<Item = Pixel<Self::Color>>,
+    {
+        // SAFETY: FRAMEBUF is only accessed from core0 display code; no concurrent access.
+        let fb = unsafe { &mut *(&raw mut FRAMEBUF) };
+        for Pixel(coord, color) in pixels {
+            if coord.x < 0
+                || coord.y < 0
+                || coord.x >= FB_W as i32
+                || coord.y >= FB_H as i32
+            {
+                continue;
+            }
+            let raw: u16 = RawU16::from(color).into_inner();
+            let idx = (coord.y as usize * FB_W + coord.x as usize) * 2;
+            fb[idx]     = (raw >> 8) as u8;
+            fb[idx + 1] = (raw & 0xFF) as u8;
         }
+        Ok(())
+    }
+
+    fn fill_contiguous<I>(&mut self, area: &Rectangle, colors: I) -> Result<(), Self::Error>
+    where
+        I: IntoIterator<Item = Self::Color>,
+    {
+        use embedded_graphics::geometry::Point;
+        let disp = Rectangle::new(Point::zero(), Size::new(FB_W as u32, FB_H as u32));
+        let area = area.intersection(&disp);
+        if area.size.width == 0 || area.size.height == 0 {
+            return Ok(());
+        }
+        let fb = unsafe { &mut *(&raw mut FRAMEBUF) };
+        let x0 = area.top_left.x as usize;
+        let y0 = area.top_left.y as usize;
+        let w  = area.size.width as usize;
+        let mut col = 0usize;
+        let mut row = 0usize;
+        for color in colors {
+            if row >= area.size.height as usize { break; }
+            let raw: u16 = RawU16::from(color).into_inner();
+            let idx = ((y0 + row) * FB_W + (x0 + col)) * 2;
+            fb[idx]     = (raw >> 8) as u8;
+            fb[idx + 1] = (raw & 0xFF) as u8;
+            col += 1;
+            if col >= w { col = 0; row += 1; }
+        }
+        Ok(())
+    }
+
+    fn fill_solid(&mut self, area: &Rectangle, color: Self::Color) -> Result<(), Self::Error> {
+        use embedded_graphics::geometry::Point;
+        let disp = Rectangle::new(Point::zero(), Size::new(FB_W as u32, FB_H as u32));
+        let area = area.intersection(&disp);
+        if area.size.width == 0 || area.size.height == 0 {
+            return Ok(());
+        }
+        let raw: u16 = RawU16::from(color).into_inner();
+        let hi = (raw >> 8) as u8;
+        let lo = (raw & 0xFF) as u8;
+        let fb = unsafe { &mut *(&raw mut FRAMEBUF) };
+        let x0 = area.top_left.x as usize;
+        let y0 = area.top_left.y as usize;
+        let w  = area.size.width as usize;
+        let h  = area.size.height as usize;
+        for row in y0..(y0 + h) {
+            let base = (row * FB_W + x0) * 2;
+            for col in 0..w {
+                fb[base + col * 2]     = hi;
+                fb[base + col * 2 + 1] = lo;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -354,9 +498,18 @@ impl WaveshareRp2350LcdBoard {
             spi1,
         }
     }
+
+    /// Split-borrow: return mutable references to the display state and SPI0
+    /// bus simultaneously.  Needed because `update_status_display()` requires
+    /// both, and Rust does not allow two `&mut self` method calls at once.
+    pub fn led_and_spi0_mut(
+        &mut self,
+    ) -> (&mut St7789V3StatusDisplay, &mut WaveshareRp2350LcdSpi0) {
+        (&mut self.display, &mut self.spi0)
+    }
 }
 
-#[cfg(feature = "waveshare_rp2350_lcd_16m")]
+#[cfg(any(feature = "waveshare_rp2350_lcd_16m", feature = "waveshare_rp2350_lcd_sdcard_dual"))]
 impl Board for WaveshareRp2350LcdBoard {
     type Led = St7789V3StatusDisplay;
     type Spi0 = WaveshareRp2350LcdSpi0;
@@ -381,19 +534,6 @@ impl Board for WaveshareRp2350LcdBoard {
     fn spi1_cs_pins(&self) -> &[u8] {
         &SPI1_CS
     }
-}
-
-// ─── Summary of HSM state for the LCD status display ─────────────────────────
-
-/// Summary of HSM state rendered on the LCD status screen.
-#[derive(Debug, Clone, Copy)]
-pub struct DisplayState {
-    /// Number of stored key objects.
-    pub key_count: u8,
-    /// Whether a PIN session is active.
-    pub authenticated: bool,
-    /// Storage health indicator (`true` = flash available).
-    pub storage_ok: bool,
 }
 
 // ─── ST7789V3 hardware driver — ARM-only async free functions ────────────────
@@ -496,8 +636,8 @@ pub fn fill_screen(
 ) {
     use embedded_hal::spi::SpiBus;
 
-    // Set window to full display area.
-    lcd_set_window(spi, dc, cs, 0, 0, LCD_WIDTH - 1, LCD_HEIGHT - 1);
+    // Set window to the full landscape display area (CASET 0–319, RASET 34–205).
+    lcd_set_window(spi, dc, cs, 0, LCD_ROW_START, LCD_WIDTH - 1, LCD_ROW_END);
 
     // Enter pixel data write mode.
     cs.set_low();
@@ -580,9 +720,9 @@ pub async fn init_lcd(
     // Colour format: 16-bit/pixel RGB565 (0x05).
     lcd_cmd_data(spi, dc, cs, CMD_COLMOD, &[0x05]);
 
-    // Memory access control: normal scan direction, no mirror.
-    // 0x00 = top-to-bottom, left-to-right, RGB (not BGR).
-    lcd_cmd_data(spi, dc, cs, CMD_MADCTL, &[0x00]);
+    // Memory access control: landscape (MY=1, MV=1 = 0xA0).
+    // 180° opposite of the broken 0x60 (MX+MV), correcting the inverted image.
+    lcd_cmd_data(spi, dc, cs, CMD_MADCTL, &[MADCTL_LANDSCAPE]);
 
     // Display inversion on — required for correct colour polarity on ST7789V3.
     lcd_write_cmd(spi, dc, cs, CMD_INVON);
@@ -590,11 +730,30 @@ pub async fn init_lcd(
     // Normal display mode on.
     lcd_write_cmd(spi, dc, cs, CMD_NORON);
 
-    // Column address: 0x0000 – 0x00AB (0–171, 172 pixels wide).
-    lcd_cmd_data(spi, dc, cs, CMD_CASET, &[0x00, 0x00, 0x00, 0xAB]);
+    // Clear the full controller GRAM to black to eliminate border artefacts.
+    // In landscape (MV=1): CASET = physical GRAM rows 0–319, RASET = physical
+    // GRAM columns 0–239.  Total: 320 × 240 = 76 800 pixels.
+    {
+        use embedded_hal::spi::SpiBus;
+        lcd_cmd_data(spi, dc, cs, CMD_CASET, &[0x00, 0x00, 0x01, 0x3F]); // 0–319
+        lcd_cmd_data(spi, dc, cs, CMD_RASET, &[0x00, 0x00, 0x00, 0xEF]); // 0–239
+        cs.set_low();
+        dc.set_low();
+        let _ = spi.write(&[CMD_RAMWR]);
+        dc.set_high();
+        let chunk = [0u8; 128];
+        let total_pixels = LCD_WIDTH as u32 * CTRL_HEIGHT as u32; // 76 800
+        let full_chunks = total_pixels / 64;
+        let remainder = (total_pixels % 64) as usize;
+        for _ in 0..full_chunks { let _ = spi.write(&chunk); }
+        if remainder > 0 { let _ = spi.write(&chunk[..remainder * 2]); }
+        cs.set_high();
+    }
 
-    // Row address: 0x0000 – 0x013F (0–319, 320 pixels tall).
-    lcd_cmd_data(spi, dc, cs, CMD_RASET, &[0x00, 0x00, 0x01, 0x3F]);
+    // Set panel window: CASET 0–319 (landscape width), RASET 34–205
+    // (physical GRAM columns 34–205 = 172 px landscape height).
+    lcd_cmd_data(spi, dc, cs, CMD_CASET, &[0x00, 0x00, 0x01, 0x3F]); // 0–319
+    lcd_cmd_data(spi, dc, cs, CMD_RASET, &[0x00, 0x22, 0x00, 0xCD]); // 34–205
 
     // Display on.
     lcd_write_cmd(spi, dc, cs, CMD_DISPON);
@@ -604,12 +763,38 @@ pub async fn init_lcd(
     bl.set_high();
 }
 
+/// Send the FRAMEBUF contents to the ST7789V3 LCD in one SPI burst.
+///
+/// Sets CASET to 0–319 (landscape width) and RASET to 34–205 (panel row
+/// window), then writes the full 320×172 FRAMEBUF.
+#[cfg(target_arch = "arm")]
+pub fn flush_display(
+    spi: &mut WaveshareRp2350LcdSpi0,
+    dc: &mut Output<'static>,
+    cs: &mut Output<'static>,
+) {
+    use embedded_hal::spi::SpiBus;
+
+    // Set window to the full landscape panel: CASET 0–319, RASET 34–205.
+    lcd_set_window(spi, dc, cs, 0, LCD_ROW_START, LCD_WIDTH - 1, LCD_ROW_END);
+
+    // Begin RAM write.
+    cs.set_low();
+    dc.set_low();
+    let _ = spi.write(&[CMD_RAMWR]);
+    dc.set_high();
+
+    // SAFETY: FRAMEBUF is only accessed from core0; no concurrent mutation.
+    let _ = spi.write(unsafe { &*(&raw const FRAMEBUF) });
+
+    cs.set_high();
+}
+
 /// Update the LCD status display and WS2812B LED with the current HSM state.
 ///
-/// Reads `pending_rgb565` and `pending_grb` from the `display` struct (set by
-/// `set_status()`) and:
-/// 1. Calls `fill_screen()` to flood the entire 172×320 LCD with the status colour.
-/// 2. Writes the GRB colour to the WS2812B LED via PIO DMA.
+/// Renders the full info UI onto FRAMEBUF via `display::render()`, then
+/// pushes it to the ST7789V3 with `flush_display()`.  Also updates the
+/// WS2812B LED colour to match `state.status`.
 ///
 /// # Parameters
 /// - `display` — mutable reference to the board's `St7789V3StatusDisplay`.
@@ -617,30 +802,7 @@ pub async fn init_lcd(
 /// - `dc`      — GPIO16 Data/Command select.
 /// - `cs`      — GPIO17 chip-select.
 /// - `ws2812`  — PIO-backed WS2812B driver (PIO0, SM0, DMA0, GPIO22).
-///
-/// # Wiring this up in `main.rs`
-/// ```rust,ignore
-/// use embassy_rp::gpio::{Level, Output};
-/// use embassy_rp::pio::Pio;
-/// use embassy_rp::pio_programs::ws2812::{PioWs2812, PioWs2812Program};
-/// use smart_leds::RGB8;
-///
-/// // LCD control pins
-/// let mut dc  = Output::new(p.PIN_16, Level::Low);
-/// let mut cs  = Output::new(p.PIN_17, Level::High);
-/// let mut rst = Output::new(p.PIN_20, Level::High);
-/// let mut bl  = Output::new(p.PIN_21, Level::Low);
-///
-/// // WS2812B on GPIO22 via PIO0 SM0
-/// let Pio { mut common, sm0, .. } = Pio::new(p.PIO0, Irqs);
-/// let ws2812_program = PioWs2812Program::new(&mut common);
-/// let mut ws2812: PioWs2812<'_, PIO0, 0, 1, _> =
-///     PioWs2812::new(&mut common, sm0, p.DMA_CH0, Irqs, p.PIN_22, &ws2812_program);
-///
-/// // Init LCD and fill with initial status
-/// init_lcd(&mut board.spi0, &mut dc, &mut cs, &mut rst, &mut bl).await;
-/// update_status_display(board.led(), &mut board.spi0, &mut dc, &mut cs, &mut ws2812).await;
-/// ```
+/// - `state`   — current HSM display state (status, key count, uptime, …).
 ///
 /// # Note on defmt
 /// This function MUST NOT be called from Core1 — see the core1 defmt deadlock
@@ -652,14 +814,19 @@ pub async fn update_status_display(
     dc: &mut Output<'static>,
     cs: &mut Output<'static>,
     ws2812: &mut impl Ws2812Writer,
+    state: &crate::display::DisplayState,
 ) {
-    let rgb565 = display.pending_rgb565;
-    let grb = display.pending_grb;
+    use crate::display::{render, ScreenLayout};
 
-    // Flood-fill the LCD with the status colour (synchronous SPI writes).
-    fill_screen(spi, dc, cs, rgb565);
+    // Render info UI into the 320×172 FRAMEBUF using the landscape layout.
+    let layout = ScreenLayout::waveshare_320x172();
+    render(display, state, &layout);
 
-    // Update the WS2812B LED colour.
+    // Push FRAMEBUF to the LCD over SPI.
+    flush_display(spi, dc, cs);
+
+    // Update WS2812B LED colour to match status.
+    let (_, grb) = status_to_colors(state.status);
     ws2812.write_pixel(grb).await;
 }
 

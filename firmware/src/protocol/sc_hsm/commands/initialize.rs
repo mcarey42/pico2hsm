@@ -171,8 +171,60 @@ pub fn handle(state: &mut ScHsmState, store: &mut dyn crate::storage::KeyStore, 
     };
     let _ = state.keys.push(dev_key);
 
+    // Reset DKEK state: init share collection for the requested count.
+    state.dkek.init_shares(dkek_count);
+
+    // Clear ephemeral exchange state.
+    state.exchange_ephem_priv = None;
+    state.exchange_ephem_pub = None;
+
     // Wipe only SC-HSM-owned keys from persistent flash keystore.
     // Degraded flash does not fail the INITIALIZE command.
     let _ = store.wipe_by_owner(AppletId::ScHsm); // best-effort; InvalidCore returns Ok(()) on Core1
+
+    // Generate device identity P-256 keypair for DKEK exchange.
+    // Stored at reserved slot 0xFE; public key written to EF 0x2F02.
+    {
+        use crate::crypto::asymmetric::generate_ec_keypair;
+        use crate::protocol::sc_hsm::{FwRng, InMemoryKey, EfEntry};
+        use pico2hsm_core::key::KeyType as CoreKeyType;
+
+        let mut rng = FwRng;
+        if let Ok(pair) = generate_ec_keypair(CoreKeyType::EcPrivateP256, &mut rng) {
+            let dev_identity_key_id = pico2hsm_core::key::KeyId::sc_hsm(0, 0xFE).0;
+
+            // Persist to flash.
+            {
+                use crate::security::key_management::{AlgorithmId, KeyObject, KeyType as KmType};
+                let mut key_obj = KeyObject::new(KmType::Ec, dev_identity_key_id, AppletId::ScHsm, AlgorithmId::EcdsaP256);
+                let _ = key_obj.private_key.extend_from_slice(&pair.private_key);
+                let _ = key_obj.public_key.extend_from_slice(&pair.public_key);
+                let _ = store.save_key(&key_obj); // best-effort
+            }
+
+            // Store in in-memory key store.
+            state.keys.retain(|k| k.key_id != dev_identity_key_id);
+            let mut entry = InMemoryKey {
+                key_id: dev_identity_key_id,
+                key_type: CoreKeyType::EcPrivateP256,
+                algo: 0x13, // EcdsaP256
+                private_key: heapless::Vec::new(),
+                public_key: heapless::Vec::new(),
+            };
+            let _ = entry.private_key.extend_from_slice(&pair.private_key);
+            let _ = entry.public_key.extend_from_slice(&pair.public_key);
+            let _ = state.keys.push(entry);
+
+            // Store public key in EF 0x2F02 (EF.C.DevAut).
+            state.ef_files.retain(|ef| ef.file_id != 0x2F02);
+            let mut ef = EfEntry {
+                file_id: 0x2F02,
+                data: heapless::Vec::new(),
+            };
+            let _ = ef.data.extend_from_slice(&pair.public_key);
+            let _ = state.ef_files.push(ef);
+        }
+    }
+
     ApduResponse::ok(&[])
 }

@@ -80,5 +80,5 @@ pub type BoardChip = AnyChip<
 ///
 /// TODO (board-storage wiring): switch to QmiFlash and initialise it from
 /// p.FLASH once the storage wiring is completed.
-#[cfg(all(target_arch = "arm", feature = "waveshare_rp2350_lcd_16m"))]
+#[cfg(all(target_arch = "arm", any(feature = "waveshare_rp2350_lcd_16m", feature = "waveshare_rp2350_lcd_sdcard_dual")))]
 pub type BoardChip = QmiFlash;

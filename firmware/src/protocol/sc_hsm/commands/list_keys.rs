@@ -28,8 +28,15 @@ pub fn handle(state: &mut ScHsmState, cmd: &ApduCommand<'_>) -> ApduResponse {
     // sc_pkcs15emu_sc_hsm_init also scans for 0xCC to call add_prkd per key.
     let mut resp: heapless::Vec<u8, 256> = heapless::Vec::new();
     for key in &state.keys {
+        let proto_ref = (key.key_id & 0xFF) as u8;
+        // Skip internal reserved slots (>= 0xF0): device identity key (0xFE),
+        // device auth sentinel at 0xFF, etc. These must not appear in the
+        // user-facing key enumeration or OpenSC will try to load PRKD for them.
+        if proto_ref >= 0xF0 {
+            continue;
+        }
         let _ = resp.push(0xCC);
-        let _ = resp.push((key.key_id & 0xFF) as u8); // proto_ref byte
+        let _ = resp.push(proto_ref);
     }
     #[cfg(feature = "rsa")]
     for key in &state.rsa_keys {

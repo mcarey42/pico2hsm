@@ -86,6 +86,16 @@ RSA_KEY_SLOTS: list[dict] = [
 
 
 # ---------------------------------------------------------------------------
+# DKEK test prerequisites
+# ---------------------------------------------------------------------------
+# DKEK exchange and key sync tests (when added) require:
+#   1. Device initialized with DKEK shares loaded (via key_domain P1=0x03)
+#   2. At least one key generated on the device
+# These are currently tested only in tools/python/tests/test_dkek_exchange.py
+# using mocks.  Hardware DKEK tests should be xfail until two physical
+# devices are available on the CI rig.
+
+# ---------------------------------------------------------------------------
 # Session-scoped fixtures
 # ---------------------------------------------------------------------------
 

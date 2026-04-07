@@ -1,21 +1,22 @@
 //! Key management — SC-HSM key object format, wrap/unwrap, per-key KEK derivation.
 //!
-//! # Key object on-storage format
+//! # Key object on-storage format (P2K3)
 //! Each key is stored as an AES-256-GCM encrypted blob at logical address
 //! `0xCC00 + key_id` (managed by the storage layer). The blob layout is:
 //!
 //! ```text
-//! [4]   magic            b"P2KY"
-//! [1]   key_type         KeyType repr (0x01–0x04)
-//! [1]   key_id           0x01–0xFF
+//! [4]   magic            b"P2K3"  (was b"P2K2" before generation field)
+//! [1]   key_type         KeyType repr (0x01-0x04)
+//! [4]   key_id           little-endian u32 (partition|applet|reserved|proto_ref)
 //! [1]   algorithm        AlgorithmId repr
 //! [1]   key_size_bytes   raw private key length
 //! [1]   key_domain       domain tag (0 = default)
 //! [4]   use_count        big-endian u32
+//! [4]   generation       big-endian u32 (new in P2K3; 0 for P2K2 blobs)
 //! [N]   private_key      raw private key scalar / symmetric key
 //! [2]   pub_len          big-endian u16 (0 if no public key)
 //! [M]   public_key       raw public key bytes (may be 0 bytes)
-//! ---  (all fields above are plaintext that becomes AAD for GCM)
+//! ---  (header = first 20 bytes, used as GCM AAD; payload encrypted in-place)
 //! [16]  GCM tag          appended by AES-256-GCM encrypt
 //! [12]  nonce            appended after tag
 //! ```
@@ -54,8 +55,19 @@ use aes_gcm::{
 // Constants
 // ---------------------------------------------------------------------------
 
-/// Magic header for stored key blobs.
-pub const KEY_MAGIC: [u8; 4] = *b"P2K2";
+/// Magic header for stored key blobs (v3: added generation counter).
+///
+/// History:
+///   - `P2K2` — original u32 key ID format (no generation counter).
+///   - `P2K3` — added 4-byte `generation` field after `use_count`.
+///
+/// Data written with `P2K2` is handled by backward-compat logic in
+/// `decrypt()` (generation defaults to 0). Firmware that writes `P2K3`
+/// cannot be read by older `P2K2`-only builds — re-INITIALIZE required.
+pub const KEY_MAGIC: [u8; 4] = *b"P2K3";
+
+/// Previous magic header — accepted on read with generation defaulting to 0.
+pub const KEY_MAGIC_V2: [u8; 4] = *b"P2K2";
 
 /// Maximum number of key slots (key_id 0x01–0xFF).
 pub const MAX_KEYS: usize = 255;
@@ -224,6 +236,13 @@ pub struct KeyObject {
     pub algorithm:   AlgorithmId,
     pub key_domain:  u8,
     pub use_count:   u32,
+    /// Monotonically increasing generation counter.
+    ///
+    /// Incremented on every `save_key` call. Starts at 1 on first write.
+    /// Used by the DKEK sync protocol to detect stale replicas.
+    /// Blobs written with the old `P2K2` magic will deserialize with
+    /// `generation = 0`.
+    pub generation:  u32,
     /// Raw private key scalar or symmetric key bytes (zeroized on drop).
     pub private_key: heapless::Vec<u8, MAX_PRIVATE_KEY_SIZE>,
     /// Optional raw public key (uncompressed EC point, or RSA public key DER).
@@ -235,6 +254,7 @@ impl Zeroize for KeyObject {
         self.private_key.zeroize();
         self.public_key.zeroize();
         self.use_count = 0;
+        self.generation = 0;
         self.key_id = 0;
         self.owner.zeroize();
         self.key_domain = 0;
@@ -262,6 +282,7 @@ impl KeyObject {
             algorithm,
             key_domain: 0,
             use_count: 0,
+            generation: 0,
             private_key: heapless::Vec::new(),
             public_key: heapless::Vec::new(),
         }
@@ -273,17 +294,18 @@ impl KeyObject {
 
     /// Serialise the fixed metadata header into `buf` (AAD portion).
     ///
-    /// Layout: magic(4) | key_type(1) | key_id(4) | algorithm(1) |
-    ///         key_size(1) | key_domain(1) | use_count(4)
-    fn write_header(&self, buf: &mut [u8; 16]) {
+    /// Layout (20 bytes, P2K3):
+    ///   magic(4) | key_type(1) | key_id(4) | algorithm(1) |
+    ///   key_size(1) | key_domain(1) | use_count(4) | generation(4)
+    fn write_header(&self, buf: &mut [u8; 20]) {
         buf[0..4].copy_from_slice(&KEY_MAGIC);
         buf[4] = self.key_type as u8;
         buf[5..9].copy_from_slice(&self.key_id.to_le_bytes());
         buf[9] = self.algorithm as u8;
         buf[10] = self.private_key.len() as u8;
         buf[11] = self.key_domain;
-        let uc = self.use_count.to_be_bytes();
-        buf[12..16].copy_from_slice(&uc);
+        buf[12..16].copy_from_slice(&self.use_count.to_be_bytes());
+        buf[16..20].copy_from_slice(&self.generation.to_be_bytes());
     }
 
     // -----------------------------------------------------------------------
@@ -293,7 +315,7 @@ impl KeyObject {
     /// Encrypt this key object into a storage blob.
     ///
     /// The returned buffer contains:
-    /// `header(16) || priv_key(N) || pub_len(2) || pub_key(M) || tag(16) || nonce(12)`
+    /// `header(20) || priv_key(N) || pub_len(2) || pub_key(M) || tag(16) || nonce(12)`
     ///
     /// where `header` also acts as the GCM AAD so any tampering with metadata
     /// is detected on decryption.
@@ -306,7 +328,7 @@ impl KeyObject {
         let kek = derive_key_encryption_key(smk, (self.key_id & 0xFF) as u8)?;
 
         // Build AAD = header bytes.
-        let mut header = [0u8; 16];
+        let mut header = [0u8; 20];
         self.write_header(&mut header);
 
         // Build plaintext = priv_key || pub_len(2) || pub_key
@@ -318,23 +340,23 @@ impl KeyObject {
             return Err(KeyError::KeyTooLarge);
         }
 
-        // GCM payload buffer (plaintext → ciphertext in-place)
+        // GCM payload buffer (plaintext -> ciphertext in-place)
         let mut ct_buf: heapless::Vec<u8, 1200> = heapless::Vec::new();
-        // Start with the header (will be included in the blob, not in GCM input)
+        // Start with the 20-byte header (included in blob, used as GCM AAD)
         ct_buf.extend_from_slice(&header).map_err(|_| KeyError::BufferTooSmall)?;
         ct_buf.extend_from_slice(&self.private_key).map_err(|_| KeyError::BufferTooSmall)?;
         let pub_len_bytes = (pub_len as u16).to_be_bytes();
         ct_buf.extend_from_slice(&pub_len_bytes).map_err(|_| KeyError::BufferTooSmall)?;
         ct_buf.extend_from_slice(&self.public_key).map_err(|_| KeyError::BufferTooSmall)?;
 
-        // Encrypt the payload portion (everything after the header) in-place.
+        // Encrypt the payload portion (everything after the 20-byte header) in-place.
         let cipher = Aes256Gcm::new_from_slice(&*kek)
             .map_err(|_| KeyError::EncryptFailure)?;
         let nonce_arr = GcmNonce::from_slice(nonce);
 
-        // payload slice starts after the 16-byte header
+        const HEADER_SIZE: usize = 20;
         let tag = cipher
-            .encrypt_in_place_detached(nonce_arr, &header, &mut ct_buf.as_mut_slice()[16..])
+            .encrypt_in_place_detached(nonce_arr, &header, &mut ct_buf.as_mut_slice()[HEADER_SIZE..])
             .map_err(|_| KeyError::EncryptFailure)?;
 
         // Append tag then nonce.
@@ -353,9 +375,24 @@ impl KeyObject {
     /// `blob` must be the exact bytes returned by [`KeyObject::encrypt`].
     /// `key_id` is the full u32 internal key ID; the low byte (proto_ref) is
     /// used for KEK derivation and must match the blob header.
+    ///
+    /// Supports both `P2K3` (20-byte header with generation) and the legacy
+    /// `P2K2` (16-byte header, generation defaults to 0).
     pub fn decrypt(blob: &[u8], key_id: u32, smk: &[u8; 32]) -> Result<Self, KeyError> {
-        // Minimum: header(16) + tag(16) + nonce(12) = 44 bytes
+        // Minimum: header(16) + tag(16) + nonce(12) = 44 bytes (P2K2 minimum)
         if blob.len() < 44 {
+            return Err(KeyError::InvalidFormat);
+        }
+
+        // Determine header version from the magic bytes.
+        let is_v3 = bool::from(blob[0..4].ct_eq(&KEY_MAGIC));
+        let is_v2 = bool::from(blob[0..4].ct_eq(&KEY_MAGIC_V2));
+        if !is_v3 && !is_v2 {
+            return Err(KeyError::BadMagic);
+        }
+        let header_size: usize = if is_v3 { 20 } else { 16 };
+
+        if blob.len() < header_size + TAG_SIZE + NONCE_SIZE {
             return Err(KeyError::InvalidFormat);
         }
 
@@ -369,22 +406,23 @@ impl KeyObject {
         let tag_bytes: &[u8; 16] = blob[tag_start..nonce_start].try_into()
             .map_err(|_| KeyError::InvalidFormat)?;
 
-        // The header is the first 16 bytes (also AAD).
-        let header: &[u8; 16] = blob[..16].try_into()
-            .map_err(|_| KeyError::InvalidFormat)?;
+        // The header is the first `header_size` bytes (also AAD).
+        let header = &blob[..header_size];
 
-        // Validate magic.
-        if !bool::from(header[0..4].ct_eq(&KEY_MAGIC)) {
-            return Err(KeyError::BadMagic);
-        }
-
-        // Parse header fields.
+        // Parse common header fields (same layout for bytes 0..16).
         let kt   = KeyType::from_u8(header[4]).ok_or(KeyError::UnknownKeyType)?;
         let stored_key_id = u32::from_le_bytes(header[5..9].try_into().unwrap());
         let algo = AlgorithmId::from_u8(header[9]).ok_or(KeyError::UnknownAlgorithm)?;
         let priv_size = header[10] as usize;
         let domain    = header[11];
         let use_count = u32::from_be_bytes(header[12..16].try_into().unwrap());
+
+        // Parse generation (P2K3 only; defaults to 0 for P2K2 blobs).
+        let generation = if is_v3 {
+            u32::from_be_bytes(header[16..20].try_into().unwrap())
+        } else {
+            0
+        };
 
         // Sanity: the key_id in the blob must match the requested key_id.
         if stored_key_id != key_id {
@@ -395,7 +433,7 @@ impl KeyObject {
         let kek = derive_key_encryption_key(smk, (key_id & 0xFF) as u8)?;
 
         // Decrypt the payload portion (between header and tag).
-        let ct_payload = &blob[16..tag_start];
+        let ct_payload = &blob[header_size..tag_start];
         if ct_payload.len() < priv_size + 2 {
             return Err(KeyError::InvalidFormat);
         }
@@ -447,6 +485,7 @@ impl KeyObject {
             algorithm: algo,
             key_domain: domain,
             use_count,
+            generation,
             private_key: heapless::Vec::new(),
             public_key: heapless::Vec::new(),
         };
@@ -590,6 +629,7 @@ impl KeyObject {
             algorithm,
             key_domain: 0,
             use_count:  0,
+            generation: 0,
             private_key: heapless::Vec::new(),
             public_key: heapless::Vec::new(),
         };
@@ -717,6 +757,7 @@ mod tests {
         let nonce = test_nonce();
 
         let mut obj = KeyObject::new(KeyType::Ec, 0x00000001u32, AppletId::ScHsm, AlgorithmId::EcdsaP256);
+        obj.generation = 42;
         // Fake 32-byte P-256 private key scalar.
         obj.private_key.extend_from_slice(&[0x42u8; 32]).unwrap();
         // Fake 65-byte uncompressed P-256 public key.
@@ -730,6 +771,7 @@ mod tests {
         assert_eq!(recovered.algorithm, AlgorithmId::EcdsaP256);
         assert_eq!(recovered.private_key.as_slice(), &[0x42u8; 32]);
         assert_eq!(recovered.public_key.as_slice(), &[0x04u8; 65]);
+        assert_eq!(recovered.generation, 42);
     }
 
     #[test]

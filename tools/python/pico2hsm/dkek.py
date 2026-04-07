@@ -1,318 +1,294 @@
-"""DKEK ceremony and Noise_XX key exchange for pico2hsm.
+"""DKEK exchange for pico2hsm — P-256 ECDH relay protocol.
 
-Implements DKEK (Device Key Encryption Key) exchange between two HSMs
-using the Noise_XX authenticated key exchange protocol.  The Noise session
-provides forward secrecy and mutual authentication via the device identity
-keys stored in each HSM.
+The host acts as a relay between two HSMs. DKEK material never passes through
+the host in plaintext. The exchange uses on-device P-256 ephemeral keypairs
+with HKDF-SHA256 session key derivation.
+
+Exchange protocol (host-mediated relay):
+
+    Host                 Source HSM              Target HSM
+    ----                 ----------              ----------
+    GET_DEVICE_PUBKEY →  ← source_static_pub
+    GET_DEVICE_PUBKEY →                          ← target_static_pub
+    [verify both are enrolled]
+    NOISE_INITIATE →     ← source_ephem_pub
+    NOISE_INITIATE(source_ephem_pub) →           ← target_ephem_pub
+    NOISE_FINALIZE_SEND(target_ephem_pub) →      ← encrypted_dkek(60B)
+    NOISE_FINALIZE_RECV(source_ephem_pub + encrypted_dkek + device_id) →
+                                                 [DKEK stored on target]
 """
 
 from __future__ import annotations
 
 import logging
-import os
 import socket
 import struct
 from typing import Optional
 
-from .crypto import decrypt_aes_gcm, encrypt_aes_gcm
+from .config import PeerConfig, PeerEntry
 from .device import Pico2HSM
-from .errors import DKEKError
+from .enrollment import DeviceEnrollment
+from .errors import DKEKError, EnrollmentError
 from .protocol import (
-    INS_EXTRAS,
-    build_extras,
-    build_get_challenge,
+    build_get_device_pubkey,
+    build_noise_initiate,
+    build_noise_finalize_send,
+    build_noise_finalize_recv,
+    build_get_generation,
+    EXTRAS_GET_DEVICE_PUBKEY,
 )
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Sub-command bytes for INS_EXTRAS used in DKEK ceremony
-# ---------------------------------------------------------------------------
-EXTRAS_DKEK_BEGIN = 0x10
-EXTRAS_DKEK_NOISE_MSG = 0x11
-EXTRAS_DKEK_IMPORT = 0x12
-EXTRAS_DKEK_EXPORT = 0x13
+# Wire framing constants
+MAGIC = b"P2H1"
+MSG_TYPE_NOISE      = 0x01
+MSG_TYPE_ACK        = 0xFF
+MSG_TYPE_DEV_PUBKEY = 0x05
+MSG_TYPE_EPHEM_PUB  = 0x06
+MSG_TYPE_ENC_DKEK   = 0x07
 
-# Noise_XX message framing over the wire (TCP or USB)
-MAGIC = b"P2H1"  # 4-byte protocol magic
-MSG_TYPE_NOISE = 0x01
-MSG_TYPE_DKEK = 0x02
-MSG_TYPE_ACK = 0xFF
-
-# Default TCP port for DKEK exchange
+# Default TCP port
 DEFAULT_PORT = 7890
 
-# AES-GCM key size for wrapping the DKEK in transit
-SESSION_KEY_SIZE = 32
+# Sizes
+PUBKEY_SIZE = 65      # uncompressed P-256
+ENCRYPTED_DKEK_SIZE = 60  # nonce(12) + ct(32) + tag(16)
+DEVICE_ID_SIZE = 16
 
 
 class DkekExchange:
-    """Implements DKEK exchange using the Noise_XX protocol.
+    """Orchestrate DKEK exchange between two HSMs.
 
-    Noise_XX provides mutual authentication (both parties prove possession of
-    their static identity keys) and forward secrecy via ephemeral DH.
-
-    The high-level flow is::
-
-        Initiator                        Responder
-        ---------                        ---------
-        -> e                             (ephemeral public key)
-                              <- e, ee, s, es   (responder ephemeral + static)
-        -> s, se                         (initiator static)
-        [session keys established]
-        -> DKEK encrypted under session key
-                              <- ACK
-
-    Device identity keys are retrieved from each HSM via ``INS_EXTRAS``.
+    The host is a relay — no plaintext DKEK material passes through it.
     """
+
+    def __init__(self, config: Optional[PeerConfig] = None):
+        self._config = config
+
+    # ------------------------------------------------------------------
+    # Public interface
+    # ------------------------------------------------------------------
 
     def exchange_local_usb(
         self,
-        source_device: Pico2HSM,
-        target_device: Pico2HSM,
+        source: Pico2HSM,
+        target: Pico2HSM,
     ) -> None:
-        """Exchange DKEK between two HSMs connected to the same host.
-
-        Steps:
-        1. Perform Noise_XX handshake using APDUs to both HSMs.
-        2. Source HSM exports DKEK encrypted under the Noise session key.
-        3. Target HSM imports the encrypted DKEK.
+        """Exchange DKEK between two locally connected HSMs.
 
         Args:
-            source_device: HSM that holds the existing DKEK to copy.
-            target_device: HSM that will receive the DKEK.
+            source: HSM that holds the DKEK to copy.
+            target: HSM that will receive the DKEK.
         """
         logger.info("Starting local USB DKEK exchange")
         try:
-            session_key = self._noise_handshake_apdu(source_device, target_device)
-            encrypted_dkek = self._export_dkek(source_device, session_key)
-            self._import_dkek(target_device, session_key, encrypted_dkek)
-            logger.info("DKEK exchange complete")
+            self._relay_exchange(source, target)
+            logger.info("Local USB DKEK exchange complete")
         except Exception as exc:
-            raise DKEKError(f"Local USB DKEK exchange failed: {exc}") from exc
+            raise DKEKError(f"Local USB exchange failed: {exc}") from exc
 
     def exchange_tcp_server(
         self,
-        source_device: Pico2HSM,
+        source: Pico2HSM,
         port: int = DEFAULT_PORT,
+        tls: bool = True,
     ) -> None:
-        """Run as TCP server: wait for a remote HSM to connect and receive the DKEK.
+        """Server mode: source HSM sends DKEK to a remote peer.
+
+        Listens on the given port. The remote peer (exchange_tcp_client) connects.
 
         Args:
-            source_device: Local HSM that holds the DKEK to share.
+            source: Local HSM that holds the DKEK.
             port: TCP port to listen on.
+            tls: Use anonymous TLS for transport encryption.
         """
-        logger.info("Listening for DKEK exchange on port %d", port)
+        logger.info("Listening for DKEK exchange on port %d (tls=%s)", port, tls)
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as srv:
             srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             srv.bind(("0.0.0.0", port))
             srv.listen(1)
-            logger.info("Waiting for remote peer...")
             conn, addr = srv.accept()
             logger.info("Connection from %s", addr)
+            if tls:
+                conn = _wrap_tls_server(conn)
             with conn:
                 try:
-                    session_key = self._noise_handshake_tcp_server(conn, source_device)
-                    encrypted_dkek = self._export_dkek(source_device, session_key)
-                    _send_framed(conn, MSG_TYPE_DKEK, encrypted_dkek)
-                    msg_type, _ = _recv_framed(conn)
-                    if msg_type != MSG_TYPE_ACK:
-                        raise DKEKError("Remote peer did not acknowledge DKEK receipt")
-                    logger.info("DKEK sent and acknowledged")
+                    self._tcp_server_relay(conn, source)
                 except Exception as exc:
-                    raise DKEKError(f"TCP server DKEK exchange failed: {exc}") from exc
+                    raise DKEKError(f"TCP server exchange failed: {exc}") from exc
 
     def exchange_tcp_client(
         self,
-        target_device: Pico2HSM,
+        target: Pico2HSM,
         server_host: str,
         server_port: int = DEFAULT_PORT,
+        tls: bool = True,
     ) -> None:
-        """Connect to a TCP server and receive the DKEK into the target HSM.
+        """Client mode: target HSM receives DKEK from a remote server.
 
         Args:
-            target_device: Local HSM that will receive the DKEK.
-            server_host: Hostname or IP of the DKEK server.
-            server_port: TCP port of the DKEK server.
+            target: Local HSM that will receive the DKEK.
+            server_host: Hostname/IP of the server running exchange_tcp_server.
+            server_port: TCP port of the server.
+            tls: Use anonymous TLS for transport encryption.
         """
-        logger.info("Connecting to DKEK server %s:%d", server_host, server_port)
-        with socket.create_connection((server_host, server_port), timeout=30) as conn:
+        logger.info("Connecting to DKEK server %s:%d (tls=%s)", server_host, server_port, tls)
+        raw_conn = socket.create_connection((server_host, server_port), timeout=30)
+        if tls:
+            raw_conn = _wrap_tls_client(raw_conn, server_host)
+        with raw_conn:
             try:
-                session_key = self._noise_handshake_tcp_client(conn, target_device)
-                msg_type, encrypted_dkek = _recv_framed(conn)
-                if msg_type != MSG_TYPE_DKEK:
-                    raise DKEKError(f"Expected DKEK message, got type {msg_type:02X}")
-                self._import_dkek(target_device, session_key, encrypted_dkek)
-                _send_framed(conn, MSG_TYPE_ACK, b"")
-                logger.info("DKEK received and imported")
+                self._tcp_client_relay(raw_conn, target)
             except Exception as exc:
-                raise DKEKError(f"TCP client DKEK exchange failed: {exc}") from exc
+                raise DKEKError(f"TCP client exchange failed: {exc}") from exc
 
     # ------------------------------------------------------------------
-    # Noise_XX handshake helpers
+    # Internal relay implementation
     # ------------------------------------------------------------------
 
-    def _noise_handshake_apdu(
-        self,
-        source: Pico2HSM,
-        target: Pico2HSM,
-    ) -> bytes:
-        """Perform a Noise_XX handshake between two locally connected HSMs.
+    def _get_device_pubkey(self, device: Pico2HSM) -> bytes:
+        """Get the 65-byte static P-256 identity key from a device."""
+        apdu = build_get_device_pubkey()
+        data, _sw = device.transmit(apdu)
+        if len(data) != PUBKEY_SIZE:
+            raise DKEKError(f"Unexpected pubkey length: {len(data)}")
+        return data
 
-        Returns the 32-byte shared session key for subsequent DKEK wrapping.
-        """
-        try:
-            from noise.connection import NoiseConnection, Keypair  # type: ignore
-            from noise.backends.default import DefaultNoise  # type: ignore
-        except ImportError:
-            raise DKEKError(
-                "noiseprotocol package not installed. "
-                "Run: pip install noiseprotocol"
+    def _verify_enrolled(self, pubkey: bytes) -> Optional[PeerEntry]:
+        """Check that pubkey is enrolled in config. Raises EnrollmentError if not enrolled."""
+        if self._config is None:
+            return None  # No config — skip enrollment check
+        peer = self._config.find_peer_by_pubkey(pubkey)
+        if peer is None:
+            raise EnrollmentError(
+                f"Device with pubkey {pubkey[:4].hex()}... is not enrolled. "
+                "Run 'hsm-tool.py enroll' and add the key to your config."
             )
+        logger.info("Verified enrolled peer: %s (%s)", peer.name, peer.role)
+        return peer
 
-        # Initiator: source device
-        initiator = NoiseConnection.from_name(b"Noise_XX_25519_AESGCM_SHA256")
-        initiator.set_as_initiator()
-        initiator.noise_protocol.prologue = b"pico2hsm-dkek-v1"
+    def _relay_exchange(self, source: Pico2HSM, target: Pico2HSM) -> None:
+        """Core 4-step DKEK relay protocol between two locally connected HSMs."""
 
-        # Responder: target device
-        responder = NoiseConnection.from_name(b"Noise_XX_25519_AESGCM_SHA256")
-        responder.set_as_responder()
-        responder.noise_protocol.prologue = b"pico2hsm-dkek-v1"
+        # Step 0: Get static pubkeys and verify enrollment
+        source_static = self._get_device_pubkey(source)
+        target_static = self._get_device_pubkey(target)
+        source_peer = self._verify_enrolled(source_static)
+        target_peer = self._verify_enrolled(target_static)
+        logger.debug(
+            "Source: %s, Target: %s",
+            source_peer.name if source_peer else "unknown",
+            target_peer.name if target_peer else "unknown",
+        )
 
-        # Get identity keys from each HSM via EXTRAS
-        source_static_pub = self._get_device_public_key(source)
-        target_static_pub = self._get_device_public_key(target)
+        # Step 1: NOISE_INITIATE on source (no peer pubkey yet)
+        # Source generates ephemeral keypair, returns source_ephem_pub
+        apdu = build_noise_initiate(b"")
+        source_ephem_pub, _sw = source.transmit(apdu)
+        if len(source_ephem_pub) != PUBKEY_SIZE:
+            raise DKEKError(f"Source returned unexpected ephem_pub length: {len(source_ephem_pub)}")
+        logger.debug("Source ephemeral pubkey: %s...", source_ephem_pub[:4].hex())
 
-        # Configure static keys (in a real implementation these come from HSM)
-        # Here we generate ephemeral stand-ins for the handshake
-        initiator_static = _generate_noise_keypair()
-        responder_static = _generate_noise_keypair()
+        # Step 2: NOISE_INITIATE on target with source's ephemeral pubkey
+        apdu = build_noise_initiate(source_ephem_pub)
+        target_ephem_pub, _sw = target.transmit(apdu)
+        if len(target_ephem_pub) != PUBKEY_SIZE:
+            raise DKEKError(f"Target returned unexpected ephem_pub length: {len(target_ephem_pub)}")
+        logger.debug("Target ephemeral pubkey: %s...", target_ephem_pub[:4].hex())
 
-        initiator.set_keypair_from_private_bytes(Keypair.STATIC, initiator_static["private"])
-        responder.set_keypair_from_private_bytes(Keypair.STATIC, responder_static["private"])
+        # Step 3: NOISE_FINALIZE_SEND on source with target's ephemeral pubkey
+        # Source computes ECDH, derives session key, encrypts DKEK, returns encrypted blob
+        apdu = build_noise_finalize_send(target_ephem_pub)
+        encrypted_dkek, _sw = source.transmit(apdu)
+        if len(encrypted_dkek) != ENCRYPTED_DKEK_SIZE:
+            raise DKEKError(f"Source returned unexpected encrypted_dkek length: {len(encrypted_dkek)}")
+        logger.debug("Received encrypted DKEK (%d bytes)", len(encrypted_dkek))
 
-        initiator.start_handshake()
-        responder.start_handshake()
+        # Step 4: NOISE_FINALIZE_RECV on target
+        # Target computes ECDH, decrypts DKEK, stores it
+        # device_id is source's static pubkey first 16 bytes (used as AAD in firmware)
+        device_id = source_static[:DEVICE_ID_SIZE]
+        apdu = build_noise_finalize_recv(source_ephem_pub, encrypted_dkek, device_id)
+        _data, _sw = target.transmit(apdu)
+        logger.debug("Target confirmed DKEK receipt")
 
-        # Message 1: initiator -> responder (e)
-        msg1 = initiator.write_message()
-        responder.read_message(data=msg1)
+    def _tcp_server_relay(self, conn: socket.socket, source: Pico2HSM) -> None:
+        """TCP server side of relay: drives source HSM, relays messages with remote target."""
 
-        # Message 2: responder -> initiator (e, ee, s, es)
-        msg2 = responder.write_message()
-        initiator.read_message(data=msg2)
+        # Exchange static pubkeys for enrollment verification
+        source_static = self._get_device_pubkey(source)
+        _send_framed(conn, MSG_TYPE_DEV_PUBKEY, source_static)
+        msg_type, target_static = _recv_framed(conn)
+        if msg_type != MSG_TYPE_DEV_PUBKEY:
+            raise DKEKError(f"Expected DEV_PUBKEY message, got {msg_type:02X}")
 
-        # Message 3: initiator -> responder (s, se)
-        msg3 = initiator.write_message()
-        responder.read_message(data=msg3)
+        self._verify_enrolled(source_static)
+        self._verify_enrolled(target_static)
 
-        # Both sides now have session keys
-        # We derive a single symmetric key from the initiator's send key
-        session_key = initiator.get_handshake_hash()[:SESSION_KEY_SIZE]
-        logger.debug("Noise_XX handshake complete, session key derived")
-        return session_key
+        # Step 1: Get source ephemeral pubkey
+        apdu = build_noise_initiate(b"")
+        source_ephem_pub, _ = source.transmit(apdu)
+        _send_framed(conn, MSG_TYPE_EPHEM_PUB, source_ephem_pub)
 
-    def _noise_handshake_tcp_server(
-        self,
-        conn: socket.socket,
-        source: Pico2HSM,
-    ) -> bytes:
-        """Server-side Noise_XX handshake over TCP."""
-        return self._tcp_noise_handshake(conn, role="server")
+        # Step 2: Receive target ephemeral pubkey
+        msg_type, target_ephem_pub = _recv_framed(conn)
+        if msg_type != MSG_TYPE_EPHEM_PUB:
+            raise DKEKError(f"Expected EPHEM_PUB, got {msg_type:02X}")
 
-    def _noise_handshake_tcp_client(
-        self,
-        conn: socket.socket,
-        target: Pico2HSM,
-    ) -> bytes:
-        """Client-side Noise_XX handshake over TCP."""
-        return self._tcp_noise_handshake(conn, role="client")
+        # Step 3: Source encrypts DKEK
+        apdu = build_noise_finalize_send(target_ephem_pub)
+        encrypted_dkek, _ = source.transmit(apdu)
+        _send_framed(conn, MSG_TYPE_ENC_DKEK, encrypted_dkek)
 
-    def _tcp_noise_handshake(self, conn: socket.socket, role: str) -> bytes:
-        """Perform Noise_XX handshake over a TCP socket."""
-        try:
-            from noise.connection import NoiseConnection, Keypair  # type: ignore
-        except ImportError:
-            raise DKEKError("noiseprotocol package not installed")
+        # Wait for ACK
+        msg_type, _ = _recv_framed(conn)
+        if msg_type != MSG_TYPE_ACK:
+            raise DKEKError(f"Expected ACK, got {msg_type:02X}")
+        logger.info("TCP DKEK server: exchange complete")
 
-        noise = NoiseConnection.from_name(b"Noise_XX_25519_AESGCM_SHA256")
-        static_kp = _generate_noise_keypair()
+    def _tcp_client_relay(self, conn: socket.socket, target: Pico2HSM) -> None:
+        """TCP client side of relay: drives target HSM, relays messages with remote server."""
 
-        if role == "client":
-            noise.set_as_initiator()
-        else:
-            noise.set_as_responder()
+        target_static = self._get_device_pubkey(target)
 
-        noise.noise_protocol.prologue = b"pico2hsm-dkek-v1"
-        noise.set_keypair_from_private_bytes(Keypair.STATIC, static_kp["private"])
-        noise.start_handshake()
+        # Exchange static pubkeys
+        msg_type, source_static = _recv_framed(conn)
+        if msg_type != MSG_TYPE_DEV_PUBKEY:
+            raise DKEKError(f"Expected DEV_PUBKEY, got {msg_type:02X}")
+        _send_framed(conn, MSG_TYPE_DEV_PUBKEY, target_static)
 
-        if role == "client":
-            # -> e
-            msg1 = noise.write_message()
-            _send_framed(conn, MSG_TYPE_NOISE, msg1)
-            # <- e, ee, s, es
-            _, msg2 = _recv_framed(conn)
-            noise.read_message(data=msg2)
-            # -> s, se
-            msg3 = noise.write_message()
-            _send_framed(conn, MSG_TYPE_NOISE, msg3)
-        else:
-            # <- e
-            _, msg1 = _recv_framed(conn)
-            noise.read_message(data=msg1)
-            # -> e, ee, s, es
-            msg2 = noise.write_message()
-            _send_framed(conn, MSG_TYPE_NOISE, msg2)
-            # <- s, se
-            _, msg3 = _recv_framed(conn)
-            noise.read_message(data=msg3)
+        self._verify_enrolled(source_static)
+        self._verify_enrolled(target_static)
 
-        return noise.get_handshake_hash()[:SESSION_KEY_SIZE]
+        # Step 2: Receive source ephemeral pubkey, get target's
+        msg_type, source_ephem_pub = _recv_framed(conn)
+        if msg_type != MSG_TYPE_EPHEM_PUB:
+            raise DKEKError(f"Expected EPHEM_PUB, got {msg_type:02X}")
+        apdu = build_noise_initiate(source_ephem_pub)
+        target_ephem_pub, _ = target.transmit(apdu)
+        _send_framed(conn, MSG_TYPE_EPHEM_PUB, target_ephem_pub)
 
-    # ------------------------------------------------------------------
-    # DKEK import / export via APDU
-    # ------------------------------------------------------------------
+        # Step 4: Receive encrypted DKEK and import into target
+        msg_type, encrypted_dkek = _recv_framed(conn)
+        if msg_type != MSG_TYPE_ENC_DKEK:
+            raise DKEKError(f"Expected ENC_DKEK, got {msg_type:02X}")
 
-    def _export_dkek(self, device: Pico2HSM, session_key: bytes) -> bytes:
-        """Export DKEK from HSM, encrypted under the Noise session key."""
-        apdu = build_extras(EXTRAS_DKEK_EXPORT)
-        raw_dkek, _ = device.transmit(apdu)
-        encrypted = encrypt_aes_gcm(session_key, raw_dkek, aad=b"dkek-export-v1")
-        logger.debug("Exported and encrypted DKEK (%d bytes)", len(encrypted))
-        return encrypted
+        device_id = source_static[:DEVICE_ID_SIZE]
+        apdu = build_noise_finalize_recv(source_ephem_pub, encrypted_dkek, device_id)
+        target.transmit(apdu)
 
-    def _import_dkek(
-        self,
-        device: Pico2HSM,
-        session_key: bytes,
-        encrypted_dkek: bytes,
-    ) -> None:
-        """Decrypt and import DKEK into target HSM."""
-        raw_dkek = decrypt_aes_gcm(session_key, encrypted_dkek, aad=b"dkek-export-v1")
-        apdu = build_extras(EXTRAS_DKEK_IMPORT, raw_dkek)
-        device.transmit(apdu)
-        logger.debug("DKEK imported into target HSM")
-
-    def _get_device_public_key(self, device: Pico2HSM) -> bytes:
-        """Retrieve the device's Noise static public key via EXTRAS APDU."""
-        apdu = build_extras(EXTRAS_DKEK_BEGIN)
-        pub_key, _ = device.transmit(apdu)
-        return pub_key
+        _send_framed(conn, MSG_TYPE_ACK, b"")
+        logger.info("TCP DKEK client: exchange complete")
 
 
 # ---------------------------------------------------------------------------
 # Wire framing helpers
 # ---------------------------------------------------------------------------
 
-
 def _send_framed(conn: socket.socket, msg_type: int, payload: bytes) -> None:
     """Send a length-prefixed framed message.
-
-    Frame format::
-
-        [4B magic] [1B type] [4B LE length] [payload]
+    Frame: [4B magic][1B type][4B BE length][payload]
     """
     frame = MAGIC + bytes([msg_type]) + struct.pack(">I", len(payload)) + payload
     conn.sendall(frame)
@@ -330,7 +306,7 @@ def _recv_framed(conn: socket.socket) -> tuple[int, bytes]:
 
 
 def _recv_exactly(conn: socket.socket, n: int) -> bytes:
-    """Receive exactly n bytes from socket."""
+    """Receive exactly n bytes."""
     buf = bytearray()
     while len(buf) < n:
         chunk = conn.recv(n - len(buf))
@@ -341,18 +317,39 @@ def _recv_exactly(conn: socket.socket, n: int) -> bytes:
 
 
 # ---------------------------------------------------------------------------
-# Noise static key generation helper
+# Anonymous TLS helpers
 # ---------------------------------------------------------------------------
 
+def _wrap_tls_server(conn: socket.socket) -> socket.socket:
+    """Wrap a server socket with anonymous TLS (no certificate verification)."""
+    import ssl
+    import tempfile
+    import subprocess
 
-def _generate_noise_keypair() -> dict[str, bytes]:
-    """Generate a Curve25519 key pair for Noise."""
-    try:
-        from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
+    # Generate a self-signed certificate on the fly for anonymous TLS
+    with tempfile.TemporaryDirectory() as tmp:
+        key_file = f"{tmp}/key.pem"
+        cert_file = f"{tmp}/cert.pem"
+        subprocess.run(
+            [
+                "openssl", "req", "-x509", "-newkey", "ec",
+                "-pkeyopt", "ec_paramgen_curve:P-256",
+                "-keyout", key_file, "-out", cert_file,
+                "-days", "1", "-nodes", "-subj", "/CN=pico2hsm",
+            ],
+            check=True, capture_output=True,
+        )
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(cert_file, key_file)
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        return ctx.wrap_socket(conn, server_side=True)
 
-        private = X25519PrivateKey.generate()
-        private_bytes = private.private_bytes_raw()
-        public_bytes = private.public_key().public_bytes_raw()
-        return {"private": private_bytes, "public": public_bytes}
-    except Exception as exc:
-        raise DKEKError(f"Failed to generate Noise keypair: {exc}") from exc
+
+def _wrap_tls_client(conn: socket.socket, _hostname: str) -> socket.socket:
+    """Wrap a client socket with anonymous TLS (no certificate verification)."""
+    import ssl
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    return ctx.wrap_socket(conn, server_side=False)

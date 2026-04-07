@@ -95,13 +95,25 @@ impl<Chip: FlashChip> FlashKeyStore<Chip> {
 #[cfg(target_arch = "arm")]
 impl<Chip: FlashChip> KeyStore for FlashKeyStore<Chip> {
     fn save_key(&mut self, obj: &KeyObject) -> Result<(), HsmError> {
+        // --- 0. Increment the generation counter before writing. ---
+        // We cannot mutate `obj` (it's a shared reference), so we clone the
+        // relevant fields into a local copy with generation bumped.
+        let mut obj_copy = KeyObject::new(obj.key_type, obj.key_id, obj.owner, obj.algorithm);
+        obj_copy.key_domain = obj.key_domain;
+        obj_copy.use_count = obj.use_count;
+        obj_copy.generation = obj.generation.saturating_add(1);
+        obj_copy.private_key.extend_from_slice(&obj.private_key)
+            .map_err(|_| HsmError::Crypto(CryptoError::EncryptFailure))?;
+        obj_copy.public_key.extend_from_slice(&obj.public_key)
+            .map_err(|_| HsmError::Crypto(CryptoError::EncryptFailure))?;
+
         // --- 1. Generate a fresh 12-byte nonce from the hardware TRNG. ---
         let mut nonce = [0u8; 12];
         crate::crypto::rng::fill_random(&mut nonce)
             .map_err(HsmError::Crypto)?;
 
-        // --- 2. Encrypt the key object. ---
-        let blob = obj
+        // --- 2. Encrypt the key object (with bumped generation). ---
+        let blob = obj_copy
             .encrypt(&self.smk, &nonce)
             .map_err(|_| HsmError::Crypto(CryptoError::EncryptFailure))?;
 
@@ -109,14 +121,14 @@ impl<Chip: FlashChip> KeyStore for FlashKeyStore<Chip> {
         // The plaintext that is hashed is the raw private key material.
         // This lets the storage layer verify integrity after decryption
         // without re-deriving the KEK.
-        let hash = compute_plaintext_blake2s(&obj.private_key);
+        let hash = compute_plaintext_blake2s(&obj_copy.private_key);
 
-        // --- 4. Map AlgorithmId → core KeyType. ---
-        let core_key_type = algo_to_core_key_type(obj.algorithm);
+        // --- 4. Map AlgorithmId -> core KeyType. ---
+        let core_key_type = algo_to_core_key_type(obj_copy.algorithm);
 
         // --- 5. Write to flash. ---
         self.storage
-            .write_key(KeyId(obj.key_id), core_key_type, &blob, &hash)
+            .write_key(KeyId(obj_copy.key_id), core_key_type, &blob, &hash)
             .map_err(HsmError::Storage)
     }
 

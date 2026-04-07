@@ -11,6 +11,7 @@ Run ``hsm-tool.py --help`` or ``hsm-tool.py <subcommand> --help`` for details.
 from __future__ import annotations
 
 import logging
+import os
 import sys
 from typing import Optional
 
@@ -746,6 +747,173 @@ def info(ctx: click.Context) -> None:
     for i, dev in enumerate(available):
         marker = " <-- selected" if i == ctx.obj["reader"] else ""
         click.echo(f"  [{i}] {dev}{marker}")
+
+
+# ---------------------------------------------------------------------------
+# enroll
+# ---------------------------------------------------------------------------
+
+
+@cli.command()
+@click.option("--name", required=True, help="Human-readable name for this device")
+@click.option("--output", "-o", required=True, type=click.Path(), help="Output PEM file path")
+@click.pass_context
+def enroll(ctx: click.Context, name: str, output: str) -> None:
+    """Enroll a device by reading and saving its P-256 identity public key."""
+    from pico2hsm.enrollment import DeviceEnrollment
+
+    with _open_hsm(ctx) as hsm:
+        hsm.select_applet()
+        info = DeviceEnrollment.get_device_info(hsm)
+        DeviceEnrollment.save_pubkey_pem(info.pubkey, output)
+        click.echo(f"Device: {name}")
+        click.echo(f"Fingerprint: {info.fingerprint}")
+        click.echo(f"Generation: {info.generation}")
+        click.echo(f"Public key saved to: {output}")
+        click.echo("")
+        click.echo("Add this to your dkek-daemon.yaml peers section:")
+        click.echo(f'  - name: "{name}"')
+        click.echo(f"    role: secondary")
+        click.echo(f"    public_key_file: {output}")
+
+
+# ---------------------------------------------------------------------------
+# sync
+# ---------------------------------------------------------------------------
+
+
+def _open_reader(reader_index: int, debug: bool = False) -> Pico2HSM:
+    """Open and connect a Pico2HSM at the given reader index."""
+    hsm = Pico2HSM(reader_index=reader_index, debug=debug)
+    hsm.connect()
+    return hsm
+
+
+def _empty_config():
+    """Return a minimal PeerConfig for config-less operation."""
+    from pico2hsm.config import PeerConfig
+    return PeerConfig(peers=[])
+
+
+@cli.command()
+@click.option("--primary-reader", type=int, required=True, help="Reader index for primary HSM")
+@click.option("--secondary-reader", type=int, default=None, help="Reader index for secondary HSM (local USB)")
+@click.option("--to", "peer_name", default=None, help="Named peer for TCP sync (requires --config)")
+@click.option("--config", "config_file", default=None, type=click.Path(exists=True), help="Peer config YAML")
+@click.option("--quorum", default=1, type=int, help="Quorum required before syncing offline nodes")
+@click.pass_context
+def sync(ctx: click.Context, primary_reader: int, secondary_reader: Optional[int],
+         peer_name: Optional[str], config_file: Optional[str], quorum: int) -> None:
+    """Sync DKEK from primary to secondary HSM."""
+    from pico2hsm.config import PeerConfig
+    from pico2hsm.state import StatePersistence
+    from pico2hsm.sync import SyncManager
+
+    debug = ctx.obj["debug"]
+    config = PeerConfig.load(config_file) if config_file else None
+    persistence = StatePersistence()
+    persistence.load()
+    manager = SyncManager(config or _empty_config(), persistence, quorum)
+
+    primary = _open_reader(primary_reader, debug=debug)
+    try:
+        primary.select_applet()
+        if secondary_reader is not None:
+            secondary = _open_reader(secondary_reader, debug=debug)
+            try:
+                secondary.select_applet()
+                result = manager.sync_local(primary, secondary)
+                if result.success:
+                    click.echo(f"Sync complete: {result.message}")
+                else:
+                    click.echo(f"Sync failed: {result.message}", err=True)
+                    raise SystemExit(1)
+            finally:
+                secondary.disconnect()
+        elif peer_name and config:
+            manager.sync_tcp_to_peer(primary, peer_name)
+        else:
+            click.echo("Specify --secondary-reader or --to with --config", err=True)
+            raise SystemExit(1)
+    finally:
+        primary.disconnect()
+
+
+# ---------------------------------------------------------------------------
+# export-key
+# ---------------------------------------------------------------------------
+
+
+@cli.command("export-key")
+@click.option("--key-id", required=True, type=int, help="Key reference (1-254)")
+@click.option("--output", "-o", required=True, type=click.Path(), help="Output blob file (.p2hk)")
+@click.pass_context
+def export_key_cmd(ctx: click.Context, key_id: int, output: str) -> None:
+    """Export a DKEK-wrapped key to a file."""
+    from pico2hsm.key_transfer import export_key as _export
+
+    with _open_hsm(ctx) as hsm:
+        hsm.select_applet()
+        _export(hsm, key_id, output)
+        click.echo(f"Key {key_id} exported to {output}")
+
+
+# ---------------------------------------------------------------------------
+# import-key
+# ---------------------------------------------------------------------------
+
+
+@cli.command("import-key")
+@click.option("--key-id", required=True, type=int, help="Key reference to store imported key")
+@click.option("--input", "input_path", required=True, type=click.Path(exists=True), help="Blob file (.p2hk)")
+@click.pass_context
+def import_key_cmd(ctx: click.Context, key_id: int, input_path: str) -> None:
+    """Import a DKEK-wrapped key from a file."""
+    from pico2hsm.key_transfer import import_key as _import
+
+    with _open_hsm(ctx) as hsm:
+        hsm.select_applet()
+        _import(hsm, key_id, input_path)
+        click.echo(f"Key imported to slot {key_id}")
+
+
+# ---------------------------------------------------------------------------
+# daemon
+# ---------------------------------------------------------------------------
+
+
+@cli.command()
+@click.option("--config", required=True, type=click.Path(exists=True), help="Peer config YAML")
+@click.option("--pid-file", default=None, type=click.Path(), help="PID file path")
+@click.option("--foreground", is_flag=True, default=False, help="Stay in foreground (default: daemonize)")
+@click.option("--quorum", default=1, type=int, help="Quorum required before syncing offline nodes")
+@click.pass_context
+def daemon(ctx: click.Context, config: str, pid_file: Optional[str],
+           foreground: bool, quorum: int) -> None:
+    """Run the DKEK sync daemon."""
+    from pico2hsm.config import PeerConfig
+    from pico2hsm.daemon import DkekDaemon
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(name)s %(levelname)s %(message)s",
+    )
+
+    cfg = PeerConfig.load(config)
+    d = DkekDaemon(cfg, quorum_required=quorum)
+
+    if not foreground:
+        # Unix double-fork daemonize
+        if os.fork() > 0:
+            sys.exit(0)
+        os.setsid()
+        if os.fork() > 0:
+            sys.exit(0)
+        sys.stdin = open(os.devnull)
+        sys.stdout = open(os.devnull, "w")
+        sys.stderr = open(os.devnull, "w")
+
+    d.run(pid_file=pid_file)
 
 
 # ---------------------------------------------------------------------------

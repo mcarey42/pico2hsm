@@ -26,6 +26,9 @@ use pico2hsm_core::{
     key::{AppletId, KeyId, KeyType as CoreKeyType},
     protocol::HsmProtocol,
 };
+use zeroize::Zeroizing;
+
+use crate::security::dkek::DkekManager;
 
 use commands::*;
 
@@ -267,6 +270,14 @@ pub struct ScHsmState {
     /// header write) followed by `D7 00 00 data(M)` (full content write, where
     /// P1=P2=0 means "write to the previously addressed file").
     pub write_target_file: Option<u16>,
+
+    /// DKEK (Device Key Encryption Key) manager for key wrap/unwrap and exchange.
+    pub dkek: DkekManager,
+
+    /// Ephemeral P-256 private key for in-progress DKEK exchange (32-byte scalar).
+    pub exchange_ephem_priv: Option<Zeroizing<[u8; 32]>>,
+    /// Ephemeral P-256 public key for in-progress DKEK exchange (65-byte uncompressed).
+    pub exchange_ephem_pub: Option<[u8; 65]>,
 }
 
 impl ScHsmState {
@@ -297,7 +308,18 @@ impl ScHsmState {
             sym_keys: heapless::Vec::new(),
             ef_files: heapless::Vec::new(),
             write_target_file: None,
+            dkek: DkekManager::new([0u8; 16]),
+            exchange_ephem_priv: None,
+            exchange_ephem_pub: None,
         }
+    }
+
+    /// Set the device ID on the DKEK manager.
+    ///
+    /// Called once at boot before any DKEK operations. Reinitializes the
+    /// DkekManager with the real device_id.
+    pub fn set_device_id(&mut self, device_id: [u8; 16]) {
+        self.dkek = DkekManager::new(device_id);
     }
 }
 
@@ -326,6 +348,12 @@ impl ScHsm {
             }
             delete_file::INS_DELETE_FILE => delete_file::handle(&mut self.state, store, cmd),
             generate_key::INS_GENERATE_KEY => generate_key::handle(&mut self.state, store, cmd),
+            export_key::INS_EXPORT_KEY => export_key::handle(&mut self.state, store, cmd),
+            // INS 0x58 shared between LIST_KEYS (P2=0x00) and IMPORT_KEY (P2=0x93)
+            list_keys::INS_LIST_KEYS if cmd.p2 == import_key::P2_IMPORT => {
+                import_key::handle(&mut self.state, store, cmd)
+            }
+            extras::INS_EXTRAS => extras::handle(&mut self.state, store, cmd),
             // All other commands fall through to the stateless dispatch.
             _ => self.dispatch(cmd),
         }
@@ -357,12 +385,12 @@ impl ScHsm {
             // INS 0x58 shared between LIST_KEYS (P2=0x00) and IMPORT_KEY (P2=0x93)
             list_keys::INS_LIST_KEYS => {
                 if cmd.p2 == import_key::P2_IMPORT {
-                    import_key::handle(&mut self.state, cmd)
+                    import_key::handle(&mut self.state, &mut LocalNullStore, cmd)
                 } else {
                     list_keys::handle(&mut self.state, cmd)
                 }
             }
-            export_key::INS_EXPORT_KEY => export_key::handle(&mut self.state, cmd),
+            export_key::INS_EXPORT_KEY => export_key::handle(&mut self.state, &mut LocalNullStore, cmd),
             read_binary::INS_READ_BINARY => read_binary::handle(&mut self.state, cmd),
             read_binary::INS_READ_BINARY_ODD => read_binary::handle_odd(&mut self.state, cmd),
             update_binary::INS_UPDATE_BINARY => update_binary::handle(&mut self.state, cmd),
@@ -375,7 +403,7 @@ impl ScHsm {
             session_pin::INS_SESSION_PIN => session_pin::handle(&mut self.state, cmd),
             puk_auth::INS_PUK_AUTH => puk_auth::handle(&mut self.state, cmd),
             bip_slip::INS_BIP_SLIP => bip_slip::handle(&mut self.state, cmd),
-            extras::INS_EXTRAS => extras::handle(&mut self.state, cmd),
+            extras::INS_EXTRAS => extras::handle(&mut self.state, &mut LocalNullStore, cmd),
             select::INS_SELECT => select::handle(&mut self.state, cmd),
             provisioning::INS_PROV_GET_STATUS => provisioning::handle_get_status(&mut self.state, cmd),
             provisioning::INS_PROV_SET_PRODUCTION => provisioning::handle_set_production_mode(&mut self.state, cmd),

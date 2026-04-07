@@ -107,8 +107,10 @@ declare -a VARIANTS=(
     "rp2350_one_4m   | Waveshare RP2350-One  4MB    | RP2350"
     "rp2350_one_16m  | Waveshare RP2350-One 16MB    | RP2350"
     "rp2350_geek_16m | Waveshare RP2350-Geek 16MB   | RP2350"
-    "rp2350_geek_sdcard      | Waveshare RP2350-Geek SDCard      | RP2350"
-    "rp2350_geek_sdcard_dual | Waveshare RP2350-Geek Dual-SDCard | RP2350"
+    "rp2350_geek_sdcard               | Waveshare RP2350-Geek SDCard           | RP2350"
+    "rp2350_geek_sdcard_dual          | Waveshare RP2350-Geek Dual-SDCard      | RP2350"
+    "waveshare_rp2350_lcd_16m         | Waveshare RP2350-LCD-1.47-B 16MB       | RP2350"
+    "waveshare_rp2350_lcd_sdcard_dual | Waveshare RP2350-LCD-1.47-B Dual-SDCard| RP2350"
 )
 
 feature_of()  { echo "$1" | awk -F'|' '{gsub(/ /,"",$1); print $1}'; }
@@ -187,16 +189,18 @@ if [[ $SKIP_ARM -eq 0 ]]; then
             if [[ $SIGN -eq 1 ]]; then
                 SIGNED_ELF="dist/pico2hsm-${FEAT}-signed.elf"
                 OTP_JSON="dist/pico2hsm-${FEAT}-otp.json"
-                if picotool seal --hash --sign \
-                        "dist/pico2hsm-${FEAT}.elf" \
-                        "$SIGNED_ELF" \
+                SIGN_OUT=$(picotool seal --hash --sign \
+                        "dist/pico2hsm-${FEAT}.elf" -t elf \
+                        "$SIGNED_ELF" -t elf \
                         "$KEY_FILE" \
                         "$OTP_JSON" \
-                        >/dev/null 2>&1; then
+                        2>&1)
+                SIGN_RC=$?
+                if [[ $SIGN_RC -eq 0 ]]; then
                     ok "  Signed → $SIGNED_ELF"
                     ok "  OTP config → $OTP_JSON"
                 else
-                    die "picotool seal failed for $NAME — aborting"
+                    die "picotool seal failed for $NAME (rc=$SIGN_RC): $SIGN_OUT"
                 fi
             fi
         else

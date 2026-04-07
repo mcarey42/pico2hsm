@@ -7,33 +7,202 @@
 //! - P1=0x04: X9.63-KDF
 //! - P1=0x05: AES-CMAC
 //! - P1=0x06: HMAC-SHA256
+//! - P1=0x30: GET_DEVICE_PUBLIC_KEY
+//! - P1=0x31: NOISE_INITIATE
+//! - P1=0x32: NOISE_FINALIZE_SEND
+//! - P1=0x33: NOISE_FINALIZE_RECV
+//! - P1=0x34: GET_GENERATION
 
 use pico2hsm_core::apdu::{
     ApduCommand, ApduResponse, SW_CONDITIONS_NOT_SATISFIED, SW_SECURITY_STATUS, SW_WRONG_DATA,
     SW_WRONG_LENGTH,
 };
+use pico2hsm_core::key::KeyId;
 
-use crate::protocol::sc_hsm::ScHsmState;
+use crate::protocol::sc_hsm::{FwRng, ScHsmState};
+use crate::storage::KeyStore;
 
 /// INS byte for EXTRAS.
 pub const INS_EXTRAS: u8 = 0x54;
 
 /// Handle an EXTRAS APDU command.
-pub fn handle(state: &mut ScHsmState, cmd: &ApduCommand<'_>) -> ApduResponse {
-    // Require PIN authentication for cryptographic operations
-    if !state.pin_verified {
-        return ApduResponse::err(SW_SECURITY_STATUS);
+pub fn handle(state: &mut ScHsmState, store: &mut dyn KeyStore, cmd: &ApduCommand<'_>) -> ApduResponse {
+    match cmd.p1 {
+        // P1=0x30..0x34: DKEK exchange sub-commands (some don't require PIN).
+        0x30 => handle_get_device_public_key(state, store, cmd),
+        0x34 => handle_get_generation(state, cmd),
+
+        // All remaining sub-commands require PIN authentication.
+        _ => {
+            if !state.pin_verified {
+                return ApduResponse::err(SW_SECURITY_STATUS);
+            }
+            match cmd.p1 {
+                0x01 => hkdf_extract(cmd.data),
+                0x02 => hkdf_expand(cmd.data),
+                0x03 => pbkdf2(cmd.data),
+                0x04 => x963_kdf(cmd.data),
+                0x05 => aes_cmac(cmd.data),
+                0x06 => hmac_sha256(cmd.data),
+                0x31 => handle_noise_initiate(state, cmd),
+                0x32 => handle_noise_finalize_send(state, cmd),
+                0x33 => handle_noise_finalize_recv(state, cmd),
+                _ => ApduResponse::err(SW_WRONG_DATA),
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// P1=0x30  GET_DEVICE_PUBLIC_KEY
+// ---------------------------------------------------------------------------
+
+fn handle_get_device_public_key(state: &mut ScHsmState, store: &mut dyn KeyStore, _cmd: &ApduCommand<'_>) -> ApduResponse {
+    let dev_key_id = KeyId::sc_hsm(0, 0xFE);
+
+    // Try in-memory key store first.
+    if let Some(key) = state.keys.iter().find(|k| k.key_id == dev_key_id.0) {
+        if !key.public_key.is_empty() {
+            return ApduResponse::ok(&key.public_key);
+        }
     }
 
-    match cmd.p1 {
-        0x01 => hkdf_extract(cmd.data),
-        0x02 => hkdf_expand(cmd.data),
-        0x03 => pbkdf2(cmd.data),
-        0x04 => x963_kdf(cmd.data),
-        0x05 => aes_cmac(cmd.data),
-        0x06 => hmac_sha256(cmd.data),
-        _ => ApduResponse::err(SW_WRONG_DATA),
+    // Try EF 0x2F02 (public key stored during INITIALIZE).
+    if let Some(ef) = state.ef_files.iter().find(|ef| ef.file_id == 0x2F02) {
+        if !ef.data.is_empty() {
+            return ApduResponse::ok(&ef.data);
+        }
     }
+
+    // Try persistent store.
+    if let Ok(Some(key_obj)) = store.fetch_key(dev_key_id) {
+        if !key_obj.public_key.is_empty() {
+            return ApduResponse::ok(&key_obj.public_key);
+        }
+    }
+
+    // Device not initialized or no identity key.
+    ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED)
+}
+
+// ---------------------------------------------------------------------------
+// P1=0x31  NOISE_INITIATE
+// ---------------------------------------------------------------------------
+
+fn handle_noise_initiate(state: &mut ScHsmState, _cmd: &ApduCommand<'_>) -> ApduResponse {
+    use crate::crypto::asymmetric::generate_ec_keypair;
+    use pico2hsm_core::key::KeyType as CoreKeyType;
+    use zeroize::Zeroizing;
+
+    let mut rng = FwRng;
+    let pair = match generate_ec_keypair(CoreKeyType::EcPrivateP256, &mut rng) {
+        Ok(p) => p,
+        Err(_) => return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
+    };
+
+    // Store ephemeral private key.
+    let mut priv_bytes = Zeroizing::new([0u8; 32]);
+    if pair.private_key.len() != 32 {
+        return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED);
+    }
+    priv_bytes.copy_from_slice(&pair.private_key);
+    state.exchange_ephem_priv = Some(priv_bytes);
+
+    // Store ephemeral public key.
+    if pair.public_key.len() != 65 {
+        return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED);
+    }
+    let mut pub_bytes = [0u8; 65];
+    pub_bytes.copy_from_slice(&pair.public_key);
+    state.exchange_ephem_pub = Some(pub_bytes);
+
+    // Return our ephemeral public key (65 bytes).
+    ApduResponse::ok(&pub_bytes)
+}
+
+// ---------------------------------------------------------------------------
+// P1=0x32  NOISE_FINALIZE_SEND
+// ---------------------------------------------------------------------------
+
+fn handle_noise_finalize_send(state: &mut ScHsmState, cmd: &ApduCommand<'_>) -> ApduResponse {
+    // Require DKEK ready.
+    if !state.dkek.is_ready() {
+        return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED);
+    }
+
+    // Require ephemeral private key from a prior NOISE_INITIATE.
+    let ephem_priv = match &state.exchange_ephem_priv {
+        Some(p) => **p, // copy the 32-byte array
+        None => return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
+    };
+
+    // cmd.data = peer's ephemeral public key (65 bytes).
+    if cmd.data.len() != 65 {
+        return ApduResponse::err(SW_WRONG_DATA);
+    }
+    let peer_ephem_pub: &[u8; 65] = cmd.data.try_into().unwrap_or_else(|_| unreachable!());
+
+    let mut rng = FwRng;
+    let result = state.dkek.noise_send_dkek_data(peer_ephem_pub, &ephem_priv, &mut rng);
+
+    // Clear ephemeral state regardless of outcome.
+    state.exchange_ephem_priv = None;
+    state.exchange_ephem_pub = None;
+
+    match result {
+        Ok(encrypted_blob) => ApduResponse::ok(&encrypted_blob),
+        Err(_) => ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// P1=0x33  NOISE_FINALIZE_RECV
+// ---------------------------------------------------------------------------
+
+fn handle_noise_finalize_recv(state: &mut ScHsmState, cmd: &ApduCommand<'_>) -> ApduResponse {
+    // Require ephemeral private key from a prior NOISE_INITIATE.
+    let ephem_priv = match &state.exchange_ephem_priv {
+        Some(p) => **p, // copy the 32-byte array
+        None => return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
+    };
+
+    // cmd.data = initiator_ephem_pub(65) || encrypted_dkek(60) || initiator_device_id(16) = 141 bytes.
+    if cmd.data.len() != 141 {
+        return ApduResponse::err(SW_WRONG_DATA);
+    }
+
+    let initiator_ephem_pub: &[u8; 65] = cmd.data[..65].try_into().unwrap();
+    let encrypted_dkek: &[u8; 60] = cmd.data[65..125].try_into().unwrap();
+    let initiator_device_id: &[u8; 16] = cmd.data[125..141].try_into().unwrap();
+
+    let result = state.dkek.noise_recv_dkek_data(
+        initiator_ephem_pub,
+        &ephem_priv,
+        encrypted_dkek,
+        initiator_device_id,
+    );
+
+    // Clear ephemeral state regardless of outcome.
+    state.exchange_ephem_priv = None;
+    state.exchange_ephem_pub = None;
+
+    match result {
+        Ok(()) => {
+            state.dkek_shares_imported = state.dkek.shares_total();
+            ApduResponse::ok(&[])
+        }
+        Err(_) => ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// P1=0x34  GET_GENERATION
+// ---------------------------------------------------------------------------
+
+fn handle_get_generation(_state: &mut ScHsmState, _cmd: &ApduCommand<'_>) -> ApduResponse {
+    // TODO: Return the max generation counter across all stored keys.
+    // For now, return placeholder zeros.
+    ApduResponse::ok(&[0u8; 4])
 }
 
 // ---------------------------------------------------------------------------
@@ -180,7 +349,7 @@ fn x963_kdf(data: &[u8]) -> ApduResponse {
 // Response: 16-byte CMAC tag
 
 fn aes_cmac(data: &[u8]) -> ApduResponse {
-    use pico2hsm_core::key::{KeyId, KeyMaterial, KeyType};
+    use pico2hsm_core::key::{KeyId as CoreKeyId, KeyMaterial, KeyType};
 
     if data.is_empty() {
         return ApduResponse::err(SW_WRONG_LENGTH);
@@ -205,7 +374,7 @@ fn aes_cmac(data: &[u8]) -> ApduResponse {
     }
     let km = KeyMaterial {
         key_type,
-        key_id: KeyId(0x0100),
+        key_id: CoreKeyId(0x0100),
         raw,
     };
 

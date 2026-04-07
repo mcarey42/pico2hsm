@@ -110,6 +110,7 @@ fn test_key_object_encrypt_decrypt_roundtrip_ec() {
     assert_eq!(recovered.public_key.as_slice(), &[0x04u8; 65]);
     assert_eq!(recovered.use_count, 0);
     assert_eq!(recovered.key_domain, 0);
+    assert_eq!(recovered.generation, 0);
 }
 
 #[test]
@@ -175,9 +176,9 @@ fn test_key_object_tamper_detection_ciphertext() {
     let obj = ec_key(0x04);
     let mut blob = obj.encrypt(&TEST_SMK, &TEST_NONCE).unwrap();
 
-    // Flip a byte in the ciphertext portion (between header [0..16] and tag [len-28..len-12])
-    // Safe index: offset 20 is inside the encrypted key material.
-    blob[20] ^= 0xFF;
+    // Flip a byte in the ciphertext portion (between header [0..20] and tag [len-28..len-12])
+    // Safe index: offset 24 is inside the encrypted key material.
+    blob[24] ^= 0xFF;
 
     let kid = pico2hsm_core::key::KeyId::sc_hsm(0, 0x04).0;
     let result = KeyObject::decrypt(&blob, kid, &TEST_SMK);
@@ -210,7 +211,7 @@ fn test_key_object_tamper_detection_header_magic() {
     let mut blob = obj.encrypt(&TEST_SMK, &TEST_NONCE).unwrap();
 
     // Header is the first 16 bytes; magic is first 4 bytes.
-    blob[0] = b'X'; // Break "P2K2" magic
+    blob[0] = b'X'; // Break "P2K3" magic
 
     let kid = pico2hsm_core::key::KeyId::sc_hsm(0, 0x06).0;
     let result = KeyObject::decrypt(&blob, kid, &TEST_SMK);
@@ -237,12 +238,14 @@ fn test_key_object_too_short_blob_fails() {
 fn test_key_object_with_use_count_preserved() {
     let mut obj = ec_key(0x08);
     obj.use_count = 1234;
+    obj.generation = 99;
 
     let blob = obj.encrypt(&TEST_SMK, &TEST_NONCE).unwrap();
     let kid = pico2hsm_core::key::KeyId::sc_hsm(0, 0x08).0;
     let recovered = KeyObject::decrypt(&blob, kid, &TEST_SMK).unwrap();
 
     assert_eq!(recovered.use_count, 1234, "use_count must be preserved through encrypt/decrypt");
+    assert_eq!(recovered.generation, 99, "generation must be preserved through encrypt/decrypt");
 }
 
 // ---------------------------------------------------------------------------

@@ -365,6 +365,46 @@ def build_extras(sub_cmd: int, data: bytes = b"") -> bytes:
 
 
 # ---------------------------------------------------------------------------
+# DKEK exchange sub-commands for INS_EXTRAS (P1 values)
+# ---------------------------------------------------------------------------
+EXTRAS_GET_DEVICE_PUBKEY  = 0x30  # Returns 65-byte uncompressed P-256 public key
+EXTRAS_NOISE_INITIATE     = 0x31  # In: peer_ephem_pub (65B) or empty; Out: our_ephem_pub (65B)
+EXTRAS_NOISE_FINALIZE_SEND = 0x32  # In: peer_ephem_pub (65B); Out: encrypted_dkek (60B)
+EXTRAS_NOISE_FINALIZE_RECV = 0x33  # In: initiator_ephem_pub(65) + encrypted_dkek(60) + device_id(16)
+EXTRAS_GET_GENERATION      = 0x34  # Returns 4-byte big-endian generation counter
+
+
+def build_get_device_pubkey() -> bytes:
+    """Build EXTRAS P1=0x30 APDU."""
+    return build_extras(EXTRAS_GET_DEVICE_PUBKEY)
+
+
+def build_noise_initiate(peer_ephem_pub: bytes = b"") -> bytes:
+    """Build EXTRAS P1=0x31 APDU. peer_ephem_pub is 65 bytes or empty."""
+    return build_extras(EXTRAS_NOISE_INITIATE, peer_ephem_pub)
+
+
+def build_noise_finalize_send(peer_ephem_pub: bytes) -> bytes:
+    """Build EXTRAS P1=0x32 APDU. peer_ephem_pub is 65 bytes."""
+    return build_extras(EXTRAS_NOISE_FINALIZE_SEND, peer_ephem_pub)
+
+
+def build_noise_finalize_recv(
+    initiator_ephem_pub: bytes,
+    encrypted_dkek: bytes,
+    initiator_device_id: bytes,
+) -> bytes:
+    """Build EXTRAS P1=0x33 APDU. Data is ephem_pub(65) + encrypted_dkek(60) + device_id(16)."""
+    data = initiator_ephem_pub + encrypted_dkek + initiator_device_id
+    return build_extras(EXTRAS_NOISE_FINALIZE_RECV, data)
+
+
+def build_get_generation() -> bytes:
+    """Build EXTRAS P1=0x34 APDU."""
+    return build_extras(EXTRAS_GET_GENERATION)
+
+
+# ---------------------------------------------------------------------------
 # Response parsers
 # ---------------------------------------------------------------------------
 

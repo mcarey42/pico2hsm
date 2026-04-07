@@ -81,33 +81,42 @@ QSPI flash (W25Q128) is connected to the RP2350A QSPI interface (not general GPI
 
 ### Display geometry
 
-| Parameter      | Value              |
-|----------------|--------------------|
-| Resolution     | 172 × 320 pixels   |
-| Colour depth   | 16-bit RGB565      |
-| CASET range    | 0x0000 – 0x00AB    |
-| RASET range    | 0x0000 – 0x013F    |
-| Pixel count    | 55 040 pixels      |
-| Frame size     | 110 080 bytes      |
-| Byte order     | Big-endian (MSB first) |
+| Parameter         | Value                                                    |
+|-------------------|----------------------------------------------------------|
+| Physical panel    | 172 × 320 pixels (portrait)                              |
+| Firmware mode     | **Landscape 320 × 172** (MADCTL MY+MV = 0xA0)           |
+| Colour depth      | 16-bit RGB565                                            |
+| CASET range       | 0x0000 – 0x013F (0–319, landscape width)                 |
+| RASET range       | 0x0022 – 0x00CD (34–205, landscape height with offset)   |
+| Column offset     | 34 — physical GRAM columns 0–33 are outside the panel    |
+| Pixel count       | 55 040 pixels (320 × 172)                                |
+| Frame size        | 110 080 bytes                                            |
+| Byte order        | Big-endian (MSB first)                                   |
+
+**Row offset note (landscape):** The ST7789V3 has 240 GRAM columns. With MV=1,
+RASET addresses physical GRAM columns. Only columns 34–205 are connected to the
+172-pixel panel; the 68 columns outside this window must be cleared during init
+to prevent border artefacts.
 
 ### Init sequence
 
-Derived from the Waveshare C reference `LCD_1in47_Init()` in `RP2350-LCD-1.47.zip`.
+Derived from Waveshare C reference `LCD_1in47_Init()`, corrected for landscape
+orientation and 34-pixel column offset.
 
 ```
 Hardware reset: RST high → low (10 ms) → high → wait 120 ms
 
-SWRESET  (01h)           Software reset                    150 ms delay
-SLPOUT   (11h)           Sleep out (enable oscillator)     255 ms delay
-COLMOD   (3Ah) 05h       16-bit/pixel RGB565
-MADCTL   (36h) 00h       Normal scan, no mirror, RGB order
-INVON    (21h)           Display inversion on (required for V3 panel)
-NORON    (13h)           Normal display mode
-CASET    (2Ah) 00 00 00 AB   Columns 0–171
-RASET    (2Bh) 00 00 01 3F   Rows 0–319
-DISPON   (29h)           Display on                        255 ms delay
-BL → high                Backlight on (GPIO21)
+SWRESET  (01h)              Software reset                       150 ms delay
+SLPOUT   (11h)              Sleep out (enable oscillator)        255 ms delay
+COLMOD   (3Ah) 05h          16-bit/pixel RGB565
+MADCTL   (36h) A0h          Landscape: MY=1, MV=1 (90° CCW / 180° from 0x60)
+INVON    (21h)              Display inversion on (required for V3 panel)
+NORON    (13h)              Normal display mode
+[clear full 240×320 GRAM: CASET 0–319, RASET 0–239, RAMWR 76 800 black pixels]
+CASET    (2Ah) 00 00 01 3F  Landscape columns 0–319
+RASET    (2Bh) 00 22 00 CD  Landscape rows 34–205 (panel window)
+DISPON   (29h)              Display on                           255 ms delay
+BL → high                   Backlight on (GPIO21)
 ```
 
 ### Pixel write protocol

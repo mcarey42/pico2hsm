@@ -61,6 +61,18 @@ class KeyError(Pico2HSMError):
     """Raised on key management errors."""
 
 
+class EnrollmentError(Pico2HSMError):
+    """Device is not enrolled or public key mismatch."""
+
+
+class SyncError(Pico2HSMError):
+    """Key sync operation failed."""
+
+
+class ConfigError(Pico2HSMError):
+    """Configuration file is invalid."""
+
+
 # Common status word descriptions
 _SW_DESCRIPTIONS: dict[int, str] = {
     0x9000: "Success",

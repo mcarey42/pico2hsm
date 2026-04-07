@@ -3,5 +3,6 @@ cryptography>=41.0.0
 click>=8.1.0
 tqdm>=4.66.0
 base58>=2.1.1
-noiseprotocol>=0.3.1
+pyyaml>=6.0
+pyudev>=0.24
 pytest>=7.0.0
