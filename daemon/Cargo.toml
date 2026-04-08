@@ -1,0 +1,19 @@
+[package]
+name = "daemon"
+version = "0.1.0"
+edition = "2021"
+description = "Cluster sync daemon for pico2hsm devices"
+license = "MIT"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+thiserror = "1"
+pcsc = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+hex = "0.4"
+libc = "0.2"
+pico2hsm-core = { path = "../pico2hsm-core", features = ["std"] }

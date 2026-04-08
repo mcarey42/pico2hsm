@@ -4,6 +4,7 @@ members = [
     "firmware",
     "tools/hsm-tool",
     "tests/integration",
+    "daemon",
 ]
 resolver = "2"
 

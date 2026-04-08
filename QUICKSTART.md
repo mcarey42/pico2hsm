@@ -289,7 +289,54 @@ If you see a slot listed, the firmware is running correctly.
 
 ---
 
+## Step 7: Initialize the device and generate a key
+
+Now that the firmware is running, initialize the device as a SmartCard-HSM
+and generate your first key. This is a quick smoke test — see
+[docs/SINGLE_DEVICE_SETUP.md](docs/SINGLE_DEVICE_SETUP.md) for a full
+walkthrough with key backup.
+
+```sh
+# Initialize with a test PIN (change these for real use)
+sc-hsm-tool --initialize \
+  --label "MyHSM" \
+  --so-pin 3537363231383830 \
+  --pin 648219 \
+  --dkek-shares 0
+
+# Generate an EC P-256 key pair
+pkcs11-tool --login --pin 648219 \
+  --keypairgen --key-type EC:prime256v1 \
+  --id 01 --label "test-key"
+
+# Sign a test message
+echo "hello pico2hsm" > /tmp/msg.txt
+pkcs11-tool --login --pin 648219 --sign \
+  --mechanism ECDSA-SHA256 --id 01 \
+  --input-file /tmp/msg.txt --output-file /tmp/sig.bin
+
+# If the sign command returns without error, the device is fully operational
+```
+
+The `--dkek-shares 0` option above means no DKEK is configured, which is fine
+for a quick test. For production use with key backup and recovery, set
+`--dkek-shares 1` and follow the full guide.
+
+---
+
 ## What's next
+
+### Set up the device for daily use
+
+Follow [docs/SINGLE_DEVICE_SETUP.md](docs/SINGLE_DEVICE_SETUP.md) to
+initialize the device with DKEK key backup, generate production keys, and
+configure key recovery.
+
+### Set up a mirrored pair for redundancy
+
+Follow [docs/MIRRORED_CLUSTER_SETUP.md](docs/MIRRORED_CLUSTER_SETUP.md) to
+run two pico2hsm devices with identical keys — if one device fails, the other
+has everything.
 
 ### Connect with an application
 
