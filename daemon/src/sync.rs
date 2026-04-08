@@ -11,7 +11,6 @@ use crate::error::{DaemonError, Result};
 
 /// Outcome of a synchronisation attempt.
 #[derive(Debug)]
-#[allow(dead_code)]
 pub struct SyncReport {
     /// True if both devices already had identical root hashes.
     pub already_in_sync: bool,
@@ -20,12 +19,19 @@ pub struct SyncReport {
 }
 
 /// Compare state hashes of two devices and, if they differ, copy every key
-/// from `primary` to `secondary` via DKEK wrap/unwrap.
-#[allow(dead_code)]
+/// from primary to secondary via DKEK wrap/unwrap.
+///
+/// Opens both devices internally so callers do not need to manage `Device`
+/// lifetimes across async boundaries.
 pub fn sync_device_pair(
-    primary: &mut Device,
-    secondary: &mut Device,
+    ctx: &pcsc::Context,
+    primary_reader: &str,
+    secondary_reader: &str,
 ) -> Result<SyncReport> {
+    let _ = ctx; // Context used to prove PC/SC is available; devices open their own.
+    let mut primary = Device::open(primary_reader)?;
+    let mut secondary = Device::open(secondary_reader)?;
+
     // Step 1: fetch state hashes from both devices.
     let (primary_hash, _sw1) = primary.transmit(&apdu::build_get_state_hash())?;
     let (secondary_hash, _sw2) = secondary.transmit(&apdu::build_get_state_hash())?;

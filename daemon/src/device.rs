@@ -75,3 +75,19 @@ impl Device {
         &self.reader_name
     }
 }
+
+/// Return owned reader names for all PC/SC readers whose names contain
+/// "pico2hsm" (case-insensitive).
+pub fn list_pico2hsm_reader_names(ctx: &Context) -> Result<Vec<String>> {
+    let mut buf = vec![0u8; 4096];
+    let readers = ctx.list_readers(&mut buf)?;
+    let names: Vec<String> = readers
+        .filter(|name| {
+            name.to_str()
+                .map(|s| s.to_lowercase().contains(PICO2HSM_READER_SUBSTRING))
+                .unwrap_or(false)
+        })
+        .map(|name| name.to_string_lossy().into_owned())
+        .collect();
+    Ok(names)
+}

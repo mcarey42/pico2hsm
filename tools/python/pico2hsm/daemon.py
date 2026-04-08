@@ -198,8 +198,8 @@ class DkekDaemon:
             if not devices:
                 return b""
             from .protocol import build_extras
-            # Use EXTRAS command with a manifest sub-command (0x35)
-            apdu = build_extras(0x35)
+            # Use EXTRAS command with a manifest sub-command (0x39)
+            apdu = build_extras(0x39)
             data, sw = devices[0].transmit(apdu)
             return data if sw == 0x9000 else b""
         except Exception as e:
@@ -214,8 +214,8 @@ class DkekDaemon:
             if not devices:
                 return b"\x00" * 104
             from .protocol import build_extras
-            # Use EXTRAS command with a state hash sub-command (0x36)
-            apdu = build_extras(0x36)
+            # Use EXTRAS command with a state hash sub-command (0x3A)
+            apdu = build_extras(0x3A)
             data, sw = devices[0].transmit(apdu)
             return data if sw == 0x9000 else b"\x00" * 104
         except Exception as e:
@@ -335,7 +335,7 @@ class DkekDaemon:
                     for i, dev in enumerate(devices):
                         try:
                             from .protocol import build_extras
-                            apdu = build_extras(0x36)
+                            apdu = build_extras(0x3A)
                             data, sw = dev.transmit(apdu)
                             if sw == 0x9000 and len(data) >= 40:
                                 root = data[8:40].hex()

@@ -24,8 +24,8 @@ INS_RESET_RETRY = 0x2C
 INS_INITIALIZE = 0x50
 INS_GENERATE_KEYPAIR = 0x46
 INS_GENERATE_KEY = 0x48
-INS_IMPORT_KEY = 0x58
-INS_EXPORT_KEY = 0x34
+INS_IMPORT_KEY = 0x74
+INS_EXPORT_KEY = 0x72
 INS_SIGN = 0x68
 INS_DECRYPT = 0x62
 INS_CIPHER_SYM = 0x78
@@ -302,7 +302,7 @@ def build_external_auth(auth_data: bytes) -> bytes:
 
 
 def build_import_key(key_id: int, key_data: bytes) -> bytes:
-    """Build IMPORT KEY APDU (INS=0x58).
+    """Build IMPORT KEY APDU (INS=0x74).
 
     key_data should be a DKEK-wrapped key blob.
     """
@@ -310,7 +310,7 @@ def build_import_key(key_id: int, key_data: bytes) -> bytes:
 
 
 def build_export_key(key_id: int) -> bytes:
-    """Build EXPORT KEY APDU (INS=0x34).
+    """Build EXPORT KEY APDU (INS=0x72).
 
     Returns the DKEK-wrapped key blob.
     """

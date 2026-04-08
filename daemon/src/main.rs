@@ -6,6 +6,7 @@ mod health;
 mod sync;
 mod tcp;
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -102,14 +103,29 @@ async fn cmd_start(config_path: PathBuf, pid_file: Option<PathBuf>) {
     let tcp_config = Arc::clone(&config);
     tokio::spawn(tcp::tcp_listener_task(tcp_config));
 
+    // Spawn peer sync task (runs periodically, syncs with configured peers).
+    if !config.peers.is_empty() {
+        let sync_config = Arc::clone(&config);
+        tokio::spawn(peer_sync_task(sync_config));
+    }
+
     // USB device monitor — polls every 5 seconds for new readers.
     let monitor_config = Arc::clone(&config);
-    usb_monitor_loop(monitor_config).await;
+    tokio::spawn(usb_monitor_task(monitor_config));
+
+    // Keep the main task alive so spawned tasks continue running.
+    // Wait for a shutdown signal (Ctrl-C).
+    tokio::signal::ctrl_c()
+        .await
+        .expect("failed to listen for ctrl-c");
+    info!("received shutdown signal — exiting");
 }
 
-/// Polling loop that watches for new pico2hsm USB devices.
-async fn usb_monitor_loop(config: Arc<Config>) {
-    let mut known_readers: Vec<String> = Vec::new();
+/// Background task that polls for new pico2hsm USB devices every 5 seconds
+/// and triggers a sync when `config.sync_on_connect` is true and at least two
+/// readers are present.
+async fn usb_monitor_task(config: Arc<Config>) {
+    let mut known_readers: HashSet<String> = HashSet::new();
 
     loop {
         tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
@@ -117,27 +133,98 @@ async fn usb_monitor_loop(config: Arc<Config>) {
         let result =
             tokio::task::spawn_blocking(|| -> error::Result<Vec<String>> {
                 let ctx = pcsc::Context::establish(pcsc::Scope::User)?;
-                Device::list_readers(&ctx)
+                device::list_pico2hsm_reader_names(&ctx)
             })
             .await;
 
         match result {
             Ok(Ok(current_readers)) => {
-                for reader in &current_readers {
-                    if !known_readers.contains(reader) {
-                        info!(reader = %reader, "new pico2hsm device detected");
-                        if config.sync_on_connect {
-                            info!("sync_on_connect is enabled — sync would start here");
-                        }
-                    }
+                let current_set: HashSet<String> =
+                    current_readers.iter().cloned().collect();
+
+                // Detect new readers.
+                let new_readers: Vec<String> = current_readers
+                    .iter()
+                    .filter(|r| !known_readers.contains(r.as_str()))
+                    .cloned()
+                    .collect();
+
+                for reader in &new_readers {
+                    info!("New pico2hsm device detected: {reader}");
                 }
+
                 // Detect removals.
                 for reader in &known_readers {
-                    if !current_readers.contains(reader) {
+                    if !current_set.contains(reader) {
                         info!(reader = %reader, "pico2hsm device removed");
                     }
                 }
-                known_readers = current_readers;
+
+                // Trigger sync for each new reader if conditions are met.
+                if config.sync_on_connect && current_readers.len() >= 2 {
+                    for new_reader in &new_readers {
+                        // Use readers[0] as primary (skip if the new reader IS readers[0]).
+                        let primary = &current_readers[0];
+                        if primary == new_reader {
+                            // Use the second reader as the other end instead.
+                            if current_readers.len() >= 2 {
+                                let secondary = new_reader.clone();
+                                let primary = current_readers[1].clone();
+                                tokio::task::spawn_blocking(move || {
+                                    match pcsc::Context::establish(pcsc::Scope::User) {
+                                        Ok(ctx) => {
+                                            match sync::sync_device_pair(
+                                                &ctx, &primary, &secondary,
+                                            ) {
+                                                Ok(report) => {
+                                                    info!(
+                                                        keys_transferred = report.keys_transferred,
+                                                        already_in_sync = report.already_in_sync,
+                                                        "sync complete"
+                                                    );
+                                                }
+                                                Err(e) => {
+                                                    warn!("sync failed: {e}");
+                                                }
+                                            }
+                                        }
+                                        Err(e) => {
+                                            warn!("PC/SC context error: {e:?}");
+                                        }
+                                    }
+                                });
+                            }
+                        } else {
+                            let primary = primary.clone();
+                            let secondary = new_reader.clone();
+                            tokio::task::spawn_blocking(move || {
+                                match pcsc::Context::establish(pcsc::Scope::User) {
+                                    Ok(ctx) => {
+                                        match sync::sync_device_pair(
+                                            &ctx, &primary, &secondary,
+                                        ) {
+                                            Ok(report) => {
+                                                info!(
+                                                    keys_transferred = report.keys_transferred,
+                                                    already_in_sync = report.already_in_sync,
+                                                    "sync complete"
+                                                );
+                                            }
+                                            Err(e) => {
+                                                warn!("sync failed: {e}");
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        warn!("PC/SC context error: {e:?}");
+                                    }
+                                }
+                            });
+                        }
+                    }
+                }
+
+                known_readers = current_set;
             }
             Ok(Err(e)) => {
                 warn!("USB monitor error: {e}");
@@ -147,6 +234,86 @@ async fn usb_monitor_loop(config: Arc<Config>) {
             }
         }
     }
+}
+
+/// Periodically connect to each configured peer and perform a state-hash
+/// comparison.  If the hashes differ, download wrapped key blobs from the
+/// peer.  The blobs are logged for now; a future iteration will unwrap them
+/// onto the local device.
+async fn peer_sync_task(config: Arc<Config>) {
+    let interval = tokio::time::Duration::from_secs(config.health_check_interval_secs);
+
+    loop {
+        tokio::time::sleep(interval).await;
+
+        // Get local state root from the first available pico2hsm device.
+        let local_root = match tokio::task::spawn_blocking(get_local_state_root).await {
+            Ok(Ok(root)) => root,
+            Ok(Err(e)) => {
+                warn!("peer_sync: could not read local state root: {e}");
+                continue;
+            }
+            Err(e) => {
+                error!("peer_sync: spawn_blocking panicked: {e}");
+                continue;
+            }
+        };
+
+        for peer in &config.peers {
+            match tcp::initiate_peer_sync(&peer.address, peer.port, local_root).await {
+                Ok(result) => {
+                    if result.already_in_sync {
+                        info!(
+                            peer = %peer.name,
+                            address = %result.peer_address,
+                            "peer already in sync"
+                        );
+                    } else {
+                        info!(
+                            peer = %peer.name,
+                            address = %result.peer_address,
+                            blobs = result.key_blobs.len(),
+                            peer_root = hex::encode(result.peer_root),
+                            "peer sync fetched key blobs"
+                        );
+                    }
+                }
+                Err(e) => {
+                    warn!(peer = %peer.name, "peer sync failed: {e}");
+                }
+            }
+        }
+    }
+}
+
+/// Read the 32-byte state root from the first available local pico2hsm device.
+/// This is a blocking function intended to run inside `spawn_blocking`.
+fn get_local_state_root() -> error::Result<[u8; 32]> {
+    let ctx = pcsc::Context::establish(pcsc::Scope::User)?;
+    let readers = Device::list_readers(&ctx)?;
+
+    if readers.is_empty() {
+        return Err(error::DaemonError::Device(
+            "no pico2hsm readers found".to_string(),
+        ));
+    }
+
+    let mut dev = Device::open(&readers[0])?;
+    let (data, sw) = dev.transmit(&apdu::build_get_state_hash())?;
+
+    if sw != 0x9000 {
+        return Err(error::DaemonError::apdu(sw));
+    }
+
+    if data.len() < 40 {
+        return Err(error::DaemonError::Sync(
+            "state hash response too short".to_string(),
+        ));
+    }
+
+    let mut root = [0u8; 32];
+    root.copy_from_slice(&data[8..40]);
+    Ok(root)
 }
 
 /// Send SIGTERM to the PID recorded in the given file.

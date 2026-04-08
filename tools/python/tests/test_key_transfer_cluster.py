@@ -72,8 +72,8 @@ class TestExportKeyFromDevice:
         assert result == VALID_BLOB_40
         assert len(hsm.transmitted) == 1
         apdu = hsm.transmitted[0]
-        # INS_EXPORT_KEY = 0x34, P2 = key_ref
-        assert apdu[1] == 0x34
+        # INS_EXPORT_KEY = 0x72, P2 = key_ref
+        assert apdu[1] == 0x72
         assert apdu[3] == 0x01
 
     def test_export_key_validates_key_ref_low(self):
@@ -142,8 +142,8 @@ class TestImportKeyToDevice:
 
         assert len(hsm.transmitted) == 1
         apdu = hsm.transmitted[0]
-        # INS_IMPORT_KEY = 0x58, P2 = key_ref
-        assert apdu[1] == 0x58
+        # INS_IMPORT_KEY = 0x74, P2 = key_ref
+        assert apdu[1] == 0x74
         assert apdu[3] == 0x05
 
     def test_import_key_apdu_error(self):

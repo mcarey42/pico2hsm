@@ -11,6 +11,9 @@ pub struct PeerConfig {
     pub name: String,
     pub address: String,
     pub port: u16,
+    /// Role of this peer: "primary", "secondary", or "" (default).
+    #[serde(default)]
+    pub role: String,
 }
 
 /// Top-level daemon configuration, deserialized from TOML.
