@@ -33,14 +33,24 @@ pub fn handle(state: &mut ScHsmState, cmd: &ApduCommand<'_>) -> ApduResponse {
         match state.dkek.import_share_raw(raw) {
             Ok(DkekImportResult::Complete) => {
                 state.dkek_shares_imported = state.dkek.shares_total();
-                // Response: [0x00, shares_total] — 0 remaining, DKEK ready
-                let resp = [0u8, state.dkek.shares_total()];
+                // sc-hsm-tool asserts apdu.resplen >= sizeof(key_check_value) + 2.
+                // key_check_value is 8 bytes, so we must return at least 10 bytes:
+                //   [remaining(1), total(1), kcv(8)]
+                let mut resp = [0u8; 10];
+                resp[0] = 0x00; // 0 shares remaining
+                resp[1] = state.dkek.shares_total();
+                if let Ok(kcv) = state.dkek.compute_kcv() {
+                    resp[2..10].copy_from_slice(&kcv);
+                }
                 return ApduResponse::ok(&resp);
             }
             Ok(DkekImportResult::MoreSharesNeeded { received, total }) => {
                 state.dkek_shares_imported = received;
                 let remaining = total - received;
-                let resp = [remaining, total];
+                // KCV is not yet computable; return zeros for the 8 KCV bytes.
+                let mut resp = [0u8; 10];
+                resp[0] = remaining;
+                resp[1] = total;
                 return ApduResponse::ok(&resp);
             }
             Err(_) => return ApduResponse::err(SW_WRONG_DATA),
@@ -165,10 +175,13 @@ mod tests {
         let resp = handle(&mut state, &cmd);
 
         assert_eq!(resp.sw, SW_OK);
-        // Response data: [remaining=0x00, total=0x01]
-        assert_eq!(resp.data.len(), 2);
+        // Response: [remaining(1), total(1), kcv(8)] = 10 bytes minimum
+        // sc-hsm-tool asserts apdu.resplen >= sizeof(key_check_value) + 2 (8+2=10)
+        assert_eq!(resp.data.len(), 10, "response must be 10 bytes for sc-hsm-tool compatibility");
         assert_eq!(resp.data[0], 0x00, "remaining shares should be 0");
         assert_eq!(resp.data[1], 0x01, "total shares should be 1");
+        // KCV bytes [2..10] must be non-zero (real DKEK was loaded)
+        assert_ne!(&resp.data[2..10], &[0u8; 8], "KCV must not be all zeros when DKEK is ready");
         // DKEK should now be ready
         assert!(state.dkek.is_ready());
         assert_eq!(state.dkek_shares_imported, 1);
