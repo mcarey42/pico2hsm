@@ -307,6 +307,7 @@ impl<P: KeyStore, S: KeyStore> HybridKeyStore<P, S> {
             Err(HsmError::Storage(pico2hsm_core::error::StorageError::WriteError))
         } else {
             self.degraded = false;
+            self.flash_error = false;
             crate::cdc_log!("HYBRID resync ok");
             Ok(())
         }
@@ -445,6 +446,8 @@ impl<P: KeyStore, S: KeyStore> KeyStore for HybridKeyStore<P, S> {
             self.flash_error = true;
             return Err(e);
         }
+        // Primary wipe succeeded — primary flash is healthy.
+        self.flash_error = false;
 
         // Wipe secondary — failure is non-fatal.
         if let Err(_e) = self.secondary.wipe_all() {
@@ -463,6 +466,8 @@ impl<P: KeyStore, S: KeyStore> KeyStore for HybridKeyStore<P, S> {
             self.flash_error = true;
             return Err(e);
         }
+        // Primary wipe succeeded — primary flash is healthy.
+        self.flash_error = false;
 
         // Wipe secondary — failure is non-fatal.
         if let Err(_e) = self.secondary.wipe_by_owner(owner) {

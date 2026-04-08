@@ -223,13 +223,18 @@ impl St7789StatusDisplay {
         self.bl.set_low();
     }
 
-    /// Send the entire framebuffer to the ST7789 display.
+    /// Send the entire framebuffer to the ST7789 display via DMA.
     ///
     /// Call this once after `render()` completes to push the composed frame
     /// to the display in a single SPI burst.  The display only transitions
     /// from the old frame to the new frame during this call — no intermediate
     /// blank-screen state is ever visible.
-    pub fn flush(&mut self) {
+    ///
+    /// The 63 KB framebuffer write uses `spi.write().await` (DMA-backed) so
+    /// the Embassy executor is not blocked during the ~17 ms transfer.  Small
+    /// command/window writes use `blocking_write()` which is fine on an Async
+    /// SPI bus and requires no async context.
+    pub async fn flush(&mut self) {
         // Re-assert the visible window before RAMWR.
         let col_start = LCD_COL_OFFSET;
         let col_end   = LCD_COL_OFFSET + LCD_WIDTH - 1;
@@ -250,8 +255,8 @@ impl St7789StatusDisplay {
         self.dc.set_high();
 
         // SAFETY: FRAMEBUF is only accessed from core0; no concurrent mutation.
-        // SAFETY: FRAMEBUF is a plain byte array; we only read it here.
-        let _ = self.spi.blocking_write(unsafe { &*(&raw const FRAMEBUF) });
+        // DMA write: yields to executor during the ~17 ms transfer.
+        let _ = self.spi.write(unsafe { &*(&raw const FRAMEBUF) }).await;
 
         self.cs_deassert();
     }
@@ -636,9 +641,13 @@ impl LedController for St7789StatusDisplay {
 pub type Rp2350GeekSpi0 =
     embassy_rp::spi::Spi<'static, embassy_rp::peripherals::SPI0, embassy_rp::spi::Blocking>;
 
-/// Blocking SPI1 type for the RP2350-Geek (LCD bus).
+/// Async SPI1 type for the RP2350-Geek (LCD bus).
+/// Async mode enables DMA-backed `flush()` that yields to the Embassy executor
+/// during the ~17 ms 63 KB framebuffer transfer, preventing USB starvation.
+/// Small command writes (1–5 bytes) still use `blocking_write()` which works
+/// on an Async SPI bus without requiring an async context.
 pub type Rp2350GeekSpi1 =
-    embassy_rp::spi::Spi<'static, embassy_rp::peripherals::SPI1, embassy_rp::spi::Blocking>;
+    embassy_rp::spi::Spi<'static, embassy_rp::peripherals::SPI1, embassy_rp::spi::Async>;
 
 // ─── Board struct ─────────────────────────────────────────────────────────────
 

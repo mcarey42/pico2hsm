@@ -89,6 +89,11 @@ static HYBRID_DEGRADED: core::sync::atomic::AtomicBool =
 static HYBRID_FLASH_ERROR: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
+/// Key count — updated by core1 dispatcher after each APDU dispatch.
+/// Read by core0 board runners to display key count on LCD.
+#[cfg(target_arch = "arm")]
+static KEY_COUNT: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
 /// Dispatcher — stored in BSS outside the async task state machine so that
 /// the `dispatcher_task` pool does not need to hold the full 50 KB Dispatcher
 /// struct (which would overflow when combined with the 4 KB APDU/response
@@ -107,6 +112,7 @@ async fn dispatcher_task(
     store: &'static mut pico2hsm_firmware::storage::BoardKeyStore,
 ) {
     use pico2hsm_firmware::apdu::dispatcher::Dispatcher;
+    use pico2hsm_firmware::storage::KeyStore;
     // Core1 must not call defmt: embassy-rp's critical_section uses Spinlock31; if Core1
     // holds it while spinning for RTT buffer space, Core0 blocks with interrupts disabled
     // and USB processing stalls entirely.
@@ -143,6 +149,10 @@ async fn dispatcher_task(
                         !store.is_flash_healthy(),
                         core::sync::atomic::Ordering::Relaxed,
                     );
+                    KEY_COUNT.store(
+                        store.enumerate_keys().len().min(255) as u8,
+                        core::sync::atomic::Ordering::Relaxed,
+                    );
                 }
                 Either::Second(_) => {
                     if store.is_degraded() {
@@ -173,6 +183,10 @@ async fn dispatcher_task(
             let response = dispatcher.dispatch_with_store(&apdu_bytes, store);
             let _ = RESP_CHANNEL.send(response).await;
         }
+        KEY_COUNT.store(
+            store.enumerate_keys().len().min(255) as u8,
+            core::sync::atomic::Ordering::Relaxed,
+        );
     }
 }
 
@@ -198,12 +212,15 @@ embassy_rp::bind_interrupts!(struct Irqs {
     TRNG_IRQ => embassy_rp::trng::InterruptHandler<embassy_rp::peripherals::TRNG>;
     USBCTRL_IRQ => embassy_rp::usb::InterruptHandler<embassy_rp::peripherals::USB>;
     // PIO0/DMA_CH0 used by WS2812B; DMA_CH1+CH2 used by async SPI0 (LCD flush).
+    // DMA_CH3+CH4 used by async SPI1 (geek board LCD flush on SPI1).
     // Multiple handlers on DMA_IRQ_0 — all DMA channels share this interrupt.
     // Harmless to register on all builds — IRQs only fire when hardware is active.
     PIO0_IRQ_0 => embassy_rp::pio::InterruptHandler<embassy_rp::peripherals::PIO0>;
     DMA_IRQ_0 => embassy_rp::dma::InterruptHandler<embassy_rp::peripherals::DMA_CH0>,
                  embassy_rp::dma::InterruptHandler<embassy_rp::peripherals::DMA_CH1>,
-                 embassy_rp::dma::InterruptHandler<embassy_rp::peripherals::DMA_CH2>;
+                 embassy_rp::dma::InterruptHandler<embassy_rp::peripherals::DMA_CH2>,
+                 embassy_rp::dma::InterruptHandler<embassy_rp::peripherals::DMA_CH3>,
+                 embassy_rp::dma::InterruptHandler<embassy_rp::peripherals::DMA_CH4>;
 });
 
 // ─── USB device identity ───────────────────────────────────────────────────────
@@ -625,13 +642,16 @@ async fn run_geek_board(p: embassy_rp::Peripherals) {
     let spi0 = Spi::new_blocking(p.SPI0, p.PIN_18, p.PIN_19, p.PIN_20, spi0_cfg);
     serial_fmt!("SPI0 ok @ {} Hz", SPI_FREQ_HZ);
 
-    serial_ln!("SPI1 init (SCK=10 MOSI=11 MISO=12)...");
+    // SPI1 LCD bus — Async/DMA mode so flush() yields to the executor during
+    // the ~17 ms 63 KB framebuffer transfer, keeping USB alive.
+    // DMA_CH3=TX, DMA_CH4=RX (RX is unused — LCD is write-only).
+    serial_ln!("SPI1 init (SCK=10 MOSI=11 MISO=12, async DMA)...");
     let mut spi1_cfg = SpiConfig::default();
-    spi1_cfg.frequency = SPI_FREQ_HZ;
+    spi1_cfg.frequency = pico2hsm_firmware::board::rp2350_geek::LCD_SPI_FREQ_HZ;
     spi1_cfg.phase = Phase::CaptureOnFirstTransition;
     spi1_cfg.polarity = Polarity::IdleLow;
-    let spi1 = Spi::new_blocking(p.SPI1, p.PIN_10, p.PIN_11, p.PIN_12, spi1_cfg);
-    serial_fmt!("SPI1 ok @ {} Hz", SPI_FREQ_HZ);
+    let spi1 = Spi::new(p.SPI1, p.PIN_10, p.PIN_11, p.PIN_12, p.DMA_CH3, p.DMA_CH4, Irqs, spi1_cfg);
+    serial_fmt!("SPI1 ok @ {} Hz (async DMA)", pico2hsm_firmware::board::rp2350_geek::LCD_SPI_FREQ_HZ);
 
     // ── CHECKPOINT 2 — board struct ──────────────────────────────────────────
     serial_ln!("Board struct init...");
@@ -756,7 +776,7 @@ async fn run_geek_board(p: embassy_rp::Peripherals) {
             serial_ln!("USB connected");
             display_state.status = LedStatus::Ready;
             pico2hsm_firmware::display::render(board.led(), &display_state, &layout);
-            board.led().flush();
+            board.led().flush().await;
             last_activity = embassy_time::Instant::now();
             screensaver = ScreensaverState::Active;
 
@@ -778,7 +798,7 @@ async fn run_geek_board(p: embassy_rp::Peripherals) {
 
                         display_state.status = LedStatus::Busy;
                         pico2hsm_firmware::display::render(board.led(), &display_state, &layout);
-                        board.led().flush();
+                        board.led().flush().await;
 
                         let _ = APDU_CHANNEL.send(apdu_bytes).await;
 
@@ -809,7 +829,7 @@ async fn run_geek_board(p: embassy_rp::Peripherals) {
                                 }
                                 if screensaver == ScreensaverState::Active {
                                     pico2hsm_firmware::display::render(board.led(), &display_state, &layout);
-                                    board.led().flush();
+                                    board.led().flush().await;
                                 }
                                 pico2hsm_firmware::transport::cdc_serial::drain_one(&mut cdc_sender).await;
                             }
@@ -1713,6 +1733,7 @@ async fn run_waveshare_lcd_board(p: embassy_rp::Peripherals) {
                             Ok(()) => {
                                 display_state.status = LedStatus::Ready;
                                 display_state.uptime_secs = embassy_time::Instant::now().as_secs() as u32;
+                                display_state.key_count = KEY_COUNT.load(core::sync::atomic::Ordering::Relaxed);
                                 if let Some((_, op_time)) = display_state.last_op {
                                     if display_state.uptime_secs.saturating_sub(op_time) >= LAST_OP_DISPLAY_SECS {
                                         display_state.last_op = None;
@@ -2060,6 +2081,7 @@ async fn run_waveshare_lcd_hybrid_board(p: embassy_rp::Peripherals) {
                                 display_state.qmi_ok = Some(!flash_err);
                                 display_state.sd_ok = Some(!degraded);
                                 display_state.uptime_secs = embassy_time::Instant::now().as_secs() as u32;
+                                display_state.key_count = KEY_COUNT.load(core::sync::atomic::Ordering::Relaxed);
                                 if let Some((_, op_time)) = display_state.last_op {
                                     if display_state.uptime_secs.saturating_sub(op_time) >= LAST_OP_DISPLAY_SECS {
                                         display_state.last_op = None;
