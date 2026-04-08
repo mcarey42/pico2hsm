@@ -5,7 +5,7 @@ hosts over a network. This covers firewall configuration, TLS identity
 setup, daemon configuration, and verification procedures.
 
 For local (same-host) mirrored setup, see
-[MIRRORED_CLUSTER_SETUP.md](MIRRORED_CLUSTER_SETUP.md).
+[SETUP_LOCAL_CLUSTER.md](SETUP_LOCAL_CLUSTER.md).
 For single-device setup, see
 [SINGLE_DEVICE_SETUP.md](SINGLE_DEVICE_SETUP.md).
 For daemon internals and reference, see
@@ -55,7 +55,7 @@ Before starting, ensure:
 - **Matching DKEK shares.** Both HSMs must be initialized with the same
   DKEK share. If this has not been done, follow the initialization
   procedure in
-  [MIRRORED_CLUSTER_SETUP.md](MIRRORED_CLUSTER_SETUP.md) (steps 1-3)
+  [SETUP_LOCAL_CLUSTER.md](SETUP_LOCAL_CLUSTER.md) (steps 1-3)
   first. This is the most common cause of sync failures.
 - **pico2hsm daemon installed on both hosts.** From the repository root:
 
@@ -704,7 +704,7 @@ For sites connected via WireGuard, OpenVPN, or IPsec:
 | `ConfigError: N primary peers; exactly one is required` | Multiple peers marked as primary | Review config on both hosts | Exactly one peer should have `role: primary` |
 | `Health check: cluster OUT OF SYNC` | Key added on one device but not yet synced | Wait 60 seconds for the next health check cycle | Usually self-resolves; run `verify-sync` to confirm |
 | Peer shows as DISCONNECTED in status | Network partition or daemon down on peer | `ping <peer-ip>`, `traceroute <peer-ip>` | Check network path; restart remote daemon |
-| Keys not syncing despite connection | DKEK mismatch (different share on each device) | Compare state hashes (section 9.3); if roots differ even with same keys, DKEK differs | Re-initialize both devices with the same DKEK share ([MIRRORED_CLUSTER_SETUP.md](MIRRORED_CLUSTER_SETUP.md)) |
+| Keys not syncing despite connection | DKEK mismatch (different share on each device) | Compare state hashes (section 9.3); if roots differ even with same keys, DKEK differs | Re-initialize both devices with the same DKEK share ([SETUP_LOCAL_CLUSTER.md](SETUP_LOCAL_CLUSTER.md)) |
 | `DKEKError: Unexpected pubkey length` | Device not initialized or wrong applet selected | `opensc-tool --list-readers` to verify device is present | Initialize the device; check USB connection |
 | `EnrollmentError: Device not enrolled` | Device identity key not in config | Run enrollment (section 8) | Add device public key to config |
 | Sync slow with many keys | Large manifest exchange | Check key count: `pkcs11-tool --login --pin 648219 --list-objects \| grep -c "Private Key"` | Normal for large key sets; initial sync is sequential |

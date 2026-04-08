@@ -5,7 +5,7 @@ PKCS#11 hardware security module with key backup and recovery.
 
 For building and flashing firmware, see [QUICKSTART.md](../QUICKSTART.md).
 For a two-device redundant setup, see
-[MIRRORED_CLUSTER_SETUP.md](MIRRORED_CLUSTER_SETUP.md).
+[SETUP_LOCAL_CLUSTER.md](SETUP_LOCAL_CLUSTER.md).
 
 ---
 

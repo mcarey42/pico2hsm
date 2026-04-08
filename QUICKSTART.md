@@ -102,7 +102,7 @@ cargo install probe-rs-tools
 ## Step 2: Get the code
 
 ```sh
-git clone https://github.com/yourorg/pico2hsm
+git clone https://github.com/mcarey42/pico2hsm
 cd pico2hsm
 ```
 
@@ -334,7 +334,7 @@ configure key recovery.
 
 ### Set up a mirrored pair for redundancy
 
-Follow [docs/MIRRORED_CLUSTER_SETUP.md](docs/MIRRORED_CLUSTER_SETUP.md) to
+Follow [docs/SETUP_LOCAL_CLUSTER.md](docs/SETUP_LOCAL_CLUSTER.md) to
 run two pico2hsm devices with identical keys — if one device fails, the other
 has everything.
 

@@ -52,7 +52,7 @@ The default build includes all three applets (SC-HSM, PIV, OpenPGP with
 Ed25519/X25519) and RSA support. Generate your signing key first, then build:
 
 ```bash
-git clone https://github.com/yourorg/pico2hsm
+git clone https://github.com/mcarey42/pico2hsm
 cd pico2hsm
 rustup target add thumbv8m.main-none-eabihf
 
