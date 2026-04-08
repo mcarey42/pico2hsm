@@ -609,6 +609,11 @@ fn handle_get_key_manifest(state: &mut ScHsmState, store: &mut dyn KeyStore, _cm
     // Iterate in-memory EC keys.
     for key in state.keys.iter() {
         let key_ref = (key.key_id & 0xFF) as u8;
+        // Exclude device-internal keys: 0x00 (device cluster signing key) and
+        // 0xFE (device auth cert key).  Only user keys 0x01–0xFD are synced.
+        if key_ref == 0x00 || key_ref >= 0xFE {
+            continue;
+        }
         let algo = key.algo;
         let key_flags = 0u8; // No flags defined yet.
         let deleted = 0u8;
@@ -632,6 +637,10 @@ fn handle_get_key_manifest(state: &mut ScHsmState, store: &mut dyn KeyStore, _cm
     let flash_keys = store.enumerate_keys();
     for kid in flash_keys.iter() {
         let key_ref = (kid.0 & 0xFF) as u8;
+        // Exclude device-internal keys (same filter as in-memory above).
+        if key_ref == 0x00 || key_ref >= 0xFE {
+            continue;
+        }
         // Skip if already seen in in-memory keys.
         if state.keys.iter().any(|k| (k.key_id & 0xFF) as u8 == key_ref) {
             continue;
@@ -1534,9 +1543,9 @@ mod tests {
 
         let resp = handle(&mut state, &mut store, &cmd);
         assert_eq!(resp.sw, 0x9000);
-        // State has 1 key (device static key at 0xFE), so 44 bytes.
-        assert_eq!(resp.data.len(), 44, "expected 44 bytes for 1 key entry");
-        assert_eq!(resp.data[0], 0xFE, "first key_ref should be 0xFE");
+        // State has only the device static key at 0xFE, which is filtered out
+        // from the manifest (only user keys 0x01–0xFD are exported).
+        assert_eq!(resp.data.len(), 0, "device key (0xFE) must be excluded from manifest");
     }
 
     #[test]

@@ -131,6 +131,29 @@ class CLIRunner:
             timeout=timeout,
         )
 
+    def send_apdu(
+        self,
+        *apdus: str,
+        reader: int = 0,
+        save_as: Optional[str] = None,
+    ) -> CLIResult:
+        """Send one or more raw APDUs via opensc-tool and return the result.
+
+        APDUs are passed as hex strings (e.g. ``"80543C0000"``).
+        opensc-tool prints each response as hex to stdout; SW bytes are on
+        the ``Received (SW1=0x.., SW2=0x..)`` line.
+
+        Args:
+            apdus: Hex APDU strings to send in sequence.
+            reader: PCSC reader index (default 0).
+            save_as: If set, save the trace to this filename in run_dir.
+        """
+        cmd = ["opensc-tool", "-c", "default", f"-r{reader}"]
+        for apdu in apdus:
+            cmd += ["-s", apdu]
+        return self.run(cmd, save_as=save_as,
+                        env_extra={"OPENSC_DEFAULT_READER": str(reader)})
+
 
 def _write_trace_file(
     path: Path,
