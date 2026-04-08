@@ -1,8 +1,15 @@
-"""Daemon TLS identity management for pico2hsm cluster."""
+"""Daemon TLS identity management for pico2hsm cluster.
+
+Supports two modes:
+  - Anonymous (default): TLS encryption only, no peer certificate verification.
+  - CA-authenticated: peer certificates must be issued by a configured CA.
+"""
 
 from __future__ import annotations
 
+import datetime
 import hashlib
+import ipaddress
 import json
 import logging
 import os
@@ -17,11 +24,14 @@ DAEMON_CERT_FILE = "daemon.crt"
 DAEMON_KEY_FILE = "daemon.key"
 KNOWN_PEERS_FILE = "known_peers.json"
 
+# Default warning threshold for certificate expiry
+DEFAULT_CERT_WARN_DAYS = 90
+
 
 def ensure_daemon_identity(config_dir: Path) -> tuple[Path, Path]:
     """Ensure daemon has a persistent TLS identity. Generate on first run.
 
-    Creates RSA-2048 self-signed X.509 certificate if not present.
+    Creates P-256 ECDSA self-signed X.509 certificate if not present.
     Sets file permissions to 0o600 for key, 0o644 for cert.
 
     Returns (cert_path, key_path).
@@ -52,15 +62,235 @@ def get_cert_fingerprint(cert_path: Path) -> bytes:
     return hashlib.sha256(cert.public_bytes(Encoding.DER)).digest()
 
 
+def create_server_context(
+    cert_path: str,
+    key_path: str,
+    ca_cert: Optional[str] = None,
+    peer_cn: Optional[str] = None,
+    warn_days: int = DEFAULT_CERT_WARN_DAYS,
+) -> ssl.SSLContext:
+    """Create TLS server context.
+
+    If ca_cert is None: anonymous mode (encryption only, CERT_NONE).
+    If ca_cert is set: CA-authenticated mode (CERT_REQUIRED, CA bundle loaded).
+
+    Args:
+        cert_path: Path to this daemon's certificate PEM.
+        key_path: Path to this daemon's private key PEM.
+        ca_cert: Path to CA bundle PEM for authenticated mode. None = anonymous.
+        peer_cn: Expected peer CN/SAN (used with CA mode for subject check).
+        warn_days: Days before expiry to log a warning for own cert.
+    """
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.load_cert_chain(cert_path, key_path)
+
+    # Check own cert expiry at context creation time
+    check_cert_expiry_file(cert_path, "own daemon", warn_days)
+
+    if ca_cert is not None:
+        # CA-authenticated mode
+        ctx.verify_mode = ssl.CERT_REQUIRED
+        ctx.load_verify_locations(cafile=ca_cert)
+        # Server contexts cannot use check_hostname (it requires server_hostname
+        # which is only available on the client side). Manual CN/SAN checks
+        # must be done after the handshake via check_peer_identity().
+    else:
+        # Anonymous mode: encryption only
+        ctx.verify_mode = ssl.CERT_NONE
+
+    # Use modern cipher suites
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+
+    return ctx
+
+
+def create_client_context(
+    cert_path: str,
+    key_path: str,
+    ca_cert: Optional[str] = None,
+    peer_name: Optional[str] = None,
+    warn_days: int = DEFAULT_CERT_WARN_DAYS,
+) -> ssl.SSLContext:
+    """Create TLS client context.
+
+    If ca_cert is None: anonymous mode (encryption only, CERT_NONE).
+    If ca_cert is set: CA-authenticated mode (CERT_REQUIRED, CA bundle,
+        hostname verification if peer_name is a hostname).
+
+    Args:
+        cert_path: Path to this daemon's certificate PEM.
+        key_path: Path to this daemon's private key PEM.
+        ca_cert: Path to CA bundle PEM for authenticated mode. None = anonymous.
+        peer_name: Expected peer hostname or IP for subject verification.
+        warn_days: Days before expiry to log a warning for own cert.
+    """
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.load_cert_chain(cert_path, key_path)
+
+    # Check own cert expiry at context creation time
+    check_cert_expiry_file(cert_path, "own daemon", warn_days)
+
+    if ca_cert is not None:
+        # CA-authenticated mode
+        ctx.verify_mode = ssl.CERT_REQUIRED
+        ctx.load_verify_locations(cafile=ca_cert)
+
+        # Enable hostname checking only for actual hostnames, not raw IPs
+        if peer_name and not _is_ip_address(peer_name):
+            ctx.check_hostname = True
+        else:
+            ctx.check_hostname = False
+    else:
+        # Anonymous mode
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+
+    return ctx
+
+
+def check_cert_expiry(
+    cert_pem: bytes,
+    name: str,
+    warn_days: int = DEFAULT_CERT_WARN_DAYS,
+) -> Optional[int]:
+    """Check certificate expiry and log a warning if it expires within warn_days.
+
+    Args:
+        cert_pem: PEM-encoded certificate bytes.
+        name: Human-readable name for log messages (e.g., peer name).
+        warn_days: Days before expiry to start warning.
+
+    Returns:
+        Days until expiry if within the warning window, None otherwise.
+    """
+    from cryptography import x509
+
+    cert = x509.load_pem_x509_certificate(cert_pem)
+    not_after = cert.not_valid_after_utc
+    now = datetime.datetime.now(datetime.timezone.utc)
+    remaining = (not_after - now).days
+
+    if remaining <= warn_days:
+        expiry_date = not_after.strftime("%Y-%m-%d")
+        logger.warning(
+            "Peer '%s' certificate expires in %d days (%s). "
+            "Renew before expiry to avoid connection failures.",
+            name, remaining, expiry_date,
+        )
+        return remaining
+    return None
+
+
+def check_cert_expiry_file(
+    cert_path: str,
+    name: str,
+    warn_days: int = DEFAULT_CERT_WARN_DAYS,
+) -> Optional[int]:
+    """Check certificate expiry from a file path. Convenience wrapper."""
+    try:
+        cert_pem = Path(cert_path).read_bytes()
+        return check_cert_expiry(cert_pem, name, warn_days)
+    except Exception as e:
+        logger.debug("Could not check cert expiry for %s: %s", name, e)
+        return None
+
+
+def check_peer_cert_expiry(
+    ssl_sock: ssl.SSLSocket,
+    peer_name: str,
+    warn_days: int = DEFAULT_CERT_WARN_DAYS,
+) -> Optional[int]:
+    """Check the peer certificate expiry after a successful TLS handshake.
+
+    Args:
+        ssl_sock: Connected SSLSocket after handshake.
+        peer_name: Human-readable name for log messages.
+        warn_days: Days before expiry to start warning.
+
+    Returns:
+        Days until expiry if within the warning window, None otherwise.
+    """
+    der_cert = ssl_sock.getpeercert(binary_form=True)
+    if der_cert is None:
+        return None
+
+    from cryptography import x509
+    cert = x509.load_der_x509_certificate(der_cert)
+    not_after = cert.not_valid_after_utc
+    now = datetime.datetime.now(datetime.timezone.utc)
+    remaining = (not_after - now).days
+
+    if remaining <= warn_days:
+        expiry_date = not_after.strftime("%Y-%m-%d")
+        logger.warning(
+            "Peer '%s' certificate expires in %d days (%s). "
+            "Renew before expiry to avoid connection failures.",
+            peer_name, remaining, expiry_date,
+        )
+        return remaining
+    return None
+
+
+def check_peer_identity(
+    ssl_sock: ssl.SSLSocket,
+    expected_name: str,
+) -> bool:
+    """Verify peer certificate CN or SAN matches expected_name.
+
+    Used in CA-authenticated mode for server-side checks (where
+    ssl.check_hostname is not available).
+
+    Args:
+        ssl_sock: Connected SSLSocket after handshake.
+        expected_name: Expected CN or SAN (hostname or IP).
+
+    Returns:
+        True if the peer identity matches.
+    """
+    der_cert = ssl_sock.getpeercert(binary_form=True)
+    if der_cert is None:
+        logger.warning("No peer certificate available for identity check")
+        return False
+
+    from cryptography import x509
+
+    cert = x509.load_der_x509_certificate(der_cert)
+
+    # Check Subject Alternative Names first
+    try:
+        san_ext = cert.extensions.get_extension_for_class(x509.SubjectAlternativeName)
+        dns_names = san_ext.value.get_values_for_type(x509.DNSName)
+        ip_addrs = [str(ip) for ip in san_ext.value.get_values_for_type(x509.IPAddress)]
+        if expected_name in dns_names or expected_name in ip_addrs:
+            return True
+    except x509.ExtensionNotFound:
+        pass
+
+    # Fall back to Common Name
+    cn_attrs = cert.subject.get_attributes_for_oid(x509.oid.NameOID.COMMON_NAME)
+    for attr in cn_attrs:
+        if attr.value == expected_name:
+            return True
+
+    logger.warning(
+        "Peer certificate CN/SAN does not match expected name '%s'",
+        expected_name,
+    )
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Legacy compatibility aliases
+# ---------------------------------------------------------------------------
+
 def create_mtls_server_context(
     cert_path: Path,
     key_path: Path,
     peer_certs: list[Path],
 ) -> ssl.SSLContext:
-    """Create mTLS server context requiring client cert verification.
-
-    peer_certs: list of trusted peer certificate files.
-    """
+    """Legacy wrapper. Use create_server_context() for new code."""
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     ctx.load_cert_chain(str(cert_path), str(key_path))
     if peer_certs:
@@ -77,10 +307,7 @@ def create_mtls_client_context(
     key_path: Path,
     server_cert: Optional[Path] = None,
 ) -> ssl.SSLContext:
-    """Create mTLS client context.
-
-    server_cert: if provided, verify server against this specific cert.
-    """
+    """Legacy wrapper. Use create_client_context() for new code."""
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     ctx.load_cert_chain(str(cert_path), str(key_path))
     ctx.check_hostname = False
@@ -88,9 +315,13 @@ def create_mtls_client_context(
         ctx.verify_mode = ssl.CERT_REQUIRED
         ctx.load_verify_locations(str(server_cert))
     else:
-        ctx.verify_mode = ssl.CERT_NONE  # fallback for development
+        ctx.verify_mode = ssl.CERT_NONE
     return ctx
 
+
+# ---------------------------------------------------------------------------
+# Peer enrollment helpers
+# ---------------------------------------------------------------------------
 
 def load_known_peers(config_dir: Path) -> dict[str, str]:
     """Load peer fingerprint -> cert_path mapping from known_peers.json."""
@@ -133,15 +364,18 @@ def enroll_peer(config_dir: Path, peer_name: str, peer_cert_pem: bytes) -> None:
     logger.info("Enrolled peer %s (fingerprint %s...)", peer_name, fingerprint[:16])
 
 
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
+
 def _generate_identity(cert_path: Path, key_path: Path) -> None:
-    """Generate RSA-2048 key + self-signed cert. Write with strict permissions."""
-    from cryptography.hazmat.primitives.asymmetric import rsa
+    """Generate P-256 ECDSA key + self-signed cert. Write with strict permissions."""
+    from cryptography.hazmat.primitives.asymmetric import ec
     from cryptography.hazmat.primitives import serialization, hashes
     from cryptography import x509
     from cryptography.x509.oid import NameOID
-    import datetime
 
-    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    key = ec.generate_private_key(ec.SECP256R1())
 
     # Write key with mode 0o600
     key_pem = key.private_bytes(
@@ -153,7 +387,7 @@ def _generate_identity(cert_path: Path, key_path: Path) -> None:
     with os.fdopen(fd, "wb") as f:
         f.write(key_pem)
 
-    # Build self-signed cert
+    # Build self-signed cert with ECDSA-SHA256
     subject = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "pico2hsm-daemon")])
     cert = (
         x509.CertificateBuilder()
@@ -181,3 +415,12 @@ def _check_key_permissions(key_path: Path) -> None:
             key_path,
             mode,
         )
+
+
+def _is_ip_address(value: str) -> bool:
+    """Return True if value is an IP address (v4 or v6)."""
+    try:
+        ipaddress.ip_address(value)
+        return True
+    except ValueError:
+        return False

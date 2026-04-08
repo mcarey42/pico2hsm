@@ -8,10 +8,8 @@
 //! - P1=0x05: AES-CMAC
 //! - P1=0x06: HMAC-SHA256
 //! - P1=0x30: GET_DEVICE_PUBLIC_KEY
-//! - P1=0x31: NOISE_INITIATE (deprecated — use V2 protocol P1=0x35-0x38)
-//! - P1=0x32: NOISE_FINALIZE_SEND (deprecated — use P1=0x37)
-//! - P1=0x33: NOISE_FINALIZE_RECV (deprecated — use P1=0x38)
-//! - P1=0x34: GET_GENERATION (deprecated — use P1=0x3C)
+//! - P1=0x31–0x33: (removed — V1 DKEK exchange, returns SW_INS_NOT_SUPPORTED)
+//! - P1=0x34: GET_GENERATION (V1 compat, returns low 4 bytes of generation counter)
 //! - P1=0x35: NOISE_TARGET_INIT (V2 mutual-auth DKEK exchange)
 //! - P1=0x36: NOISE_SOURCE_RESPOND (V2)
 //! - P1=0x37: NOISE_FINALIZE_SEND_V2
@@ -65,10 +63,8 @@ pub fn handle(state: &mut ScHsmState, store: &mut dyn KeyStore, cmd: &ApduComman
                 0x04 => x963_kdf(cmd.data),
                 0x05 => aes_cmac(cmd.data),
                 0x06 => hmac_sha256(cmd.data),
-                // Deprecated V1 DKEK exchange — kept for backward compatibility.
-                0x31 => handle_noise_initiate(state, cmd),
-                0x32 => handle_noise_finalize_send(state, cmd),
-                0x33 => handle_noise_finalize_recv(state, cmd),
+                // V1 DKEK exchange (P1=0x31–0x33) removed — use V2 (P1=0x35–0x38).
+                0x31 | 0x32 | 0x33 => ApduResponse::err(pico2hsm_core::apdu::SW_INS_NOT_SUPPORTED),
                 // V2 mutual-auth DKEK exchange.
                 0x35 => handle_noise_target_init(state, store, cmd),
                 0x36 => handle_noise_source_respond(state, store, cmd),
@@ -113,123 +109,12 @@ fn handle_get_device_public_key(state: &mut ScHsmState, store: &mut dyn KeyStore
 }
 
 // ---------------------------------------------------------------------------
-// P1=0x31  NOISE_INITIATE
-// ---------------------------------------------------------------------------
-
-fn handle_noise_initiate(state: &mut ScHsmState, _cmd: &ApduCommand<'_>) -> ApduResponse {
-    use crate::crypto::asymmetric::generate_ec_keypair;
-    use pico2hsm_core::key::KeyType as CoreKeyType;
-    use zeroize::Zeroizing;
-
-    let mut rng = FwRng;
-    let pair = match generate_ec_keypair(CoreKeyType::EcPrivateP256, &mut rng) {
-        Ok(p) => p,
-        Err(_) => return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
-    };
-
-    // Store ephemeral private key.
-    let mut priv_bytes = Zeroizing::new([0u8; 32]);
-    if pair.private_key.len() != 32 {
-        return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED);
-    }
-    priv_bytes.copy_from_slice(&pair.private_key);
-    state.exchange_ephem_priv = Some(priv_bytes);
-
-    // Store ephemeral public key.
-    if pair.public_key.len() != 65 {
-        return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED);
-    }
-    let mut pub_bytes = [0u8; 65];
-    pub_bytes.copy_from_slice(&pair.public_key);
-    state.exchange_ephem_pub = Some(pub_bytes);
-
-    // Return our ephemeral public key (65 bytes).
-    ApduResponse::ok(&pub_bytes)
-}
-
-// ---------------------------------------------------------------------------
-// P1=0x32  NOISE_FINALIZE_SEND
-// ---------------------------------------------------------------------------
-
-fn handle_noise_finalize_send(state: &mut ScHsmState, cmd: &ApduCommand<'_>) -> ApduResponse {
-    // Require DKEK ready.
-    if !state.dkek.is_ready() {
-        return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED);
-    }
-
-    // Require ephemeral private key from a prior NOISE_INITIATE.
-    let ephem_priv = match &state.exchange_ephem_priv {
-        Some(p) => **p, // copy the 32-byte array
-        None => return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
-    };
-
-    // cmd.data = peer's ephemeral public key (65 bytes).
-    if cmd.data.len() != 65 {
-        return ApduResponse::err(SW_WRONG_DATA);
-    }
-    let peer_ephem_pub: &[u8; 65] = cmd.data.try_into().unwrap_or_else(|_| unreachable!());
-
-    let mut rng = FwRng;
-    let result = state.dkek.noise_send_dkek_data(peer_ephem_pub, &ephem_priv, &mut rng);
-
-    // Clear ephemeral state regardless of outcome.
-    state.exchange_ephem_priv = None;
-    state.exchange_ephem_pub = None;
-
-    match result {
-        Ok(encrypted_blob) => ApduResponse::ok(&encrypted_blob),
-        Err(_) => ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
-    }
-}
-
-// ---------------------------------------------------------------------------
-// P1=0x33  NOISE_FINALIZE_RECV
-// ---------------------------------------------------------------------------
-
-fn handle_noise_finalize_recv(state: &mut ScHsmState, cmd: &ApduCommand<'_>) -> ApduResponse {
-    // Require ephemeral private key from a prior NOISE_INITIATE.
-    let ephem_priv = match &state.exchange_ephem_priv {
-        Some(p) => **p, // copy the 32-byte array
-        None => return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
-    };
-
-    // cmd.data = initiator_ephem_pub(65) || encrypted_dkek(60) || initiator_device_id(16) = 141 bytes.
-    if cmd.data.len() != 141 {
-        return ApduResponse::err(SW_WRONG_DATA);
-    }
-
-    let initiator_ephem_pub: &[u8; 65] = cmd.data[..65].try_into().unwrap();
-    let encrypted_dkek: &[u8; 60] = cmd.data[65..125].try_into().unwrap();
-    let initiator_device_id: &[u8; 16] = cmd.data[125..141].try_into().unwrap();
-
-    let result = state.dkek.noise_recv_dkek_data(
-        initiator_ephem_pub,
-        &ephem_priv,
-        encrypted_dkek,
-        initiator_device_id,
-    );
-
-    // Clear ephemeral state regardless of outcome.
-    state.exchange_ephem_priv = None;
-    state.exchange_ephem_pub = None;
-
-    match result {
-        Ok(()) => {
-            state.dkek_shares_imported = state.dkek.shares_total();
-            ApduResponse::ok(&[])
-        }
-        Err(_) => ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
-    }
-}
-
-// ---------------------------------------------------------------------------
 // P1=0x34  GET_GENERATION
 // ---------------------------------------------------------------------------
 
-fn handle_get_generation(_state: &mut ScHsmState, _cmd: &ApduCommand<'_>) -> ApduResponse {
-    // TODO: Return the max generation counter across all stored keys.
-    // For now, return placeholder zeros.
-    ApduResponse::ok(&[0u8; 4])
+fn handle_get_generation(state: &mut ScHsmState, _cmd: &ApduCommand<'_>) -> ApduResponse {
+    // Return the low 4 bytes of the generation counter (V1 compat).
+    ApduResponse::ok(&(state.generation as u32).to_be_bytes())
 }
 
 // ---------------------------------------------------------------------------
@@ -310,9 +195,32 @@ fn handle_noise_source_respond(state: &mut ScHsmState, store: &mut dyn KeyStore,
     let challenge: &[u8; 32] = cmd.data[65..97].try_into().unwrap();
     let sig_t: &[u8; 64] = cmd.data[97..161].try_into().unwrap();
 
-    // TODO(V2): verify Sig_T against enrolled peer pubkey.
-    // For V1, just check signature format validity (64 bytes, already validated by length).
-    let _ = sig_t;
+    // Verify Sig_T: TARGET signed SHA-256(ephem_T_pub || challenge) with its static key.
+    if let Some(ref peer_pubkey) = state.noise_enrolled_peer_pubkey {
+        use ecdsa::signature::hazmat::PrehashVerifier;
+        use p256::ecdsa::VerifyingKey;
+
+        let vk = match VerifyingKey::from_sec1_bytes(peer_pubkey) {
+            Ok(v) => v,
+            Err(_) => return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
+        };
+        // Reconstruct the message hash that TARGET signed.
+        let mut hasher = Sha256::new();
+        hasher.update(ephem_t_pub);
+        hasher.update(challenge);
+        let msg_hash: [u8; 32] = hasher.finalize().into();
+
+        let sig = match ecdsa::Signature::<p256::NistP256>::from_bytes(sig_t.into()) {
+            Ok(s) => s,
+            Err(_) => return ApduResponse::err(SW_WRONG_DATA),
+        };
+        if vk.verify_prehash(&msg_hash, &sig).is_err() {
+            return ApduResponse::err(SW_SECURITY_STATUS);
+        }
+    } else {
+        // No peer pubkey enrolled — unauthenticated mode.
+        // Continue without signature verification (allows bootstrapping before enrollment).
+    }
 
     // Source must already have an ephemeral keypair from a prior NOISE_INITIATE (P1=0x31).
     let ephem_s_pub = match &state.exchange_ephem_pub {
@@ -516,9 +424,46 @@ fn handle_noise_finalize_recv_v2(state: &mut ScHsmState, store: &mut dyn KeyStor
         return ApduResponse::err(SW_WRONG_DATA);
     }
 
-    // TODO(V2): verify Sig_S against enrolled source pubkey.
-    // For V1, just validate signature format (64 bytes, already checked by length).
-    let _ = sig_s;
+    // Verify Sig_S: SOURCE signed SHA-256(source_ephem_pub || challenge) with its static key.
+    if let Some(ref peer_pubkey) = state.noise_enrolled_peer_pubkey {
+        use ecdsa::signature::hazmat::PrehashVerifier;
+        use p256::ecdsa::VerifyingKey;
+        use sha2::{Digest, Sha256};
+
+        let vk = match VerifyingKey::from_sec1_bytes(peer_pubkey) {
+            Ok(v) => v,
+            Err(_) => {
+                state.exchange_ephem_priv = None;
+                state.exchange_ephem_pub = None;
+                state.exchange_challenge = None;
+                return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED);
+            }
+        };
+        // Reconstruct the message hash that SOURCE signed.
+        let mut hasher = Sha256::new();
+        hasher.update(source_ephem_pub.as_slice());
+        hasher.update(&challenge);
+        let msg_hash: [u8; 32] = hasher.finalize().into();
+
+        let sig = match ecdsa::Signature::<p256::NistP256>::from_bytes(sig_s.into()) {
+            Ok(s) => s,
+            Err(_) => {
+                state.exchange_ephem_priv = None;
+                state.exchange_ephem_pub = None;
+                state.exchange_challenge = None;
+                return ApduResponse::err(SW_WRONG_DATA);
+            }
+        };
+        if vk.verify_prehash(&msg_hash, &sig).is_err() {
+            state.exchange_ephem_priv = None;
+            state.exchange_ephem_pub = None;
+            state.exchange_challenge = None;
+            return ApduResponse::err(SW_SECURITY_STATUS);
+        }
+    } else {
+        // No peer pubkey enrolled — unauthenticated mode.
+        // Continue without signature verification (allows bootstrapping before enrollment).
+    }
 
     // Compute ECDH shared secret.
     let shared_secret = match p256_ecdh(&ephem_priv, source_ephem_pub) {

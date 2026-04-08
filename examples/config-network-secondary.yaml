@@ -40,6 +40,14 @@ tls_enabled: true
 identity_cert: "/var/lib/pico2hsm/daemon.crt"
 identity_key: "/var/lib/pico2hsm/daemon.key"
 
+# Path to CA certificate bundle PEM. When set, TLS switches from anonymous
+# (encryption-only) mode to CA-authenticated mode: peer certificates must be
+# issued by this CA or a sub-CA in its chain. Must match the primary's setting.
+# ca_cert: "/etc/pico2hsm/ca/ca-bundle.pem"
+
+# Days before certificate expiry to start logging warnings.
+# tls_cert_warn_days: 90
+
 # ---- Cluster ----
 # Must match the primary's cluster_id.
 cluster_id: "prod-cluster"
@@ -54,6 +62,10 @@ peers:
     # TLS certificate of the primary node for mutual authentication.
     # Obtain this from the primary node's state_dir/daemon.crt.
     cert_path: "/etc/pico2hsm/certs/primary-node.crt"
+    # SHA-256 fingerprint of the primary's TLS cert (for anonymous mode pinning).
+    # cert_fingerprint: "ab:cd:ef:01:23:45:67:89..."
+    # Expected CN or SAN in the peer's certificate (defaults to peer name).
+    # peer_cn: "hsm-primary.example.com"
 
   - name: "hsm-secondary"
     role: "secondary"

@@ -338,32 +338,56 @@ def _recv_exactly(conn: socket.socket, n: int) -> bytes:
 
 
 # ---------------------------------------------------------------------------
-# Anonymous TLS helpers
+# Anonymous TLS helpers (used by standalone exchange_tcp_server/client)
 # ---------------------------------------------------------------------------
 
-def _wrap_tls_server(conn: socket.socket, cert_path=None, key_path=None) -> socket.socket:
+def _wrap_tls_server(
+    conn: socket.socket,
+    cert_path: Optional[str] = None,
+    key_path: Optional[str] = None,
+    ca_cert: Optional[str] = None,
+) -> socket.socket:
     """Wrap server socket with TLS. Uses daemon identity cert if provided."""
-    from .tls import ensure_daemon_identity
+    from .tls import ensure_daemon_identity, create_server_context
     import tempfile
     from pathlib import Path
 
     if cert_path is None or key_path is None:
-        # Fallback: generate ephemeral cert using cryptography library (no subprocess)
         tmp_dir = Path(tempfile.mkdtemp())
-        cert_path, key_path = ensure_daemon_identity(tmp_dir)
+        cert_path_p, key_path_p = ensure_daemon_identity(tmp_dir)
+        cert_path = str(cert_path_p)
+        key_path = str(key_path_p)
 
-    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    ctx.load_cert_chain(str(cert_path), str(key_path))
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
+    ctx = create_server_context(
+        cert_path=cert_path,
+        key_path=key_path,
+        ca_cert=ca_cert,
+    )
     return ctx.wrap_socket(conn, server_side=True)
 
 
-def _wrap_tls_client(conn: socket.socket, _hostname: str, cert_path=None, key_path=None) -> socket.socket:
-    """Wrap a client socket with TLS. Uses daemon identity cert for mTLS if provided."""
-    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+def _wrap_tls_client(
+    conn: socket.socket,
+    hostname: str,
+    cert_path: Optional[str] = None,
+    key_path: Optional[str] = None,
+    ca_cert: Optional[str] = None,
+) -> socket.socket:
+    """Wrap a client socket with TLS. Uses daemon identity cert if provided."""
+    from .tls import create_client_context
+
     if cert_path and key_path:
-        ctx.load_cert_chain(str(cert_path), str(key_path))
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
-    return ctx.wrap_socket(conn, server_side=False)
+        ctx = create_client_context(
+            cert_path=cert_path,
+            key_path=key_path,
+            ca_cert=ca_cert,
+            peer_name=hostname,
+        )
+    else:
+        # No identity cert -- anonymous encryption-only client
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+
+    server_hostname = hostname if ca_cert else None
+    return ctx.wrap_socket(conn, server_hostname=server_hostname)

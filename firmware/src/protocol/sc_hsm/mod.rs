@@ -290,6 +290,11 @@ pub struct ScHsmState {
 
     /// Monotonic generation counter, incremented on key generate/import/delete.
     pub generation: u64,
+
+    /// Enrolled peer device static public key (65-byte uncompressed P-256).
+    /// Used by V2 DKEK exchange to verify the peer's ECDSA signature.
+    /// None = unauthenticated mode (signature verification skipped).
+    pub noise_enrolled_peer_pubkey: Option<[u8; 65]>,
 }
 
 impl ScHsmState {
@@ -328,6 +333,7 @@ impl ScHsmState {
             exchange_challenge_cache: [[0u8; 32]; 16],
             exchange_challenge_cache_count: 0,
             generation: 0,
+            noise_enrolled_peer_pubkey: None,
         }
     }
 

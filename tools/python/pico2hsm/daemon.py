@@ -6,16 +6,27 @@ import logging
 import os
 import signal
 import socket
+import ssl
 import threading
 import time
 from typing import Optional
 
-from .config import PeerConfig
+from pathlib import Path
+
+from .config import PeerConfig, PeerEntry
 from .dkek import DkekExchange
 from .enrollment import DeviceEnrollment
 from .errors import SyncError, EnrollmentError
 from .state import StatePersistence
 from .sync import SyncManager
+from .tls import (
+    ensure_daemon_identity,
+    create_server_context,
+    create_client_context,
+    check_peer_cert_expiry,
+    check_peer_identity,
+    check_cert_expiry_file,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +47,13 @@ class DkekDaemon:
         self._persistence.load()
         self._sync = SyncManager(config, self._persistence, quorum_required)
         self._exchange = DkekExchange()
+
+        # TLS identity setup
+        self._cert_path: Optional[Path] = None
+        self._key_path: Optional[Path] = None
+        self._tls_server_ctx: Optional[ssl.SSLContext] = None
+        if config.tls_enabled:
+            self._init_tls()
 
     def run(self, pid_file: Optional[str] = None) -> None:
         """Start the daemon. Blocks until shutdown signal."""
@@ -97,6 +115,147 @@ class DkekDaemon:
         logger.info("Received signal %d -- shutting down", signum)
         self._running = False
 
+    def _init_tls(self) -> None:
+        """Initialize TLS identity and server context at daemon startup."""
+        config = self._config
+
+        # Ensure we have an identity cert/key
+        if config.identity_cert and config.identity_key:
+            self._cert_path = Path(config.identity_cert)
+            self._key_path = Path(config.identity_key)
+            if not self._cert_path.exists() or not self._key_path.exists():
+                logger.error(
+                    "TLS identity files not found: cert=%s key=%s. "
+                    "Cannot start with TLS enabled.",
+                    config.identity_cert, config.identity_key,
+                )
+                raise SystemExit(1)
+        else:
+            state_dir = Path(os.path.expanduser(config.state_dir))
+            self._cert_path, self._key_path = ensure_daemon_identity(state_dir)
+
+        # Check own cert expiry at startup
+        check_cert_expiry_file(
+            str(self._cert_path), "own daemon", config.tls_cert_warn_days
+        )
+
+        # Log TLS mode
+        if config.ca_cert:
+            if not Path(config.ca_cert).exists():
+                logger.error(
+                    "CA certificate not found: %s. Cannot start with TLS enabled.",
+                    config.ca_cert,
+                )
+                raise SystemExit(1)
+            logger.info("TLS running in CA-authenticated mode (ca_cert=%s)", config.ca_cert)
+        else:
+            logger.warning(
+                "TLS running in unauthenticated mode -- connections are encrypted "
+                "but peer identity is not verified"
+            )
+
+        # Pre-build server context (reused for all incoming connections)
+        self._tls_server_ctx = create_server_context(
+            cert_path=str(self._cert_path),
+            key_path=str(self._key_path),
+            ca_cert=config.ca_cert,
+            warn_days=config.tls_cert_warn_days,
+        )
+
+    def _wrap_tls_server(self, raw_conn: socket.socket) -> Optional[ssl.SSLSocket]:
+        """Wrap an accepted TCP connection with server-side TLS.
+
+        Returns the SSLSocket on success, or None if the handshake fails.
+        """
+        if self._tls_server_ctx is None:
+            return raw_conn  # type: ignore[return-value]
+        try:
+            ssl_conn = self._tls_server_ctx.wrap_socket(raw_conn, server_side=True)
+            # Check peer cert expiry (only meaningful in CA mode)
+            if self._config.ca_cert:
+                check_peer_cert_expiry(
+                    ssl_conn, "incoming", self._config.tls_cert_warn_days
+                )
+            return ssl_conn
+        except ssl.SSLError as e:
+            logger.error("TLS handshake failed for incoming connection: %s", e)
+            try:
+                raw_conn.close()
+            except Exception:
+                pass
+            return None
+        except Exception as e:
+            logger.error("TLS setup failed for incoming connection: %s", e)
+            try:
+                raw_conn.close()
+            except Exception:
+                pass
+            return None
+
+    def _wrap_tls_client(
+        self,
+        raw_conn: socket.socket,
+        peer: Optional[PeerEntry] = None,
+        hostname: Optional[str] = None,
+    ) -> Optional[ssl.SSLSocket]:
+        """Wrap an outbound TCP connection with client-side TLS.
+
+        Returns the SSLSocket on success, or None if the handshake fails.
+        """
+        if not self._config.tls_enabled or self._cert_path is None:
+            return raw_conn  # type: ignore[return-value]
+
+        peer_name = None
+        if peer:
+            peer_name = peer.peer_cn or peer.name
+        elif hostname:
+            peer_name = hostname
+
+        try:
+            ctx = create_client_context(
+                cert_path=str(self._cert_path),
+                key_path=str(self._key_path),
+                ca_cert=self._config.ca_cert,
+                peer_name=peer_name,
+                warn_days=self._config.tls_cert_warn_days,
+            )
+            # server_hostname is needed for SNI and hostname check
+            server_hostname = peer_name if (self._config.ca_cert and peer_name) else None
+            ssl_conn = ctx.wrap_socket(raw_conn, server_hostname=server_hostname)
+
+            # Post-handshake checks in CA mode
+            if self._config.ca_cert:
+                check_peer_cert_expiry(
+                    ssl_conn,
+                    peer_name or "unknown",
+                    self._config.tls_cert_warn_days,
+                )
+                # Manual identity check for IP addresses (check_hostname=False)
+                if peer_name and not ctx.check_hostname:
+                    if not check_peer_identity(ssl_conn, peer_name):
+                        logger.error(
+                            "Peer identity mismatch for '%s' -- closing connection",
+                            peer_name,
+                        )
+                        ssl_conn.close()
+                        return None
+
+            return ssl_conn
+        except ssl.SSLError as e:
+            logger.error("TLS handshake failed for outbound connection: %s", e)
+            try:
+                raw_conn.close()
+            except Exception:
+                pass
+            return None
+        except Exception as e:
+            logger.error("TLS setup failed for outbound connection: %s", e)
+            try:
+                raw_conn.close()
+            except Exception:
+                pass
+            return None
+
     def _tcp_listener(self, host: str, port: int) -> None:
         """Accept incoming TCP connections from remote peers."""
         try:
@@ -111,6 +270,11 @@ class DkekDaemon:
                     except socket.timeout:
                         continue
                     logger.info("TCP connection from %s", addr)
+                    # Wrap with TLS immediately after accept
+                    if self._config.tls_enabled:
+                        conn = self._wrap_tls_server(conn)
+                        if conn is None:
+                            continue  # TLS setup failed, connection dropped
                     t = threading.Thread(
                         target=self._handle_tcp_connection,
                         args=(conn, addr),

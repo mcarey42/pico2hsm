@@ -59,19 +59,23 @@ in standalone exchange mode, it provides no peer authentication.
 
 ---
 
-### C3. test_11 (DKEK wrap/unwrap round-trip) will fail on hardware
+### C3. test_11 (DKEK wrap/unwrap round-trip) — implementation complete, awaiting hardware validation
 
-**Severity:** CRITICAL (misleading test suite)
+**Severity:** LOW (test gap, not code gap)
 **File:** `tests/hw/test_11_dkek_roundtrip.py`
 
-`sc-hsm-tool --wrap-key` sends `INS=0x72` (EXPORT KEY) and `--unwrap-key` sends `INS=0x74`
-(IMPORT KEY). Both commands are implemented in the dispatch table but the underlying DKEK wrap/
-unwrap has not been validated end-to-end on hardware with actual key material. The test exists
-without a passing record.
+**Status (2026-04-08):** Code audit confirms all four DKEK operations are **COMPLETE**:
+- `DkekManager::wrap()` — real AES-256-CBC encrypt with random IV, PKCS#7 padding, KCV header
+- `DkekManager::unwrap()` — constant-time KCV verify, AES-256-CBC decrypt, PKCS#7 unpad, zeroize
+- `export_key::handle()` (INS=0x72) — PIN check, DKEK-ready check, loads key from flash/memory, calls wrap()
+- `import_key::handle()` (INS=0x74) — PIN check, DKEK-ready check, calls unwrap(), persists to flash+memory
 
-**Fix:** Run test_11 on hardware with both devices. If it fails, mark the failing assertions
-`pytest.mark.xfail(reason="DKEK wrap/unwrap: hardware validation pending", strict=True)` rather
-than leaving a permanently red test. Remove xfail markers once the test passes.
+The dispatch table wires both INS bytes. Firmware unit tests (wrap round-trip, KCV mismatch,
+empty data rejection) pass. The hardware integration test (`test_11`) exercises the full
+sc-hsm-tool workflow (generate -> wrap -> re-init -> unwrap -> sign -> verify).
+
+**Remaining:** Run `test_11` on physical hardware. The test is enabled (no skip/xfail markers)
+and tagged `pytest.mark.hw`. No code changes are needed; only a hardware test run is required.
 
 ---
 

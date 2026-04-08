@@ -1,5 +1,13 @@
 """Hardware integration tests for DKEK wrap/unwrap key backup round-trip.
 
+Status: implementation complete; requires hardware validation with a physical device.
+
+The firmware DKEK subsystem (DkekManager::wrap/unwrap, export_key::handle INS=0x72,
+import_key::handle INS=0x74) is fully implemented with real AES-256-CBC crypto,
+KCV verification, PKCS#7 padding, and persistent key storage.  Unit tests in
+firmware/src/security/dkek.rs and firmware/src/protocol/sc_hsm/commands/ pass.
+This hardware integration test exercises the end-to-end sc-hsm-tool workflow.
+
 Tests the standard sc-hsm-tool DKEK key backup workflow:
   1. Initialize device with DKEK shares=1
   2. Create and import a DKEK share
@@ -36,6 +44,8 @@ from cryptography.hazmat.primitives.asymmetric import ec, utils
 from helpers.cli import CLIRunner
 
 log = logging.getLogger(__name__)
+
+pytestmark = pytest.mark.hw
 
 DKEK_PASSPHRASE = "dkek-roundtrip-test"
 KEY_REF = "30"          # key slot 0x30, avoids collision with slots 01-11

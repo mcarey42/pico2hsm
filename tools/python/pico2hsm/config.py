@@ -29,6 +29,8 @@ class PeerEntry:
     fingerprint: str                 # SHA-256 hex of public_key
     address: Optional[str] = None   # "host:port" for TCP sync, None for USB-only
     cert_path: Optional[str] = None  # Path to peer's TLS certificate for mTLS
+    cert_fingerprint: Optional[str] = None  # SHA-256 hex of peer TLS cert (anonymous mode pinning)
+    peer_cn: Optional[str] = None    # Expected CN/SAN in peer cert (defaults to peer name)
 
 
 @dataclass
@@ -42,6 +44,8 @@ class PeerConfig:
     tls_enabled: bool = True         # Use anonymous TLS for TCP transport
     identity_cert: Optional[str] = None   # This daemon's TLS cert path
     identity_key: Optional[str] = None    # This daemon's TLS key path
+    ca_cert: Optional[str] = None    # Path to CA bundle PEM (enables authenticated mode)
+    tls_cert_warn_days: int = 90     # Days before expiry to start warning
     cluster_id: str = "default-cluster"   # Cluster identifier for enrollment
 
     @classmethod
@@ -85,6 +89,8 @@ class PeerConfig:
             tls_enabled=bool(raw.get("tls_enabled", True)),
             identity_cert=raw.get("identity_cert"),
             identity_key=raw.get("identity_key"),
+            ca_cert=raw.get("ca_cert"),
+            tls_cert_warn_days=int(raw.get("tls_cert_warn_days", 90)),
             cluster_id=raw.get("cluster_id", "default-cluster"),
         )
 
@@ -136,6 +142,8 @@ class PeerConfig:
             fingerprint=fingerprint,
             address=entry.get("address"),
             cert_path=entry.get("cert_path"),
+            cert_fingerprint=entry.get("cert_fingerprint"),
+            peer_cn=entry.get("peer_cn"),
         )
 
     def find_peer_by_pubkey(self, pubkey: bytes) -> Optional[PeerEntry]:
