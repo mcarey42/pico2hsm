@@ -32,19 +32,12 @@ fn main() {
         "rp2350_one_16m"
     } else if cfg!(feature = "rp2350_geek_16m") {
         "rp2350_geek_16m"
-    } else if cfg!(feature = "rp2350_geek_sdcard") || cfg!(feature = "rp2350_geek_sdcard_dual") {
+    } else if cfg!(feature = "rp2350_geek_sdcard") {
         "rp2350_geek_sdcard"
-    } else if cfg!(feature = "rp2354_embedded") {
-        "rp2354_embedded"
-    } else if cfg!(feature = "pico2_4m")
-        || cfg!(feature = "pico2_4m_sdcard")
-        || cfg!(feature = "pico2_4m_sdcard_hybrid")
-    {
+    } else if cfg!(feature = "pico2_4m") {
         "pico2_4m"
     } else if cfg!(feature = "waveshare_rp2350_lcd_16m")
         || cfg!(feature = "waveshare_rp2350_lcd_sdcard")
-        || cfg!(feature = "waveshare_rp2350_lcd_sdcard_dual")
-        || cfg!(feature = "waveshare_rp2350_lcd_sdcard_hybrid")
     {
         "waveshare_rp2350_lcd_16m"
     } else {

@@ -1,6 +1,6 @@
 [package]
 name = "pico2hsm-firmware"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2021"
 description = "pico2hsm HSM firmware for Raspberry Pi RP2350/RP2354"
 license = "MIT"

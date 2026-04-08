@@ -8,7 +8,7 @@ Always use the debug script to build and flash firmware. Do not run `cargo build
 ./build-all-debug.sh pico2_4m
 ```
 
-Valid board arguments for the Pico 2: `pico2_4m` (bare board).
+Valid board arguments: `pico2_4m`, `rp2350_one_4m`, `rp2350_one_16m`, `rp2350_geek_16m`, `rp2350_geek_sdcard`, `waveshare_rp2350_lcd_16m`, `waveshare_rp2350_lcd_sdcard`.
 
 This script:
 - Builds with `DEFMT_LOG=trace` (required for defmt log output to survive optimisation)
@@ -188,7 +188,7 @@ static mut CORE1_STACK: Stack<131072> = Stack::new();
 
 ### Feature flags and default features
 
-`Cargo.toml` sets `default = ["rp2350_one_4m"]`. Using `--features X` adds to the defaults, which causes multiple conflicting board features to be active simultaneously and will fail to compile. Always use `--no-default-features` when specifying a non-default board:
+`Cargo.toml` sets `default = ["rp2350_one_4m", "rsa", "applet-piv", "applet-openpgp-curve25519"]`. Using `--features X` adds to the defaults, which causes multiple conflicting board features to be active simultaneously and will fail to compile. Always use `--no-default-features` when specifying a non-default board:
 
 ```sh
 cargo check --no-default-features --features rp2350_geek_16m
