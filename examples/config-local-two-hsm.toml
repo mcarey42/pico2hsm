@@ -1,0 +1,46 @@
+# pico2hsm Rust daemon configuration -- local two-HSM setup
+#
+# Both HSMs are plugged into the same Linux host via USB.
+# The daemon auto-syncs DKEK material and keys from the primary reader
+# to any secondary reader when a new device is detected.
+#
+# To list connected readers:
+#   opensc-tool --list-readers
+
+# IP address to bind the TCP listener on.
+# "127.0.0.1" restricts to loopback (not exposed on network).
+listen_address = "127.0.0.1"
+
+# TCP port for inter-daemon peer protocol.
+# Set to 0 to disable the TCP listener entirely.
+listen_port = 7777
+
+# Directory for persistent state (generation counters, sync records).
+# The daemon creates this directory on first run if it does not exist.
+# Ownership should be pico2hsm:pico2hsm with mode 0700.
+state_dir = "/var/lib/pico2hsm"
+
+# Automatically sync when a new secondary device is detected via USB.
+# Set to false for manual-only sync.
+sync_on_connect = true
+
+# Interval in seconds between health-check sweeps.
+# Each sweep queries all connected devices for their state root hash
+# and logs whether the cluster is in sync.
+health_check_interval_secs = 60
+
+# Known peers.
+# For local (USB-only) peers, the address field is used for identification
+# but no TCP connection is made (both devices are on the same PCSC bus).
+
+[[peers]]
+name = "primary"
+address = "127.0.0.1"
+port = 7777
+role = "primary"
+
+[[peers]]
+name = "secondary"
+address = "127.0.0.1"
+port = 7778
+role = "secondary"

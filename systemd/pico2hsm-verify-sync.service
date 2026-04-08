@@ -1,0 +1,25 @@
+[Unit]
+Description=pico2hsm verify-sync one-shot (called by pico2hsm-daemon.timer)
+Documentation=https://github.com/pico2hsm/pico2hsm
+After=pcscd.service
+Requires=pcscd.service
+
+[Service]
+Type=oneshot
+User=pico2hsm
+Group=pico2hsm
+SupplementaryGroups=plugdev
+
+ExecStart=/usr/local/bin/hsm_daemon.py verify-sync --config /etc/pico2hsm/daemon.yaml
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=pico2hsm-verify
+
+# Security hardening
+ProtectSystem=strict
+ProtectHome=yes
+NoNewPrivileges=yes
+PrivateTmp=yes
+ReadWritePaths=/var/lib/pico2hsm

@@ -1,0 +1,37 @@
+[Unit]
+Description=pico2hsm DKEK cluster synchronisation daemon
+Documentation=https://github.com/pico2hsm/pico2hsm
+After=pcscd.service network.target
+Requires=pcscd.service
+
+[Service]
+Type=forking
+User=pico2hsm
+Group=pico2hsm
+SupplementaryGroups=plugdev
+
+ExecStart=/usr/local/bin/hsm_daemon.py start --config /etc/pico2hsm/daemon.yaml --pid-file /run/pico2hsm/daemon.pid
+ExecStop=/usr/local/bin/hsm_daemon.py stop --pid-file /run/pico2hsm/daemon.pid
+PIDFile=/run/pico2hsm/daemon.pid
+
+RuntimeDirectory=pico2hsm
+StateDirectory=pico2hsm
+ConfigurationDirectory=pico2hsm
+
+Restart=on-failure
+RestartSec=5
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=pico2hsm
+
+# Security hardening
+ProtectSystem=strict
+ProtectHome=yes
+NoNewPrivileges=yes
+PrivateTmp=yes
+ReadWritePaths=/var/lib/pico2hsm /run/pico2hsm
+
+[Install]
+WantedBy=multi-user.target

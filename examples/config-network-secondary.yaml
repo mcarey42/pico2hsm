@@ -1,0 +1,61 @@
+# pico2hsm daemon configuration -- network secondary node
+#
+# This is the SECONDARY node in a two-site network sync setup.
+# It connects TO the primary node at 192.168.1.10:7890 to fetch
+# DKEK material and key blobs.
+#
+# The secondary device is connected to this machine via USB.
+# The primary device is on the remote machine at 192.168.1.10.
+#
+# Data flow: this daemon initiates an outbound TCP connection to the
+# primary, requests the key manifest, downloads missing DKEK-wrapped
+# key blobs, and imports them onto the local secondary HSM.
+#
+# sync_on_connect is true: when the local secondary HSM is plugged in,
+# the daemon immediately attempts to sync from the primary over TCP.
+
+# ---- Network listener ----
+# The secondary also listens for connections (the primary may initiate
+# health-check state hash comparisons).
+listen_address: "0.0.0.0"
+
+# TCP port for peer connections. Must be reachable from the primary.
+listen_port: 7890
+
+# ---- Storage ----
+state_dir: "/var/lib/pico2hsm"
+
+# ---- Logging ----
+log_level: "INFO"
+
+# ---- Sync behaviour ----
+# Automatically sync from the primary when the local device is detected.
+sync_on_connect: true
+
+# ---- TLS ----
+# Enable TLS for all TCP connections. Must match the primary's setting.
+tls_enabled: true
+
+# This daemon's TLS identity. Auto-generated on first run if not specified.
+identity_cert: "/var/lib/pico2hsm/daemon.crt"
+identity_key: "/var/lib/pico2hsm/daemon.key"
+
+# ---- Cluster ----
+# Must match the primary's cluster_id.
+cluster_id: "prod-cluster"
+
+# ---- Peers ----
+peers:
+  - name: "hsm-primary"
+    role: "primary"
+    # The primary daemon's address -- this is where we connect to fetch keys.
+    address: "192.168.1.10:7890"
+    public_key_file: "/etc/pico2hsm/keys/hsm-primary.pub.pem"
+    # TLS certificate of the primary node for mutual authentication.
+    # Obtain this from the primary node's state_dir/daemon.crt.
+    cert_path: "/etc/pico2hsm/certs/primary-node.crt"
+
+  - name: "hsm-secondary"
+    role: "secondary"
+    # The secondary device is local (no address needed).
+    public_key_file: "/etc/pico2hsm/keys/hsm-secondary.pub.pem"

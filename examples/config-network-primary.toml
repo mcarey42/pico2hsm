@@ -1,0 +1,33 @@
+# pico2hsm Rust daemon configuration -- network primary node
+#
+# This is the PRIMARY node in a two-site network sync setup.
+# It listens on the configured port and accepts incoming sync requests
+# from the secondary node.
+#
+# The primary HSM device is connected to this machine via USB.
+# The secondary HSM device is on a remote machine running its own daemon.
+
+# Bind on all interfaces so the secondary node can reach us.
+listen_address = "0.0.0.0"
+
+# TCP port for the peer protocol. Must be reachable from the secondary.
+# Ensure firewall rules allow inbound TCP on this port.
+listen_port = 7777
+
+# Directory for persistent state.
+state_dir = "/var/lib/pico2hsm"
+
+# Auto-sync locally connected secondary devices on USB plug-in.
+sync_on_connect = true
+
+# Health check interval (seconds). Queries all connected devices and
+# configured peers for state root hashes.
+health_check_interval_secs = 60
+
+# The secondary peer -- the Rust daemon connects to this address
+# periodically to compare state hashes and push key blobs if needed.
+[[peers]]
+name = "hsm-secondary"
+address = "192.168.1.11"
+port = 7777
+role = "secondary"
