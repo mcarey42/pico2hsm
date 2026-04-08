@@ -1595,7 +1595,7 @@ dependencies = [
 
 [[package]]
 name = "pico2hsm-firmware"
-version = "0.8.5"
+version = "0.9.0"
 dependencies = [
  "aes",
  "aes-gcm",
