@@ -8,7 +8,7 @@ Always use the debug script to build and flash firmware. Do not run `cargo build
 ./build-all-debug.sh pico2_4m
 ```
 
-Valid board arguments for the Pico 2: `pico2_4m` (bare board), `pico2_4m_sdcard` (Pico 2 with SD card wiring), `pico2_4m_sdcard_hybrid` (Pico 2 with hybrid flash+SD card storage).
+Valid board arguments for the Pico 2: `pico2_4m` (bare board).
 
 This script:
 - Builds with `DEFMT_LOG=trace` (required for defmt log output to survive optimisation)
@@ -129,9 +129,9 @@ The `docs/` directory contains generated reference documents:
 | `SC_HSM_APDU_REFERENCE.md` | All 28 SC-HSM commands — INS bytes, TLV tags, algo IDs, pico2hsm deviations |
 | `PIV_APDU_REFERENCE.md` | Full NIST SP 800-73-4 command set, 3DES GENERAL AUTHENTICATE, key slots |
 | `OPENPGP_APDU_REFERENCE.md` | OpenPGP Card 3.4 — PSO:CDS/DECIPHER, Ed25519/X25519 algo attrs, PW1/PW3 |
-| `BOARD_RP2350_ONE.md` | GPIO pinout, WS2812B PIO timing, external SD card wiring |
-| `BOARD_RP2350_GEEK.md` | ST7789 pin table, init sequence, SD card wiring (single + dual) |
-| `BOARD_WAVESHARE_LCD_1_47.md` | ST7789V3 + WS2812B, SD card topology, dual-SD wiring |
+| `BOARD_RP2350_ONE.md` | GPIO pinout, WS2812B PIO timing |
+| `BOARD_RP2350_GEEK.md` | ST7789 pin table, init sequence, SD card wiring |
+| `BOARD_WAVESHARE_LCD_1_47.md` | ST7789V3 + WS2812B, SD card topology |
 | `SD_CARD_WIRING.md` | Per-board SD card wiring tables, embedded-sdmmc integration notes |
 | `BUILD_CONFIGURATIONS.md` | All feature flag combinations with exact cargo commands, flash/RAM budget |
 

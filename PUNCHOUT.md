@@ -174,10 +174,9 @@ surfaces on more capable hardware.**
    Cortex-M33 is not the right lever.
 
 **Flash layout decision (adopted in place of this item):**
-All boards use a fixed firmware / keystore split.  For the RP2354 embedded-flash
-variant (2 MB total), the canonical split is **1 MB firmware / 1 MB keystore**
-(see `boards/rp2354_embedded.x`).  The 254-key addressable limit per session is
-documented as a known protocol constraint, not a target for workaround.
+All boards use a fixed firmware / keystore split.  The 254-key addressable
+limit per session is documented as a known protocol constraint, not a target
+for workaround.
 
 ---
 
@@ -207,13 +206,11 @@ or Windows CNG without OpenSC installed.
 
 ---
 
-## Deferred: Geek board SD card storage variants
+## Deferred: Geek board SD card storage wiring
 
 **Status: DEFERRED — implement after LCD-1.47-B SD variants are hardware-validated.**
 
-**Feature flags to add when undeferred:**
-- `rp2350_geek_sdcard` — already exists in Cargo.toml but is not wired to use the SD card; needs wiring to `SdCardFlash` via SPI1 with shared-bus pattern
-- `rp2350_geek_sdcard_hybrid` — new flag; QMI flash primary + SD card secondary, RAID-1
+**Feature flag:** `rp2350_geek_sdcard` — exists in Cargo.toml but is not yet wired to use the SD card; needs wiring to `SdCardFlash` via SPI1 with shared-bus pattern.
 
 **Blocking issue:**
 The Geek board's SPI1 is shared between the ST7789 LCD (CS=GPIO9) and the SD card (CS=GPIO5). `St7789StatusDisplay` currently owns the raw SPI1 bus. Wiring the SD card requires converting the display driver to use an `embedded_hal::spi::SpiDevice` abstraction (via `embassy_embedded_hal::shared_bus::blocking::spi::SpiDevice`) so that both the LCD and SD card can time-share the bus with CS-gated transactions.
@@ -223,5 +220,5 @@ The Geek board's SPI1 is shared between the ST7789 LCD (CS=GPIO9) and the SD car
 2. Wrap SPI1 in a `StaticCell<Mutex<CriticalSectionRawMutex, Spi<SPI1, Blocking>>>`.
 3. Create two `SpiDevice` wrappers: one for LCD (CS=GPIO9) and one for SD (CS=GPIO5).
 4. Wire `SdCardFlash` via the SD `SpiDevice` following the LCD-1.47-B pattern.
-5. Add `BoardChip` and `BoardKeyStore` aliases for both new variants in `board_chips.rs`.
+5. Add `BoardChip` and `BoardKeyStore` aliases in `board_chips.rs`.
 6. Add feature-gated keystore init in `run_geek_board` in `main.rs`.

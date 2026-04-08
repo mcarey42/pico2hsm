@@ -224,7 +224,6 @@ in the current file) and before `let usb_fut = usb.run();` (line 599):
 #[cfg(any(
     feature = "rp2350_geek_16m",
     feature = "rp2350_geek_sdcard",
-    feature = "rp2350_geek_sdcard_dual",
 ))]
 spawner.spawn(display_task()).expect("display task");
 ```
@@ -346,7 +345,6 @@ const SCREENSAVER_TIMEOUT_SECS: u32 = 300; // 5 minutes
 #[cfg(any(
     feature = "rp2350_geek_16m",
     feature = "rp2350_geek_sdcard",
-    feature = "rp2350_geek_sdcard_dual",
 ))]
 #[embassy_executor::task]
 async fn display_task() {
@@ -799,7 +797,6 @@ embedded-graphics = { version = "0.8", optional = true }
 display = ["embedded-graphics"]
 rp2350_geek_16m       = ["display", ...]
 rp2350_geek_sdcard    = ["display", ...]
-rp2350_geek_sdcard_dual = ["display", ...]
 waveshare_rp2350_lcd_16m = ["display", ...]
 ```
 

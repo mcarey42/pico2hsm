@@ -32,7 +32,7 @@ row along the bottom edge.
 |   1  | UART0 RX / SPI0 CS0     | —                                |
 |   2  | SPI0 SCK                | —                                |
 |   3  | SPI0 MOSI               | —                                |
-|   4  | SDCARD1 CS              | Dual-SD variant: slot 1 CS       |
+|   4  | GPIO                    | — (free)                         |
 |   5  | SDCARD0 CS              | SD variant: slot 0 CS            |
 |   6  | I2C1 SDA                | —                                |
 |   7  | I2C1 SCL                | —                                |
@@ -197,19 +197,7 @@ by deassering the LCD CS and asserting the SD card CS.
 | MISO     |  24  | SD card data out       |
 | CS       |   5  | SD card 0 chip select  |
 
-### Dual SD card variant (`rp2350_geek_sdcard_dual`)
-
-A second SD card slot adds one more CS line.
-
-| Signal   | GPIO | Note                   |
-|----------|------|------------------------|
-| SCK      |  10  | Shared SPI1 clock      |
-| MOSI     |  11  | Shared SPI1 MOSI       |
-| MISO     |  24  | Shared SPI1 MISO       |
-| CS (0)   |   5  | SD card 0 chip select  |
-| CS (1)   |   4  | SD card 1 chip select  |
-
-### SD card module wiring — single card
+### SD card module wiring
 
 Connect a standard SD card breakout module to the RP2350-Geek header:
 
@@ -222,30 +210,17 @@ Connect a standard SD card breakout module to the RP2350-Geek header:
 | VCC           | 3.3 V         | 3V3 rail   |
 | GND           | Ground        | GND        |
 
-### SD card module wiring — dual card (second card)
-
-| SD module pin | Signal | RP2350-Geek GPIO |
-|---------------|--------|-------------------|
-| CLK / SCK     | SPI1 clock | GPIO 10       |
-| CMD / MOSI    | SPI1 data out | GPIO 11    |
-| DAT0 / MISO   | SPI1 data in  | GPIO 24    |
-| CS / SS       | Chip select   | GPIO 4     |
-| VCC           | 3.3 V         | 3V3 rail   |
-| GND           | Ground        | GND        |
-
 ---
 
 ## 7. Feature Flags
 
-| Feature flag              | LCD | SD slot | Dual SD |
-|---------------------------|-----|---------|---------|
-| `rp2350_geek_16m`         | yes | no      | no      |
-| `rp2350_geek_sdcard`      | yes | 1       | no      |
-| `rp2350_geek_sdcard_dual` | yes | 2       | yes     |
+| Feature flag              | LCD | SD slot |
+|---------------------------|-----|---------|
+| `rp2350_geek_16m`         | yes | no      |
+| `rp2350_geek_sdcard`      | yes | 1       |
 
-All three variants include the full ST7789 LCD driver.  The SD card feature
-flags gate the `SDCARD0_CS` / `SDCARD1_CS` constants and any SD-specific init
-logic.
+Both variants include the full ST7789 LCD driver.  The SD card feature
+flag gates the `SDCARD0_CS` constant and any SD-specific init logic.
 
 ---
 
@@ -264,12 +239,6 @@ cargo build --release --no-default-features --features rp2350_geek_16m
 
 ```sh
 cargo build --release --no-default-features --features rp2350_geek_sdcard
-```
-
-### SC-HSM + dual SD card slots
-
-```sh
-cargo build --release --no-default-features --features rp2350_geek_sdcard_dual
 ```
 
 ### With additional applets (example: PIV + OpenPGP)

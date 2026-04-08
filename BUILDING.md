@@ -55,7 +55,8 @@ brew install arm-none-eabi-binutils
 | `rp2350_one_16m` | Waveshare RP2350-One | 16 MB | 14 MB keystore |
 | `rp2350_geek_16m` | Waveshare RP2350-Geek | 16 MB | 6 MB keystore |
 | `rp2350_geek_sdcard` | Waveshare RP2350-Geek + SDCard | 16 MB + SD | 14 MB keystore |
-| `rp2350_geek_sdcard_dual` | Waveshare RP2350-Geek + 2× SDCard | 16 MB + 2× SD | 14 MB keystore |
+| `waveshare_rp2350_lcd_16m` | Waveshare RP2350-LCD-1.47-B | 16 MB | 14 MB keystore |
+| `waveshare_rp2350_lcd_sdcard` | Waveshare RP2350-LCD-1.47-B + SDCard | 16 MB + SD | SD keystore |
 | `pico2_4m` | Raspberry Pi Pico 2 (stock) | 4 MB | 2 MB keystore |
 
 > **Note:** Board feature flags are mutually exclusive. Always pass
@@ -252,7 +253,8 @@ dist/pico2hsm-rp2350_one_4m.uf2
 dist/pico2hsm-rp2350_one_16m.uf2
 dist/pico2hsm-rp2350_geek_16m.uf2
 dist/pico2hsm-rp2350_geek_sdcard.uf2
-dist/pico2hsm-rp2350_geek_sdcard_dual.uf2
+dist/pico2hsm-waveshare_rp2350_lcd_16m.uf2
+dist/pico2hsm-waveshare_rp2350_lcd_sdcard.uf2
 ```
 
 To flash via UF2:

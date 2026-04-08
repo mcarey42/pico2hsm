@@ -13,7 +13,8 @@ jobs:
           - rp2350_one_16m
           - rp2350_geek_16m
           - rp2350_geek_sdcard
-          - rp2350_geek_sdcard_dual
+          - waveshare_rp2350_lcd_16m
+          - waveshare_rp2350_lcd_sdcard
 
     steps:
       - uses: actions/checkout@v4

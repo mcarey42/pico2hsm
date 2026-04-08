@@ -103,16 +103,13 @@ COMMON_FEATURES="rsa,applet-piv,applet-openpgp-curve25519"
 # ── Board variant table ───────────────────────────────────────────────────────
 # (feature flag, human name, probe-rs chip id)
 declare -a VARIANTS=(
-    "pico2_4m        | Raspberry Pi Pico 2 4MB      | RP2350"
-    "rp2350_one_4m   | Waveshare RP2350-One  4MB    | RP2350"
-    "rp2350_one_16m  | Waveshare RP2350-One 16MB    | RP2350"
-    "rp2350_geek_16m | Waveshare RP2350-Geek 16MB   | RP2350"
+    "pico2_4m                 | Raspberry Pi Pico 2 4MB                | RP2350"
+    "rp2350_one_4m            | Waveshare RP2350-One  4MB              | RP2350"
+    "rp2350_one_16m           | Waveshare RP2350-One 16MB              | RP2350"
+    "rp2350_geek_16m          | Waveshare RP2350-Geek 16MB             | RP2350"
     "rp2350_geek_sdcard               | Waveshare RP2350-Geek SDCard           | RP2350"
-    "rp2350_geek_sdcard_dual          | Waveshare RP2350-Geek Dual-SDCard      | RP2350"
     "waveshare_rp2350_lcd_16m         | Waveshare RP2350-LCD-1.47-B 16MB       | RP2350"
     "waveshare_rp2350_lcd_sdcard        | Waveshare RP2350-LCD-1.47-B SDCard     | RP2350"
-    "waveshare_rp2350_lcd_sdcard_dual   | Waveshare RP2350-LCD-1.47-B Dual-SDCard| RP2350"
-    "waveshare_rp2350_lcd_sdcard_hybrid | Waveshare RP2350-LCD-1.47-B Hybrid     | RP2350"
 )
 
 feature_of()  { echo "$1" | awk -F'|' '{gsub(/ /,"",$1); print $1}'; }

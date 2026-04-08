@@ -11,18 +11,12 @@
 #
 # Valid board features:
 #   pico2_4m               Raspberry Pi Pico 2 4MB
-#   pico2_4m_sdcard        Raspberry Pi Pico 2 4MB with SD card (SPI1, CS=GPIO15)
-#   pico2_4m_sdcard_hybrid Raspberry Pi Pico 2 4MB QMI flash + SD card RAID-1 hybrid
 #   rp2350_one_4m          Waveshare RP2350-One  4MB
 #   rp2350_one_16m         Waveshare RP2350-One 16MB
 #   rp2350_geek_16m        Waveshare RP2350-Geek 16MB
 #   rp2350_geek_sdcard     Waveshare RP2350-Geek SDCard
-#   rp2350_geek_sdcard_dual  Waveshare RP2350-Geek Dual-SDCard
 #   waveshare_rp2350_lcd_16m           Waveshare RP2350-LCD-1.47-B 16MB
-#   waveshare_rp2350_lcd_sdcard_dual   Waveshare RP2350-LCD-1.47-B Dual-SDCard
 #   waveshare_rp2350_lcd_sdcard        Waveshare RP2350-LCD-1.47-B SD-only keystore
-#   waveshare_rp2350_lcd_sdcard_hybrid Waveshare RP2350-LCD-1.47-B Flash+SD RAID-1
-#   rp2354_embedded        RP2354 Embedded
 #
 # Unlike build-all.sh this uses the dev (debug) profile so that:
 #   - #[cfg(debug_assertions)] blocks are compiled in (delay loop, sentinels)
@@ -46,18 +40,12 @@ fi
 
 VALID_FEATURES=(
     pico2_4m
-    pico2_4m_sdcard
-    pico2_4m_sdcard_hybrid
     rp2350_one_4m
     rp2350_one_16m
     rp2350_geek_16m
     rp2350_geek_sdcard
-    rp2350_geek_sdcard_dual
     waveshare_rp2350_lcd_16m
     waveshare_rp2350_lcd_sdcard
-    waveshare_rp2350_lcd_sdcard_dual
-    waveshare_rp2350_lcd_sdcard_hybrid
-    rp2354_embedded
 )
 VALID=0
 for f in "${VALID_FEATURES[@]}"; do

@@ -63,10 +63,10 @@ functions, and its assignment in the pico2hsm `rp2350_one` firmware build.
 |  1         | 0x01       | UART0 RX / SPI0 CSn / I2C0 SCL          | — (free)                                         |
 |  2         | 0x02       | SPI0 SCK / I2C1 SDA                     | — (free)                                         |
 |  3         | 0x03       | SPI0 MOSI / I2C1 SCL                    | — (free)                                         |
-|  4         | 0x04       | SPI0 MISO / UART1 TX                    | **SDCARD MISO** (`SDCARD_MISO` = 4) — opt.       |
-|  5         | 0x05       | SPI0 CSn / UART1 RX                     | **SDCARD CS**   (`SDCARD_CS`   = 5) — opt.       |
-|  6         | 0x06       | SPI0 SCK / UART1 CTS                    | **SDCARD SCK**  (`SDCARD_SCK`  = 6) — opt.       |
-|  7         | 0x07       | SPI0 MOSI / UART1 RTS                   | **SDCARD MOSI** (`SDCARD_MOSI` = 7) — opt.       |
+|  4         | 0x04       | SPI0 MISO / UART1 TX                    | — (free)                                         |
+|  5         | 0x05       | SPI0 CSn / UART1 RX                     | — (free)                                         |
+|  6         | 0x06       | SPI0 SCK / UART1 CTS                    | — (free)                                         |
+|  7         | 0x07       | SPI0 MOSI / UART1 RTS                   | — (free)                                         |
 |  8         | 0x08       | SPI1 RX / I2C0 SDA                      | — (free)                                         |
 |  9         | 0x09       | SPI1 CSn / I2C0 SCL                     | **SPI1 CS[0]** — mirror flash chip 0             |
 | 10         | 0x0A       | SPI1 SCK / I2C1 SDA                     | **SPI1 SCK**   — mirror flash bus clock          |
@@ -91,9 +91,6 @@ functions, and its assignment in the pico2hsm `rp2350_one` firmware build.
 | 29         | 0x1D       | ADC3 / VBUS sense                       | — (VBUS sensing; not a general-purpose output)   |
 
 **Notes:**
-- "opt." on GPIOs 4–7 means the assignment only applies when the
-  `rp2350_one_sdcard` or `rp2350_one_sdcard_dual` feature flag is enabled.
-  When neither SD card flag is active, these GPIOs are free.
 - GPIO 16 is driven exclusively by PIO0 SM0 after `Ws2812Led::new()` runs.
   It must not be configured as a regular GPIO output or claimed by any other
   peripheral in the same firmware build.
@@ -325,79 +322,20 @@ final wiring.  See the TODO comment in `firmware/src/main.rs` →
 
 ---
 
-## 6. External SD Card Wiring
+## 6. Feature Flags
 
-The RP2350-One has no built-in SD card slot.  An external SPI SD card breakout
-module can be connected to GPIOs 4–7, which are free when no SD card feature
-flag is active.
+### 6.1 Board Variant Flags
 
-### 6.1 Recommended Wiring
-
-| SD card signal | RP2350-One GPIO | GPIO (hex) | Constant       | Notes                           |
-|----------------|-----------------|-----------|----------------|---------------------------------|
-| DAT0 / MISO    | GPIO 4          | 0x04       | `SDCARD_MISO`  | SPI0 MISO alternate function    |
-| CS / DAT3      | GPIO 5          | 0x05       | `SDCARD_CS`    | Active-low; pull-up recommended |
-| CLK / SCLK     | GPIO 6          | 0x06       | `SDCARD_SCK`   | SPI0 SCK alternate function     |
-| CMD / MOSI     | GPIO 7          | 0x07       | `SDCARD_MOSI`  | SPI0 MOSI alternate function    |
-| VCC            | 3V3 pin         | —          | —              | 100 nF bypass cap near module   |
-| GND            | GND             | —          | —              | Common ground                   |
-
-Source constants (`firmware/src/board/rp2350_one.rs`):
-
-```rust
-pub const SDCARD_MISO: u8 = 4;
-pub const SDCARD_CS:   u8 = 5;
-pub const SDCARD_SCK:  u8 = 6;
-pub const SDCARD_MOSI: u8 = 7;
-```
-
-Note that GPIOs 4–7 overlap with SPI0's alternate-function capability in the
-RP2350A multiplexer, but they are **not** wired to the `SPI0` peripheral in
-this firmware.  In the `rp2350_one_sdcard` build the SD card driver uses these
-pins as software-controlled SPI lines (or a separate SPI peripheral instance)
-independent of the keystore SPI0 bus on GPIOs 17–22.
-
-### 6.2 Dual SD Card Variant
-
-The `rp2350_one_sdcard_dual` feature flag is defined in `Cargo.toml` for a
-two-card configuration.  A second CS pin has not yet been assigned in the
-firmware source; it will be selected from the remaining free GPIOs
-(0–3, 8, 25, 27, 28) when the feature is implemented.  The shared bus lines
-(MISO/SCK/MOSI on GPIOs 4/6/7) remain the same for both cards.
-
-### 6.3 Electrical Notes
-
-- SD cards in SPI mode operate at CPOL=0, CPHA=0 (Mode 0).
-- Initialization must begin at ≤ 400 kHz; switch to high-speed (up to 25 MHz)
-  after the card responds.
-- The RP2350A GPIO pins are 3.3 V; no level shifter is required for a 3.3 V
-  SD card module.  Do not connect a 5 V-only module without a level shifter.
-- The CMD/DAT lines typically require 10–47 kΩ pull-ups to 3.3 V for reliable
-  SPI initialisation.  Many SD card breakout modules include these on-board.
-- Place a 100 nF decoupling capacitor between VCC and GND close to the SD card
-  connector.
-
----
-
-## 7. Feature Flags
-
-### 7.1 Board Variant Flags
-
-| Feature flag              | Flash  | SD slots | RAID-1 SPI1 | Notes                    |
-|---------------------------|--------|----------|-------------|--------------------------|
-| `rp2350_one_4m`           | 4 MB   | —        | yes         | **Default** in Cargo.toml |
-| `rp2350_one_16m`          | 16 MB  | —        | yes         |                          |
-| `rp2350_one_sdcard`       | *      | 1        | yes         | Adds SD card on GPIO 4–7 |
-| `rp2350_one_sdcard_dual`  | *      | 2        | yes         | Second card CS TBD       |
-
-`*` — the SD card variant flags do not encode a flash size themselves; combine
-with `rp2350_one_4m` or `rp2350_one_16m` as appropriate.
+| Feature flag              | Flash  | RAID-1 SPI1 | Notes                    |
+|---------------------------|--------|-------------|--------------------------|
+| `rp2350_one_4m`           | 4 MB   | yes         | **Default** in Cargo.toml |
+| `rp2350_one_16m`          | 16 MB  | yes         |                          |
 
 Always pass `--no-default-features` when selecting a non-default board flag to
 prevent conflicting features from being simultaneously active (see `CLAUDE.md`
 § "Feature flags and default features").
 
-### 7.2 Applet Feature Flags (composable with any board flag)
+### 6.2 Applet Feature Flags (composable with any board flag)
 
 | Feature flag                 | Applet / capability added              |
 |------------------------------|----------------------------------------|
@@ -407,7 +345,7 @@ prevent conflicting features from being simultaneously active (see `CLAUDE.md`
 | `applet-openpgp-curve25519`  | Adds Ed25519 + X25519 to OpenPGP       |
 | `rsa`                        | RSA-2048 and RSA-4096 keygen + sign    |
 
-### 7.3 Flash / RAM Budget (release, rp2350_one_4m)
+### 6.3 Flash / RAM Budget (release, rp2350_one_4m)
 
 | Configuration                          | Flash    | RAM      |
 |----------------------------------------|----------|----------|
@@ -423,9 +361,9 @@ has a fixed 520 KB SRAM; flash is not a concern.
 
 ---
 
-## 8. Build Commands
+## 7. Build Commands
 
-### 8.1 Release Builds
+### 7.1 Release Builds
 
 ```sh
 # SC-HSM only, 4 MB flash (default — no flags required)
@@ -460,7 +398,7 @@ cargo build --release --no-default-features \
 cargo build --release --no-default-features --features rp2350_one_4m,rsa
 ```
 
-### 8.2 Debug Build and Flash (hardware required)
+### 7.2 Debug Build and Flash (hardware required)
 
 The `build-all-debug.sh` script sets `DEFMT_LOG=trace` at compile time, builds
 with the debug profile, flashes via `probe-rs run --chip RP235x`, and streams
@@ -480,7 +418,7 @@ probe-rs process:
 pkill -9 -f "probe-rs"
 ```
 
-### 8.3 Running Integration Tests
+### 7.3 Running Integration Tests
 
 Start the debug build in one terminal, wait for USB re-enumeration, then run
 the test suite in a second terminal:
@@ -495,9 +433,9 @@ the test suite in a second terminal:
 
 ---
 
-## 9. Implementation Notes
+## 8. Implementation Notes
 
-### 9.1 GPIO Ownership After Init
+### 8.1 GPIO Ownership After Init
 
 `run_one_board()` in `firmware/src/main.rs` claims peripherals in this order:
 
@@ -511,11 +449,11 @@ the test suite in a second terminal:
 | PIO0        | `Ws2812Led::new()` — **stolen** inside board init     |
 | GPIO 16     | `Ws2812Led::new()` — **stolen** inside board init     |
 
-The CS GPIO lines (9, 13, 14, 15, 17, 21, 22, 26) and the SD card GPIOs
-(4, 5, 6, 7) are driven via direct register writes by the storage and SD card
-layers; they do not go through the Embassy `Output<PIN_N>` ownership model.
+The CS GPIO lines (9, 13, 14, 15, 17, 21, 22, 26) are driven via direct
+register writes by the storage layer; they do not go through the Embassy
+`Output<PIN_N>` ownership model.
 
-### 9.2 SPI Mode 0 Configuration
+### 8.2 SPI Mode 0 Configuration
 
 Both SPI buses are configured identically:
 
@@ -528,7 +466,7 @@ spi_cfg.frequency = SPI_FREQ_HZ;                    // 40_000_000 Hz
 Mode 0 (CPOL=0, CPHA=0) is compatible with all standard W25Q-series and
 IS25-series SPI NOR flash chips.
 
-### 9.3 Core1 Stack Headroom
+### 8.3 Core1 Stack Headroom
 
 The RP2350-One uses the same 128 KB Core1 stack as all other board variants
 (`static mut CORE1_STACK: Stack<131072>` in `firmware/src/main.rs`).
@@ -536,7 +474,7 @@ See `CLAUDE.md` § "Core1 stack overflow (silent hang)" for the rationale.
 The RP2350 has 520 KB SRAM; current BSS usage is approximately 210 KB, leaving
 headroom for further growth.
 
-### 9.4 PIO0_IRQ_0 and the Interrupt Vector
+### 8.4 PIO0_IRQ_0 and the Interrupt Vector
 
 `Pio::new()` (called inside `Ws2812Led::new()`) enables PIO0_IRQ_0 in the
 NVIC.  No `bind_interrupts!` entry is registered for PIO0 in `main.rs` because
@@ -545,7 +483,7 @@ the WS2812B driver uses synchronous `StateMachineTx::push()` and never calls
 interrupt never fires.  If it did, the cortex-m-rt `DefaultHandler` would be
 used as the fallback — a benign no-op.
 
-### 9.5 defmt on Core1
+### 8.5 defmt on Core1
 
 Core1 must not call `defmt` macros.  Spinlock 31 is used internally by the
 defmt RTT transport, and if Core1 holds Spinlock 31 while Core0 is inside the

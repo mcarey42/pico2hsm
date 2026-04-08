@@ -43,14 +43,6 @@ All three applets plus RSA. These are the configurations `build-all.sh` produces
 cargo build --release --no-default-features \
     --features pico2_4m,rsa,applet-piv,applet-openpgp-curve25519
 
-# Raspberry Pi Pico 2 with SD card keystore (SPI1, CS=GPIO15)
-cargo build --release --no-default-features \
-    --features pico2_4m_sdcard,rsa,applet-piv,applet-openpgp-curve25519
-
-# Raspberry Pi Pico 2 — Flash+SD RAID-1 hybrid keystore
-cargo build --release --no-default-features \
-    --features pico2_4m_sdcard_hybrid,rsa,applet-piv,applet-openpgp-curve25519
-
 # Waveshare RP2350-One 4MB
 cargo build --release --no-default-features \
     --features rp2350_one_4m,rsa,applet-piv,applet-openpgp-curve25519
@@ -78,19 +70,7 @@ cargo build --release --no-default-features \
 # Pico 2 — 4 MB flash, GPIO25 LED, USB debug
 cargo build --release --no-default-features --features pico2_4m
 
-# Pico 2 — 4 MB flash + external SD card keystore on SPI1 (CS=GPIO15)
-cargo build --release --no-default-features --features pico2_4m_sdcard
-
-# Pico 2 — 4 MB flash (primary) + SD card on SPI1 (secondary) RAID-1 hybrid
-cargo build --release --no-default-features --features pico2_4m_sdcard_hybrid
 ```
-
-The `pico2_4m_sdcard` variant uses the same SPI1 pin assignment as the
-Waveshare RP2350-LCD-1.47-B built-in SD slot (SCK=GPIO10, MOSI=GPIO11,
-MISO=GPIO12, CS=GPIO15). No LCD is driven. See `docs/BOARD_PICO2_4M_SDCARD.md`
-for wiring details.
-
-The `pico2_4m_sdcard_hybrid` variant mirrors every write to both QMI flash and the SD card; keys survive SD removal (degraded mode) and resync automatically on card reinsertion. See `docs/BOARD_PICO2_4M_SDCARD.md` for details.
 
 ### Waveshare RP2350-One
 
@@ -101,15 +81,7 @@ cargo build --release --no-default-features --features rp2350_one_4m
 # 16 MB flash variant (no SD card)
 cargo build --release --no-default-features --features rp2350_one_16m
 
-# 16 MB flash + one external SD card module (SPI1, CS=GPIO9)
-cargo build --release --no-default-features --features rp2350_one_sdcard
-
-# 16 MB flash + two external SD card modules (SPI1, CS0=GPIO9 CS1=GPIO13)
-cargo build --release --no-default-features --features rp2350_one_sdcard_dual
 ```
-
-See `docs/SD_CARD_WIRING.md` for the physical wiring required by the
-`rp2350_one_sdcard` and `rp2350_one_sdcard_dual` configurations.
 
 ### Waveshare RP2350-Geek
 
@@ -120,8 +92,6 @@ cargo build --release --no-default-features --features rp2350_geek_16m
 # 16 MB flash + built-in SD card slot (GPIO5 CS)
 cargo build --release --no-default-features --features rp2350_geek_sdcard
 
-# 16 MB flash + dual SD card slots (GPIO5 + GPIO4 CS)
-cargo build --release --no-default-features --features rp2350_geek_sdcard_dual
 ```
 
 ### Waveshare RP2350-LCD-1.47-B
@@ -130,14 +100,9 @@ cargo build --release --no-default-features --features rp2350_geek_sdcard_dual
 # 16 MB flash + built-in SD card (SPI1 GPIO10/11/12/15) + 1.47" LCD
 cargo build --release --no-default-features --features waveshare_rp2350_lcd_16m
 
-# 16 MB flash + built-in SD (GPIO15 CS) + second external SD (GPIO13 CS)
-cargo build --release --no-default-features --features waveshare_rp2350_lcd_sdcard_dual
-
 # SD card as sole keystore (replaces QMI flash)
 cargo build --release --no-default-features --features waveshare_rp2350_lcd_sdcard
 
-# QMI flash (primary) + SD card (secondary) RAID-1 hybrid
-cargo build --release --no-default-features --features waveshare_rp2350_lcd_sdcard_hybrid
 ```
 
 #### SD-only keystore (`waveshare_rp2350_lcd_sdcard`)
@@ -152,27 +117,6 @@ cargo build --release --no-default-features \
 **Flash budget**: Same as `waveshare_rp2350_lcd_16m`.
 **RAM budget**: Same as `waveshare_rp2350_lcd_16m`; no framebuffer change.
 **Keystore**: SD card raw blocks. Keys do not survive SD card removal without the hybrid variant.
-
-#### Hybrid Flash+SD RAID-1 (`waveshare_rp2350_lcd_sdcard_hybrid`)
-
-QMI flash (primary) mirrored to a single microSD card (secondary). Every write goes to both; reads prefer flash; SD failure degrades gracefully (flash remains authoritative). Periodic polling detects SD reinsertion and triggers automatic resync.
-
-```sh
-cargo build --release --no-default-features \
-    --features waveshare_rp2350_lcd_sdcard_hybrid,rsa,applet-piv,applet-openpgp-curve25519
-```
-
-**Primary store**: Internal RP2350 QMI flash (same as `waveshare_rp2350_lcd_16m`).
-**Secondary store**: SD card raw blocks (mirrored copy).
-**Degraded mode**: SD write failure → `LedStatus::Degraded`; HSM remains operational via flash.
-**Flash error**: Primary flash failure → `LedStatus::Error`; HSM halts (flash is authoritative).
-**SD recovery**: Polling detects card reinsertion → automatic resync from flash to SD card → `LedStatus::Ready`.
-
-### RP2354 with embedded flash
-
-```sh
-cargo build --release --no-default-features --features rp2354_embedded
-```
 
 ---
 
@@ -295,38 +239,18 @@ code paths), and streams RTT output via probe-rs.
 # Pico 2 (default development target)
 ./build-all-debug.sh pico2_4m
 
-# Pico 2 with SD card keystore
-./build-all-debug.sh pico2_4m_sdcard
-
-# Pico 2 — Flash+SD RAID-1 hybrid
-./build-all-debug.sh pico2_4m_sdcard_hybrid
-
 # RP2350-One 16 MB
 ./build-all-debug.sh rp2350_one_16m
-
-# RP2350-One with external SD card
-./build-all-debug.sh rp2350_one_sdcard
-
-# RP2350-One with dual SD cards
-./build-all-debug.sh rp2350_one_sdcard_dual
 
 # RP2350-Geek with built-in SD card
 ./build-all-debug.sh rp2350_geek_sdcard
 
-# RP2350-Geek with dual SD cards
-./build-all-debug.sh rp2350_geek_sdcard_dual
-
 # Waveshare RP2350-LCD-1.47-B
 ./build-all-debug.sh waveshare_rp2350_lcd_16m
-
-# Waveshare RP2350-LCD-1.47-B with dual SD cards
-./build-all-debug.sh waveshare_rp2350_lcd_sdcard_dual
 
 # Waveshare RP2350-LCD-1.47-B — SD card as sole keystore
 ./build-all-debug.sh waveshare_rp2350_lcd_sdcard
 
-# Waveshare RP2350-LCD-1.47-B — Flash+SD RAID-1 hybrid
-./build-all-debug.sh waveshare_rp2350_lcd_sdcard_hybrid
 ```
 
 The script blocks on RTT streaming. To run the integration test suite, start

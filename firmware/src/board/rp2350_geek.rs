@@ -3,7 +3,6 @@
 //! Board variants covered by this module:
 //! - RP2350-Geek 16MB               (`rp2350_geek_16m` feature)
 //! - RP2350-Geek with SDCard        (`rp2350_geek_sdcard` feature)
-//! - RP2350-Geek with dual SDCard   (`rp2350_geek_sdcard_dual` feature)
 //!
 //! # Hardware specifics
 //! - MCU: RP2350A @ 150 MHz
@@ -17,8 +16,7 @@
 //! - SPI0 pins: SCK=GPIO18, MOSI=GPIO19, MISO=GPIO20
 //!   CS[0..3] = GPIO17, GPIO21, GPIO22, GPIO26 (keystore flash chips)
 //! - SPI1 also: CS[1..3] = GPIO13, GPIO14, GPIO15 (mirror flash, beyond LCD CS=GPIO9)
-//! - SDCard slot CS: GPIO5 (first card)
-//! - Second SDCard CS: GPIO4 (dual-SDCard variant only, `rp2350_geek_sdcard_dual`)
+//! - SDCard slot CS: GPIO5
 //!
 //! # ST7789 LCD pin assignments
 //! Confirmed from:
@@ -49,7 +47,6 @@ use super::{LedController, LedStatus};
 #[cfg(any(
     feature = "rp2350_geek_16m",
     feature = "rp2350_geek_sdcard",
-    feature = "rp2350_geek_sdcard_dual",
 ))]
 use super::Board;
 
@@ -86,12 +83,8 @@ pub const SPI1_MISO: u8 = 24;
 /// SPI1 software CS pins — LCD CS is GPIO9; extra CS slots for mirror flash.
 pub const SPI1_CS: [u8; 4] = [9, 13, 14, 15];
 
-/// SD-Card slot 0 chip-select pin.
+/// SD-Card slot chip-select pin.
 pub const SDCARD0_CS: u8 = 5;
-
-/// SD-Card slot 1 chip-select pin (dual-SDCard variant only).
-#[cfg(feature = "rp2350_geek_sdcard_dual")]
-pub const SDCARD1_CS: u8 = 4;
 
 /// SPI0 frequency — flash chips at 40 MHz.
 pub const SPI_FREQ_HZ: u32 = 40_000_000;
@@ -698,7 +691,6 @@ impl Rp2350GeekBoard {
 #[cfg(any(
     feature = "rp2350_geek_16m",
     feature = "rp2350_geek_sdcard",
-    feature = "rp2350_geek_sdcard_dual",
 ))]
 impl Board for Rp2350GeekBoard {
     type Led = St7789StatusDisplay;

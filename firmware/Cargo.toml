@@ -21,24 +21,10 @@ rp2350_one_4m = []
 rp2350_one_16m = []
 rp2350_geek_16m = []
 rp2350_geek_sdcard = []
-rp2350_geek_sdcard_dual = []
-rp2354_embedded = []
 pico2_4m = []
-# Raspberry Pi Pico 2 4MB with external SD card keystore on SPI1 (CS=GPIO15, same pins as Waveshare LCD-1.47-B)
-pico2_4m_sdcard = []
-# Raspberry Pi Pico 2 4MB: QMI flash (primary) + SD card on SPI1 (secondary) RAID-1 hybrid — for hybrid init debug
-pico2_4m_sdcard_hybrid = []
 waveshare_rp2350_lcd_16m = []
 # Waveshare RP2350-LCD-1.47-B: single SD card keystore on SPI1 (CS=GPIO15)
 waveshare_rp2350_lcd_sdcard = []
-# RP2350-One with one externally wired SPI SD card module (SPI1, CS=GPIO9)
-rp2350_one_sdcard = []
-# RP2350-One with two externally wired SPI SD card modules (SPI1, CS0=GPIO9 CS1=GPIO13)
-rp2350_one_sdcard_dual = []
-# Waveshare RP2350-LCD-1.47-B: built-in SD on SPI1 + second external SD card (CS=GPIO13)
-waveshare_rp2350_lcd_sdcard_dual = []
-# Waveshare RP2350-LCD-1.47-B: QMI flash (primary) + single SD card on SPI1 (secondary) RAID-1 hybrid
-waveshare_rp2350_lcd_sdcard_hybrid = []
 rsa = ["dep:rsa", "dep:embedded-alloc"]  # RSA support — adds ~1MB to binary; disabled by default
 debug = []         # Debug mode: enables memory dump APDUs, disables secure boot enforcement
 applet-piv = ["dep:des"]                 # PIV applet (NIST SP 800-73-4); adds 3DES (~10 KB)
@@ -126,7 +112,7 @@ embedded-sdmmc = { version = "0.9" }
 
 # Logging / diagnostics
 defmt = { version = "0.3" }
-defmt-rtt = { version = "0.4" }
+defmt-rtt = { version = "0.4", features = ["disable-blocking-mode"] }
 
 # ARM Cortex-M runtime
 cortex-m = { version = "0.7", features = ["critical-section-single-core"] }
