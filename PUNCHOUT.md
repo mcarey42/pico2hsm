@@ -93,30 +93,6 @@ interval.  See `firmware/src/crypto/rng.rs` TODO comment.
 
 ---
 
-## 5. ECDH cofactor derive — `ECDH1-COFACTOR-DERIVE` returns `CKR_GENERAL_ERROR`
-
-**Current state:**
-Integration tests `test_ecdh_returns_correct_length`, `test_ecdh_cross_check`, and
-`test_ecdh_different_peers_give_different_secrets` all fail for P-256 when the test
-harness requests mechanism `ECDH1-COFACTOR-DERIVE` (0x1051).  The firmware returns
-`CKR_GENERAL_ERROR`; the standard `ECDH1-DERIVE` (0x1050) path is not exercised by
-these tests and is believed to work.  These tests are marked `xfail` in the suite.
-
-**Root cause (to confirm):**
-Mechanism `ECDH1-COFACTOR-DERIVE` multiplies the shared point by the curve cofactor
-(h=1 for P-256, so it is mathematically identical to plain ECDH on this curve).
-The OpenSC sc-hsm driver likely maps this mechanism to a different INS byte or a
-different `algo_ref` than plain ECDH.  The firmware dispatch in
-`protocol/sc_hsm/commands/ecdh.rs` (or equivalent) may not recognise the cofactor
-algo ID and falls through to a generic error.
-
-**What needs to happen:**
-- Trace the ECDH1-COFACTOR-DERIVE APDU on hardware to identify the `algo_ref` byte
-  the driver sends.
-- Add the cofactor algo_ref as an alias for the standard ECDH handler in the dispatch
-  match arm (for P-256/P-384/P-521 cofactor h=1, the result is identical).
-- Add the three ECDH tests to the passing baseline and remove the `xfail` markers.
-
 ---
 
 ## Deferred: Multi-partition key store
