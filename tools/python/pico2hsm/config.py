@@ -28,6 +28,7 @@ class PeerEntry:
     public_key: bytes                # 65-byte uncompressed P-256 (internal representation)
     fingerprint: str                 # SHA-256 hex of public_key
     address: Optional[str] = None   # "host:port" for TCP sync, None for USB-only
+    cert_path: Optional[str] = None  # Path to peer's TLS certificate for mTLS
 
 
 @dataclass
@@ -39,6 +40,9 @@ class PeerConfig:
     log_level: str = "INFO"
     sync_on_connect: bool = True
     tls_enabled: bool = True         # Use anonymous TLS for TCP transport
+    identity_cert: Optional[str] = None   # This daemon's TLS cert path
+    identity_key: Optional[str] = None    # This daemon's TLS key path
+    cluster_id: str = "default-cluster"   # Cluster identifier for enrollment
 
     @classmethod
     def load(cls, path: str) -> "PeerConfig":
@@ -79,6 +83,9 @@ class PeerConfig:
             log_level=raw.get("log_level", "INFO"),
             sync_on_connect=bool(raw.get("sync_on_connect", True)),
             tls_enabled=bool(raw.get("tls_enabled", True)),
+            identity_cert=raw.get("identity_cert"),
+            identity_key=raw.get("identity_key"),
+            cluster_id=raw.get("cluster_id", "default-cluster"),
         )
 
     @classmethod
@@ -128,6 +135,7 @@ class PeerConfig:
             public_key=pubkey_bytes,
             fingerprint=fingerprint,
             address=entry.get("address"),
+            cert_path=entry.get("cert_path"),
         )
 
     def find_peer_by_pubkey(self, pubkey: bytes) -> Optional[PeerEntry]:

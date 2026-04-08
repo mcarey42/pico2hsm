@@ -805,6 +805,7 @@ pub fn handle(state: &mut ScHsmState, store: &mut dyn crate::storage::KeyStore, 
             let _ = key_obj.public_key.extend_from_slice(&pair.exponent);
             let _ = store.save_key(&key_obj); // best-effort; InvalidCore is silent on Core1
         }
+        state.generation = state.generation.wrapping_add(1);
 
         // Store RSA key (replacing any existing entry with the same key_id)
         state.rsa_keys.retain(|k| k.key_id != key_id);
@@ -851,6 +852,7 @@ pub fn handle(state: &mut ScHsmState, store: &mut dyn crate::storage::KeyStore, 
         let _ = key_obj.public_key.extend_from_slice(&pair.public_key);
         let _ = store.save_key(&key_obj); // best-effort; InvalidCore is silent on Core1
     }
+    state.generation = state.generation.wrapping_add(1);
 
     // Store (replacing any existing key with the same key_id)
     state.keys.retain(|k| k.key_id != key_id);

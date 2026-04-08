@@ -100,6 +100,7 @@ pub fn handle(
         return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED);
     }
 
+    state.generation = state.generation.wrapping_add(1);
     ApduResponse::ok(&[])
 }
 

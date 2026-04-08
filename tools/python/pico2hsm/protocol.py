@@ -404,6 +404,82 @@ def build_get_generation() -> bytes:
     return build_extras(EXTRAS_GET_GENERATION)
 
 
+def build_delete_key(key_ref: int) -> bytes:
+    """Build DELETE KEY APDU.
+
+    Uses DELETE FILE (INS=0xE4) with FID encoding 0xCC:key_ref,
+    which the firmware interprets as a key object deletion.
+    """
+    data = struct.pack(">H", 0xCC00 | (key_ref & 0xFF))
+    return _encode_apdu(0x80, INS_DELETE_FILE, 0x02, 0x00, data)
+
+
+# ---------------------------------------------------------------------------
+# Cluster sub-commands for INS_EXTRAS (V2 protocol, P1 values 0x35-0x3C)
+# ---------------------------------------------------------------------------
+EXTRAS_NOISE_TARGET_INIT      = 0x35
+EXTRAS_NOISE_SOURCE_RESPOND   = 0x36
+EXTRAS_NOISE_FINALIZE_SEND_V2 = 0x37
+EXTRAS_NOISE_FINALIZE_RECV_V2 = 0x38
+EXTRAS_GET_KEY_MANIFEST       = 0x39
+EXTRAS_GET_STATE_HASH         = 0x3A
+EXTRAS_SIGN_ENROLLMENT        = 0x3B
+EXTRAS_GET_GENERATION_V2      = 0x3C
+
+
+def build_noise_target_init(source_static_pub: bytes) -> bytes:
+    """INS=0x54, P1=0x35: target generates challenge + signs ephem key."""
+    assert len(source_static_pub) == 65
+    return build_extras(EXTRAS_NOISE_TARGET_INIT, source_static_pub)
+
+
+def build_noise_source_respond(ephem_T_pub: bytes, challenge: bytes, sig_T: bytes) -> bytes:
+    """INS=0x54, P1=0x36: source verifies target's signed ephem + signs its own."""
+    data = ephem_T_pub + challenge + sig_T
+    assert len(data) == 161
+    return build_extras(EXTRAS_NOISE_SOURCE_RESPOND, data)
+
+
+def build_noise_finalize_send_v2(
+    target_ephem_pub: bytes, target_static_pub: bytes, challenge: bytes,
+) -> bytes:
+    """INS=0x54, P1=0x37."""
+    data = target_ephem_pub + target_static_pub + challenge
+    assert len(data) == 162
+    return build_extras(EXTRAS_NOISE_FINALIZE_SEND_V2, data)
+
+
+def build_noise_finalize_recv_v2(
+    source_ephem_pub: bytes, sig_S: bytes, encrypted_dkek: bytes,
+) -> bytes:
+    """INS=0x54, P1=0x38."""
+    data = source_ephem_pub + sig_S + encrypted_dkek
+    assert len(data) == 189
+    return build_extras(EXTRAS_NOISE_FINALIZE_RECV_V2, data)
+
+
+def build_get_key_manifest() -> bytes:
+    """INS=0x54, P1=0x39."""
+    return build_extras(EXTRAS_GET_KEY_MANIFEST)
+
+
+def build_get_state_hash() -> bytes:
+    """INS=0x54, P1=0x3A."""
+    return build_extras(EXTRAS_GET_STATE_HASH)
+
+
+def build_sign_enrollment(tls_fingerprint: bytes, cluster_id: bytes) -> bytes:
+    """INS=0x54, P1=0x3B."""
+    data = tls_fingerprint + cluster_id
+    assert len(data) == 48
+    return build_extras(EXTRAS_SIGN_ENROLLMENT, data)
+
+
+def build_get_generation_v2() -> bytes:
+    """INS=0x54, P1=0x3C."""
+    return build_extras(EXTRAS_GET_GENERATION_V2)
+
+
 # ---------------------------------------------------------------------------
 # Response parsers
 # ---------------------------------------------------------------------------

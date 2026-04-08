@@ -243,6 +243,8 @@ pub struct KeyObject {
     /// Blobs written with the old `P2K2` magic will deserialize with
     /// `generation = 0`.
     pub generation:  u32,
+    /// Daemon-assigned HLC timestamp (ms since epoch), 0 for legacy/locally-generated keys.
+    pub timestamp_ms: u64,
     /// Raw private key scalar or symmetric key bytes (zeroized on drop).
     pub private_key: heapless::Vec<u8, MAX_PRIVATE_KEY_SIZE>,
     /// Optional raw public key (uncompressed EC point, or RSA public key DER).
@@ -255,6 +257,7 @@ impl Zeroize for KeyObject {
         self.public_key.zeroize();
         self.use_count = 0;
         self.generation = 0;
+        self.timestamp_ms = 0;
         self.key_id = 0;
         self.owner.zeroize();
         self.key_domain = 0;
@@ -283,6 +286,7 @@ impl KeyObject {
             key_domain: 0,
             use_count: 0,
             generation: 0,
+            timestamp_ms: 0,
             private_key: heapless::Vec::new(),
             public_key: heapless::Vec::new(),
         }
@@ -486,6 +490,7 @@ impl KeyObject {
             key_domain: domain,
             use_count,
             generation,
+            timestamp_ms: 0,
             private_key: heapless::Vec::new(),
             public_key: heapless::Vec::new(),
         };
@@ -630,6 +635,7 @@ impl KeyObject {
             key_domain: 0,
             use_count:  0,
             generation: 0,
+            timestamp_ms: 0,
             private_key: heapless::Vec::new(),
             public_key: heapless::Vec::new(),
         };

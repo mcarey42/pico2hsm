@@ -75,6 +75,7 @@ pub fn handle(state: &mut ScHsmState, store: &mut dyn KeyStore, cmd: &ApduComman
     if store.save_key(&key_obj).is_err() {
         return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED);
     }
+    state.generation = state.generation.wrapping_add(1);
 
     // Also store in in-memory EC key store for immediate use.
     // Map algo byte to CoreKeyType for InMemoryKey.

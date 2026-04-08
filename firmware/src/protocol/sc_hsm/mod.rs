@@ -278,6 +278,18 @@ pub struct ScHsmState {
     pub exchange_ephem_priv: Option<Zeroizing<[u8; 32]>>,
     /// Ephemeral P-256 public key for in-progress DKEK exchange (65-byte uncompressed).
     pub exchange_ephem_pub: Option<[u8; 65]>,
+
+    /// Challenge for in-progress V2 DKEK exchange.
+    pub exchange_challenge: Option<[u8; 32]>,
+    /// Peer's ephemeral pub stored during V2 exchange for channel binding.
+    pub exchange_peer_ephem_pub: Option<[u8; 65]>,
+    /// Replay cache for V2 exchange challenges (RAM only, cleared on reset).
+    pub exchange_challenge_cache: [[u8; 32]; 16],
+    /// Number of valid entries in exchange_challenge_cache.
+    pub exchange_challenge_cache_count: u8,
+
+    /// Monotonic generation counter, incremented on key generate/import/delete.
+    pub generation: u64,
 }
 
 impl ScHsmState {
@@ -311,6 +323,11 @@ impl ScHsmState {
             dkek: DkekManager::new([0u8; 16]),
             exchange_ephem_priv: None,
             exchange_ephem_pub: None,
+            exchange_challenge: None,
+            exchange_peer_ephem_pub: None,
+            exchange_challenge_cache: [[0u8; 32]; 16],
+            exchange_challenge_cache_count: 0,
+            generation: 0,
         }
     }
 

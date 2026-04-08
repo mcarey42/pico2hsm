@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import tempfile
 from dataclasses import dataclass, asdict, field
 from datetime import datetime, timezone
 from typing import Optional
@@ -76,11 +77,37 @@ class SyncState:
             "devices": {k: asdict(v) for k, v in self.devices.items()},
         }
 
+    # Schema validation constants
+    _ALLOWED_DEVICE_FIELDS = {'fingerprint', 'name', 'last_generation', 'last_seen', 'last_sync_result'}
+    _FIELD_TYPES = {
+        'fingerprint': str,
+        'name': str,
+        'last_generation': int,
+        'last_seen': str,
+        'last_sync_result': str,
+    }
+
     @classmethod
     def from_dict(cls, data: dict) -> "SyncState":
         devices = {}
         for fp, d in data.get("devices", {}).items():
-            devices[fp] = DeviceState(**d)
+            # Validate: only known fields, correct types
+            unknown = set(d.keys()) - cls._ALLOWED_DEVICE_FIELDS
+            if unknown:
+                logger.warning("Ignoring unknown fields in state.json device entry: %s", unknown)
+                d = {k: v for k, v in d.items() if k in cls._ALLOWED_DEVICE_FIELDS}
+            # Type validation
+            valid = True
+            for field_name, expected_type in cls._FIELD_TYPES.items():
+                if field_name in d and not isinstance(d[field_name], expected_type):
+                    logger.warning(
+                        "Invalid type for field %s in device %s, skipping device",
+                        field_name, fp,
+                    )
+                    valid = False
+                    break
+            if valid:
+                devices[fp] = DeviceState(**d)
         return cls(version=data.get("version", 1), devices=devices)
 
 
@@ -110,17 +137,23 @@ class StatePersistence:
         return self._state
 
     def save(self, state: Optional[SyncState] = None) -> None:
-        """Persist state to disk."""
+        """Persist state to disk with secure file permissions."""
         if state is not None:
             self._state = state
-        os.makedirs(self._state_dir, exist_ok=True)
-        tmp = self._state_file + ".tmp"
+        os.makedirs(self._state_dir, mode=0o700, exist_ok=True)
+        # Use unique temp file to avoid TOCTOU race between threads
+        tmp_fd, tmp_path = tempfile.mkstemp(dir=self._state_dir, suffix='.tmp')
         try:
-            with open(tmp, "w") as f:
+            with os.fdopen(tmp_fd, 'w') as f:
                 json.dump(self._state.to_dict(), f, indent=2)
-            os.replace(tmp, self._state_file)
+            os.chmod(tmp_path, 0o600)
+            os.replace(tmp_path, self._state_file)
         except Exception as e:
             logger.error("Failed to save state: %s", e)
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
 
     @property
     def state(self) -> SyncState:

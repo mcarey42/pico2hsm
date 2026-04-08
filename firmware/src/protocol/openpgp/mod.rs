@@ -340,6 +340,7 @@ impl OpenPgp {
             key_domain: 0,
             use_count: 0,
             generation: 0,
+            timestamp_ms: 0,
             private_key: heapless::Vec::new(),
             public_key: heapless::Vec::new(),
         };
@@ -377,6 +378,7 @@ impl OpenPgp {
             key_domain: 0,
             use_count: 0,
             generation: 0,
+            timestamp_ms: 0,
             private_key: heapless::Vec::new(),
             public_key: heapless::Vec::new(),
         };

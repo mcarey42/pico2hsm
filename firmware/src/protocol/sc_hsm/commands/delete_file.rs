@@ -71,6 +71,7 @@ pub fn handle(state: &mut ScHsmState, store: &mut dyn crate::storage::KeyStore, 
     // Erase from flash (best-effort; do not fail APDU on flash error).
     if deleted_key {
         let _ = store.erase_key(pico2hsm_core::key::KeyId(full_key_id));
+        state.generation = state.generation.wrapping_add(1);
     }
 
     if deleted_ef || deleted_key {

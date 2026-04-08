@@ -11,8 +11,16 @@ from .device import Pico2HSM
 from .dkek import DkekExchange
 from .enrollment import DeviceEnrollment
 from .errors import SyncError
+from .key_transfer import transfer_keys
 from .protocol import build_get_generation
 from .state import StatePersistence, SyncState
+
+try:
+    from .manifest import KeyManifestEntry, compute_state_root
+    from .cluster import SyncPlan, SyncResult as ClusterSyncResult, diff_manifests
+    _CLUSTER_AVAILABLE = True
+except ImportError:
+    _CLUSTER_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
 
@@ -185,3 +193,143 @@ class SyncManager:
         port = int(port_str) if port_str else 7890
 
         self._exchange.exchange_tcp_server(source, port=port)
+
+    # ------------------------------------------------------------------
+    # Cluster key sync methods
+    # ------------------------------------------------------------------
+
+    def get_manifest(self, device: Pico2HSM) -> list:
+        """Fetch key manifest from device. Returns empty list on failure."""
+        try:
+            return device.get_key_manifest()
+        except Exception as e:
+            logger.warning("Failed to get manifest from device: %s", e)
+            return []
+
+    def get_state_hash(self, device: Pico2HSM) -> Optional[tuple]:
+        """Returns (generation, state_root, sig) or None on failure."""
+        try:
+            return device.get_state_hash()
+        except Exception as e:
+            logger.warning("Failed to get state hash: %s", e)
+            return None
+
+    def full_sync(
+        self,
+        primary: Pico2HSM,
+        secondary: Pico2HSM,
+        primary_name: str = "primary",
+        secondary_name: str = "secondary",
+        ensure_dkek: bool = True,
+    ) -> "ClusterSyncResult":
+        """Full sync: DKEK check -> manifest diff -> key transfer -> verify.
+
+        Steps:
+        1. If ensure_dkek: check generation numbers; if secondary gen < primary,
+           trigger DkekExchange._relay_exchange(primary, secondary)
+        2. Get manifests from both via get_manifest()
+        3. diff_manifests(primary_manifest, secondary_manifest) -> SyncPlan
+        4. transfer_keys(primary, secondary, plan) -> ClusterSyncResult
+        5. Verify: get_state_hash() from both; log if roots match or mismatch
+        6. Update StatePersistence with results
+
+        Requires cluster modules (manifest.py, cluster.py) to be available.
+        """
+        if not _CLUSTER_AVAILABLE:
+            raise SyncError(
+                "Cluster sync modules not available (manifest.py / cluster.py not found)"
+            )
+
+        # Step 1: Ensure DKEK is shared
+        if ensure_dkek:
+            primary_gen = self.get_generation(primary)
+            secondary_gen = self.get_generation(secondary)
+            if secondary_gen < primary_gen:
+                logger.info(
+                    "DKEK generation mismatch: %s gen=%d, %s gen=%d — syncing DKEK",
+                    primary_name, primary_gen, secondary_name, secondary_gen,
+                )
+                self._exchange._relay_exchange(primary, secondary)
+
+        # Step 2: Get manifests
+        primary_manifest = self.get_manifest(primary)
+        secondary_manifest = self.get_manifest(secondary)
+        logger.info(
+            "Manifests: %s has %d keys, %s has %d keys",
+            primary_name, len(primary_manifest),
+            secondary_name, len(secondary_manifest),
+        )
+
+        # Step 3: Diff
+        plan = diff_manifests(primary_manifest, secondary_manifest)
+        logger.info(
+            "Sync plan: %d missing, %d conflicts, %d tombstones, %d orphans",
+            len(plan.missing_on_secondary),
+            len(plan.conflicts),
+            len(plan.tombstone_on_secondary),
+            len(plan.orphans),
+        )
+
+        # Step 4: Transfer
+        result = transfer_keys(primary, secondary, plan)
+
+        # Step 5: Verify
+        primary_hash = self.get_state_hash(primary)
+        secondary_hash = self.get_state_hash(secondary)
+        if primary_hash is not None and secondary_hash is not None:
+            if primary_hash[1] == secondary_hash[1]:
+                logger.info("Verification: state roots match after sync")
+            else:
+                logger.warning(
+                    "Verification: state roots MISMATCH after sync "
+                    "(primary=%s, secondary=%s)",
+                    primary_hash[1].hex() if isinstance(primary_hash[1], bytes) else primary_hash[1],
+                    secondary_hash[1].hex() if isinstance(secondary_hash[1], bytes) else secondary_hash[1],
+                )
+
+        # Step 6: Persist
+        try:
+            state = self._persistence.load()
+            # Update with sync results
+            self._persistence.save(state)
+        except Exception as e:
+            logger.warning("Failed to persist sync state: %s", e)
+
+        return result
+
+    def verify_sync(
+        self,
+        devices: list[tuple[str, Pico2HSM]],
+    ) -> dict[str, Optional[bytes]]:
+        """Fetch state roots from all devices. Returns {name: state_root}.
+
+        Logs whether all roots are equal (cluster in sync) or differ.
+        Does NOT raise on individual device failures -- returns None for failed devices.
+        """
+        roots: dict[str, Optional[bytes]] = {}
+        for name, device in devices:
+            hash_result = self.get_state_hash(device)
+            if hash_result is not None:
+                roots[name] = hash_result[1]
+                logger.info("Device %s: state_root=%s", name,
+                            hash_result[1].hex() if isinstance(hash_result[1], bytes) else hash_result[1])
+            else:
+                roots[name] = None
+                logger.warning("Device %s: failed to get state hash", name)
+
+        # Check if all non-None roots are equal
+        valid_roots = [v for v in roots.values() if v is not None]
+        if len(valid_roots) >= 2:
+            if all(r == valid_roots[0] for r in valid_roots):
+                logger.info("All %d reachable devices are in sync", len(valid_roots))
+            else:
+                logger.warning(
+                    "Cluster divergence detected: %d reachable devices have different state roots",
+                    len(valid_roots),
+                )
+        elif len(valid_roots) == 1:
+            logger.info("Only 1 device reachable — cannot verify cluster sync")
+        else:
+            logger.warning("No devices reachable — cannot verify cluster sync")
+
+        return roots

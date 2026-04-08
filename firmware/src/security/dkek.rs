@@ -359,6 +359,18 @@ impl DkekManager {
         }
     }
 
+    /// Set the DKEK directly (bypassing share collection).
+    ///
+    /// Used by V2 DKEK exchange (NOISE_FINALIZE_RECV_V2) to store a
+    /// decrypted DKEK received from a peer HSM.
+    pub fn set_dkek_direct(&mut self, dkek: [u8; 32]) {
+        self.status.zeroize();
+        self.status = DkekStatus::Ready {
+            dkek: Zeroizing::new(dkek),
+        };
+        self.total_shares = 1;
+    }
+
     /// Zeroize and reset to `NotInitialized`.
     pub fn clear(&mut self) {
         self.status.zeroize();
@@ -737,7 +749,7 @@ fn decrypt_share_blob(blob: &[u8], password: &[u8]) -> Result<[u8; SHARE_PT_SIZE
 /// `peer_pub` is the 65-byte uncompressed public key (0x04 || X || Y).
 ///
 /// Returns the 32-byte X-coordinate of the shared point.
-fn p256_ecdh(
+pub fn p256_ecdh(
     priv_key: &[u8; 32],
     peer_pub: &[u8; P256_UNCOMPRESSED_SIZE],
 ) -> Result<Zeroizing<[u8; 32]>, DkekError> {
@@ -778,6 +790,29 @@ fn p256_ecdh(
     let mut out = Zeroizing::new([0u8; 32]);
     out.copy_from_slice(x.as_slice());
 
+    Ok(out)
+}
+
+/// Derive an AES-256 session key for V2 DKEK exchange with channel binding.
+///
+/// `info = b"pico2hsm-dkek-v2" || ephem_pub_1(65) || ephem_pub_2(65) || challenge(32)`
+/// `session_key = HKDF-SHA256(ikm=shared_secret, salt=[], info=info, len=32)`
+pub fn derive_session_key_v2(
+    shared_secret: &[u8; 32],
+    ephem_pub_1: &[u8; 65],
+    ephem_pub_2: &[u8; 65],
+    challenge: &[u8; 32],
+) -> Result<Zeroizing<[u8; 32]>, DkekError> {
+    let hkdf = Hkdf::<Sha256>::new(None, shared_secret.as_ref());
+    // info = b"pico2hsm-dkek-v2"(16) || ephem_pub_1(65) || ephem_pub_2(65) || challenge(32) = 178 bytes
+    let mut info_buf = [0u8; 178];
+    info_buf[..16].copy_from_slice(b"pico2hsm-dkek-v2");
+    info_buf[16..81].copy_from_slice(ephem_pub_1);
+    info_buf[81..146].copy_from_slice(ephem_pub_2);
+    info_buf[146..].copy_from_slice(challenge);
+    let mut out = Zeroizing::new([0u8; 32]);
+    hkdf.expand(&info_buf, out.as_mut())
+        .map_err(|_| DkekError::KdfFailure)?;
     Ok(out)
 }
 

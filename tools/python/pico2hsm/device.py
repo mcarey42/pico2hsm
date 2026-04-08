@@ -150,6 +150,48 @@ class Pico2HSM:
         self.transmit(apdu)
         logger.debug("SC-HSM applet selected")
 
+    def get_key_manifest(self) -> list:
+        """Fetch the key manifest from the device.
+
+        Returns a list of KeyManifestEntry objects.
+        """
+        from .manifest import parse_key_manifest
+        from .protocol import build_get_key_manifest
+
+        apdu = build_get_key_manifest()
+        data, sw = self.transmit(apdu)
+        return parse_key_manifest(data)
+
+    def get_state_hash(self) -> tuple:
+        """Fetch the state hash from the device.
+
+        Returns (generation: int, state_root: bytes[32], sig: bytes[64]).
+        """
+        from .protocol import build_get_state_hash
+
+        apdu = build_get_state_hash()
+        data, sw = self.transmit(apdu)
+        if len(data) != 104:
+            raise DeviceConnectionError(
+                f"GET_STATE_HASH: expected 104 bytes, got {len(data)}"
+            )
+        generation = struct.unpack(">Q", data[0:8])[0]
+        state_root = data[8:40]
+        sig = data[40:104]
+        return generation, state_root, sig
+
+    def get_generation_v2(self) -> int:
+        """Returns u64 generation counter."""
+        from .protocol import build_get_generation_v2
+
+        apdu = build_get_generation_v2()
+        data, sw = self.transmit(apdu)
+        if len(data) != 8:
+            raise DeviceConnectionError(
+                f"GET_GENERATION_V2: expected 8 bytes, got {len(data)}"
+            )
+        return struct.unpack(">Q", data)[0]
+
     @classmethod
     def list_devices(cls) -> list[str]:
         """Return a list of available HSM reader/device names."""

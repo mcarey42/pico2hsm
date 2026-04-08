@@ -21,6 +21,7 @@ Exchange protocol (host-mediated relay):
 from __future__ import annotations
 
 import logging
+import ssl
 import socket
 import struct
 from typing import Optional
@@ -48,6 +49,16 @@ MSG_TYPE_DEV_PUBKEY = 0x05
 MSG_TYPE_EPHEM_PUB  = 0x06
 MSG_TYPE_ENC_DKEK   = 0x07
 
+# Cluster sync message types
+MSG_TYPE_MANIFEST_REQ    = 0x10
+MSG_TYPE_MANIFEST_RESP   = 0x11
+MSG_TYPE_KEY_BLOB        = 0x12
+MSG_TYPE_SYNC_COMPLETE   = 0x13
+MSG_TYPE_STATE_HASH_REQ  = 0x14
+MSG_TYPE_STATE_HASH_RESP = 0x15
+MSG_TYPE_TOMBSTONE       = 0x20
+MSG_TYPE_PROMOTE_PRIMARY = 0x21
+
 # Default TCP port
 DEFAULT_PORT = 7890
 
@@ -55,6 +66,12 @@ DEFAULT_PORT = 7890
 PUBKEY_SIZE = 65      # uncompressed P-256
 ENCRYPTED_DKEK_SIZE = 60  # nonce(12) + ct(32) + tag(16)
 DEVICE_ID_SIZE = 16
+MAX_FRAME_SIZE = 65536  # 64 KB max payload
+
+# TCP listener DoS protection is implemented in daemon.py:
+# - conn.settimeout(30.0) after accept
+# - rate limiting: max 3 concurrent connections per IP
+# - max 100 messages per minute per connection
 
 
 class DkekExchange:
@@ -215,6 +232,7 @@ class DkekExchange:
 
     def _tcp_server_relay(self, conn: socket.socket, source: Pico2HSM) -> None:
         """TCP server side of relay: drives source HSM, relays messages with remote target."""
+        conn.settimeout(30.0)
 
         # Exchange static pubkeys for enrollment verification
         source_static = self._get_device_pubkey(source)
@@ -249,6 +267,7 @@ class DkekExchange:
 
     def _tcp_client_relay(self, conn: socket.socket, target: Pico2HSM) -> None:
         """TCP client side of relay: drives target HSM, relays messages with remote server."""
+        conn.settimeout(30.0)
 
         target_static = self._get_device_pubkey(target)
 
@@ -301,6 +320,8 @@ def _recv_framed(conn: socket.socket) -> tuple[int, bytes]:
         raise DKEKError(f"Bad protocol magic: {header[:4].hex()}")
     msg_type = header[4]
     length = struct.unpack(">I", header[5:9])[0]
+    if length > MAX_FRAME_SIZE:
+        raise DKEKError(f"Frame payload too large: {length} bytes (max {MAX_FRAME_SIZE})")
     payload = _recv_exactly(conn, length) if length else b""
     return msg_type, payload
 
@@ -320,36 +341,29 @@ def _recv_exactly(conn: socket.socket, n: int) -> bytes:
 # Anonymous TLS helpers
 # ---------------------------------------------------------------------------
 
-def _wrap_tls_server(conn: socket.socket) -> socket.socket:
-    """Wrap a server socket with anonymous TLS (no certificate verification)."""
-    import ssl
+def _wrap_tls_server(conn: socket.socket, cert_path=None, key_path=None) -> socket.socket:
+    """Wrap server socket with TLS. Uses daemon identity cert if provided."""
+    from .tls import ensure_daemon_identity
     import tempfile
-    import subprocess
+    from pathlib import Path
 
-    # Generate a self-signed certificate on the fly for anonymous TLS
-    with tempfile.TemporaryDirectory() as tmp:
-        key_file = f"{tmp}/key.pem"
-        cert_file = f"{tmp}/cert.pem"
-        subprocess.run(
-            [
-                "openssl", "req", "-x509", "-newkey", "ec",
-                "-pkeyopt", "ec_paramgen_curve:P-256",
-                "-keyout", key_file, "-out", cert_file,
-                "-days", "1", "-nodes", "-subj", "/CN=pico2hsm",
-            ],
-            check=True, capture_output=True,
-        )
-        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-        ctx.load_cert_chain(cert_file, key_file)
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-        return ctx.wrap_socket(conn, server_side=True)
+    if cert_path is None or key_path is None:
+        # Fallback: generate ephemeral cert using cryptography library (no subprocess)
+        tmp_dir = Path(tempfile.mkdtemp())
+        cert_path, key_path = ensure_daemon_identity(tmp_dir)
+
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.load_cert_chain(str(cert_path), str(key_path))
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    return ctx.wrap_socket(conn, server_side=True)
 
 
-def _wrap_tls_client(conn: socket.socket, _hostname: str) -> socket.socket:
-    """Wrap a client socket with anonymous TLS (no certificate verification)."""
-    import ssl
+def _wrap_tls_client(conn: socket.socket, _hostname: str, cert_path=None, key_path=None) -> socket.socket:
+    """Wrap a client socket with TLS. Uses daemon identity cert for mTLS if provided."""
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    if cert_path and key_path:
+        ctx.load_cert_chain(str(cert_path), str(key_path))
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
     return ctx.wrap_socket(conn, server_side=False)
