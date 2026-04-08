@@ -311,6 +311,50 @@ impl DkekManager {
         }
     }
 
+    /// Import one raw (unencrypted) 32-byte DKEK share.
+    ///
+    /// This is the code path used by `sc-hsm-tool --import-dkek-share` which
+    /// decrypts the PBE-protected share file on the host side and sends the
+    /// raw 32-byte share value to the card via `INS=0x52 P1=0x00`.
+    ///
+    /// Follows the same state machine as [`import_share`]: XOR-accumulates
+    /// the value and transitions to `Ready` when all shares have arrived.
+    pub fn import_share_raw(
+        &mut self,
+        raw_share: &[u8; 32],
+    ) -> Result<DkekImportResult, DkekError> {
+        // Ensure we are in the right state.
+        let (received, total, accumulated) = match &mut self.status {
+            DkekStatus::CollectingShares { received, total, accumulated } => {
+                (received, *total, accumulated)
+            }
+            _ => return Err(DkekError::WrongState),
+        };
+
+        // XOR-accumulate this share into the running DKEK.
+        for (acc, sh) in accumulated.iter_mut().zip(raw_share.iter()) {
+            *acc ^= sh;
+        }
+
+        *received += 1;
+        let received_now = *received;
+
+        if received_now >= total {
+            // All shares collected — move to Ready state.
+            let dkek_val: [u8; 32] = **accumulated;
+            self.status.zeroize();
+            self.status = DkekStatus::Ready {
+                dkek: Zeroizing::new(dkek_val),
+            };
+            Ok(DkekImportResult::Complete)
+        } else {
+            Ok(DkekImportResult::MoreSharesNeeded {
+                received: received_now,
+                total,
+            })
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Share generation
     // -----------------------------------------------------------------------

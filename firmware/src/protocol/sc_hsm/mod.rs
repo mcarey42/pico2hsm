@@ -366,10 +366,7 @@ impl ScHsm {
             delete_file::INS_DELETE_FILE => delete_file::handle(&mut self.state, store, cmd),
             generate_key::INS_GENERATE_KEY => generate_key::handle(&mut self.state, store, cmd),
             export_key::INS_EXPORT_KEY => export_key::handle(&mut self.state, store, cmd),
-            // INS 0x58 shared between LIST_KEYS (P2=0x00) and IMPORT_KEY (P2=0x93)
-            list_keys::INS_LIST_KEYS if cmd.p2 == import_key::P2_IMPORT => {
-                import_key::handle(&mut self.state, store, cmd)
-            }
+            import_key::INS_IMPORT_KEY => import_key::handle(&mut self.state, store, cmd),
             extras::INS_EXTRAS => extras::handle(&mut self.state, store, cmd),
             // All other commands fall through to the stateless dispatch.
             _ => self.dispatch(cmd),
@@ -399,15 +396,9 @@ impl ScHsm {
                     decrypt::handle(&mut self.state, cmd)
                 }
             }
-            // INS 0x58 shared between LIST_KEYS (P2=0x00) and IMPORT_KEY (P2=0x93)
-            list_keys::INS_LIST_KEYS => {
-                if cmd.p2 == import_key::P2_IMPORT {
-                    import_key::handle(&mut self.state, &mut LocalNullStore, cmd)
-                } else {
-                    list_keys::handle(&mut self.state, cmd)
-                }
-            }
+            list_keys::INS_LIST_KEYS => list_keys::handle(&mut self.state, cmd),
             export_key::INS_EXPORT_KEY => export_key::handle(&mut self.state, &mut LocalNullStore, cmd),
+            import_key::INS_IMPORT_KEY => import_key::handle(&mut self.state, &mut LocalNullStore, cmd),
             read_binary::INS_READ_BINARY => read_binary::handle(&mut self.state, cmd),
             read_binary::INS_READ_BINARY_ODD => read_binary::handle_odd(&mut self.state, cmd),
             update_binary::INS_UPDATE_BINARY => update_binary::handle(&mut self.state, cmd),

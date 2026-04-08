@@ -180,14 +180,13 @@ def dkek_loaded_source(init_both_devices, runner: CLIRunner, config: dict) -> No
         ],
         capture_output=True, timeout=30,
     )
-    if result.returncode != 0:
-        pytest.skip(f"Could not create DKEK share: {result.stderr.decode()}")
+    assert result.returncode == 0, (
+        f"Could not create DKEK share: {result.stderr.decode()}"
+    )
 
     # Import into SOURCE device.
-    # NOTE: sc-hsm-tool --import-dkek-share uses the key_domain protocol
-    # (INS=0x52 P1=0x03) which returns SW_INS_NOT_SUPPORTED in pico2hsm
-    # until PUNCHOUT item 2 (DKEK standard protocol) is implemented.
-    # We skip gracefully so the exchange step tests are xfail-marked.
+    # sc-hsm-tool --import-dkek-share sends INS=0x52 P1=0x00 with the raw
+    # 32-byte share.  pico2hsm now supports the standard DKEK wire format.
     result = subprocess.run(
         [
             "sc-hsm-tool",
@@ -198,11 +197,9 @@ def dkek_loaded_source(init_both_devices, runner: CLIRunner, config: dict) -> No
         ],
         capture_output=True, timeout=30,
     )
-    if result.returncode != 0:
-        pytest.skip(
-            "DKEK import via sc-hsm-tool not yet supported (PUNCHOUT item 2). "
-            f"sc-hsm-tool: {result.stderr.decode().strip()}"
-        )
+    assert result.returncode == 0, (
+        f"DKEK share import failed on reader 0: {result.stderr.decode().strip()}"
+    )
     log.info("DKEK share loaded on reader 0 (SOURCE)")
 
 

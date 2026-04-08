@@ -1,21 +1,14 @@
-//! LIST KEYS command handler (INS = 0x58, P2 = 0x00).
+//! LIST KEYS command handler (INS = 0x58).
 //!
 //! Returns a list of all key objects stored in the keystore. The response
 //! contains a sequence of key descriptor TLV structures.
-//!
-//! Note: INS=0x58 is shared with IMPORT KEY; the P2 byte distinguishes them:
-//! - P2=0x00: List all keys → this handler
-//! - P2=0x93: Import key → import_key handler
 
 use pico2hsm_core::apdu::{ApduCommand, ApduResponse, SW_CONDITIONS_NOT_SATISFIED, SW_OK};
 
 use crate::protocol::sc_hsm::ScHsmState;
 
-/// INS byte for LIST KEYS (shared with IMPORT KEY).
+/// INS byte for LIST KEYS.
 pub const INS_LIST_KEYS: u8 = 0x58;
-
-/// P1 value that distinguishes LIST KEYS from IMPORT KEY.
-pub const P1_LIST: u8 = 0x00;
 
 /// Handle a LIST KEYS APDU command.
 pub fn handle(state: &mut ScHsmState, cmd: &ApduCommand<'_>) -> ApduResponse {
