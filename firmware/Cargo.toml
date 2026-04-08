@@ -24,6 +24,10 @@ rp2350_geek_sdcard = []
 rp2350_geek_sdcard_dual = []
 rp2354_embedded = []
 pico2_4m = []
+# Raspberry Pi Pico 2 4MB with external SD card keystore on SPI1 (CS=GPIO15, same pins as Waveshare LCD-1.47-B)
+pico2_4m_sdcard = []
+# Raspberry Pi Pico 2 4MB: QMI flash (primary) + SD card on SPI1 (secondary) RAID-1 hybrid — for hybrid init debug
+pico2_4m_sdcard_hybrid = []
 waveshare_rp2350_lcd_16m = []
 # Waveshare RP2350-LCD-1.47-B: single SD card keystore on SPI1 (CS=GPIO15)
 waveshare_rp2350_lcd_sdcard = []

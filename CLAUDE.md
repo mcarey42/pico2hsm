@@ -8,6 +8,8 @@ Always use the debug script to build and flash firmware. Do not run `cargo build
 ./build-all-debug.sh pico2_4m
 ```
 
+Valid board arguments for the Pico 2: `pico2_4m` (bare board), `pico2_4m_sdcard` (Pico 2 with SD card wiring), `pico2_4m_sdcard_hybrid` (Pico 2 with hybrid flash+SD card storage).
+
 This script:
 - Builds with `DEFMT_LOG=trace` (required for defmt log output to survive optimisation)
 - Uses the debug profile so `#[cfg(debug_assertions)]` sentinels are active
@@ -29,6 +31,8 @@ To run the integration test suite against the flashed device:
 
 Start `build-all-debug.sh` in the background first (it blocks on RTT streaming), then wait ~5 s for USB re-enumeration before running `run_tests.sh`.
 
+If multiple pico2hsm devices are connected, use `OPENSC_DEFAULT_READER=N ./run_tests.sh` to target a specific reader (e.g. `N=1` for the second reader). Run `opensc-tool --list-readers` to see which index is which.
+
 If `probe-rs` reports "interface is busy (errno 16)", a previous probe-rs process is still holding the USB device:
 
 ```sh
@@ -42,6 +46,8 @@ pkill -9 -f "probe-rs"
 - **Core1** — Embassy async executor: `dispatcher_task()` receives APDUs, calls the synchronous `Dispatcher::dispatch()` chain, sends responses back.
 
 Both channels use RP2350 hardware spinlocks (29 and 30) for SMP-safe cross-core signalling.
+
+**CDC serial logger**: Core0 runs a `drain_one()` task that forwards buffered log lines to `/dev/ttyACMx`. `drain_one()` checks DTR before writing; if no terminal has `/dev/ttyACMx` open, the line is dropped silently (no CCID stall).
 
 **APDU dispatch chain** (all on core1, synchronous):
 ```

@@ -112,8 +112,9 @@ pub use embassy_usb::class::cdc_acm::{CdcAcmClass, State as CdcAcmState};
 /// Drain at most one buffered log line into the CDC-ACM sender.
 ///
 /// Call this from the core0 main loop each iteration.  Returns immediately
-/// if the channel is empty.  Silently drops the line if the USB endpoint is
-/// not yet connected.
+/// if the channel is empty or if no host terminal is connected (DTR not set).
+/// Drops the line rather than blocking so the CCID loop is never stalled by
+/// an unread serial port.
 #[cfg(target_arch = "arm")]
 pub async fn drain_one<'d, D: embassy_usb::driver::Driver<'d>>(
     sender: &mut embassy_usb::class::cdc_acm::Sender<'d, D>,
@@ -123,6 +124,13 @@ pub async fn drain_one<'d, D: embassy_usb::driver::Driver<'d>>(
         Ok(line) => line,
         Err(_) => return,
     };
+
+    // Drop the line if no host terminal has the port open (DTR not asserted).
+    // write_packet().await blocks until the host reads; without this check the
+    // CCID loop stalls whenever /dev/ttyACMx is not being read.
+    if !sender.dtr() {
+        return;
+    }
 
     // Send in ≤63-byte chunks (never exact max_packet_size to avoid ZLP ambiguity).
     let mut sent = 0usize;

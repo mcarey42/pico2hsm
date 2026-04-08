@@ -26,7 +26,12 @@ use crate::storage::{
     flash_chip::{QmiFlash, SpiFlash},
 };
 
-#[cfg(all(target_arch = "arm", any(feature = "waveshare_rp2350_lcd_sdcard", feature = "waveshare_rp2350_lcd_sdcard_hybrid")))]
+#[cfg(all(target_arch = "arm", any(
+    feature = "waveshare_rp2350_lcd_sdcard",
+    feature = "waveshare_rp2350_lcd_sdcard_hybrid",
+    feature = "pico2_4m_sdcard",
+    feature = "pico2_4m_sdcard_hybrid",
+)))]
 use crate::storage::sdcard::SdCardFlash;
 
 // ── pico2_4m ─────────────────────────────────────────────────────────────────
@@ -34,6 +39,40 @@ use crate::storage::sdcard::SdCardFlash;
 /// Internal QMI flash — no external chips on the stock Pico 2.
 #[cfg(all(target_arch = "arm", feature = "pico2_4m"))]
 pub type BoardChip = QmiFlash;
+
+// ── pico2_4m_sdcard ───────────────────────────────────────────────────────────
+
+/// Single SD card on SPI1 (SCK=GPIO10, MOSI=GPIO11, MISO=GPIO12, CS=GPIO15).
+/// Same pin assignment as the Waveshare RP2350-LCD-1.47-B built-in SD slot.
+#[cfg(all(target_arch = "arm", feature = "pico2_4m_sdcard"))]
+pub type BoardChip = SdCardFlash<
+    embassy_embedded_hal::shared_bus::blocking::spi::SpiDevice<
+        'static,
+        embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex,
+        embassy_rp::spi::Spi<'static, embassy_rp::peripherals::SPI1, embassy_rp::spi::Blocking>,
+        Output<'static>,
+    >,
+    embassy_time::Delay,
+>;
+
+// ── pico2_4m_sdcard_hybrid ────────────────────────────────────────────────────
+
+/// Hybrid RAID-1: QMI flash (primary) + SD card on SPI1 (secondary).
+/// Mirrors the waveshare_rp2350_lcd_sdcard_hybrid layout but with no LCD.
+#[cfg(all(target_arch = "arm", feature = "pico2_4m_sdcard_hybrid"))]
+pub type BoardChip = QmiFlash;
+
+/// SD card chip type for pico2_4m_sdcard_hybrid — same SPI1 wiring as other SD variants.
+#[cfg(all(target_arch = "arm", feature = "pico2_4m_sdcard_hybrid"))]
+pub type HybridSdChip = SdCardFlash<
+    embassy_embedded_hal::shared_bus::blocking::spi::SpiDevice<
+        'static,
+        embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex,
+        embassy_rp::spi::Spi<'static, embassy_rp::peripherals::SPI1, embassy_rp::spi::Blocking>,
+        Output<'static>,
+    >,
+    embassy_time::Delay,
+>;
 
 // ── rp2350_one_* ─────────────────────────────────────────────────────────────
 
@@ -109,8 +148,7 @@ pub type BoardChip = SdCardFlash<
 #[cfg(all(target_arch = "arm", feature = "waveshare_rp2350_lcd_sdcard_hybrid"))]
 pub type BoardChip = QmiFlash;
 
-/// SD card chip type for the hybrid variant — SPI1 bus wrapped as a shared-bus
-/// `SpiDevice` via `embassy_embedded_hal`.
+/// SD card chip type for the waveshare hybrid variant.
 #[cfg(all(target_arch = "arm", feature = "waveshare_rp2350_lcd_sdcard_hybrid"))]
 pub type HybridSdChip = SdCardFlash<
     embassy_embedded_hal::shared_bus::blocking::spi::SpiDevice<
@@ -125,11 +163,17 @@ pub type HybridSdChip = SdCardFlash<
 // ── BoardKeyStore type alias ──────────────────────────────────────────────────
 
 /// `BoardKeyStore` for non-hybrid variants: a single `FlashKeyStore` over `BoardChip`.
-#[cfg(all(target_arch = "arm", not(feature = "waveshare_rp2350_lcd_sdcard_hybrid")))]
+#[cfg(all(target_arch = "arm", not(any(
+    feature = "waveshare_rp2350_lcd_sdcard_hybrid",
+    feature = "pico2_4m_sdcard_hybrid",
+))))]
 pub type BoardKeyStore = crate::storage::FlashKeyStore<BoardChip>;
 
-/// `BoardKeyStore` for the hybrid variant: RAID-1 over QMI flash and SD card.
-#[cfg(all(target_arch = "arm", feature = "waveshare_rp2350_lcd_sdcard_hybrid"))]
+/// `BoardKeyStore` for hybrid variants: RAID-1 over QMI flash and SD card.
+#[cfg(all(target_arch = "arm", any(
+    feature = "waveshare_rp2350_lcd_sdcard_hybrid",
+    feature = "pico2_4m_sdcard_hybrid",
+)))]
 pub type BoardKeyStore = crate::storage::HybridKeyStore<
     crate::storage::FlashKeyStore<QmiFlash>,
     crate::storage::FlashKeyStore<HybridSdChip>,

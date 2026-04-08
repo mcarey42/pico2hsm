@@ -60,7 +60,7 @@ pub struct GpioLed {
 }
 
 impl GpioLed {
-    fn new(pin: embassy_rp::Peri<'static, embassy_rp::peripherals::PIN_25>) -> Self {
+    pub fn new(pin: embassy_rp::Peri<'static, embassy_rp::peripherals::PIN_25>) -> Self {
         Self { pin: Output::new(pin, Level::Low) }
     }
 }

@@ -11,6 +11,8 @@
 #
 # Valid board features:
 #   pico2_4m               Raspberry Pi Pico 2 4MB
+#   pico2_4m_sdcard        Raspberry Pi Pico 2 4MB with SD card (SPI1, CS=GPIO15)
+#   pico2_4m_sdcard_hybrid Raspberry Pi Pico 2 4MB QMI flash + SD card RAID-1 hybrid
 #   rp2350_one_4m          Waveshare RP2350-One  4MB
 #   rp2350_one_16m         Waveshare RP2350-One 16MB
 #   rp2350_geek_16m        Waveshare RP2350-Geek 16MB
@@ -44,6 +46,8 @@ fi
 
 VALID_FEATURES=(
     pico2_4m
+    pico2_4m_sdcard
+    pico2_4m_sdcard_hybrid
     rp2350_one_4m
     rp2350_one_16m
     rp2350_geek_16m
@@ -108,7 +112,11 @@ if [[ -f "$KEY_FILE" ]]; then
     if [[ $SIGN_RC -eq 0 ]]; then
         ok "Signed → $SIGNED_ELF"
         ok "OTP config → $OTP_JSON"
-        FLASH_ELF="$SIGNED_ELF"
+        # NOTE: probe-rs 0.31.0 rejects picotool-signed debug ELFs due to a
+        # defmt parse bug (.sigx section alignment=0). Flash the unsigned ELF;
+        # the signed artifact in dist/ is kept for OTP provisioning workflows.
+        warn "Flashing UNSIGNED ELF (probe-rs 0.31.0 defmt bug with signed debug ELFs)"
+        # FLASH_ELF stays as $ELF (unsigned)
     else
         echo -e "${RED}[WARN]${NC} picotool seal failed (rc=$SIGN_RC) — flashing unsigned debug build"
         echo "       picotool output: $SIGN_OUT"
@@ -122,7 +130,6 @@ fi
 # ── Flash + run ───────────────────────────────────────────────────────────────
 section "Flash + RTT monitor: $FEAT"
 info "Flashing with probe-rs run --chip $CHIP ..."
-[[ "$FLASH_ELF" != "$ELF" ]] && info "Using signed ELF: $FLASH_ELF"
 info "RTT output will appear below.  Press Ctrl+C to stop monitoring."
 echo ""
 

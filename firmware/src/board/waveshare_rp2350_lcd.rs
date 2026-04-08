@@ -462,8 +462,11 @@ impl DrawTarget for St7789V3StatusDisplay {
 
 /// Blocking SPI0 type for the Waveshare RP2350-LCD-1.47-B (LCD bus).
 /// `'static` lifetime: peripherals come from `embassy_rp::init()`.
+/// SPI0 bus for the LCD — Async mode so `flush_display` / `fill_screen` use
+/// DMA and yield to the embassy executor during the 110 KB framebuffer transfer,
+/// preventing USB starvation.  Small command writes use `spi.blocking_write()`.
 pub type WaveshareRp2350LcdSpi0 =
-    embassy_rp::spi::Spi<'static, embassy_rp::peripherals::SPI0, embassy_rp::spi::Blocking>;
+    embassy_rp::spi::Spi<'static, embassy_rp::peripherals::SPI0, embassy_rp::spi::Async>;
 
 /// Blocking SPI1 type for the Waveshare RP2350-LCD-1.47-B (SD card bus).
 pub type WaveshareRp2350LcdSpi1 =
@@ -583,10 +586,9 @@ fn lcd_write_cmd(
     cs: &mut Output<'static>,
     cmd: u8,
 ) {
-    use embedded_hal::spi::SpiBus;
     cs.set_low();
     dc.set_low();
-    let _ = spi.write(&[cmd]);
+    let _ = spi.blocking_write(&[cmd]);
     cs.set_high();
 }
 
@@ -602,13 +604,12 @@ fn lcd_cmd_data(
     cmd: u8,
     data: &[u8],
 ) {
-    use embedded_hal::spi::SpiBus;
     cs.set_low();
     dc.set_low();
-    let _ = spi.write(&[cmd]);
+    let _ = spi.blocking_write(&[cmd]);
     if !data.is_empty() {
         dc.set_high();
-        let _ = spi.write(data);
+        let _ = spi.blocking_write(data);
     }
     cs.set_high();
 }
@@ -651,29 +652,26 @@ fn lcd_set_window(
 /// - `cs`    — GPIO17 chip-select output.
 /// - `color` — RGB565 colour value (big-endian u16: high byte first).
 #[cfg(target_arch = "arm")]
-pub fn fill_screen(
+pub async fn fill_screen(
     spi: &mut WaveshareRp2350LcdSpi0,
     dc: &mut Output<'static>,
     cs: &mut Output<'static>,
     color: u16,
 ) {
-    use embedded_hal::spi::SpiBus;
-
     // Set window to the full landscape display area (CASET 0–319, RASET 34–205).
     lcd_set_window(spi, dc, cs, 0, LCD_ROW_START, LCD_WIDTH - 1, LCD_ROW_END);
 
     // Enter pixel data write mode.
     cs.set_low();
     dc.set_low();
-    let _ = spi.write(&[CMD_RAMWR]);
+    let _ = spi.blocking_write(&[CMD_RAMWR]);
     dc.set_high();
 
-    // Stream pixel data in 64-pixel (128-byte) chunks to keep stack usage low.
-    // Each pixel is two bytes, big-endian.
+    // Stream pixel data in 64-pixel (128-byte) chunks via async DMA.
+    // Each chunk yields to the executor, keeping USB serviced.
     let hi = (color >> 8) as u8;
     let lo = (color & 0xFF) as u8;
 
-    // Build a 128-byte chunk (64 pixels) on the stack.
     let mut chunk = [0u8; 128];
     for i in 0..64 {
         chunk[i * 2] = hi;
@@ -685,10 +683,10 @@ pub fn fill_screen(
     let remainder = (total_pixels % 64) as usize;
 
     for _ in 0..full_chunks {
-        let _ = spi.write(&chunk);
+        let _ = spi.write(&chunk).await;
     }
     if remainder > 0 {
-        let _ = spi.write(&chunk[..remainder * 2]);
+        let _ = spi.write(&chunk[..remainder * 2]).await;
     }
 
     cs.set_high();
@@ -757,19 +755,18 @@ pub async fn init_lcd(
     // In landscape (MV=1): CASET = physical GRAM rows 0–319, RASET = physical
     // GRAM columns 0–239.  Total: 320 × 240 = 76 800 pixels.
     {
-        use embedded_hal::spi::SpiBus;
         lcd_cmd_data(spi, dc, cs, CMD_CASET, &[0x00, 0x00, 0x01, 0x3F]); // 0–319
         lcd_cmd_data(spi, dc, cs, CMD_RASET, &[0x00, 0x00, 0x00, 0xEF]); // 0–239
         cs.set_low();
         dc.set_low();
-        let _ = spi.write(&[CMD_RAMWR]);
+        let _ = spi.blocking_write(&[CMD_RAMWR]);
         dc.set_high();
         let chunk = [0u8; 128];
         let total_pixels = LCD_WIDTH as u32 * CTRL_HEIGHT as u32; // 76 800
         let full_chunks = total_pixels / 64;
         let remainder = (total_pixels % 64) as usize;
-        for _ in 0..full_chunks { let _ = spi.write(&chunk); }
-        if remainder > 0 { let _ = spi.write(&chunk[..remainder * 2]); }
+        for _ in 0..full_chunks { let _ = spi.write(&chunk).await; }
+        if remainder > 0 { let _ = spi.write(&chunk[..remainder * 2]).await; }
         cs.set_high();
     }
 
@@ -791,24 +788,26 @@ pub async fn init_lcd(
 /// Sets CASET to 0–319 (landscape width) and RASET to 34–205 (panel row
 /// window), then writes the full 320×172 FRAMEBUF.
 #[cfg(target_arch = "arm")]
-pub fn flush_display(
+/// Send the FRAMEBUF to the LCD via DMA.  The async DMA write yields to the
+/// embassy executor while the 110 KB transfer is in flight, so `usb_fut` keeps
+/// running and USB does not stall.
+pub async fn flush_display(
     spi: &mut WaveshareRp2350LcdSpi0,
     dc: &mut Output<'static>,
     cs: &mut Output<'static>,
 ) {
-    use embedded_hal::spi::SpiBus;
-
     // Set window to the full landscape panel: CASET 0–319, RASET 34–205.
     lcd_set_window(spi, dc, cs, 0, LCD_ROW_START, LCD_WIDTH - 1, LCD_ROW_END);
 
     // Begin RAM write.
     cs.set_low();
     dc.set_low();
-    let _ = spi.write(&[CMD_RAMWR]);
+    let _ = spi.blocking_write(&[CMD_RAMWR]);
     dc.set_high();
 
     // SAFETY: FRAMEBUF is only accessed from core0; no concurrent mutation.
-    let _ = spi.write(unsafe { &*(&raw const FRAMEBUF) });
+    // DMA write: yields to executor during the ~22 ms transfer.
+    let _ = spi.write(unsafe { &*(&raw const FRAMEBUF) }).await;
 
     cs.set_high();
 }
@@ -845,8 +844,8 @@ pub async fn update_status_display(
     let layout = ScreenLayout::waveshare_320x172();
     render(display, state, &layout);
 
-    // Push FRAMEBUF to the LCD over SPI.
-    flush_display(spi, dc, cs);
+    // Push FRAMEBUF to the LCD via DMA (async — yields to executor during transfer).
+    flush_display(spi, dc, cs).await;
 
     // Update WS2812B LED colour to match status.
     let (_, grb) = status_to_colors(state.status);

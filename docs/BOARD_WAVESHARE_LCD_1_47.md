@@ -71,7 +71,7 @@ QSPI flash (W25Q128) is connected to the RP2350A QSPI interface (not general GPI
 
 | Signal     | GPIO | Embassy-rp peripheral  | Note                           |
 |------------|------|-------------------------|--------------------------------|
-| SCK        |  18  | SPI0 CLK                | 40 MHz, SPI mode 0 (CPOL=0/CPHA=0) |
+| SCK        |  18  | SPI0 CLK                | 40 MHz, SPI mode 0 (CPOL=0/CPHA=0); async DMA for framebuffer transfers |
 | MOSI / DIN |  19  | SPI0 TX                 | Data to display                |
 | MISO       |   4  | SPI0 RX (hardware only) | Display never drives this pin  |
 | DC         |  16  | GPIO Output             | Low = command, High = data     |
@@ -126,6 +126,7 @@ After `CASET`/`RASET`, send `RAMWR (2Ch)` then stream pixel data:
 - DC high during data bytes
 - Each pixel: 2 bytes big-endian RGB565 (high byte first)
 - Full-screen fill: 110 080 bytes, sent in 128-byte chunks
+- Framebuffer flush is **async** (`flush_display().await`): DMA_CH1/CH2 transfer the 110 KB in ~22 ms while yielding to the Embassy executor, keeping USB serviced
 
 ### RGB565 status colours
 
@@ -168,8 +169,10 @@ callers pass standard `RGB8 { r, g, b }` values.
 |-------------|--------------------------------------|
 | PIO         | PIO0                                 |
 | State machine | SM0 (or any free SM)               |
-| DMA channel | DMA_CH0 (or any free channel)       |
+| DMA channel | DMA_CH0                             |
 | Pixel count | N = 1                                |
+
+> **DMA channel allocation**: DMA_CH0 is used by the WS2812B PIO driver. DMA_CH1 and DMA_CH2 are used by the async SPI0 LCD framebuffer transfers (`flush_display`, `fill_screen`). All three channels are registered in the `DMA_IRQ_0` handler in `main.rs`.
 
 ### GRB colour mapping
 
@@ -279,6 +282,8 @@ The debug script sets `DEFMT_LOG=trace` and uses the debug profile; see
 and returns immediately.  Actual LCD rendering and WS2812B updates require
 async operations and GPIO handles that cannot be stored in `St7789V3StatusDisplay`
 without changing the `WaveshareRp2350LcdBoard::new(spi0, spi1)` call site.
+
+SPI0 operates in async mode; `flush_display()` and `fill_screen()` are async and must be `.await`ed. The DMA transfer yields to the executor during the ~22 ms framebuffer write.
 
 The intended usage pattern in `run_waveshare_lcd_board()`:
 

@@ -39,9 +39,17 @@ The `build-all-debug.sh` and `build-all.sh` scripts handle this correctly.
 All three applets plus RSA. These are the configurations `build-all.sh` produces.
 
 ```sh
-# Raspberry Pi Pico 2
+# Raspberry Pi Pico 2 (internal flash)
 cargo build --release --no-default-features \
     --features pico2_4m,rsa,applet-piv,applet-openpgp-curve25519
+
+# Raspberry Pi Pico 2 with SD card keystore (SPI1, CS=GPIO15)
+cargo build --release --no-default-features \
+    --features pico2_4m_sdcard,rsa,applet-piv,applet-openpgp-curve25519
+
+# Raspberry Pi Pico 2 — Flash+SD RAID-1 hybrid keystore
+cargo build --release --no-default-features \
+    --features pico2_4m_sdcard_hybrid,rsa,applet-piv,applet-openpgp-curve25519
 
 # Waveshare RP2350-One 4MB
 cargo build --release --no-default-features \
@@ -69,7 +77,20 @@ cargo build --release --no-default-features \
 ```sh
 # Pico 2 — 4 MB flash, GPIO25 LED, USB debug
 cargo build --release --no-default-features --features pico2_4m
+
+# Pico 2 — 4 MB flash + external SD card keystore on SPI1 (CS=GPIO15)
+cargo build --release --no-default-features --features pico2_4m_sdcard
+
+# Pico 2 — 4 MB flash (primary) + SD card on SPI1 (secondary) RAID-1 hybrid
+cargo build --release --no-default-features --features pico2_4m_sdcard_hybrid
 ```
+
+The `pico2_4m_sdcard` variant uses the same SPI1 pin assignment as the
+Waveshare RP2350-LCD-1.47-B built-in SD slot (SCK=GPIO10, MOSI=GPIO11,
+MISO=GPIO12, CS=GPIO15). No LCD is driven. See `docs/BOARD_PICO2_4M_SDCARD.md`
+for wiring details.
+
+The `pico2_4m_sdcard_hybrid` variant mirrors every write to both QMI flash and the SD card; keys survive SD removal (degraded mode) and resync automatically on card reinsertion. See `docs/BOARD_PICO2_4M_SDCARD.md` for details.
 
 ### Waveshare RP2350-One
 
@@ -273,6 +294,12 @@ code paths), and streams RTT output via probe-rs.
 ```sh
 # Pico 2 (default development target)
 ./build-all-debug.sh pico2_4m
+
+# Pico 2 with SD card keystore
+./build-all-debug.sh pico2_4m_sdcard
+
+# Pico 2 — Flash+SD RAID-1 hybrid
+./build-all-debug.sh pico2_4m_sdcard_hybrid
 
 # RP2350-One 16 MB
 ./build-all-debug.sh rp2350_one_16m
