@@ -75,7 +75,11 @@ def _parse_received_blocks(opensc_output: str) -> list[bytes]:
             current = None
             continue
         if current is not None:
-            tokens = re.findall(r'\b[0-9A-Fa-f]{2}\b', stripped)
+            # Split on whitespace and only accept standalone 2-char hex tokens.
+            # This avoids the ASCII column on the right side of opensc-tool output
+            # where printable chars can form 2-char sequences that match the regex.
+            tokens = [t for t in stripped.split()
+                      if len(t) == 2 and all(c in '0123456789abcdefABCDEF' for c in t)]
             for tok in tokens[:16]:
                 current.append(int(tok, 16))
     if current is not None:
@@ -297,6 +301,19 @@ class TestDkekExchangeV2:
         source_pub = self._get_pubkey(runner, reader=0)
         target_pub = self._get_pubkey(runner, reader=1)
 
+        # Pre-step: SOURCE — NOISE_INITIATE (P1=0x31) on reader 0.
+        # Generates SOURCE ephemeral key pair and stores it in firmware state.
+        # NOISE_SOURCE_RESPOND (step 2) requires exchange_ephem_pub to be set.
+        APDU_NOISE_INITIATE = "8054310000"
+        result_31 = runner.send_apdu(
+            SELECT_SC_HSM, VERIFY_PIN, APDU_NOISE_INITIATE,
+            reader=0, save_as="10_step0_source_initiate",
+        )
+        assert _last_sw(result_31.stdout) == 0x9000, (
+            f"NOISE_INITIATE (pre-step) failed on reader 0: {result_31.stdout}"
+        )
+        log.info("Pre-step OK — SOURCE ephemeral key generated on reader 0")
+
         # Step 1: TARGET — NOISE_TARGET_INIT(source_static_pub) → 161B
         apdu_35 = self._apdu_with_lc_data(0x35, source_pub)
         result_35 = runner.send_apdu(
@@ -327,7 +344,7 @@ class TestDkekExchangeV2:
         payload_37 = ephem_T_pub + target_pub + challenge   # 162 bytes
         apdu_37 = self._apdu_with_lc_data(0x37, payload_37)
         result_37 = runner.send_apdu(
-            SELECT_SC_HSM, apdu_37,
+            SELECT_SC_HSM, VERIFY_PIN, apdu_37,
             reader=0, save_as="10_step3_send_v2",
         )
         assert _last_sw(result_37.stdout) == 0x9000, f"Step 3 failed: {result_37.stdout}"
@@ -340,7 +357,7 @@ class TestDkekExchangeV2:
         payload_38 = ephem_S_pub + sig_S + enc_dkek   # 189 bytes
         apdu_38 = self._apdu_with_lc_data(0x38, payload_38)
         result_38 = runner.send_apdu(
-            SELECT_SC_HSM, apdu_38,
+            SELECT_SC_HSM, VERIFY_PIN, apdu_38,
             reader=1, save_as="10_step4_recv_v2",
         )
         last = _last_sw(result_38.stdout)
