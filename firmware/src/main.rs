@@ -679,6 +679,8 @@ async fn run_geek_board(p: embassy_rp::Peripherals) {
                         pico2hsm_firmware::display::render(board.led(), &display_state, &layout);
                         board.led().flush().await;
 
+                        let apdu_ins = apdu_bytes.get(1).copied().unwrap_or(0);
+                        let apdu_p1  = apdu_bytes.get(2).copied().unwrap_or(0);
                         let _ = APDU_CHANNEL.send(apdu_bytes).await;
 
                         // Wait for core1 response (with time extensions every 1.5s)
@@ -701,6 +703,45 @@ async fn run_geek_board(p: embassy_rp::Peripherals) {
                             Ok(()) => {
                                 display_state.status = LedStatus::Ready;
                                 display_state.uptime_secs = embassy_time::Instant::now().as_secs() as u32;
+                                // Update key count from core1 atomic.
+                                display_state.key_count = KEY_COUNT.load(core::sync::atomic::Ordering::Relaxed);
+                                // Derive last_op and authenticated from APDU INS byte + SW.
+                                let sw_ok = response.len() >= 2
+                                    && response[response.len() - 2] == 0x90
+                                    && response[response.len() - 1] == 0x00;
+                                if sw_ok {
+                                    match apdu_ins {
+                                        0x20 => {
+                                            display_state.authenticated = true;
+                                            display_state.last_op = Some((LastOperation::Verify, display_state.uptime_secs));
+                                        }
+                                        0x50 => { // SC-HSM INITIALIZE
+                                            display_state.authenticated = false;
+                                            display_state.last_op = Some((LastOperation::Initialize, display_state.uptime_secs));
+                                        }
+                                        0x47 | 0x48 => { // PIV/OpenPGP GENERATE KEYPAIR (0x47) or SC-HSM GENERATE KEY (0x48)
+                                            display_state.last_op = Some((LastOperation::KeyGen, display_state.uptime_secs));
+                                        }
+                                        0xE4 => { // SC-HSM DELETE FILE
+                                            display_state.last_op = Some((LastOperation::DeleteKey, display_state.uptime_secs));
+                                        }
+                                        0x2A => { // PSO: sign (P1=0x9E) or decrypt (P1=0x80)
+                                            if apdu_p1 == 0x9E {
+                                                display_state.last_op = Some((LastOperation::Sign, display_state.uptime_secs));
+                                            } else if apdu_p1 == 0x80 {
+                                                display_state.last_op = Some((LastOperation::Decrypt, display_state.uptime_secs));
+                                            }
+                                        }
+                                        0x62 => { // SC-HSM DERIVE ASYM / ECDH
+                                            display_state.last_op = Some((LastOperation::Ecdh, display_state.uptime_secs));
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                                // SELECT always resets auth state regardless of SW.
+                                if apdu_ins == 0xA4 {
+                                    display_state.authenticated = false;
+                                }
                                 if let Some((_, op_time)) = display_state.last_op {
                                     if display_state.uptime_secs.saturating_sub(op_time) >= LAST_OP_DISPLAY_SECS {
                                         display_state.last_op = None;
@@ -917,7 +958,7 @@ async fn run_waveshare_lcd_board(p: embassy_rp::Peripherals) {
         init_lcd, update_status_display, PioWs2812Writer,
     };
     use pico2hsm_firmware::board::{Board, LedStatus};
-    use pico2hsm_firmware::display::{DisplayState, ScreensaverState, SCREENSAVER_TIMEOUT_SECS, LAST_OP_DISPLAY_SECS};
+    use pico2hsm_firmware::display::{DisplayState, LastOperation, ScreensaverState, SCREENSAVER_TIMEOUT_SECS, LAST_OP_DISPLAY_SECS};
     use pico2hsm_firmware::transport::ccid::CcidError;
     use pico2hsm_firmware::transport::CcidTransport;
 
@@ -1140,6 +1181,8 @@ async fn run_waveshare_lcd_board(p: embassy_rp::Peripherals) {
                             let (disp, spi) = board.led_and_spi0_mut();
                             update_status_display(disp, spi, &mut dc, &mut cs, &mut ws2812_writer, &display_state).await;
                         }
+                        let apdu_ins = apdu_bytes.get(1).copied().unwrap_or(0);
+                        let apdu_p1  = apdu_bytes.get(2).copied().unwrap_or(0);
                         let _ = APDU_CHANNEL.send(apdu_bytes).await;
                         // Wait for response with time-extension support.
                         let response = {
@@ -1160,7 +1203,45 @@ async fn run_waveshare_lcd_board(p: embassy_rp::Peripherals) {
                             Ok(()) => {
                                 display_state.status = LedStatus::Ready;
                                 display_state.uptime_secs = embassy_time::Instant::now().as_secs() as u32;
+                                // Update key count from core1 atomic.
                                 display_state.key_count = KEY_COUNT.load(core::sync::atomic::Ordering::Relaxed);
+                                // Derive last_op and authenticated from APDU INS byte + SW.
+                                let sw_ok = response.len() >= 2
+                                    && response[response.len() - 2] == 0x90
+                                    && response[response.len() - 1] == 0x00;
+                                if sw_ok {
+                                    match apdu_ins {
+                                        0x20 => {
+                                            display_state.authenticated = true;
+                                            display_state.last_op = Some((LastOperation::Verify, display_state.uptime_secs));
+                                        }
+                                        0x50 => { // SC-HSM INITIALIZE
+                                            display_state.authenticated = false;
+                                            display_state.last_op = Some((LastOperation::Initialize, display_state.uptime_secs));
+                                        }
+                                        0x47 | 0x48 => { // PIV/OpenPGP GENERATE KEYPAIR (0x47) or SC-HSM GENERATE KEY (0x48)
+                                            display_state.last_op = Some((LastOperation::KeyGen, display_state.uptime_secs));
+                                        }
+                                        0xE4 => { // SC-HSM DELETE FILE
+                                            display_state.last_op = Some((LastOperation::DeleteKey, display_state.uptime_secs));
+                                        }
+                                        0x2A => { // PSO: sign (P1=0x9E) or decrypt (P1=0x80)
+                                            if apdu_p1 == 0x9E {
+                                                display_state.last_op = Some((LastOperation::Sign, display_state.uptime_secs));
+                                            } else if apdu_p1 == 0x80 {
+                                                display_state.last_op = Some((LastOperation::Decrypt, display_state.uptime_secs));
+                                            }
+                                        }
+                                        0x62 => { // SC-HSM DERIVE ASYM / ECDH
+                                            display_state.last_op = Some((LastOperation::Ecdh, display_state.uptime_secs));
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                                // SELECT always resets auth state regardless of SW.
+                                if apdu_ins == 0xA4 {
+                                    display_state.authenticated = false;
+                                }
                                 if let Some((_, op_time)) = display_state.last_op {
                                     if display_state.uptime_secs.saturating_sub(op_time) >= LAST_OP_DISPLAY_SECS {
                                         display_state.last_op = None;
