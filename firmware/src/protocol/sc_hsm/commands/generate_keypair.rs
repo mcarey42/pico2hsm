@@ -755,6 +755,13 @@ pub fn handle(state: &mut ScHsmState, store: &mut dyn crate::storage::KeyStore, 
         None => return ApduResponse::err(SW_INS_NOT_SUPPORTED),
     };
 
+    // Parse key flags from TLV tag 0xD4 (SC-HSM key access conditions).
+    // Bit 3 = NO_EXPORT: if set, EXPORT KEY (INS=0x72) will reject wrapping.
+    // Default 0x00 = all operations allowed, exportable.
+    let key_flags: u8 = find_tlv(cmd.data, 0xD4)
+        .and_then(|v| v.first().copied())
+        .unwrap_or(0x00);
+
     // ---- RSA key generation (feature-gated) ---------------------------------
     #[cfg(feature = "rsa")]
     if is_rsa_key_type(key_type) {
@@ -814,6 +821,7 @@ pub fn handle(state: &mut ScHsmState, store: &mut dyn crate::storage::KeyStore, 
             key_id,
             key_type,
             algo,
+            key_flags,
             private_key_der: heapless::Vec::new(),
             modulus: heapless::Vec::new(),
             exponent: heapless::Vec::new(),
@@ -861,6 +869,7 @@ pub fn handle(state: &mut ScHsmState, store: &mut dyn crate::storage::KeyStore, 
         key_id,
         key_type,
         algo,
+        key_flags,
         private_key: heapless::Vec::new(),
         public_key: heapless::Vec::new(),
     };

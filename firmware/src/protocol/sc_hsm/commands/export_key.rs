@@ -22,6 +22,12 @@ use crate::storage::KeyStore;
 /// pico2hsm-internal value that no host tool ever used.
 pub const INS_EXPORT_KEY: u8 = 0x72;
 
+/// Key flag bit: if set, EXPORT KEY must reject wrapping this key.
+///
+/// SC-HSM GENERATE KEY PAIR TLV tag 0xD4 carries the key access conditions.
+/// Bit layout: 0=ALLOW_SIGN, 1=ALLOW_DECRYPT, 2=ALLOW_DERIVE, 3=NO_EXPORT.
+pub const NO_EXPORT_BIT: u8 = 0x08;
+
 /// Handle an EXPORT KEY APDU command.
 pub fn handle(state: &mut ScHsmState, store: &mut dyn KeyStore, cmd: &ApduCommand<'_>) -> ApduResponse {
     // Require PIN authentication
@@ -45,20 +51,28 @@ pub fn handle(state: &mut ScHsmState, store: &mut dyn KeyStore, cmd: &ApduComman
     let full_key_id = KeyId::sc_hsm(0, key_ref);
 
     // Try to load key from persistent store first, then fall back to in-memory.
-    let (private_key_bytes, algo_byte) = match store.fetch_key(full_key_id) {
+    // Also retrieve key_flags to enforce NO_EXPORT.
+    //
+    // TODO(H1): Flash-persisted keys (`KeyObject`) do not yet store key_flags
+    // in their on-disk format — the header is a fixed 20-byte layout and
+    // changing it requires a flash format migration (P2K4).  Keys loaded from
+    // flash therefore default to key_flags=0x00 (exportable).  Once the flash
+    // format is extended, remove this default and read the stored flags.
+    let (private_key_bytes, algo_byte, key_flags) = match store.fetch_key(full_key_id) {
         Ok(Some(key_obj)) => {
             // Got a key from flash. Extract private key and algorithm byte.
+            // Flash format does not yet store key_flags; default to 0x00 (exportable).
             let algo = key_obj.algorithm as u8;
             let mut priv_data: heapless::Vec<u8, 2400> = heapless::Vec::new();
             let _ = priv_data.extend_from_slice(&key_obj.private_key);
-            (priv_data, algo)
+            (priv_data, algo, 0x00u8)
         }
         _ => {
             // Fall back to in-memory key lookup (EC keys).
             if let Some(key) = state.keys.iter().find(|k| k.key_id == full_key_id.0) {
                 let mut priv_data: heapless::Vec<u8, 2400> = heapless::Vec::new();
                 let _ = priv_data.extend_from_slice(&key.private_key);
-                (priv_data, key.algo)
+                (priv_data, key.algo, key.key_flags)
             } else {
                 // Try RSA keys.
                 #[cfg(feature = "rsa")]
@@ -66,7 +80,7 @@ pub fn handle(state: &mut ScHsmState, store: &mut dyn KeyStore, cmd: &ApduComman
                     if let Some(rsa_key) = state.rsa_keys.iter().find(|k| k.key_id == full_key_id.0) {
                         let mut priv_data: heapless::Vec<u8, 2400> = heapless::Vec::new();
                         let _ = priv_data.extend_from_slice(&rsa_key.private_key_der);
-                        (priv_data, rsa_key.algo)
+                        (priv_data, rsa_key.algo, rsa_key.key_flags)
                     } else {
                         return ApduResponse::err(SW_FILE_NOT_FOUND);
                     }
@@ -78,6 +92,13 @@ pub fn handle(state: &mut ScHsmState, store: &mut dyn KeyStore, cmd: &ApduComman
             }
         }
     };
+
+    // Enforce NO_EXPORT flag: reject wrapping if the key was generated with
+    // the NO_EXPORT bit set in its key access conditions (TLV tag 0xD4).
+    if key_flags & NO_EXPORT_BIT != 0 {
+        crate::cdc_log!("SC-HSM EXPORT KEY rejected: NO_EXPORT flag set (flags=0x{:02x})", key_flags);
+        return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED);
+    }
 
     // Wrap key under DKEK.
     let mut rng = FwRng;
@@ -131,6 +152,7 @@ mod tests {
             key_id: key_id.0,
             key_type: CoreKeyType::EcPrivateP256,
             algo: 0x13, // ECDSA P-256
+            key_flags: 0x00, // exportable
             private_key: heapless::Vec::new(),
             public_key: heapless::Vec::new(),
         };
@@ -159,6 +181,7 @@ mod tests {
             key_id: key_id.0,
             key_type: CoreKeyType::EcPrivateP256,
             algo: 0x13,
+            key_flags: 0x00,
             private_key: heapless::Vec::new(),
             public_key: heapless::Vec::new(),
         };
@@ -182,5 +205,55 @@ mod tests {
         let resp = handle(&mut state, &mut store, &cmd);
 
         assert_eq!(resp.sw, SW_FILE_NOT_FOUND);
+    }
+
+    #[test]
+    fn test_export_key_rejects_no_export_flag() {
+        let mut state = state_with_dkek();
+
+        // Insert a P-256 EC key at key_ref=0x02 with NO_EXPORT flag set.
+        let key_id = KeyId::sc_hsm(0, 0x02);
+        let mut entry = InMemoryKey {
+            key_id: key_id.0,
+            key_type: CoreKeyType::EcPrivateP256,
+            algo: 0x13, // ECDSA P-256
+            key_flags: NO_EXPORT_BIT, // 0x08 = NO_EXPORT
+            private_key: heapless::Vec::new(),
+            public_key: heapless::Vec::new(),
+        };
+        let _ = entry.private_key.extend_from_slice(&[0x42u8; 32]);
+        let _ = state.keys.push(entry);
+
+        let cmd = make_cmd(0x02, 0x92, &[]);
+        let mut store = NullStore;
+        let resp = handle(&mut state, &mut store, &cmd);
+
+        assert_eq!(resp.sw, SW_CONDITIONS_NOT_SATISFIED,
+            "EXPORT KEY must reject keys with NO_EXPORT flag");
+    }
+
+    #[test]
+    fn test_export_key_allows_exportable_key_with_other_flags() {
+        let mut state = state_with_dkek();
+
+        // Insert a key with ALLOW_SIGN + ALLOW_DECRYPT set but NOT NO_EXPORT.
+        let key_id = KeyId::sc_hsm(0, 0x03);
+        let mut entry = InMemoryKey {
+            key_id: key_id.0,
+            key_type: CoreKeyType::EcPrivateP256,
+            algo: 0x13,
+            key_flags: 0x03, // ALLOW_SIGN | ALLOW_DECRYPT, no NO_EXPORT
+            private_key: heapless::Vec::new(),
+            public_key: heapless::Vec::new(),
+        };
+        let _ = entry.private_key.extend_from_slice(&[0x42u8; 32]);
+        let _ = state.keys.push(entry);
+
+        let cmd = make_cmd(0x03, 0x92, &[]);
+        let mut store = NullStore;
+        let resp = handle(&mut state, &mut store, &cmd);
+
+        assert_eq!(resp.sw, SW_OK,
+            "EXPORT KEY must allow keys without NO_EXPORT flag");
     }
 }

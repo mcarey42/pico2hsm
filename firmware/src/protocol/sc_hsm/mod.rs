@@ -120,6 +120,8 @@ pub struct RsaInMemoryKey {
     pub key_type: CoreKeyType,
     /// SC-HSM AlgorithmId byte used during keygen (e.g. 0x05 = RSA-2048, 0x07 = RSA-4096).
     pub algo: u8,
+    /// SC-HSM key flags byte (see `InMemoryKey::key_flags` for bit layout).
+    pub key_flags: u8,
     /// PKCS#1 DER-encoded `RSAPrivateKey` (≤1200 bytes for RSA-2048, ≤2350 bytes for RSA-4096).
     pub private_key_der: heapless::Vec<u8, 2400>,
     /// Raw RSA modulus, big-endian (256 bytes for RSA-2048, 512 bytes for RSA-4096).
@@ -140,6 +142,12 @@ pub struct InMemoryKey {
     pub key_type: CoreKeyType,
     /// SC-HSM AlgorithmId byte (e.g. 0x13 = EcdsaP256, 0x23 = EcdhP256).
     pub algo: u8,
+    /// SC-HSM key flags byte from GENERATE KEY PAIR TLV (tag 0xD4).
+    ///
+    /// Bit 0 = ALLOW_SIGN, Bit 1 = ALLOW_DECRYPT, Bit 2 = ALLOW_DERIVE,
+    /// Bit 3 = NO_EXPORT (if set, EXPORT KEY must be rejected).
+    /// Default 0x00 = all operations allowed, exportable.
+    pub key_flags: u8,
     /// Raw private key scalar (big-endian), up to 66 bytes for P-521.
     pub private_key: heapless::Vec<u8, 66>,
     /// Uncompressed public key `04 || X || Y`, up to 133 bytes for P-521.
@@ -285,8 +293,11 @@ pub struct ScHsmState {
     pub exchange_peer_ephem_pub: Option<[u8; 65]>,
     /// Replay cache for V2 exchange challenges (RAM only, cleared on reset).
     pub exchange_challenge_cache: [[u8; 32]; 16],
-    /// Number of valid entries in exchange_challenge_cache.
+    /// Number of valid entries in exchange_challenge_cache (capped at 16).
     pub exchange_challenge_cache_count: u8,
+    /// Ring-buffer write pointer for the challenge replay cache.
+    /// Incremented unconditionally on every write; mod 16 gives the slot.
+    pub exchange_challenge_cache_write_idx: u8,
 
     /// Monotonic generation counter, incremented on key generate/import/delete.
     pub generation: u64,
@@ -332,6 +343,7 @@ impl ScHsmState {
             exchange_peer_ephem_pub: None,
             exchange_challenge_cache: [[0u8; 32]; 16],
             exchange_challenge_cache_count: 0,
+            exchange_challenge_cache_write_idx: 0,
             generation: 0,
             noise_enrolled_peer_pubkey: None,
         }

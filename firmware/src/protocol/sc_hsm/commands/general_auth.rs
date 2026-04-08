@@ -279,6 +279,7 @@ mod tests {
             key_id: pico2hsm_core::key::KeyId::sc_hsm(0, 0x01).0,
             key_type: KeyType::EcPrivateP256,
             algo: 0x13,
+            key_flags: 0,
             private_key: kp.private_key.clone(),
             public_key: kp.public_key.clone(),
         };

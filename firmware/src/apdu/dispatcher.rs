@@ -305,6 +305,7 @@ fn push_key_object_to_state(
             key_id: obj.key_id,
             key_type: core_key_type,
             algo,
+            key_flags: 0, // TODO(H1): flash format does not store key_flags yet
             private_key_der: heapless::Vec::new(),
             modulus: heapless::Vec::new(),
             exponent: heapless::Vec::new(),
@@ -334,6 +335,7 @@ fn push_key_object_to_state(
         key_id: obj.key_id,
         key_type: core_key_type,
         algo,
+        key_flags: 0,
         private_key: heapless::Vec::new(),
         public_key: heapless::Vec::new(),
     };

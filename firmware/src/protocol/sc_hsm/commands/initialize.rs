@@ -10,6 +10,8 @@
 //! - Tag 0x91: DKEK share count (1 byte, 0–8; 0 = no DKEK)
 //! - Tag 0x92: Options bitmask (2 bytes LE16)
 
+use subtle::ConstantTimeEq;
+
 use pico2hsm_core::{
     apdu::{ApduCommand, ApduResponse, SW_CONDITIONS_NOT_SATISFIED, SW_OK, SW_SECURITY_STATUS,
         SW_WRONG_DATA, SW_WRONG_LENGTH},
@@ -87,7 +89,7 @@ pub fn handle(state: &mut ScHsmState, store: &mut dyn crate::storage::KeyStore, 
         if let Some(stored_hash) = state.so_pin_hash {
             let mut provided_hash = [0u8; 32];
             hash_pin(init_code, &mut provided_hash);
-            if provided_hash != stored_hash {
+            if !bool::from(provided_hash.ct_eq(&stored_hash)) {
                 return ApduResponse::err(SW_SECURITY_STATUS);
             }
         }
@@ -167,6 +169,7 @@ pub fn handle(state: &mut ScHsmState, store: &mut dyn crate::storage::KeyStore, 
         key_id: pico2hsm_core::key::KeyId::sc_hsm(0, 0).0,
         key_type: pico2hsm_core::key::KeyType::EcPrivateP256,
         algo: 0x13,
+        key_flags: 0,
         private_key: heapless::Vec::new(),
         public_key: heapless::Vec::new(),
     };
@@ -209,6 +212,7 @@ pub fn handle(state: &mut ScHsmState, store: &mut dyn crate::storage::KeyStore, 
                 key_id: dev_identity_key_id,
                 key_type: CoreKeyType::EcPrivateP256,
                 algo: 0x13, // EcdsaP256
+                key_flags: 0,
                 private_key: heapless::Vec::new(),
                 public_key: heapless::Vec::new(),
             };
@@ -229,4 +233,76 @@ pub fn handle(state: &mut ScHsmState, store: &mut dyn crate::storage::KeyStore, 
 
     crate::cdc_log!("SC-HSM INITIALIZE complete");
     ApduResponse::ok(&[])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::sc_hsm::ScHsmState;
+    use pico2hsm_core::apdu::{SW_OK, SW_SECURITY_STATUS};
+
+    /// Build a minimal INITIALIZE APDU with the given TLV-encoded data.
+    fn make_initialize(data: &[u8]) -> heapless::Vec<u8, 128> {
+        let mut apdu: heapless::Vec<u8, 128> = heapless::Vec::new();
+        let _ = apdu.extend_from_slice(&[0x00, INS_INITIALIZE, 0x00, 0x00]);
+        if !data.is_empty() {
+            let _ = apdu.push(data.len() as u8);
+            let _ = apdu.extend_from_slice(data);
+        }
+        apdu
+    }
+
+    /// Encode a single TLV primitive: tag + length + value.
+    fn tlv(tag: u8, value: &[u8]) -> heapless::Vec<u8, 64> {
+        let mut v: heapless::Vec<u8, 64> = heapless::Vec::new();
+        let _ = v.push(tag);
+        let _ = v.push(value.len() as u8);
+        let _ = v.extend_from_slice(value);
+        v
+    }
+
+    #[test]
+    fn test_reinit_wrong_sopin_rejected() {
+        let mut state = ScHsmState::new();
+        let mut store = crate::storage::NullKeyStore;
+
+        // First INITIALIZE with SO-PIN "12345678"
+        let init_code = b"12345678";
+        let data = tlv(0x82, init_code);
+        let apdu = make_initialize(&data);
+        let cmd = pico2hsm_core::apdu::ApduCommand::parse(&apdu).unwrap();
+        let resp = handle(&mut state, &mut store, &cmd);
+        assert_eq!(resp.sw, SW_OK);
+        assert!(state.initialized);
+        assert!(state.so_pin_hash.is_some());
+
+        // Re-INITIALIZE with wrong SO-PIN must be rejected
+        let wrong_code = b"XXXXXXXX";
+        let data2 = tlv(0x82, wrong_code);
+        let apdu2 = make_initialize(&data2);
+        let cmd2 = pico2hsm_core::apdu::ApduCommand::parse(&apdu2).unwrap();
+        let resp2 = handle(&mut state, &mut store, &cmd2);
+        assert_eq!(resp2.sw, SW_SECURITY_STATUS);
+    }
+
+    #[test]
+    fn test_reinit_correct_sopin_accepted() {
+        let mut state = ScHsmState::new();
+        let mut store = crate::storage::NullKeyStore;
+
+        // First INITIALIZE with SO-PIN "12345678"
+        let init_code = b"12345678";
+        let data = tlv(0x82, init_code);
+        let apdu = make_initialize(&data);
+        let cmd = pico2hsm_core::apdu::ApduCommand::parse(&apdu).unwrap();
+        let resp = handle(&mut state, &mut store, &cmd);
+        assert_eq!(resp.sw, SW_OK);
+
+        // Re-INITIALIZE with correct SO-PIN must succeed
+        let data2 = tlv(0x82, init_code);
+        let apdu2 = make_initialize(&data2);
+        let cmd2 = pico2hsm_core::apdu::ApduCommand::parse(&apdu2).unwrap();
+        let resp2 = handle(&mut state, &mut store, &cmd2);
+        assert_eq!(resp2.sw, SW_OK);
+    }
 }

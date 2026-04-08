@@ -799,9 +799,10 @@ fn check_and_add_challenge(state: &mut ScHsmState, challenge: &[u8; 32]) -> bool
         }
     }
     // Add to cache with ring-buffer eviction.
-    let idx = (state.exchange_challenge_cache_count as usize) % 16;
+    let idx = (state.exchange_challenge_cache_write_idx % 16) as usize;
     state.exchange_challenge_cache[idx] = *challenge;
-    if (state.exchange_challenge_cache_count as usize) < 16 {
+    state.exchange_challenge_cache_write_idx = state.exchange_challenge_cache_write_idx.wrapping_add(1);
+    if state.exchange_challenge_cache_count < 16 {
         state.exchange_challenge_cache_count += 1;
     }
     true
@@ -1246,6 +1247,7 @@ mod tests {
             key_id: dev_key_id,
             key_type: CoreKeyType::EcPrivateP256,
             algo: 0x13,
+            key_flags: 0,
             private_key: heapless::Vec::new(),
             public_key: heapless::Vec::new(),
         };
@@ -1344,6 +1346,77 @@ mod tests {
     }
 
     #[test]
+    fn test_challenge_cache_full_rotation() {
+        let mut state = ScHsmState::new();
+
+        // Fill cache with 16 unique challenges (slots 0..15).
+        for i in 0u8..16 {
+            let mut c = [0u8; 32];
+            c[0] = i;
+            assert!(check_and_add_challenge(&mut state, &c), "challenge {} should succeed", i);
+        }
+        assert_eq!(state.exchange_challenge_cache_count, 16);
+
+        // Add a 17th challenge — this should evict slot 0 (challenge with c[0]=0).
+        let mut c17 = [0u8; 32];
+        c17[0] = 0x10; // 16
+        assert!(check_and_add_challenge(&mut state, &c17), "17th challenge should succeed");
+
+        // The 17th challenge should be found (it was just inserted in slot 0).
+        assert!(!check_and_add_challenge(&mut state, &c17), "17th challenge should be detected as replay");
+
+        // Challenge 0 (c[0]=0) was evicted from slot 0 and should NOT be detected.
+        let c0 = [0u8; 32];
+        assert!(check_and_add_challenge(&mut state, &c0), "evicted challenge 0 should be accepted as new");
+        // c0 was written to slot 1 (write_idx=18, 18%16=2 — wait, 17%16=1), evicting challenge 1.
+
+        // Challenges 2..15 should still be in the cache (slots 2..15 untouched).
+        for i in 2u8..16 {
+            let mut c = [0u8; 32];
+            c[0] = i;
+            assert!(!check_and_add_challenge(&mut state, &c), "challenge {} should still be in cache", i);
+        }
+
+        // Challenge 1 was evicted by c0's insert and should be accepted as new.
+        let mut c1 = [0u8; 32];
+        c1[0] = 1;
+        assert!(check_and_add_challenge(&mut state, &c1), "evicted challenge 1 should be accepted as new");
+
+        // Verify write pointer advances correctly: after 19 inserts (16+3),
+        // write_idx should be 19.
+        assert_eq!(state.exchange_challenge_cache_write_idx, 19);
+        assert_eq!(state.exchange_challenge_cache_count, 16);
+    }
+
+    #[test]
+    fn test_challenge_cache_deduplication_works() {
+        let mut state = ScHsmState::new();
+        let challenge_a = [0xAAu8; 32];
+
+        // First insert succeeds.
+        assert!(check_and_add_challenge(&mut state, &challenge_a));
+        // Duplicate is rejected.
+        assert!(!check_and_add_challenge(&mut state, &challenge_a));
+
+        // Fill remaining 15 slots with distinct challenges.
+        for i in 1u8..16 {
+            let mut c = [0u8; 32];
+            c[0] = i;
+            assert!(check_and_add_challenge(&mut state, &c));
+        }
+
+        // challenge_a should still be detected (it's in slot 0, not yet evicted).
+        assert!(!check_and_add_challenge(&mut state, &challenge_a));
+
+        // One more insert evicts slot 0 (where challenge_a lives).
+        let new_c = [0xFFu8; 32];
+        assert!(check_and_add_challenge(&mut state, &new_c));
+
+        // Now challenge_a has been evicted — it should be accepted as new.
+        assert!(check_and_add_challenge(&mut state, &challenge_a));
+    }
+
+    #[test]
     fn test_get_state_hash_returns_104_bytes() {
         let mut state = state_with_device_key();
         let mut store = NullStore;
@@ -1387,6 +1460,7 @@ mod tests {
             key_id: key_id2,
             key_type: CoreKeyType::EcPrivateP256,
             algo: 0x13,
+            key_flags: 0,
             private_key: heapless::Vec::new(),
             public_key: heapless::Vec::new(),
         };

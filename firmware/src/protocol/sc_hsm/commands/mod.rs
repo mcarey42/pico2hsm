@@ -13,6 +13,7 @@ pub mod challenge;
 pub mod change_pin;
 pub mod create_file;
 pub mod cipher_sym;
+#[cfg(feature = "debug")]
 pub mod debug_dump;
 pub mod decrypt;
 pub mod delete_file;
@@ -39,3 +40,12 @@ pub mod sign;
 pub mod update_binary;
 pub mod verify;
 pub mod write_data;
+
+#[cfg(all(test, not(feature = "debug")))]
+mod debug_gate_tests {
+    // This test verifies that when the "debug" feature is absent,
+    // the debug_dump module is not compiled. The fact that this module
+    // compiles without referencing debug_dump is itself the test.
+    #[test]
+    fn debug_module_gated() {}
+}

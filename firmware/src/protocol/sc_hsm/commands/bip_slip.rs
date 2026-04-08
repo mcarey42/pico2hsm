@@ -141,6 +141,7 @@ mod tests {
             key_id: full_key_id,
             key_type: CoreKeyType::Bip32Master,
             algo: 0x00,
+            key_flags: 0,
             private_key,
             public_key: heapless::Vec::new(),
         };
@@ -228,6 +229,7 @@ mod tests {
             key_id: full_key_id,
             key_type: CoreKeyType::Bip32Master,
             algo: 0x00,
+            key_flags: 0,
             private_key,
             public_key: heapless::Vec::new(),
         };

@@ -114,6 +114,7 @@ mod tests {
             key_id: full_key_id,
             key_type: CoreKeyType::EcPrivateP256,
             algo: 0x13,
+            key_flags: 0,
             private_key,
             public_key: heapless::Vec::new(),
         };

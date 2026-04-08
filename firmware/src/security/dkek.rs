@@ -54,7 +54,7 @@ use core::convert::TryInto;
 
 use hkdf::Hkdf;
 use sha2::{Digest, Sha256};
-use subtle::ConstantTimeEq;
+use subtle::{Choice, ConstantTimeEq};
 use zeroize::{Zeroize, Zeroizing};
 
 use cmac::{Cmac, Mac as CmacMac};
@@ -584,7 +584,7 @@ impl DkekManager {
         algo_id: u8,
         key_flags: u8,
         rng: &mut (impl rand_core::CryptoRng + rand_core::RngCore),
-    ) -> Result<heapless::Vec<u8, 2080>, DkekError> {
+    ) -> Result<heapless::Vec<u8, 2448>, DkekError> {
         let dkek = self.get_dkek().ok_or(DkekError::WrongState)?;
 
         // Compute KCV.
@@ -596,9 +596,9 @@ impl DkekManager {
         let pad_len = 16 - (plain_data_len % 16);
         let padded_len = plain_data_len + pad_len;
 
-        // Use a stack buffer. Max private key = 132 bytes (P-521); + 2 + up to 16 pad = 150 bytes.
-        // heapless::Vec<u8, 160> for the plaintext buffer.
-        let mut pt: heapless::Vec<u8, 160> = heapless::Vec::new();
+        // Use a stack buffer. Max private key = ~2350 bytes (RSA-4096 PKCS#1 DER);
+        // + 2 (algo_id + key_flags) + up to 16 pad = ~2368 bytes.
+        let mut pt: heapless::Vec<u8, 2400> = heapless::Vec::new();
         pt.extend_from_slice(key_material).map_err(|_| DkekError::EncryptFailure)?;
         pt.push(algo_id).map_err(|_| DkekError::EncryptFailure)?;
         pt.push(key_flags).map_err(|_| DkekError::EncryptFailure)?;
@@ -612,7 +612,7 @@ impl DkekManager {
 
         // AES-256-CBC encrypt in-place.
         // The cbc encryptor needs a mutable fixed-size slice. Use a fixed stack buffer.
-        let mut ct_buf = [0u8; 160];
+        let mut ct_buf = [0u8; 2400];
         let ct_slice = &mut ct_buf[..padded_len];
         ct_slice.copy_from_slice(&pt[..padded_len]);
 
@@ -625,7 +625,7 @@ impl DkekManager {
         for b in pt.iter_mut() { *b = 0; }
 
         // Assemble output: KCV(8) || IV(16) || ciphertext(padded_len)
-        let mut out: heapless::Vec<u8, 2080> = heapless::Vec::new();
+        let mut out: heapless::Vec<u8, 2448> = heapless::Vec::new();
         out.extend_from_slice(&kcv).map_err(|_| DkekError::EncryptFailure)?;
         out.extend_from_slice(&iv).map_err(|_| DkekError::EncryptFailure)?;
         out.extend_from_slice(ct_slice).map_err(|_| DkekError::EncryptFailure)?;
@@ -640,7 +640,7 @@ impl DkekManager {
     pub fn unwrap(
         &self,
         blob: &[u8],
-    ) -> Result<(heapless::Vec<u8, 2048>, u8, u8), DkekError> {
+    ) -> Result<(heapless::Vec<u8, 2400>, u8, u8), DkekError> {
         let dkek = self.get_dkek().ok_or(DkekError::WrongState)?;
 
         // Validate minimum length and alignment.
@@ -663,7 +663,7 @@ impl DkekManager {
         }
 
         // AES-256-CBC decrypt.
-        let mut pt_buf = [0u8; 160];
+        let mut pt_buf = [0u8; 2400];
         if ct_len > pt_buf.len() {
             return Err(DkekError::InvalidWrapBlob);
         }
@@ -675,16 +675,28 @@ impl DkekManager {
         dec.decrypt_padded_mut::<NoPadding>(pt_slice)
             .map_err(|_| DkekError::DecryptFailure)?;
 
-        // Remove PKCS#7 padding.
+        // Remove PKCS#7 padding — constant-time validation to avoid leaking
+        // information about the decrypted plaintext structure via timing.
         let pad_len = *pt_slice.last().ok_or(DkekError::InvalidPadding)? as usize;
-        if pad_len == 0 || pad_len > 16 || pad_len > ct_len {
-            return Err(DkekError::InvalidPadding);
+
+        // Constant-time bounds check: pad_len must be 1..=16 and <= ct_len.
+        let pad_invalid = Choice::from((pad_len == 0 || pad_len > 16 || pad_len > ct_len) as u8);
+
+        // Constant-time padding byte check — accumulate without early exit.
+        // Iterate over all 16 potential padding positions with a fixed loop count
+        // to avoid length-dependent timing.
+        let mut bad = Choice::from(0u8);
+        for i in 0..16usize {
+            let in_range = Choice::from((i < pad_len && ct_len >= pad_len && i < ct_len) as u8);
+            let idx = ct_len.saturating_sub(pad_len).saturating_add(i).min(ct_len.saturating_sub(1));
+            let byte_ok = pt_slice[idx].ct_eq(&(pad_len as u8));
+            // Only count mismatch if we're in the padding range.
+            bad |= in_range & !byte_ok;
         }
-        // Validate all padding bytes.
-        for &b in &pt_slice[ct_len - pad_len..] {
-            if b as usize != pad_len {
-                return Err(DkekError::InvalidPadding);
-            }
+        bad |= pad_invalid;
+
+        if bool::from(bad) {
+            return Err(DkekError::InvalidPadding);
         }
         let unpadded_len = ct_len - pad_len;
 
@@ -697,7 +709,7 @@ impl DkekManager {
         let algo_id = pt_slice[key_material_len];
         let key_flags = pt_slice[key_material_len + 1];
 
-        let mut key_material: heapless::Vec<u8, 2048> = heapless::Vec::new();
+        let mut key_material: heapless::Vec<u8, 2400> = heapless::Vec::new();
         key_material.extend_from_slice(&pt_slice[..key_material_len])
             .map_err(|_| DkekError::InvalidWrapBlob)?;
 
@@ -1133,5 +1145,94 @@ mod tests {
         let dummy_blob = [0u8; 40]; // KCV(8) + IV(16) + one block(16)
         let result = mgr.unwrap(&dummy_blob);
         assert_eq!(result, Err(DkekError::WrongState));
+    }
+
+    /// H4: Verify that corrupted padding is rejected by the constant-time
+    /// padding validation (no early return, accumulator-based).
+    #[test]
+    fn test_unwrap_bad_padding_rejected_constant_time() {
+        let mut mgr = DkekManager::new(test_device_id());
+        mgr.init_shares(1);
+        let share = [0x99u8; 32];
+        let iv = [0x44u8; 16];
+        let blob = encrypt_share_blob(&share, b"pw4", &iv).unwrap();
+        mgr.import_share(&blob, b"pw4").unwrap();
+
+        let mut rng = DeterministicRng::seeded(5);
+        let key_material = [0xBBu8; 32];
+        let mut wrapped = mgr.wrap(&key_material, 0x13, 0x01, &mut rng).unwrap();
+
+        // Corrupt the last byte of the ciphertext — this will corrupt the
+        // padding after decryption, which the constant-time check must reject.
+        let last = wrapped.len() - 1;
+        wrapped[last] ^= 0xFF;
+        let result = mgr.unwrap(&wrapped);
+        assert!(
+            result == Err(DkekError::InvalidPadding) || result == Err(DkekError::InvalidWrapBlob),
+            "expected padding or blob error, got {:?}", result
+        );
+    }
+
+    /// H4: Verify that padding with an incorrect value (but correct length)
+    /// is also rejected. We corrupt the last ciphertext block (which contains
+    /// the padding) to guarantee invalid padding bytes after decryption.
+    #[test]
+    fn test_unwrap_forged_padding_value_rejected() {
+        let mut mgr = DkekManager::new(test_device_id());
+        mgr.init_shares(1);
+        let share = [0x88u8; 32];
+        let iv = [0x55u8; 16];
+        let blob = encrypt_share_blob(&share, b"pw5", &iv).unwrap();
+        mgr.import_share(&blob, b"pw5").unwrap();
+
+        let mut rng = DeterministicRng::seeded(6);
+        let key_material = [0xCCu8; 32];
+        let wrapped = mgr.wrap(&key_material, 0x13, 0x01, &mut rng).unwrap();
+
+        // Corrupt every byte of the last ciphertext block to guarantee
+        // the decrypted padding is completely destroyed.
+        let mut forged = wrapped.clone();
+        let ct_start = KCV_SIZE + CBC_IV_SIZE;
+        let ct_end = forged.len();
+        let last_block_start = ct_end - 16;
+        for i in last_block_start..ct_end {
+            forged[i] ^= 0xFF;
+        }
+        let result = mgr.unwrap(&forged);
+        // Could be InvalidPadding or InvalidWrapBlob depending on what the
+        // decrypted garbage looks like.
+        assert!(result.is_err(), "forged ciphertext must be rejected, got {:?}", result);
+    }
+
+    /// H6: Verify that wrapping a large key (RSA-4096 size) succeeds with the
+    /// increased buffer.
+    #[test]
+    fn test_wrap_unwrap_large_rsa_key() {
+        let mut mgr = DkekManager::new(test_device_id());
+        mgr.init_shares(1);
+        let share = [0xAAu8; 32];
+        let iv = [0x66u8; 16];
+        let blob = encrypt_share_blob(&share, b"pw6", &iv).unwrap();
+        mgr.import_share(&blob, b"pw6").unwrap();
+
+        let mut rng = DeterministicRng::seeded(7);
+
+        // Simulate an RSA-4096 PKCS#1 DER private key (~2348 bytes).
+        // Use a repeating pattern so we can verify the round-trip.
+        let mut key_material = [0u8; 2348];
+        for (i, b) in key_material.iter_mut().enumerate() {
+            *b = (i & 0xFF) as u8;
+        }
+        let algo_id = 0x73u8; // hypothetical RSA-4096 algo ID
+        let key_flags = 0x01u8;
+
+        let wrapped = mgr.wrap(&key_material, algo_id, key_flags, &mut rng)
+            .expect("wrap() must succeed for RSA-4096 sized key");
+        let (recovered, recovered_algo, recovered_flags) = mgr.unwrap(&wrapped)
+            .expect("unwrap() must succeed for RSA-4096 sized key");
+
+        assert_eq!(&*recovered, &key_material[..]);
+        assert_eq!(recovered_algo, algo_id);
+        assert_eq!(recovered_flags, key_flags);
     }
 }

@@ -14,6 +14,8 @@ Last updated: 2026-04-08 (v0.9.5 review board)
 | 1 | Display: key_count, authenticated, last_op not wired | v0.9.0 |
 | 2 | DKEK fully stubbed (share import, wrap, unwrap, Noise exchange) | v0.9.5 |
 | 5 | ECDH P-256 xfail markers left from OpenSC 0.25-rc1 regression | v0.9.5 |
+| H4 | PKCS#7 padding validation in dkek.unwrap() not constant-time | v0.9.5 |
+| H6 | RSA DKEK wrap buffer too small for RSA-4096 | v0.9.5 |
 
 ---
 
@@ -142,87 +144,89 @@ with a responsible disclosure contact (GitHub private security advisory or a ded
 
 ## HIGH — Should fix before v1.0
 
-### H1. Export key does not enforce NO-EXPORT flag
+### H1. ~~Export key does not enforce NO-EXPORT flag~~ — PARTIALLY RESOLVED
 
-**File:** `firmware/src/protocol/sc_hsm/commands/export_key.rs:26-87`
+**File:** `firmware/src/protocol/sc_hsm/commands/export_key.rs`
 
-The file header states "Keys marked with NO-EXPORT flag are rejected" but the `handle()` function
-never reads any export flag. All keys are wrappable regardless of their generation policy.
+**What was done (2026-04-08):**
+- Added `key_flags: u8` field to `InMemoryKey` and `RsaInMemoryKey` structs.
+- `GENERATE KEY PAIR` (INS=0x46) now parses TLV tag `0xD4` from the command data
+  and stores the key flags byte in the in-memory key entry.
+- `EXPORT KEY` (INS=0x72) checks `key_flags & NO_EXPORT_BIT (0x08)` before wrapping;
+  returns `SW_CONDITIONS_NOT_SATISFIED` if the NO_EXPORT bit is set.
+- Added `NO_EXPORT_BIT` constant and two unit tests (rejection + allowance).
 
-**Fix:** Read a `key_flags` / `exportable` field from the key's metadata blob and return
-`SW_CONDITIONS_NOT_SATISFIED` if the key is marked non-exportable.
-
----
-
-### H2. INITIALIZE SO-PIN comparison is not constant-time
-
-**File:** `firmware/src/protocol/sc_hsm/commands/initialize.rs:90`
-
-Re-initialization compares the provided SO-PIN hash with the stored hash using `!=` on `[u8; 32]`,
-which short-circuits on the first differing byte. `verify.rs` correctly uses `subtle::ConstantTimeEq`.
-
-**Fix:**
-```rust
-use subtle::ConstantTimeEq;
-if !bool::from(provided_hash.ct_eq(&stored_hash)) { ... }
-```
+**What remains:**
+- Flash-persisted keys (`KeyObject`) do not store `key_flags` in the on-disk header
+  (fixed 20-byte P2K3 format). Keys loaded from flash default to `key_flags=0x00`
+  (exportable). A flash format migration (P2K4) is needed to persist key flags.
+- `IMPORT KEY` (INS=0x74) sets `key_flags=0` on imported keys since the wrapped blob
+  format embeds only `algo_id` + `key_flags` (the DKEK wrap `key_flags` byte), but
+  this is the DKEK-level flag, not the access-condition flag from GENERATE.
+- The `key_domain` byte in `KeyObject` header byte 11 could potentially be repurposed
+  or an additional byte appended, but this requires careful format versioning.
 
 ---
 
-### H3. V2 challenge replay cache rotation is broken after 16 entries
+### H2. ~~INITIALIZE SO-PIN comparison is not constant-time~~ — RESOLVED
 
-**File:** `firmware/src/protocol/sc_hsm/commands/extras.rs:847-863`
+**File:** `firmware/src/protocol/sc_hsm/commands/initialize.rs:91`
 
-After 16 challenges, `exchange_challenge_cache_count` is capped at 16 but new entries always
-write to slot 0 (index `count % 16 = 0`), overwriting the oldest entry. After the 17th exchange,
-the first challenge can be replayed without detection.
-
-**Fix:** Add a separate `exchange_challenge_cache_write_idx: u8` field; write to
-`write_idx % 16` and increment unconditionally. Read-scan still iterates the full 16 slots.
+**Fixed 2026-04-08:** Replaced `provided_hash != stored_hash` (short-circuit `[u8; 32]` comparison)
+with `!bool::from(provided_hash.ct_eq(&stored_hash))` using `subtle::ConstantTimeEq`, matching the
+pattern already used in `verify.rs`. Added `use subtle::ConstantTimeEq;` import (line 13) and two
+unit tests (`test_reinit_wrong_sopin_rejected`, `test_reinit_correct_sopin_accepted`).
 
 ---
 
-### H4. PKCS#7 padding validation in `dkek.unwrap()` is not constant-time
+### H3. V2 challenge replay cache rotation is broken after 16 entries — FIXED
 
-**File:** `firmware/src/security/dkek.rs:679-688`
+**File:** `firmware/src/protocol/sc_hsm/commands/extras.rs` (`check_and_add_challenge`)
 
-The padding check loop short-circuits on the first mismatched byte, potentially leaking
-information about the decrypted DKEK plaintext structure via timing.
-
-**Fix:** Replace with a constant-time accumulator:
-```rust
-let mut bad = subtle::Choice::from(0u8);
-for &b in &plaintext[pt_len - pad_len..] {
-    bad |= subtle::Choice::from((b as usize != pad_len) as u8);
-}
-if bool::from(bad) { return Err(DkekError::Crypto); }
-```
+**Status (2026-04-08):** Fixed. Added `exchange_challenge_cache_write_idx: u8` to `ScHsmState`
+as a separate ring-buffer write pointer that increments unconditionally via `wrapping_add(1)`.
+The write slot is `write_idx % 16`, independent of the count (which is capped at 16 for the
+read-scan). Two unit tests added: `test_challenge_cache_full_rotation` (verifies correct
+eviction after 19 inserts) and `test_challenge_cache_deduplication_works` (verifies replay
+detection survives full rotation and eviction).
 
 ---
 
-### H5. `debug_dump` module declaration is not feature-gated
+### H4. ~~PKCS#7 padding validation in `dkek.unwrap()` is not constant-time~~ — RESOLVED
 
-**File:** `firmware/src/protocol/sc_hsm/commands/mod.rs:16`
+**File:** `firmware/src/security/dkek.rs`
 
-`pub mod debug_dump;` is declared without `#[cfg(feature = "debug")]`, only the internals
-are gated. A future contributor adding code to that module could inadvertently ship it in
-release builds.
-
-**Fix:** Add `#[cfg(feature = "debug")]` to the module declaration line.
+**Fixed 2026-04-08:** Replaced the short-circuit early-return padding validation loop with a
+constant-time accumulator using `subtle::Choice`. The new implementation iterates a fixed 16
+positions, masks out-of-range indices, and accumulates mismatches into a `bad` accumulator
+without branching on padding content. Added `test_unwrap_bad_padding_rejected_constant_time`
+and `test_unwrap_forged_padding_value_rejected` unit tests.
 
 ---
 
-### H6. RSA DKEK wrap buffer too small for RSA-4096
+### H5. ~~`debug_dump` module declaration is not feature-gated~~ — RESOLVED
 
-**File:** `firmware/src/security/dkek.rs:599-601`
+**File:** `firmware/src/protocol/sc_hsm/commands/mod.rs:16-17`
 
-Internal wrap plaintext buffer is `heapless::Vec<u8, 160>` (sized for P-521 at 132 bytes).
-RSA-4096 PKCS#1 DER private keys are up to ~2350 bytes. Attempting RSA-4096 DKEK export
-silently returns `DkekError::EncryptFailure`.
+**Fixed 2026-04-08:** Added `#[cfg(feature = "debug")]` to the `pub mod debug_dump;` declaration
+in `commands/mod.rs`. Removed redundant per-item `#[cfg(feature = "debug")]` attrs inside
+`debug_dump.rs` (the module-level gate is sufficient). Added compile-time assertion test
+(`debug_gate_tests::debug_module_gated`) that runs when `debug` feature is absent. Dispatch
+table reference at `sc_hsm/mod.rs:438-439` was already correctly gated.
 
-**Fix:** Either increase the plaintext buffer to `heapless::Vec<u8, 2400>` (matching the
-export_key buffer), or explicitly gate RSA key export with a size check that returns
-`SW_CONDITIONS_NOT_SATISFIED` with a clear error.
+---
+
+### H6. ~~RSA DKEK wrap buffer too small for RSA-4096~~ — RESOLVED
+
+**File:** `firmware/src/security/dkek.rs`
+
+**Fixed 2026-04-08:** Increased all internal DKEK wrap/unwrap buffers from 160 bytes (P-521
+only) to 2400 bytes to accommodate RSA-4096 PKCS#1 DER private keys (~2350 bytes). Buffers
+changed: `wrap()` plaintext Vec (160 -> 2400), `wrap()` ct_buf array (160 -> 2400), `wrap()`
+output Vec (2080 -> 2448), `unwrap()` pt_buf array (160 -> 2400), `unwrap()` returned key
+material Vec (2048 -> 2400). All buffers are stack-local (only alive during the wrap/unwrap
+call), so no BSS impact. Added `test_wrap_unwrap_large_rsa_key` unit test exercising a
+2348-byte key round-trip.
 
 ---
 

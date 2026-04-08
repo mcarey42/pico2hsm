@@ -1,7 +1,5 @@
-//! DEBUG MEMORY DUMP command handler.
-//!
-//! This command is ONLY compiled when the `debug` feature is active.
-//! It is NEVER included in production builds.
+//! Debug memory dump APDU handler.
+//! Only compiled when `#[cfg(feature = "debug")]` — gated at module declaration in mod.rs.
 //!
 //! # Security warning
 //! Including this command in a production build would constitute a
@@ -16,13 +14,9 @@
 use pico2hsm_core::apdu::{ApduCommand, ApduResponse, SW_WRONG_DATA};
 
 /// INS byte for DEBUG MEMORY DUMP.
-#[cfg(feature = "debug")]
 pub const INS_DEBUG_DUMP: u8 = 0xFE;
 
 /// Handle a DEBUG MEMORY DUMP APDU command.
-///
-/// Only compiled when the `debug` feature is active.
-#[cfg(feature = "debug")]
 pub fn handle(cmd: &ApduCommand<'_>) -> ApduResponse {
     // TODO: implement — read memory region and return raw bytes.
     // NOTE: This is a debug-only stub. Production builds never compile this.
