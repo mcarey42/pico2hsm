@@ -433,31 +433,31 @@ echo "Reader 0: $READER0    Reader 1: $READER1    PIN: ******"
 echo ""
 
 # Pre-flight
-printf "${CYAN}-- Pre-flight checks --${RESET}\n"
+printf "${CYAN}=== Pre-flight checks ===${RESET}\n"
 check_pcscd
 check_readers
 check_firmware "$READER0" "primary"
 check_firmware "$READER1" "secondary"
 
 # DKEK / state
-printf "\n${CYAN}-- DKEK and state checks --${RESET}\n"
+printf "\n${CYAN}=== DKEK and state checks ===${RESET}\n"
 check_dkek_loaded "$READER0" "primary"
 check_dkek_loaded "$READER1" "secondary"
 check_state_hash_match
 
 # Key list
-printf "\n${CYAN}-- Key synchronization checks --${RESET}\n"
+printf "\n${CYAN}=== Key synchronization checks ===${RESET}\n"
 check_key_list_match
 
 # Full mode: sign/verify
 if [[ "$FULL" -eq 1 ]]; then
-    printf "\n${CYAN}-- Sign/verify test --${RESET}\n"
+    printf "\n${CYAN}=== Sign/verify test ===${RESET}\n"
     check_sign_verify
 fi
 
 # Daemon checks
 if [[ "$SKIP_DAEMON" -eq 0 ]]; then
-    printf "\n${CYAN}-- Daemon health checks --${RESET}\n"
+    printf "\n${CYAN}=== Daemon health checks ===${RESET}\n"
     check_daemon_running
     check_daemon_no_errors
 fi

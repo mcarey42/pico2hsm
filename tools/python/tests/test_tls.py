@@ -59,6 +59,7 @@ def _generate_ca(tmp_path: Path) -> tuple[Path, "cryptography.x509.Certificate",
         )
         .sign(ca_key, hashes.SHA256())
     )
+    tmp_path.mkdir(parents=True, exist_ok=True)
     ca_path = tmp_path / "ca.crt"
     ca_path.write_bytes(ca_cert.public_bytes(serialization.Encoding.PEM))
     return ca_path, ca_cert, ca_key

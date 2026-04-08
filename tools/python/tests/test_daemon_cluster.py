@@ -34,6 +34,7 @@ def _make_config(**kwargs):
     config.state_dir = "/tmp/test_pico2hsm"
     config.get_primary.return_value = None
     config.get_secondaries.return_value = []
+    config.tls_enabled = kwargs.get("tls_enabled", False)
     return config
 
 
