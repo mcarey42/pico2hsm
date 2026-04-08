@@ -117,7 +117,7 @@
 // Always import shared types — St7789V3StatusDisplay implements LedController unconditionally.
 use super::{LedController, LedStatus};
 // Board trait is only needed inside the feature-gated impl block.
-#[cfg(any(feature = "waveshare_rp2350_lcd_16m", feature = "waveshare_rp2350_lcd_sdcard"))]
+#[cfg(feature = "waveshare_rp2350_lcd_16m")]
 use super::Board;
 
 // ─── GPIO pin assignments — LCD (SPI0) ────────────────────────────────────────
@@ -478,8 +478,7 @@ pub type WaveshareRp2350LcdSpi1 =
 ///
 /// When the `waveshare_rp2350_lcd_sdcard` feature is active, SPI1 is consumed
 /// by the SD card keystore and is NOT part of the board struct.  The `spi1`
-/// field is only present for the `waveshare_rp2350_lcd_16m` and
-/// `waveshare_rp2350_lcd_sdcard_dual` variants.
+/// field is only present for the `waveshare_rp2350_lcd_16m` variant.
 pub struct WaveshareRp2350LcdBoard {
     display: St7789V3StatusDisplay,
     pub spi0: WaveshareRp2350LcdSpi0,
@@ -535,7 +534,7 @@ impl WaveshareRp2350LcdBoard {
     }
 }
 
-#[cfg(any(feature = "waveshare_rp2350_lcd_16m", feature = "waveshare_rp2350_lcd_sdcard"))]
+#[cfg(feature = "waveshare_rp2350_lcd_16m")]
 impl Board for WaveshareRp2350LcdBoard {
     type Led = St7789V3StatusDisplay;
     type Spi0 = WaveshareRp2350LcdSpi0;
