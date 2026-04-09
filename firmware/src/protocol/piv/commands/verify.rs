@@ -87,6 +87,11 @@ pub fn handle(state: &mut PivState, cmd: &ApduCommand<'_>) -> ApduResponse {
             // Strip 0xFF padding to get the actual PIN
             let pin = strip_pin_padding(cmd.data);
 
+            // FIPS 201-2 §2.4.3: PIV PIN must contain only numeric digits (0x30–0x39).
+            if pin.iter().any(|&b| !(0x30..=0x39).contains(&b)) {
+                return ApduResponse::err(0x6A80); // wrong data — non-digit byte
+            }
+
             // Verify against PinState
             match state.pin_state.verify_pin(pin, &state.device_id, None) {
                 Ok(PinVerifyResult::Success) => {

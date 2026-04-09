@@ -119,24 +119,35 @@ pub fn handle(state: &mut OpenPgpState, cmd: &ApduCommand<'_>) -> ApduResponse {
         // 5F35 — Sex
         0x5F35 => ApduResponse::ok(&[state.sex]),
 
+        // 5F50 — URL of public key server
+        0x5F50 => ApduResponse::ok(&state.url),
+
+        // 7F21 — Cardholder Certificate (AUT key cert)
+        0x7F21 => ApduResponse::ok(&state.cardholder_cert),
+
         _ => ApduResponse::err(SW_DO_NOT_FOUND),
     }
 }
 
 /// Extended Capabilities (DO C0) — 10 bytes.
 fn extended_capabilities() -> [u8; 10] {
-    // Byte 0: feature flags
-    //   bit 2 (0x04) = ALG_ATTR_CHANGEABLE
-    //   bit 5 (0x20) = KEY_IMPORT (not yet, but set for future)
-    //   bit 6 (0x40) = GET_CHALLENGE
-    let byte0: u8 = 0x44; // ALG_ATTR_CHANGEABLE + GET_CHALLENGE
+    // Byte 0: feature flags (OpenPGP Card spec §4.4.3.7)
+    //   bit 0 (0x01) = Secure Messaging supported — NO
+    //   bit 1 (0x02) = GET CHALLENGE supports extended length — NO
+    //   bit 2 (0x04) = Algorithm attributes changeable — YES
+    //   bit 3 (0x08) = Private DOs supported — NO
+    //   bit 4 (0x10) = Key import (PUT DATA) supported — YES
+    //   bit 5 (0x20) = GET CHALLENGE (redundant with bit 6) — NO
+    //   bit 6 (0x40) = GET CHALLENGE supported — YES
+    //   bit 7 (0x80) = Secure Messaging using AES — NO
+    let byte0: u8 = 0x54; // ALG_ATTR_CHANGEABLE (0x04) | KEY_IMPORT (0x10) | GET_CHALLENGE (0x40)
     // Byte 1: 0x00 (no SM, no MSE, no PIN block 2)
     let byte1: u8 = 0x00;
-    // Bytes 2-3: max GET CHALLENGE = 0x00FF (255)
-    // Bytes 4-5: max certificate length = 0x0000 (not supported)
-    // Bytes 6-7: max special DO size = 0x00FF (255)
+    // Bytes 2-3: max GET CHALLENGE length = 0x00FF (255 bytes)
+    // Bytes 4-5: max certificate length = 0x0400 (1024 bytes, per cardholder_cert field size)
+    // Bytes 6-7: max special DO size = 0x00FE (254 bytes, per url/login_data field size)
     // Bytes 8-9: reserved = 0x0000
-    [byte0, byte1, 0x00, 0xFF, 0x00, 0x00, 0x00, 0xFF, 0x00, 0x00]
+    [byte0, byte1, 0x00, 0xFF, 0x04, 0x00, 0x00, 0xFE, 0x00, 0x00]
 }
 
 /// PW Status Bytes (DO C4) — 7 bytes.

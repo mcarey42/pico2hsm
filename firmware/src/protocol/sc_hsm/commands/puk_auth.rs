@@ -11,16 +11,14 @@ use pico2hsm_core::apdu::{
 };
 
 use crate::protocol::sc_hsm::ScHsmState;
+use crate::security::pin::PinState;
 
 /// INS byte for PUK AUTHENTICATE.
 pub const INS_PUK_AUTH: u8 = 0x28;
 
-/// Compute SHA-256 of `puk` into `out[..32]`.
-fn hash_puk(puk: &[u8], out: &mut [u8; 32]) {
-    use sha2::{Digest, Sha256};
-    let mut h = Sha256::new();
-    h.update(puk);
-    out.copy_from_slice(&h.finalize());
+/// Compute PBKDF2-HMAC-SHA256 of `puk` using `salt` (P1-1 fix).
+fn hash_puk_pbkdf2(puk: &[u8], salt: &[u8; 16]) -> [u8; 32] {
+    PinState::hash_puk(puk, b"pico2hsm-device", salt)
 }
 
 /// Handle a PUK AUTHENTICATE APDU command.
@@ -41,9 +39,8 @@ pub fn handle(state: &mut ScHsmState, cmd: &ApduCommand<'_>) -> ApduResponse {
         return ApduResponse::err(SW_AUTH_BLOCKED);
     }
 
-    // Compute SHA-256 of the submitted PUK.
-    let mut computed = [0u8; 32];
-    hash_puk(puk, &mut computed);
+    // Compute PBKDF2 of the submitted PUK and compare (P1-1 fix).
+    let computed = hash_puk_pbkdf2(puk, &state.puk_salt);
 
     // Constant-time compare.
     let matches: bool = computed.ct_eq(&stored_hash).into();
@@ -78,13 +75,12 @@ mod tests {
         apdu
     }
 
-    /// Create a state with a stored PUK hash for the given PUK bytes.
+    /// Create a state with a stored PUK hash for the given PUK bytes (using PBKDF2).
     fn make_state_with_puk(puk: &[u8]) -> ScHsmState {
-        use sha2::{Digest, Sha256};
+        let salt = [0xBBu8; 16]; // deterministic test salt
         let mut state = ScHsmState::new();
-        let mut h = [0u8; 32];
-        h.copy_from_slice(&Sha256::digest(puk));
-        state.puk_hash = Some(h);
+        state.puk_salt = salt;
+        state.puk_hash = Some(hash_puk_pbkdf2(puk, &salt));
         state
     }
 

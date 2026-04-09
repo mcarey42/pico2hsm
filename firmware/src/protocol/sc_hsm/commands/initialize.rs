@@ -43,18 +43,31 @@ fn find_tlv<'a>(data: &'a [u8], tag: u8) -> Option<&'a [u8]> {
     None
 }
 
-/// Compute a naive SHA-256 of `input` into `out[..32]`.
-/// We use a manual constant since `sha2` is not usable without the crypto agent wiring.
-/// For now store raw PIN bytes hashed via SHA-256.
-/// TODO (Agent 7): replace with proper zeroizing hash call.
-fn hash_pin(pin: &[u8], out: &mut [u8; 32]) {
-    use sha2::{Digest, Sha256};
-    use zeroize::Zeroize;
-    let mut h = Sha256::new();
-    h.update(pin);
-    let mut result = h.finalize();
-    out.copy_from_slice(&result);
-    result.zeroize();
+/// Compute PBKDF2-HMAC-SHA256 of `pin` with the given salt, writing into `out[..32]`.
+///
+/// Uses `PinState::hash_pin` so the hash format is identical to what VERIFY uses.
+/// Salt composition: device_id (fallback [0;16]) || "pin" || extra_salt.
+fn hash_pin_pbkdf2(pin: &[u8], salt: &[u8; 16]) -> [u8; 32] {
+    use crate::security::pin::PinState;
+    // Use a fixed device_id fallback for INITIALIZE-time hashing.
+    // The salt already contains per-device randomness via `salt`.
+    PinState::hash_pin(pin, b"pico2hsm-device", salt)
+}
+
+/// Compute PBKDF2-HMAC-SHA256 of `puk` with the given salt.
+fn hash_puk_pbkdf2(puk: &[u8], salt: &[u8; 16]) -> [u8; 32] {
+    use crate::security::pin::PinState;
+    PinState::hash_puk(puk, b"pico2hsm-device", salt)
+}
+
+/// Generate 16 random bytes for a salt using the firmware RNG.
+fn gen_salt() -> [u8; 16] {
+    use crate::protocol::sc_hsm::FwRng;
+    use rand_core::RngCore;
+    let mut rng = FwRng;
+    let mut salt = [0u8; 16];
+    rng.fill_bytes(&mut salt);
+    salt
 }
 
 /// Handle an INITIALIZE DEVICE APDU command.
@@ -87,8 +100,7 @@ pub fn handle(state: &mut ScHsmState, store: &mut dyn crate::storage::KeyStore, 
     // command itself — no prior VERIFY is required.
     if state.initialized {
         if let Some(stored_hash) = state.so_pin_hash {
-            let mut provided_hash = [0u8; 32];
-            hash_pin(init_code, &mut provided_hash);
+            let provided_hash = hash_pin_pbkdf2(init_code, &state.so_pin_salt);
             if !bool::from(provided_hash.ct_eq(&stored_hash)) {
                 return ApduResponse::err(SW_SECURITY_STATUS);
             }
@@ -114,27 +126,29 @@ pub fn handle(state: &mut ScHsmState, store: &mut dyn crate::storage::KeyStore, 
     // Tag 0x92: DKEK share count (optional, 0 = no DKEK).
     let dkek_count = find_tlv(data, 0x92).and_then(|v| v.first().copied()).unwrap_or(0);
 
-    // Store SO-PIN (init code) hash.
-    let mut so_hash = [0u8; 32];
-    hash_pin(init_code, &mut so_hash);
-    state.so_pin_hash = Some(so_hash);
+    // Generate fresh random salts for all credentials.
+    let so_salt = gen_salt();
+    let user_salt = gen_salt();
+    let puk_salt_bytes = gen_salt();
 
-    // Store User PIN hash if provided.
+    // Store SO-PIN (init code) hash using PBKDF2.
+    state.so_pin_salt = so_salt;
+    state.so_pin_hash = Some(hash_pin_pbkdf2(init_code, &so_salt));
+
+    // Store User PIN hash if provided, using PBKDF2.
     if let Some(up) = user_pin {
-        let mut u_hash = [0u8; 32];
-        hash_pin(up, &mut u_hash);
-        state.user_pin_hash = Some(u_hash);
+        state.user_pin_salt = user_salt;
+        state.user_pin_hash = Some(hash_pin_pbkdf2(up, &user_salt));
         state.pin_retry_count = retry_counter;
     }
 
-    // Tag 0x93: PUK (optional, 8–16 bytes).
+    // Tag 0x93: PUK (optional, 8–16 bytes), using PBKDF2.
     if let Some(puk) = find_tlv(data, 0x93) {
         if puk.len() < 8 || puk.len() > 16 {
             return ApduResponse::err(SW_WRONG_LENGTH);
         }
-        let mut puk_h = [0u8; 32];
-        hash_pin(puk, &mut puk_h);
-        state.puk_hash = Some(puk_h);
+        state.puk_salt = puk_salt_bytes;
+        state.puk_hash = Some(hash_puk_pbkdf2(puk, &puk_salt_bytes));
         state.puk_retry_count = 10;
     } else {
         state.puk_hash = None;

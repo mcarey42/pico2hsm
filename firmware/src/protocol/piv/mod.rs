@@ -94,6 +94,10 @@ pub struct PivState {
     pub keys: heapless::Vec<InMemoryPivKey, MAX_PIV_KEYS>,
     /// Stored data objects (certificates, etc.).
     pub data_objects: heapless::Vec<PivDataObject, MAX_PIV_DATA_OBJECTS>,
+    /// Buffer for chained GET RESPONSE (INS=0xC0) — stores the full pending response.
+    pub last_response: heapless::Vec<u8, 4096>,
+    /// Byte offset into `last_response` for the next GET RESPONSE chunk.
+    pub last_response_offset: usize,
 }
 
 #[cfg(feature = "applet-piv")]
@@ -128,6 +132,8 @@ impl PivState {
             device_id,
             keys: heapless::Vec::new(),
             data_objects: heapless::Vec::new(),
+            last_response: heapless::Vec::new(),
+            last_response_offset: 0,
         }
     }
 }
@@ -152,7 +158,16 @@ impl Piv {
     fn dispatch(&mut self, cmd: &ApduCommand<'_>) -> ApduResponse {
         use commands::*;
 
-        match cmd.ins {
+        // GET RESPONSE (INS=0xC0) — return next chunk of a previously buffered response.
+        if cmd.ins == 0xC0 {
+            return self.handle_get_response(cmd.le);
+        }
+
+        // Any non-GET-RESPONSE command clears the pending response buffer.
+        self.state.last_response.clear();
+        self.state.last_response_offset = 0;
+
+        let raw = match cmd.ins {
             select::INS_SELECT => select::handle(cmd),
             get_data::INS_GET_DATA => get_data::handle(&self.state, cmd),
             verify::INS_VERIFY => verify::handle(&mut self.state, cmd),
@@ -169,8 +184,71 @@ impl Piv {
             reset_retry_counter::INS_RESET_RETRY_COUNTER => {
                 reset_retry_counter::handle(&mut self.state, cmd)
             }
-            _ => ApduResponse::err(SW_INS_NOT_SUPPORTED),
+            _ => return ApduResponse::err(SW_INS_NOT_SUPPORTED),
+        };
+
+        self.maybe_chain_response(raw, cmd.le)
+    }
+
+    /// Handle GET RESPONSE (INS=0xC0): return next chunk from `last_response`.
+    ///
+    /// `le` is the Le field from the GET RESPONSE APDU: `None` = no Le,
+    /// `Some(0)` = 256 bytes (short APDU convention), `Some(n)` = n bytes.
+    #[cfg(feature = "applet-piv")]
+    fn handle_get_response(&mut self, le: Option<u16>) -> ApduResponse {
+        let offset = self.state.last_response_offset;
+        let remaining = self.state.last_response.len().saturating_sub(offset);
+        if remaining == 0 {
+            // Nothing pending — return empty 9000 per ISO spec.
+            return ApduResponse::ok(&[]);
         }
+        let chunk_len = match le {
+            None => remaining,
+            Some(0) => remaining.min(256),
+            Some(n) => remaining.min(n as usize),
+        };
+        let chunk = &self.state.last_response[offset..offset + chunk_len];
+        let mut resp = ApduResponse::ok(chunk);
+        self.state.last_response_offset += chunk_len;
+        let new_remaining = self.state.last_response.len()
+            .saturating_sub(self.state.last_response_offset);
+        if new_remaining > 0 {
+            let xx = new_remaining.min(0xFF) as u8;
+            resp.sw = 0x6100 | (xx as u16);
+        } else {
+            self.state.last_response.clear();
+            self.state.last_response_offset = 0;
+        }
+        resp
+    }
+
+    /// If the response data exceeds `le`, buffer the remainder and return SW=61xx.
+    ///
+    /// `le` is the Le field from the command APDU: `None` = no Le (no truncation),
+    /// `Some(0)` = 256 bytes (short APDU convention), `Some(n)` = n bytes.
+    #[cfg(feature = "applet-piv")]
+    fn maybe_chain_response(&mut self, resp: ApduResponse, le: Option<u16>) -> ApduResponse {
+        // Only chain successful responses with data.
+        if resp.sw != 0x9000 {
+            return resp;
+        }
+        let le_val = match le {
+            None => return resp, // no Le field — no truncation
+            Some(0) => 256usize,
+            Some(n) => n as usize,
+        };
+        if resp.data.len() <= le_val {
+            return resp;
+        }
+        // Store overflow in pending buffer; return first le_val bytes with SW=0x61xx.
+        self.state.last_response.clear();
+        self.state.last_response_offset = 0;
+        let _ = self.state.last_response.extend_from_slice(&resp.data[le_val..]);
+        let mut out = ApduResponse::ok(&resp.data[..le_val]);
+        let remaining = self.state.last_response.len();
+        let xx = remaining.min(0xFF) as u8;
+        out.sw = 0x6100 | (xx as u16);
+        out
     }
 
     /// KeyId for the PIV PIN/PUK record sentinel.
@@ -254,7 +332,17 @@ impl Piv {
         store: &mut dyn crate::storage::KeyStore,
     ) -> ApduResponse {
         use commands::*;
-        match cmd.ins {
+
+        // GET RESPONSE is handled inside dispatch(); delegate unconditionally.
+        if cmd.ins == 0xC0 {
+            return self.dispatch(cmd);
+        }
+
+        // Any non-GET-RESPONSE command clears the pending response buffer.
+        self.state.last_response.clear();
+        self.state.last_response_offset = 0;
+
+        let raw = match cmd.ins {
             generate_keypair::INS_GENERATE_KEYPAIR => {
                 generate_keypair::handle_with_store(&mut self.state, store, cmd)
             }
@@ -267,8 +355,41 @@ impl Piv {
             reset_retry_counter::INS_RESET_RETRY_COUNTER => {
                 reset_retry_counter::handle_with_store(&mut self.state, store, cmd)
             }
-            _ => self.dispatch(cmd),
-        }
+            _ => {
+                // Re-use the non-store dispatch path but skip the buffer clear
+                // (already done above) and the GET RESPONSE branch (already handled).
+                return self.dispatch_inner(cmd);
+            }
+        };
+
+        self.maybe_chain_response(raw, cmd.le)
+    }
+
+    /// Inner dispatch for commands that don't need store access (skips GET RESPONSE
+    /// and buffer-clear preamble — callers must handle those before calling this).
+    #[cfg(feature = "applet-piv")]
+    fn dispatch_inner(&mut self, cmd: &ApduCommand<'_>) -> ApduResponse {
+        use commands::*;
+        let raw = match cmd.ins {
+            select::INS_SELECT => select::handle(cmd),
+            get_data::INS_GET_DATA => get_data::handle(&self.state, cmd),
+            verify::INS_VERIFY => verify::handle(&mut self.state, cmd),
+            generate_keypair::INS_GENERATE_KEYPAIR => {
+                generate_keypair::handle(&mut self.state, cmd)
+            }
+            put_data::INS_PUT_DATA => put_data::handle(&mut self.state, cmd),
+            general_authenticate::INS_GENERAL_AUTHENTICATE => {
+                general_authenticate::handle(&mut self.state, cmd)
+            }
+            change_reference_data::INS_CHANGE_REFERENCE_DATA => {
+                change_reference_data::handle(&mut self.state, cmd)
+            }
+            reset_retry_counter::INS_RESET_RETRY_COUNTER => {
+                reset_retry_counter::handle(&mut self.state, cmd)
+            }
+            _ => return ApduResponse::err(SW_INS_NOT_SUPPORTED),
+        };
+        self.maybe_chain_response(raw, cmd.le)
     }
 
     /// Process a raw APDU with access to persistent storage.

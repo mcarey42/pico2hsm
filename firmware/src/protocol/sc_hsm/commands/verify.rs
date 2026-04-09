@@ -16,6 +16,8 @@ use pico2hsm_core::apdu::{
 };
 
 use crate::protocol::sc_hsm::ScHsmState;
+use crate::security::anti_glitch::{double_check, DoubleCheckResult};
+use crate::security::pin::PinState;
 
 /// INS byte for VERIFY.
 pub const INS_VERIFY: u8 = 0x20;
@@ -34,14 +36,24 @@ fn sw_retry(remaining: u8) -> u16 {
     0x63C0 | (remaining as u16 & 0x0F)
 }
 
-/// Compute SHA-256 of `pin` and compare with `stored_hash` in constant time.
-fn verify_pin_hash(pin: &[u8], stored_hash: &[u8; 32]) -> bool {
-    use sha2::{Digest, Sha256};
-    let mut h = Sha256::new();
-    h.update(pin);
-    let computed = h.finalize();
-    // Constant-time compare
-    computed.as_slice().ct_eq(stored_hash).into()
+/// Compute PBKDF2-HMAC-SHA256 of `pin` using `salt` and compare with `stored_hash`
+/// in constant time.
+///
+/// Replaces the previous bare SHA-256 verify to resist dictionary attacks (P1-1 fix).
+fn verify_pin_pbkdf2(pin: &[u8], salt: &[u8; 16], stored_hash: &[u8; 32]) -> bool {
+    let computed = PinState::hash_pin(pin, b"pico2hsm-device", salt);
+    // Constant-time compare.
+    computed.ct_eq(stored_hash).into()
+}
+
+/// Compute PBKDF2-HMAC-SHA256 of `so_pin` using `salt` and compare with `stored_hash`.
+///
+/// SO-PIN uses the same `hash_pin` function as the user PIN since both are
+/// set by INITIALIZE using `hash_pin_pbkdf2` → `PinState::hash_pin`.
+fn verify_so_pin_pbkdf2(so_pin: &[u8], salt: &[u8; 16], stored_hash: &[u8; 32]) -> bool {
+    let computed = PinState::hash_pin(so_pin, b"pico2hsm-device", salt);
+    // Constant-time compare.
+    computed.ct_eq(stored_hash).into()
 }
 
 /// Handle a VERIFY APDU command.
@@ -75,7 +87,17 @@ pub fn handle(state: &mut ScHsmState, cmd: &ApduCommand<'_>) -> ApduResponse {
                 None => return ApduResponse::err(SW_SECURITY_STATUS),
             };
 
-            if verify_pin_hash(pin, &stored) {
+            let salt = state.user_pin_salt;
+            // Evaluate twice with a compiler fence between them (P1-2: fault injection countermeasure).
+            let ok1 = verify_pin_pbkdf2(pin, &salt, &stored);
+            let ok2 = verify_pin_pbkdf2(pin, &salt, &stored);
+            if double_check(ok1, ok2) == DoubleCheckResult::Mismatch {
+                // Possible fault injection — refuse the attempt.
+                state.pin_verified = false;
+                state.pin_retry_count = state.pin_retry_count.saturating_sub(1);
+                return ApduResponse::err(SW_SECURITY_STATUS);
+            }
+            if ok1 {
                 state.pin_verified = true;
                 state.pin_retry_count = 3;
                 ApduResponse::ok(&[])
@@ -113,7 +135,17 @@ pub fn handle(state: &mut ScHsmState, cmd: &ApduCommand<'_>) -> ApduResponse {
                 None => return ApduResponse::err(SW_SECURITY_STATUS),
             };
 
-            if verify_pin_hash(pin, &stored) {
+            let salt = state.so_pin_salt;
+            // Evaluate twice with a compiler fence between them (P1-2: fault injection countermeasure).
+            let ok1 = verify_so_pin_pbkdf2(pin, &salt, &stored);
+            let ok2 = verify_so_pin_pbkdf2(pin, &salt, &stored);
+            if double_check(ok1, ok2) == DoubleCheckResult::Mismatch {
+                // Possible fault injection — refuse the attempt.
+                state.so_pin_verified = false;
+                state.so_pin_retry_count = state.so_pin_retry_count.saturating_sub(1);
+                return ApduResponse::err(SW_SECURITY_STATUS);
+            }
+            if ok1 {
                 state.so_pin_verified = true;
                 state.so_pin_retry_count = 5;
                 ApduResponse::ok(&[])

@@ -42,6 +42,7 @@
 use chacha20::{ChaCha20, Key, Nonce};
 use chacha20::cipher::{KeyIvInit, StreamCipher};
 use core::cell::UnsafeCell;
+use core::sync::atomic::{AtomicU32, Ordering};
 use pico2hsm_core::error::CryptoError;
 use sha2::{Digest, Sha256};
 
@@ -69,6 +70,16 @@ struct CsprngCell(UnsafeCell<Option<ChaCha20>>);
 unsafe impl Sync for CsprngCell {}
 
 static CSPRNG: CsprngCell = CsprngCell(UnsafeCell::new(None));
+
+/// Number of `fill_random` calls between automatic CSPRNG reseeds.
+const RESEED_INTERVAL: u32 = 1_000;
+
+/// Operation counter for periodic CSPRNG reseeding.
+///
+/// Incremented (wrapping) on every `fill_random` call.  Only accessed from
+/// Core1's single dispatcher task — the `AtomicU32` is used for interior
+/// mutability without UnsafeCell, not for cross-core synchronisation.
+static FILL_COUNT: AtomicU32 = AtomicU32::new(0);
 
 // ─── Rng struct ───────────────────────────────────────────────────────────────
 
@@ -247,6 +258,19 @@ fn pac_fill_bytes(buf: &mut [u8]) -> Result<(), CryptoError> {
 /// Returns `Err(CryptoError::RngFailure)` if the TRNG hardware times out
 /// (should not happen on functional silicon).
 pub fn fill_random(buf: &mut [u8]) -> Result<(), CryptoError> {
+    // Periodic reseed: increment the call counter and reseed every
+    // RESEED_INTERVAL calls.  Wrapping add prevents panics on overflow.
+    // The reseed happens *before* generating output so the new key material
+    // is used immediately.
+    let prev = FILL_COUNT.fetch_add(1, Ordering::Relaxed);
+    if prev % RESEED_INTERVAL == 0 && prev != 0 {
+        // Best-effort: log on failure but do not propagate the error so that
+        // callers are not broken by a transient TRNG timeout.
+        if let Err(_) = reseed() {
+            defmt::warn!("RNG: periodic reseed failed — continuing with existing CSPRNG state");
+        }
+    }
+
     // SAFETY: only called from Core1 dispatcher task; no concurrent access.
     let csprng_opt = unsafe { &mut *CSPRNG.0.get() };
     if let Some(csprng) = csprng_opt {

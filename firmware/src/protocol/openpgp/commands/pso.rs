@@ -175,34 +175,34 @@ fn handle_decipher(state: &mut OpenPgpState, cmd: &ApduCommand<'_>) -> ApduRespo
 
 /// Parse ECDH input from PSO:DECIPHER data.
 ///
-/// Expected format: A6 [len] 7F49 [len] 86 [len] <point>
-/// Returns the peer public key point (including 04 prefix).
+/// Required format per OpenPGP Card spec §8.2.1:
+///   A6 [len] 7F49 [len] 86 [len] <point>
+///
+/// Returns the peer public key point (including 04 prefix for ECDH, or
+/// raw 32 bytes for X25519). Returns `None` if the A6 wrapper is absent or
+/// the TLV structure is malformed — callers return SW=6A80 (wrong data).
 fn parse_ecdh_input(data: &[u8]) -> Option<&[u8]> {
-    // Check for A6 tag (padding indicator for ECDH)
     if data.is_empty() {
         return None;
     }
 
-    if data[0] == 0xA6 {
-        // Parse A6 TLV
-        let (a6_content, _) = parse_tlv_content(&data[1..])?;
-
-        // Look for 7F49 tag inside
-        if a6_content.len() >= 2 && a6_content[0] == 0x7F && a6_content[1] == 0x49 {
-            let (inner_content, _) = parse_tlv_content(&a6_content[2..])?;
-
-            // Look for 86 tag
-            if !inner_content.is_empty() && inner_content[0] == 0x86 {
-                let (point, _) = parse_tlv_content(&inner_content[1..])?;
-                return Some(point);
-            }
-        }
+    // Require A6 tag — no fallback per spec §8.2.1
+    if data[0] != 0xA6 {
+        return None;
     }
 
-    // Fallback: if the data starts directly with 04 (uncompressed point),
-    // treat the whole thing as the peer public key.
-    if data[0] == 0x04 {
-        return Some(data);
+    // Parse A6 TLV
+    let (a6_content, _) = parse_tlv_content(&data[1..])?;
+
+    // Look for 7F49 tag inside
+    if a6_content.len() >= 2 && a6_content[0] == 0x7F && a6_content[1] == 0x49 {
+        let (inner_content, _) = parse_tlv_content(&a6_content[2..])?;
+
+        // Look for 86 tag
+        if !inner_content.is_empty() && inner_content[0] == 0x86 {
+            let (point, _) = parse_tlv_content(&inner_content[1..])?;
+            return Some(point);
+        }
     }
 
     None

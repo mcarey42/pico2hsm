@@ -218,8 +218,14 @@ fn handle_noise_source_respond(state: &mut ScHsmState, store: &mut dyn KeyStore,
             return ApduResponse::err(SW_SECURITY_STATUS);
         }
     } else {
-        // No peer pubkey enrolled — unauthenticated mode.
-        // Continue without signature verification (allows bootstrapping before enrollment).
+        // No peer pubkey enrolled.
+        // Only allow unauthenticated mode if the flag permits it (P1-6 fix).
+        // Once a peer has been enrolled and dkek_unauthenticated_allowed is false,
+        // refuse unauthenticated exchanges to prevent downgrade attacks.
+        if !state.dkek_unauthenticated_allowed {
+            return ApduResponse::err(SW_SECURITY_STATUS);
+        }
+        // else: bootstrapping mode allowed, proceed without signature verification.
     }
 
     // Source must already have an ephemeral keypair from a prior NOISE_INITIATE (P1=0x31).
@@ -461,8 +467,15 @@ fn handle_noise_finalize_recv_v2(state: &mut ScHsmState, store: &mut dyn KeyStor
             return ApduResponse::err(SW_SECURITY_STATUS);
         }
     } else {
-        // No peer pubkey enrolled — unauthenticated mode.
-        // Continue without signature verification (allows bootstrapping before enrollment).
+        // No peer pubkey enrolled.
+        // Only allow unauthenticated mode if the flag permits it (P1-6 fix).
+        if !state.dkek_unauthenticated_allowed {
+            state.exchange_ephem_priv = None;
+            state.exchange_ephem_pub = None;
+            state.exchange_challenge = None;
+            return ApduResponse::err(SW_SECURITY_STATUS);
+        }
+        // else: bootstrapping mode allowed, proceed without signature verification.
     }
 
     // Compute ECDH shared secret.
@@ -529,6 +542,13 @@ fn handle_noise_finalize_recv_v2(state: &mut ScHsmState, store: &mut dyn KeyStor
     // Store DKEK via DkekManager — put it directly into Ready state.
     state.dkek.set_dkek_direct(*dkek_buf);
     state.dkek_shares_imported = state.dkek.shares_total();
+
+    // P1-6: After the first successful unauthenticated DKEK exchange, lock out
+    // further unauthenticated exchanges. Once a peer has sent a DKEK, subsequent
+    // exchanges must use the enrolled peer pubkey for signature verification.
+    if state.noise_enrolled_peer_pubkey.is_none() {
+        state.dkek_unauthenticated_allowed = false;
+    }
 
     // Clear ephemeral state.
     state.exchange_ephem_priv = None;

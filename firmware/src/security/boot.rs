@@ -53,10 +53,22 @@ pub const WATCHDOG_PERIOD_MS: u32 = 5000;
 /// 3. Reject debugger attachment in production mode
 /// 4. Flash integrity marker check (via OTP boot flags)
 pub fn security_checks() {
+    // P1-3 fix: is_production_mode_otp() now returns Result<bool, ()>.
+    // An OTP read error means we cannot determine security state — treat as
+    // an unrecoverable fault to prevent fault-injection bypass.
+    let in_production = match is_production_mode_otp() {
+        Ok(v) => v,
+        Err(()) => {
+            // OTP read failure — security state is unknowable. Hard reset.
+            // Do NOT log or proceed: a glitch may have caused this.
+            cortex_m::peripheral::SCB::sys_reset();
+        }
+    };
+
     // Arm the hardware glitch detector FIRST, before any other security check,
     // to protect the checks themselves from voltage-glitch fault injection.
     // Only arm in production mode to avoid false resets during development.
-    if is_production_mode_otp() {
+    if in_production {
         crate::security::anti_glitch::arm_glitch_detector();
     }
 
@@ -67,21 +79,30 @@ pub fn security_checks() {
         // PRODUCTION_MODE bit is 0, so this check passes and boot continues.
         // This prevents the device from hanging on first flash when the
         // probe leaves DHCSR.C_DEBUGEN=1 after the download session.
-        if is_production_mode_otp() && check_debugger_attached() {
+        if in_production && check_debugger_attached() {
             // Spin forever — do NOT panic (panic may produce debug output).
             loop {
                 core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
             }
         }
 
-        // Check if we are in production mode via OTP boot flags.
-        // OTP row 0x110 bit 1 = PRODUCTION_MODE (see otp.rs).
-        let in_production = is_production_mode_otp();
-
         if in_production {
+            // P1-4 fix: Assert that secure boot is actually active when the
+            // device is in production mode. If secure boot is NOT enabled but
+            // production mode IS set, this is a critical inconsistency —
+            // either the provisioning was incomplete or something is wrong.
+            // Hard-fault rather than boot in an insecure state.
+            if !is_secure_boot_enabled() {
+                // Production mode set but secure boot not active — inconsistency.
+                // This may indicate incomplete provisioning or a hardware fault.
+                // Hard reset: do not boot in this state.
+                cortex_m::peripheral::SCB::sys_reset();
+            }
+
             // Disable JTAG permanently if not already disabled.
             // OTP row 0x110 bit 0 = JTAG_DISABLED (pico2hsm user-land flag).
-            // The hardware JTAG fuse write is handled in disable_jtag_permanent().
+            // The hardware JTAG CRIT0 fuse write is also handled in
+            // disable_jtag_permanent().
             disable_jtag_permanent();
         }
     }
@@ -97,21 +118,24 @@ pub fn security_checks() {
 
 /// Read the pico2hsm production-mode flag from OTP row 0x110.
 ///
-/// Returns `true` if bit 1 (BOOT_FLAG_PRODUCTION_MODE) is set.
-/// Returns `false` on OTP read failure (fail-open for boot flags read errors
-/// is intentional — a failed OTP read should not cause a hard lock-out
-/// on unprovisioned devices; actual lock-out happens when provisioning sets
-/// the bit explicitly).
+/// Returns `Ok(true)` if bit 1 (BOOT_FLAG_PRODUCTION_MODE) is set.
+/// Returns `Ok(false)` if the bit is clear (unprovisioned device).
+/// Returns `Err(())` on OTP read failure — the caller MUST treat this as a
+/// fatal error and reset rather than proceeding with unknown security state.
+///
+/// P1-3 fix: previously returned `false` on OTP read error (fail-open), which
+/// allowed a fault-injected OTP read to bypass the glitch detector arming and
+/// debugger check entirely. Now returns `Err(())` so callers can hard-fault.
 ///
 /// See `otp.rs` constant `OTP_BOOT_FLAGS_ROW = 0x110`.
-fn is_production_mode_otp() -> bool {
+fn is_production_mode_otp() -> Result<bool, ()> {
     use embassy_rp::otp;
     const OTP_BOOT_FLAGS_ROW: usize = 0x110;
     const BOOT_FLAG_PRODUCTION_MODE: u32 = 1 << 1;
 
     otp::read_raw_word(OTP_BOOT_FLAGS_ROW)
         .map(|flags| flags & BOOT_FLAG_PRODUCTION_MODE != 0)
-        .unwrap_or(false)
+        .map_err(|_| ())
 }
 
 /// Check if the RP2350 is running in secure boot mode.
@@ -202,6 +226,50 @@ pub fn disable_jtag_permanent() {
         }
         Err(_) => {
             defmt::error!("boot: failed to set JTAG disable OTP flag");
+        }
+    }
+
+    // P0-2 fix: Also write the RP2350 hardware CRIT0 register (OTP row 0x18)
+    // bit 2 (debug_disable) to actually disable JTAG/SWD at the hardware level.
+    //
+    // The pico2hsm bookkeeping flag in row 0x110 bit 0 is a user-land marker;
+    // it does NOT prevent probe-rs from connecting. The RP2350 hardware JTAG
+    // lockdown is controlled by OTP CRIT0 (row 0x18):
+    //   bit 0: secure_boot_enable
+    //   bit 1: secure_debug_disable
+    //   bit 2: debug_disable  ← this disables JTAG/SWD entirely
+    //   bit 4: glitch_detector_enable
+    //
+    // RP2350 datasheet §5.6.4 "Critical Boot Flags": row 0x18 controls CRIT0.
+    // Writing bit 2 (debug_disable = 0x04) via otp_access permanently disables
+    // the debug interface. This is irreversible.
+    //
+    // SAFETY: CRIT0 row 0x18 is in OTP page 0. The RP2350 ROM otp_access
+    // function (called by write_raw_word) handles the programming voltage.
+    // We read-modify-write to preserve any bits already set (e.g. secure boot).
+    const RP2350_CRIT0_ROW: usize = 0x18;
+    const CRIT0_DEBUG_DISABLE_BIT: u32 = 1 << 2; // bit 2 = debug_disable
+
+    let crit0_current = match otp::read_raw_word(RP2350_CRIT0_ROW) {
+        Ok(v) => v,
+        Err(_) => {
+            defmt::error!("boot: failed to read CRIT0 row — skipping hardware JTAG disable");
+            return;
+        }
+    };
+
+    if crit0_current & CRIT0_DEBUG_DISABLE_BIT != 0 {
+        // CRIT0 debug_disable already set — no-op.
+        return;
+    }
+
+    let crit0_new = crit0_current | CRIT0_DEBUG_DISABLE_BIT;
+    match otp::write_raw_word(RP2350_CRIT0_ROW, crit0_new) {
+        Ok(()) => {
+            defmt::warn!("boot: RP2350 CRIT0 debug_disable fuse burned — JTAG/SWD PERMANENTLY DISABLED");
+        }
+        Err(_) => {
+            defmt::error!("boot: failed to burn CRIT0 debug_disable fuse");
         }
     }
 }

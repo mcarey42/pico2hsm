@@ -7,23 +7,38 @@
 use subtle::ConstantTimeEq;
 
 use pico2hsm_core::apdu::{
-    ApduCommand, ApduResponse, SW_CONDITIONS_NOT_SATISFIED, SW_OK, SW_SECURITY_STATUS,
-    SW_WRONG_LENGTH,
+    ApduCommand, ApduResponse, SW_AUTH_BLOCKED, SW_CONDITIONS_NOT_SATISFIED, SW_OK,
+    SW_SECURITY_STATUS, SW_WRONG_LENGTH,
 };
 
 use crate::protocol::sc_hsm::ScHsmState;
+use crate::security::anti_glitch::{double_check, DoubleCheckResult};
 
 /// INS byte for EXTERNAL AUTHENTICATE.
 pub const INS_EXTERNAL_AUTH: u8 = 0x82;
 
+/// Build a retry-count status word: 0x63C0 | remaining.
+fn sw_retry(remaining: u8) -> u16 {
+    0x63C0 | (remaining as u16 & 0x0F)
+}
+
 /// Handle an EXTERNAL AUTHENTICATE APDU command.
 pub fn handle(state: &mut ScHsmState, cmd: &ApduCommand<'_>) -> ApduResponse {
-    // A challenge must have been issued previously via GET CHALLENGE.
-    if state.challenge.is_none() {
-        return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED);
+    // Empty data = query remaining retry count (P1-5).
+    if cmd.data.is_empty() {
+        if state.ext_auth_retry_count == 0 {
+            return ApduResponse::err(SW_AUTH_BLOCKED);
+        }
+        return ApduResponse::err(sw_retry(state.ext_auth_retry_count));
     }
 
-    if cmd.data.is_empty() {
+    // Check retry counter before processing (P1-5: brute-force lockout).
+    if state.ext_auth_retry_count == 0 {
+        return ApduResponse::err(SW_AUTH_BLOCKED);
+    }
+
+    // A challenge must have been issued previously via GET CHALLENGE.
+    if state.challenge.is_none() {
         return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED);
     }
 
@@ -47,11 +62,29 @@ pub fn handle(state: &mut ScHsmState, cmd: &ApduCommand<'_>) -> ApduResponse {
     let expected = crate::crypto::kdf::hmac_sha256(&so_pin_hash, &challenge_bytes);
 
     // Constant-time comparison to prevent timing attacks.
-    if expected.ct_eq(cmd.data).into() {
+    let ok1 = expected.ct_eq(cmd.data).into();
+    // Double-check evaluation for fault injection resistance (P1-2).
+    let ok2 = crate::crypto::kdf::hmac_sha256(&so_pin_hash, &challenge_bytes).ct_eq(cmd.data).into();
+    if double_check(ok1, ok2) == DoubleCheckResult::Mismatch {
+        // Possible fault injection — decrement counter and refuse.
+        state.ext_auth_retry_count = state.ext_auth_retry_count.saturating_sub(1);
+        state.so_pin_verified = false;
+        return ApduResponse::err(SW_SECURITY_STATUS);
+    }
+
+    if ok1 {
         state.so_pin_verified = true;
+        state.ext_auth_retry_count = 5; // Reset on success.
         ApduResponse::ok(&[])
     } else {
-        ApduResponse::err(SW_SECURITY_STATUS)
+        // Wrong cryptogram — decrement retry counter (P1-5).
+        state.ext_auth_retry_count = state.ext_auth_retry_count.saturating_sub(1);
+        state.so_pin_verified = false;
+        if state.ext_auth_retry_count == 0 {
+            ApduResponse::err(SW_AUTH_BLOCKED)
+        } else {
+            ApduResponse::err(sw_retry(state.ext_auth_retry_count))
+        }
     }
 }
 
@@ -116,7 +149,11 @@ mod tests {
         // 32 bytes but all wrong
         let cmd = make_cmd(&[0xFFu8; 32]);
         let resp = handle(&mut state, &cmd);
-        assert_eq!(resp.sw, SW_SECURITY_STATUS);
+        // Wrong cryptogram now returns retry count SW (P1-5: brute-force lockout).
+        // Initial retry count is 5, so after one failure it returns 63C4 (4 remaining).
+        assert_eq!(resp.sw, 0x63C4);
+        // Retry counter decremented.
+        assert_eq!(state.ext_auth_retry_count, 4);
         // so_pin_verified must remain false
         assert!(!state.so_pin_verified);
     }

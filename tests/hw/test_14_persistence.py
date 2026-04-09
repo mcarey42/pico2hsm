@@ -188,6 +188,19 @@ def _verify_pin_apdu(pin: str) -> str:
     return f"00200081{len(pin_bytes):02X}{pin_bytes.hex()}"
 
 
+def _verify_sopin_apdu(so_pin: str) -> str:
+    """Build a VERIFY SO-PIN APDU.
+
+    sc-hsm-tool encodes --so-pin as a 16-char hex string representing 8 raw
+    bytes.  VERIFY must send those same 8 raw bytes (P2=0x88 selects SO-PIN).
+    """
+    try:
+        so_bytes = bytes.fromhex(so_pin)
+    except ValueError:
+        so_bytes = so_pin.encode()
+    return f"00200088{len(so_bytes):02X}{so_bytes.hex()}"
+
+
 def _build_keygen_apdu(key_ref: int, data_hex: str) -> str:
     """Build a GENERATE KEY PAIR APDU (INS=0x46) using short APDU encoding.
 
@@ -481,3 +494,66 @@ class TestPinPersistence:
         assert _last_sw(r.stdout) == 0x9000, (
             "Could not re-verify correct PIN after wrong-PIN test"
         )
+
+    def test_sopin_persists_across_reboot(
+        self,
+        runner: CLIRunner,
+        config: dict,
+    ) -> None:
+        """After INITIALIZE + reset, the SO-PIN must still be accepted and wrong SO-PIN rejected."""
+        so_pin = config["so_pin"]  # 16-char hex string, e.g. "3537363231383830"
+
+        # 1. Initialize device
+        _initialize_device(config)
+
+        # 2. Verify SO-PIN works before reset
+        sopin_apdu = _verify_sopin_apdu(so_pin)
+        r = runner.send_apdu(
+            SELECT_SC_HSM, sopin_apdu,
+            reader=0, save_as="14_sopin_verify_pre_reset",
+        )
+        assert _last_sw(r.stdout) == 0x9000, (
+            f"VERIFY SO-PIN failed pre-reset: SW={_last_sw(r.stdout):04X}"
+        )
+        log.info("SO-PIN verified successfully before reset")
+
+        # 3. Reset device
+        _reset_device()
+
+        # 4. Verify correct SO-PIN after reset
+        r = runner.send_apdu(
+            SELECT_SC_HSM, sopin_apdu,
+            reader=0, save_as="14_sopin_verify_post_reset",
+        )
+        post_sw = _last_sw(r.stdout)
+        assert post_sw == 0x9000, (
+            f"VERIFY SO-PIN failed after reset -- SO-PIN not persisted: SW={post_sw:04X}"
+        )
+        log.info("SO-PIN verified successfully after reset -- SO-PIN persisted")
+
+        # 5. Verify wrong SO-PIN is rejected after reset
+        # Build an APDU with 8 bytes of zeros (definitely wrong)
+        # CLA=00 INS=20 P1=00 P2=88 Lc=08 data=8×0x00 (26 hex chars = 13 bytes)
+        wrong_sopin_apdu = "00200088080000000000000000"
+        r = runner.send_apdu(
+            SELECT_SC_HSM, wrong_sopin_apdu,
+            reader=0, save_as="14_sopin_wrong_post_reset",
+        )
+        wrong_sw = _last_sw(r.stdout)
+        assert wrong_sw != 0x9000, (
+            f"Wrong SO-PIN accepted after reset: SW={wrong_sw:04X}"
+        )
+        assert (wrong_sw & 0xFFF0) == 0x63C0, (
+            f"Expected 63Cx retry counter for wrong SO-PIN, got {wrong_sw:04X}"
+        )
+        log.info("Wrong SO-PIN correctly rejected after reset (SW=%04X)", wrong_sw)
+
+        # 6. Re-verify correct SO-PIN to restore retry counter
+        r = runner.send_apdu(
+            SELECT_SC_HSM, sopin_apdu,
+            reader=0,
+        )
+        assert _last_sw(r.stdout) == 0x9000, (
+            "Could not re-verify correct SO-PIN after wrong-SO-PIN test"
+        )
+        log.info("SO-PIN retry counter restored")

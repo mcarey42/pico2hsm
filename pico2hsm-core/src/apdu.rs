@@ -183,6 +183,16 @@ impl ApduResponse {
         ApduResponse { data: Vec::new(), sw }
     }
 
+    /// Construct a SW=61xx response indicating more data is available.
+    ///
+    /// `next_len` is the number of bytes available in the next chunk (SW2 of 0x61xx).
+    /// A value of 0 means "more than 255 bytes remaining" and is sent as 0x6100.
+    pub fn ok_more(data: &[u8], next_len: u8) -> Self {
+        let mut buf: Vec<u8, 4096> = Vec::new();
+        let _ = buf.extend_from_slice(&data[..data.len().min(4096)]);
+        ApduResponse { data: buf, sw: 0x6100 | (next_len as u16) }
+    }
+
     /// Serialize the response to bytes: `data || SW1 || SW2`.
     ///
     /// The returned buffer is at most 4098 bytes (4096 data + 2 status).

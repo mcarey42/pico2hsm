@@ -166,12 +166,116 @@ fn build_ec_prkd(key_id: u8, algo: u8) -> Option<Vec<u8, 256>> {
 }
 
 // ---------------------------------------------------------------------------
+// Build a PKCS#15 PrivateRSAKey descriptor (PRKD at EF 0xC4xx)
+// ---------------------------------------------------------------------------
+//
+// Format (SC-HSM style, mirrors EC PRKD but with [1] RSA attributes):
+//   30 xx                           -- outer SEQUENCE
+//     A0 xx                         -- [0] CommonObjectAttributes
+//       30 xx
+//         03 02 05 C0               -- keyUsageFlags (sign + decrypt, no keyAgreement)
+//     A1 xx                         -- [1] CommonKeyAttributes
+//       30 xx
+//         04 01 <key_id>            -- id
+//         03 02 05 C0               -- keyUsageFlags
+//         01 01 FF                  -- native TRUE
+//     A1 xx                         -- [1] PrivateRSAKeyAttributes
+//       30 xx
+//         30 xx                     -- rsaKeyType (AlgorithmIdentifier: RSA OID, no params)
+//           06 09 2A 86 48 86 F7 0D 01 01 01
+//         30 xx                     -- rsaAttr (path)
+//           04 02 C4 <key_id>
+//
+// NOTE: PKCS#15 uses [1] CONTEXT tag for PrivateRSAKeyAttributes (rsaPrivateKey choice),
+// which overlaps with [1] CommonKeyAttributes.  In the SC-HSM DER encoding the outer
+// SEQUENCE uses the following tag ordering: A0, A1 (common key attrs), A1 (RSA attrs).
+// OpenSC's sc-hsm driver accepts the flat PrivateKeyInfo path approach; the path
+// `04 02 C4 <key_id>` tells OpenSC where to load the key descriptor.
+
+/// OID for rsaEncryption: 1.2.840.113549.1.1.1
+const OID_RSA: &[u8] = &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x01];
+
+#[cfg(feature = "rsa")]
+fn build_rsa_prkd(key_id: u8, _algo: u8) -> Vec<u8, 256> {
+    // keyUsageFlags BIT STRING: sign (bit 1) + decrypt (bit 3) = 0xC0 in the usage byte,
+    // with 5 unused bits.  Value: 03 02 05 C0.
+    let key_usage_bs: [u8; 4] = [0x03, 0x02, 0x05, 0xC0];
+
+    // A0 content: 30 (03 02 05 C0)
+    let coa_inner = key_usage_bs;
+    let mut coa_seq: Vec<u8, 16> = Vec::new();
+    let _ = coa_seq.push(0x30);
+    let _ = coa_seq.push(coa_inner.len() as u8);
+    let _ = coa_seq.extend_from_slice(&coa_inner);
+
+    // A1 (CommonKeyAttributes) content: 30 (04 01 XX  03 02 05 C0  01 01 FF)
+    let mut cka_inner: Vec<u8, 32> = Vec::new();
+    let _ = cka_inner.extend_from_slice(&[0x04, 0x01, key_id]);
+    let _ = cka_inner.extend_from_slice(&key_usage_bs);
+    let _ = cka_inner.extend_from_slice(&[0x01, 0x01, 0xFF]);
+    let mut cka_seq: Vec<u8, 40> = Vec::new();
+    let _ = cka_seq.push(0x30);
+    let _ = cka_seq.push(cka_inner.len() as u8);
+    let _ = cka_seq.extend_from_slice(&cka_inner);
+
+    // A1 (PrivateRSAKeyAttributes) content:
+    //   30 (30 (06 09 <rsa_oid>  05 00)  30 (04 02 C4 key_id))
+    let mut alg_seq: Vec<u8, 16> = Vec::new();
+    let _ = alg_seq.push(0x06);
+    let _ = alg_seq.push(OID_RSA.len() as u8);
+    let _ = alg_seq.extend_from_slice(OID_RSA);
+    // NULL params: 05 00
+    let _ = alg_seq.push(0x05);
+    let _ = alg_seq.push(0x00);
+    let mut alg_outer: Vec<u8, 20> = Vec::new();
+    let _ = alg_outer.push(0x30);
+    let _ = alg_outer.push(alg_seq.len() as u8);
+    let _ = alg_outer.extend_from_slice(&alg_seq);
+
+    let path_inner: [u8; 4] = [0x04, 0x02, 0xC4, key_id];
+    let mut path_outer: Vec<u8, 8> = Vec::new();
+    let _ = path_outer.push(0x30);
+    let _ = path_outer.push(path_inner.len() as u8);
+    let _ = path_outer.extend_from_slice(&path_inner);
+
+    let rsa_attr_inner_len = alg_outer.len() + path_outer.len();
+    let mut rsa_attr_inner: Vec<u8, 40> = Vec::new();
+    let _ = rsa_attr_inner.push(0x30);
+    let _ = rsa_attr_inner.push(rsa_attr_inner_len as u8);
+    let _ = rsa_attr_inner.extend_from_slice(&alg_outer);
+    let _ = rsa_attr_inner.extend_from_slice(&path_outer);
+
+    // Assemble outer SEQUENCE: A0, A1(common), A1(rsa)
+    let outer_body_len = (2 + coa_seq.len()) + (2 + cka_seq.len()) + (2 + rsa_attr_inner.len());
+    let mut out: Vec<u8, 256> = Vec::new();
+    let _ = out.push(0x30);
+    let _ = out.push(outer_body_len as u8);
+    // [0] EXPLICIT — CommonObjectAttributes
+    let _ = out.push(0xA0);
+    let _ = out.push(coa_seq.len() as u8);
+    let _ = out.extend_from_slice(&coa_seq);
+    // [1] EXPLICIT — CommonKeyAttributes
+    let _ = out.push(0xA1);
+    let _ = out.push(cka_seq.len() as u8);
+    let _ = out.extend_from_slice(&cka_seq);
+    // [1] EXPLICIT — PrivateRSAKeyAttributes
+    let _ = out.push(0xA1);
+    let _ = out.push(rsa_attr_inner.len() as u8);
+    let _ = out.extend_from_slice(&rsa_attr_inner);
+
+    out
+}
+
+// ---------------------------------------------------------------------------
 // Build PrKDF (EF 0xC100) — sequence of key pointers
 // ---------------------------------------------------------------------------
 //
-// For each key in the store emit:
-//   A0 06 30 04 04 02 C4 <key_id>
+// For each EC key in the store emit:
+//   A0 06 30 04 04 02 C4 <key_id>   -- PrivateKeyChoice for EC key
+// For each RSA key in the store emit:
+//   A1 06 30 04 04 02 C4 <key_id>   -- PrivateKeyChoice for RSA key
 // These are PrivateKeyChoice entries pointing at the per-key PRKD.
+// EC keys use [0] (PrivateECKey choice); RSA keys use [1] (PrivateRSAKey choice).
 
 fn build_prkdf(state: &ScHsmState) -> Vec<u8, 256> {
     let mut out: Vec<u8, 256> = Vec::new();
@@ -180,6 +284,12 @@ fn build_prkdf(state: &ScHsmState) -> Vec<u8, 256> {
         // key.key_id is u32; extract the proto_ref byte (low byte) for the file ID.
         let proto_ref = (key.key_id & 0xFF) as u8;
         let _ = out.extend_from_slice(&[0xA0, 0x06, 0x30, 0x04, 0x04, 0x02, 0xC4, proto_ref]);
+    }
+    #[cfg(feature = "rsa")]
+    for key in &state.rsa_keys {
+        // A1 06  30 04  04 02 C4 <key_id>  — RSA key (PrivateRSAKey choice = [1])
+        let proto_ref = (key.key_id & 0xFF) as u8;
+        let _ = out.extend_from_slice(&[0xA1, 0x06, 0x30, 0x04, 0x04, 0x02, 0xC4, proto_ref]);
     }
     out
 }
@@ -238,11 +348,13 @@ fn read_file(state: &ScHsmState, file_id: u16, offset: usize, max_len: usize) ->
         return ApduResponse::ok(slice);
     }
 
-    // PrKDF (0xC100) is always empty for SC-HSM.
-    // SC-HSM enumerates keys via LIST KEYS (INS=0x58) and per-key C4xx EFs,
-    // not via the standard PKCS#15 PrKDF mechanism.
+    // PrKDF (0xC100): dynamically built from in-memory key stores.
+    // Returns pointers to all EC and RSA key descriptors (EF 0xC4xx).
     if file_id == 0xC100 {
-        return ApduResponse::ok(&[]);
+        let prkdf = build_prkdf(state);
+        let start = offset.min(prkdf.len());
+        let slice = &prkdf[start..prkdf.len().min(start + max_len)];
+        return ApduResponse::ok(slice);
     }
 
     // Check dynamic EF store (written via WRITE DATA INS=0xD7)
@@ -259,18 +371,30 @@ fn read_file(state: &ScHsmState, file_id: u16, offset: usize, max_len: usize) ->
 
     match hi {
         0xC4 => {
-            let key_algo = state.keys.iter().find(|k| k.key_id == full_key_id).map(|k| k.algo);
-            match key_algo {
-                Some(algo) => match build_ec_prkd(key_id_proto, algo) {
+            // First check EC key store.
+            let ec_algo = state.keys.iter().find(|k| k.key_id == full_key_id).map(|k| k.algo);
+            if let Some(algo) = ec_algo {
+                return match build_ec_prkd(key_id_proto, algo) {
                     Some(prkd) => {
                         let start = offset.min(prkd.len());
                         let slice = &prkd[start..prkd.len().min(start + max_len)];
                         ApduResponse::ok(slice)
                     }
                     None => ApduResponse::err(SW_FILE_NOT_FOUND),
-                },
-                None => ApduResponse::err(SW_FILE_NOT_FOUND),
+                };
             }
+            // Then check RSA key store (feature-gated).
+            #[cfg(feature = "rsa")]
+            {
+                let rsa_key = state.rsa_keys.iter().find(|k| k.key_id == full_key_id);
+                if let Some(key) = rsa_key {
+                    let prkd = build_rsa_prkd(key_id_proto, key.algo);
+                    let start = offset.min(prkd.len());
+                    let slice = &prkd[start..prkd.len().min(start + max_len)];
+                    return ApduResponse::ok(slice);
+                }
+            }
+            ApduResponse::err(SW_FILE_NOT_FOUND)
         }
         0xCC | 0xCE => ApduResponse::err(SW_FILE_NOT_FOUND),
         _ => ApduResponse::err(SW_FILE_NOT_FOUND),

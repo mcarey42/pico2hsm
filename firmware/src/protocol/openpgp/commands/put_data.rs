@@ -188,6 +188,26 @@ pub fn handle(state: &mut OpenPgpState, cmd: &ApduCommand<'_>) -> ApduResponse {
             ApduResponse::ok(&[])
         }
 
+        // 5F50 — URL of public key server (max 254 bytes)
+        0x5F50 => {
+            if cmd.data.len() > 254 {
+                return ApduResponse::err(SW_WRONG_LENGTH);
+            }
+            state.url.clear();
+            let _ = state.url.extend_from_slice(cmd.data);
+            ApduResponse::ok(&[])
+        }
+
+        // 7F21 — Cardholder Certificate (max 1024 bytes)
+        0x7F21 => {
+            if cmd.data.len() > 1024 {
+                return ApduResponse::err(SW_WRONG_LENGTH);
+            }
+            state.cardholder_cert.clear();
+            let _ = state.cardholder_cert.extend_from_slice(cmd.data);
+            ApduResponse::ok(&[])
+        }
+
         _ => ApduResponse::err(SW_DO_NOT_FOUND),
     }
 }

@@ -28,6 +28,12 @@ use pico2hsm_core::{
 };
 use zeroize::Zeroizing;
 
+/// INS byte for GET RESPONSE (ISO 7816-4 §7.6.1).
+///
+/// The host sends this to retrieve additional bytes when the card returned
+/// SW=0x61xx indicating that `XX` bytes remain in the response buffer.
+const INS_GET_RESPONSE: u8 = 0xC0;
+
 use crate::security::dkek::DkekManager;
 
 use commands::*;
@@ -253,15 +259,37 @@ pub struct ScHsmState {
     /// Number of DKEK shares already imported.
     pub dkek_shares_imported: u8,
 
-    /// Stored User PIN hash (SHA-256, 32 bytes). None if not set.
+    /// Stored User PIN hash (PBKDF2-HMAC-SHA256, 32 bytes). None if not set.
+    ///
+    /// NOTE: On-flash hash format changed from bare SHA-256 to PBKDF2 (P1-1 fix).
+    /// Devices initialized on older firmware must be re-INITIALIZE'd.
     pub user_pin_hash: Option<[u8; 32]>,
-    /// Stored SO-PIN hash (SHA-256, 32 bytes). None if not set.
+    /// 16-byte random salt for the User PIN PBKDF2 hash.
+    pub user_pin_salt: [u8; 16],
+    /// Stored SO-PIN hash (PBKDF2-HMAC-SHA256, 32 bytes). None if not set.
     pub so_pin_hash: Option<[u8; 32]>,
+    /// 16-byte random salt for the SO-PIN PBKDF2 hash.
+    pub so_pin_salt: [u8; 16],
 
-    /// Stored PUK hash (SHA-256). None if no PUK is configured.
+    /// Stored PUK hash (PBKDF2-HMAC-SHA256). None if no PUK is configured.
     pub puk_hash: Option<[u8; 32]>,
+    /// 16-byte random salt for the PUK PBKDF2 hash.
+    pub puk_salt: [u8; 16],
     /// Remaining PUK retry attempts (0 = blocked).
     pub puk_retry_count: u8,
+
+    /// Remaining EXTERNAL AUTHENTICATE retry attempts (0 = blocked).
+    ///
+    /// Initialized to 5. Decremented on each failed EXTERNAL AUTH attempt.
+    /// Resets to 5 on success. Returns SW_AUTH_BLOCKED (0x6983) when zero.
+    pub ext_auth_retry_count: u8,
+
+    /// When true, DKEK exchange is allowed without peer signature verification
+    /// (bootstrapping mode before the first peer is enrolled).
+    ///
+    /// Set to false permanently once a peer public key has been enrolled via
+    /// SIGN_ENROLLMENT, preventing unauthenticated exchanges after enrollment.
+    pub dkek_unauthenticated_allowed: bool,
 
     /// In-memory (volatile) EC key store. Cleared on INITIALIZE.
     pub keys: heapless::Vec<InMemoryKey, MAX_IN_MEMORY_KEYS>,
@@ -306,6 +334,16 @@ pub struct ScHsmState {
     /// Used by V2 DKEK exchange to verify the peer's ECDSA signature.
     /// None = unauthenticated mode (signature verification skipped).
     pub noise_enrolled_peer_pubkey: Option<[u8; 65]>,
+
+    /// GET RESPONSE buffer (ISO 7816-4 §7.6.1).
+    ///
+    /// When a response data field exceeds the Le byte specified by the host,
+    /// the full response is stored here and SW=0x61xx is returned.  The host
+    /// then sends GET RESPONSE (INS=0xC0) to retrieve successive chunks.
+    /// Cleared on every non-GET-RESPONSE command.
+    pub pending_response: heapless::Vec<u8, 4096>,
+    /// Byte offset into `pending_response` for the next GET RESPONSE chunk.
+    pub pending_response_offset: usize,
 }
 
 impl ScHsmState {
@@ -327,9 +365,14 @@ impl ScHsmState {
             dkek_shares_required: 0,
             dkek_shares_imported: 0,
             user_pin_hash: None,
+            user_pin_salt: [0u8; 16],
             so_pin_hash: None,
+            so_pin_salt: [0u8; 16],
             puk_hash: None,
+            puk_salt: [0u8; 16],
             puk_retry_count: 10,
+            ext_auth_retry_count: 5,
+            dkek_unauthenticated_allowed: true,
             keys: heapless::Vec::new(),
             #[cfg(feature = "rsa")]
             rsa_keys: heapless::Vec::new(),
@@ -346,6 +389,8 @@ impl ScHsmState {
             exchange_challenge_cache_write_idx: 0,
             generation: 0,
             noise_enrolled_peer_pubkey: None,
+            pending_response: heapless::Vec::new(),
+            pending_response_offset: 0,
         }
     }
 
@@ -376,6 +421,13 @@ impl ScHsm {
         cmd: &ApduCommand<'_>,
         store: &mut dyn crate::storage::KeyStore,
     ) -> ApduResponse {
+        // GET RESPONSE passes through to dispatch() which handles pending buffer.
+        // All other commands routed here (which don't fall through to dispatch)
+        // must clear the pending buffer so a stale buffer is not left around.
+        if cmd.ins != INS_GET_RESPONSE {
+            self.state.pending_response.clear();
+            self.state.pending_response_offset = 0;
+        }
         match cmd.ins {
             initialize::INS_INITIALIZE => initialize::handle(&mut self.state, store, cmd),
             generate_keypair::INS_GENERATE_KEYPAIR => {
@@ -383,7 +435,16 @@ impl ScHsm {
             }
             delete_file::INS_DELETE_FILE => delete_file::handle(&mut self.state, store, cmd),
             generate_key::INS_GENERATE_KEY => generate_key::handle(&mut self.state, store, cmd),
-            export_key::INS_EXPORT_KEY => export_key::handle(&mut self.state, store, cmd),
+            // INS=0x72: pico2hsm proprietary EXPORT KEY (kept for custom tooling).
+            // INS=0x34: standard SC-HSM WRAP KEY alias — same handler.
+            export_key::INS_EXPORT_KEY | 0x34 => export_key::handle(&mut self.state, store, cmd),
+            // INS=0x74: pico2hsm proprietary IMPORT KEY (kept for custom tooling).
+            // NOTE: the standard SC-HSM IMPORT KEY uses INS=0x58, but that byte
+            // is already claimed by LIST KEYS in this firmware.  INS=0x58 is NOT
+            // aliased here to avoid routing LIST KEYS requests to the import
+            // handler.  Standard tools that send INS=0x58 for import will receive
+            // SW=9000 from LIST KEYS instead of import behaviour — this is a known
+            // limitation.  Custom tooling should continue to use INS=0x74.
             import_key::INS_IMPORT_KEY => import_key::handle(&mut self.state, store, cmd),
             change_pin::INS_CHANGE_PIN => change_pin::handle_with_store(&mut self.state, store, cmd),
             reset_retry::INS_RESET_RETRY => reset_retry::handle_with_store(&mut self.state, store, cmd),
@@ -395,7 +456,38 @@ impl ScHsm {
 
     /// Dispatch an already-parsed APDU to the appropriate command handler.
     fn dispatch(&mut self, cmd: &ApduCommand<'_>) -> ApduResponse {
+        // GET RESPONSE (INS=0xC0) is handled before clearing the pending buffer.
+        // All other commands clear the pending buffer first.
+        if cmd.ins != INS_GET_RESPONSE {
+            self.state.pending_response.clear();
+            self.state.pending_response_offset = 0;
+        }
         match cmd.ins {
+            // GET RESPONSE (ISO 7816-4 §7.6.1): return next chunk of pending response.
+            INS_GET_RESPONSE => {
+                let offset = self.state.pending_response_offset;
+                let remaining = self.state.pending_response.len().saturating_sub(offset);
+                if remaining == 0 {
+                    // Nothing pending — return empty 9000 per ISO spec.
+                    return ApduResponse::ok(&[]);
+                }
+                // Le=0 means 256 for short APDU; None means send all.
+                let chunk_len = match cmd.le {
+                    None => remaining,
+                    Some(0) => remaining.min(256),
+                    Some(n) => remaining.min(n as usize),
+                };
+                let chunk = &self.state.pending_response[offset..offset + chunk_len];
+                let mut resp = ApduResponse::ok(chunk);
+                self.state.pending_response_offset += chunk_len;
+                let new_remaining = self.state.pending_response.len().saturating_sub(self.state.pending_response_offset);
+                if new_remaining > 0 {
+                    // More data still pending — SW=0x61xx.
+                    let xx = new_remaining.min(0xFF) as u8;
+                    resp.sw = 0x6100 | (xx as u16);
+                }
+                resp
+            }
             initialize::INS_INITIALIZE => initialize::handle(&mut self.state, &mut LocalNullStore, cmd),
             verify::INS_VERIFY => verify::handle(&mut self.state, cmd),
             change_pin::INS_CHANGE_PIN => change_pin::handle(&mut self.state, cmd),
@@ -417,7 +509,11 @@ impl ScHsm {
                 }
             }
             list_keys::INS_LIST_KEYS => list_keys::handle(&mut self.state, cmd),
-            export_key::INS_EXPORT_KEY => export_key::handle(&mut self.state, &mut LocalNullStore, cmd),
+            // INS=0x72: pico2hsm proprietary EXPORT KEY (kept for custom tooling).
+            // INS=0x34: standard SC-HSM WRAP KEY alias — same handler.
+            export_key::INS_EXPORT_KEY | 0x34 => export_key::handle(&mut self.state, &mut LocalNullStore, cmd),
+            // INS=0x74: pico2hsm IMPORT KEY. INS=0x58 conflicts with LIST KEYS; see
+            // dispatch_with_store for full explanation.
             import_key::INS_IMPORT_KEY => import_key::handle(&mut self.state, &mut LocalNullStore, cmd),
             read_binary::INS_READ_BINARY => read_binary::handle(&mut self.state, cmd),
             read_binary::INS_READ_BINARY_ODD => read_binary::handle_odd(&mut self.state, cmd),
@@ -453,28 +549,39 @@ impl ScHsm {
     /// Serialize and persist the SC-HSM PIN/SO-PIN/PUK state to flash.
     ///
     /// Stored as a Generic key object at `KeyId::sc_hsm(0, 0xFF)`.
-    /// Layout (101 bytes total):
-    ///   [0..32]   user_pin_hash (all zeros if None)
-    ///   [32]      pin_retry_count
-    ///   [33..65]  so_pin_hash (all zeros if None)
-    ///   [65]      so_pin_retry_count
-    ///   [66..98]  puk_hash (all zeros if None)
-    ///   [98]      puk_retry_count
-    ///   [99]      initialized (1 = true, 0 = false)
-    ///   [100]     reserved (0x00)
+    /// Layout (149 bytes total — PBKDF2 + per-credential 16-byte salts):
+    ///   [0..32]    user_pin_hash (PBKDF2, all zeros if None)
+    ///   [32..48]   user_pin_salt (16 bytes)
+    ///   [48]       pin_retry_count
+    ///   [49..81]   so_pin_hash (PBKDF2, all zeros if None)
+    ///   [81..97]   so_pin_salt (16 bytes)
+    ///   [97]       so_pin_retry_count
+    ///   [98..130]  puk_hash (PBKDF2, all zeros if None)
+    ///   [130..146] puk_salt (16 bytes)
+    ///   [146]      puk_retry_count
+    ///   [147]      initialized (1 = true, 0 = false)
+    ///   [148]      reserved (0x00)
+    ///
+    /// NOTE: Format changed from 101-byte (bare SHA-256, no salts) to 149-byte
+    /// (PBKDF2 + per-credential salts).  Old flash blobs are ≤101 bytes and will
+    /// be rejected by the length check in `load_pin_state_from_store`, requiring
+    /// re-INITIALIZE.  This is intentional and acceptable for pre-production devices.
     pub fn save_pin_to_store(state: &ScHsmState, store: &mut dyn crate::storage::KeyStore) {
         use crate::security::key_management::{AlgorithmId, KeyObject, KeyType as KmKeyType};
         use pico2hsm_core::key::AppletId;
 
-        let mut buf: heapless::Vec<u8, 128> = heapless::Vec::new();
+        let mut buf: heapless::Vec<u8, 256> = heapless::Vec::new();
         let user_hash = state.user_pin_hash.unwrap_or([0u8; 32]);
         let _ = buf.extend_from_slice(&user_hash);
+        let _ = buf.extend_from_slice(&state.user_pin_salt);
         let _ = buf.push(state.pin_retry_count);
         let so_hash = state.so_pin_hash.unwrap_or([0u8; 32]);
         let _ = buf.extend_from_slice(&so_hash);
+        let _ = buf.extend_from_slice(&state.so_pin_salt);
         let _ = buf.push(state.so_pin_retry_count);
         let puk_hash = state.puk_hash.unwrap_or([0u8; 32]);
         let _ = buf.extend_from_slice(&puk_hash);
+        let _ = buf.extend_from_slice(&state.puk_salt);
         let _ = buf.push(state.puk_retry_count);
         let _ = buf.push(state.initialized as u8);
         let _ = buf.push(0x00); // reserved
@@ -490,17 +597,23 @@ impl ScHsm {
         let kid = Self::sc_hsm_pin_key_id();
         if let Ok(Some(obj)) = store.fetch_key(kid) {
             let b = &obj.private_key;
-            if b.len() >= 101 {
+            // Require the new 149-byte PBKDF2+salt format.
+            // Blobs ≤101 bytes are old bare-SHA-256 format and are rejected,
+            // requiring re-INITIALIZE (acceptable on pre-production devices).
+            if b.len() >= 149 {
                 let user_hash: [u8; 32] = b[0..32].try_into().unwrap_or([0u8; 32]);
                 state.user_pin_hash = if user_hash == [0u8; 32] { None } else { Some(user_hash) };
-                state.pin_retry_count = b[32];
-                let so_hash: [u8; 32] = b[33..65].try_into().unwrap_or([0u8; 32]);
+                state.user_pin_salt = b[32..48].try_into().unwrap_or([0u8; 16]);
+                state.pin_retry_count = b[48];
+                let so_hash: [u8; 32] = b[49..81].try_into().unwrap_or([0u8; 32]);
                 state.so_pin_hash = if so_hash == [0u8; 32] { None } else { Some(so_hash) };
-                state.so_pin_retry_count = b[65];
-                let puk_hash: [u8; 32] = b[66..98].try_into().unwrap_or([0u8; 32]);
+                state.so_pin_salt = b[81..97].try_into().unwrap_or([0u8; 16]);
+                state.so_pin_retry_count = b[97];
+                let puk_hash: [u8; 32] = b[98..130].try_into().unwrap_or([0u8; 32]);
                 state.puk_hash = if puk_hash == [0u8; 32] { None } else { Some(puk_hash) };
-                state.puk_retry_count = b[98];
-                state.initialized = b[99] != 0;
+                state.puk_salt = b[130..146].try_into().unwrap_or([0u8; 16]);
+                state.puk_retry_count = b[146];
+                state.initialized = b[147] != 0;
             }
         }
     }
@@ -510,13 +623,41 @@ impl ScHsm {
     /// All key-mutating commands (INITIALIZE, GENERATE KEY PAIR, DELETE FILE)
     /// will persist/erase via `store`. Non-mutating commands fall through to
     /// the stateless dispatch path.
+    ///
+    /// Implements ISO 7816-4 GET RESPONSE chaining: if the response data
+    /// exceeds the Le byte, the first `Le` bytes are returned with SW=0x61xx
+    /// and the remainder is buffered in `state.pending_response` for subsequent
+    /// GET RESPONSE (INS=0xC0) calls.
     pub fn process_apdu_with_store(
         &mut self,
         apdu: &[u8],
         store: &mut dyn crate::storage::KeyStore,
     ) -> Vec<u8, 4096> {
         let resp = match ApduCommand::parse(apdu) {
-            Ok(cmd) => self.dispatch_with_store(&cmd, store),
+            Ok(cmd) => {
+                let le = cmd.le;
+                let is_get_response = cmd.ins == INS_GET_RESPONSE;
+                let mut r = self.dispatch_with_store(&cmd, store);
+                // Apply Le truncation with GET RESPONSE chaining for successful
+                // responses that have not already been chunked by the GET RESPONSE
+                // handler itself.
+                if !is_get_response && r.sw == SW_OK {
+                    if let Some(le_val) = le {
+                        let le_usize = if le_val == 0 { 256 } else { le_val as usize };
+                        if r.data.len() > le_usize {
+                            // Store overflow bytes in pending buffer for GET RESPONSE.
+                            self.state.pending_response.clear();
+                            let _ = self.state.pending_response.extend_from_slice(&r.data[le_usize..]);
+                            self.state.pending_response_offset = 0;
+                            r.data.truncate(le_usize);
+                            let remaining = self.state.pending_response.len();
+                            let xx = remaining.min(0xFF) as u8;
+                            r.sw = 0x6100 | (xx as u16);
+                        }
+                    }
+                }
+                r
+            }
             Err(_) => ApduResponse::err(SW_INS_NOT_SUPPORTED),
         };
         let serialized = resp.serialize();
@@ -531,7 +672,29 @@ impl HsmProtocol for ScHsm {
         // Used by the stateless dispatch path (host-side tests and non-ScHsm protocols).
         // Key-mutating commands here use NullKeyStore (no-op flash writes).
         let resp = match ApduCommand::parse(apdu) {
-            Ok(cmd) => self.dispatch(&cmd),
+            Ok(cmd) => {
+                let le = cmd.le;
+                let is_get_response = cmd.ins == INS_GET_RESPONSE;
+                let mut r = self.dispatch(&cmd);
+                // Apply Le truncation with GET RESPONSE chaining for successful
+                // responses that have not already been chunked by the GET RESPONSE
+                // handler itself.
+                if !is_get_response && r.sw == SW_OK {
+                    if let Some(le_val) = le {
+                        let le_usize = if le_val == 0 { 256 } else { le_val as usize };
+                        if r.data.len() > le_usize {
+                            self.state.pending_response.clear();
+                            self.state.pending_response_offset = 0;
+                            let _ = self.state.pending_response.extend_from_slice(&r.data[le_usize..]);
+                            r.data.truncate(le_usize);
+                            let remaining = self.state.pending_response.len();
+                            let xx = remaining.min(0xFF) as u8;
+                            r.sw = 0x6100 | (xx as u16);
+                        }
+                    }
+                }
+                r
+            }
             Err(_) => ApduResponse::err(SW_INS_NOT_SUPPORTED),
         };
         let serialized = resp.serialize();

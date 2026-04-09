@@ -306,29 +306,129 @@ pub fn write_row(row: u8, data: [u8; 3]) -> Result<(), StorageError> {
         .map_err(otp_err_to_storage)
 }
 
-/// Permanently lock a range of OTP rows for reading.
+/// Permanently lock a range of OTP rows for reading via the RP2350 SW_LOCK
+/// page registers.
 ///
-/// OTP row read-locking is not yet implemented.
+/// P0-3 fix: previously a stub that always returned `Err`. Now implemented
+/// using the RP2350 OTP peripheral's `sw_lock` registers (64 per-page
+/// software lock registers at OTP base + 0x000). Each register controls
+/// one 64-row OTP page; setting both `sec` and `nsec` fields to
+/// `INACCESSIBLE` (0x3) prevents all reads of that page regardless of
+/// privilege level.
 ///
-/// Returns `Err` to prevent callers from falsely assuming the rows are locked.
-/// Full implementation requires PAC access to the OTP_DATA_RAW permission
-/// bits or the ROM `otp_access` function with a lock flag.
-pub fn lock_read(_row_start: u8, _row_count: u8) -> Result<(), StorageError> {
-    defmt::warn!(
-        "OTP: lock_read/lock_write not yet implemented — returning Err to prevent false assumption of locked state"
-    );
-    Err(StorageError::WriteError)
+/// # Page mapping
+/// Each OTP page covers 64 consecutive rows:
+///   page = row / 64  (integer division)
+///
+/// Rows 0x100–0x127 (IKM, device key, boot flags) all fall in OTP page 4
+/// (rows 0x100–0x13F). Locking page 4 makes the key material unreadable via
+/// SWD after provisioning.
+///
+/// # Effect
+/// After this call, `embassy_rp::otp::read_raw_word` and `read_ecc_word` for
+/// any row in a locked page will return `Err(InvalidPermissions)` (the OTP
+/// data memory-mapped read returns 0xFFFF_FFFF for locked rows).
+///
+/// # Irreversibility
+/// The SW_LOCK registers are reset on the next power-on reset (they are NOT
+/// OTP-burned). For permanent lock-out, combine with OTP lock pages (written
+/// via provisioning tool). This function provides runtime protection that
+/// prevents SWD reads during the current boot session.
+///
+/// # Safety
+/// Uses `embassy_rp::pac::OTP` which is a well-known RP2350 MMIO peripheral
+/// at address 0x4012_0000 (RP2350 datasheet §5.4 "OTP Control Registers").
+/// Single-caller assumption: this is called once at provisioning time.
+#[cfg(target_arch = "arm")]
+pub fn lock_read(row_start: u8, row_count: u8) -> Result<(), StorageError> {
+    use embassy_rp::pac::OTP;
+    use embassy_rp::pac::otp::vals::{SwLockNsec, SwLockSec};
+
+    if row_count == 0 {
+        return Ok(());
+    }
+
+    // Compute the range of OTP pages covered by [row_start, row_start + row_count).
+    let first_page = (row_start as usize) / 64;
+    let last_row = (row_start as usize).saturating_add(row_count as usize).saturating_sub(1);
+    let last_page = last_row / 64;
+
+    // Validate page indices — OTP has 64 pages (0..63).
+    if last_page >= 64 {
+        defmt::error!("OTP: lock_read — row range 0x{:02X}+{} exceeds OTP page count",
+            row_start, row_count);
+        return Err(StorageError::WriteError);
+    }
+
+    // Lock each page in the range by setting both Secure and Non-Secure access
+    // to INACCESSIBLE (0x3).  This prevents reads from any privilege level.
+    for page in first_page..=last_page {
+        // SAFETY: OTP SW_LOCK registers at 0x4012_0000 + page*4.
+        // Each register is a 32-bit MMIO register controlling one OTP page.
+        // Writing INACCESSIBLE to both sec and nsec fields blocks all reads.
+        unsafe {
+            OTP.sw_lock(page).write(|w| {
+                w.set_sec(SwLockSec::INACCESSIBLE);
+                w.set_nsec(SwLockNsec::INACCESSIBLE);
+            });
+        }
+        defmt::warn!("OTP: page {} read-locked (rows 0x{:02X}–0x{:02X}) — reset required to unlock",
+            page, page * 64, page * 64 + 63);
+    }
+
+    Ok(())
 }
 
-/// OTP row write-locking is not yet implemented.
+/// Stub for non-ARM targets (host tests).
+#[cfg(not(target_arch = "arm"))]
+pub fn lock_read(_row_start: u8, _row_count: u8) -> Result<(), StorageError> {
+    Ok(())
+}
+
+/// Lock a range of OTP rows for writing via the RP2350 SW_LOCK page registers.
 ///
-/// Returns `Err` to prevent callers from falsely assuming the rows are locked.
-/// See `lock_read()` for rationale.
+/// Sets the per-page SW_LOCK to READ_ONLY for both Secure and Non-Secure
+/// access, preventing any further writes to OTP rows in the specified range.
+///
+/// See `lock_read()` for page mapping and register layout details.
+#[cfg(target_arch = "arm")]
+pub fn lock_write(row_start: u8, row_count: u8) -> Result<(), StorageError> {
+    use embassy_rp::pac::OTP;
+    use embassy_rp::pac::otp::vals::{SwLockNsec, SwLockSec};
+
+    if row_count == 0 {
+        return Ok(());
+    }
+
+    let first_page = (row_start as usize) / 64;
+    let last_row = (row_start as usize).saturating_add(row_count as usize).saturating_sub(1);
+    let last_page = last_row / 64;
+
+    if last_page >= 64 {
+        defmt::error!("OTP: lock_write — row range 0x{:02X}+{} exceeds OTP page count",
+            row_start, row_count);
+        return Err(StorageError::WriteError);
+    }
+
+    for page in first_page..=last_page {
+        // READ_ONLY prevents writes while still allowing reads.
+        unsafe {
+            OTP.sw_lock(page).write(|w| {
+                w.set_sec(SwLockSec::READ_ONLY);
+                w.set_nsec(SwLockNsec::READ_ONLY);
+            });
+        }
+        defmt::warn!("OTP: page {} write-locked (rows 0x{:02X}–0x{:02X})",
+            page, page * 64, page * 64 + 63);
+    }
+
+    Ok(())
+}
+
+/// Stub for non-ARM targets (host tests).
+#[cfg(not(target_arch = "arm"))]
 pub fn lock_write(_row_start: u8, _row_count: u8) -> Result<(), StorageError> {
-    defmt::warn!(
-        "OTP: lock_read/lock_write not yet implemented — returning Err to prevent false assumption of locked state"
-    );
-    Err(StorageError::WriteError)
+    Ok(())
 }
 
 /// Read the 32-byte device root secret from OTP rows 0x20–0x3F (legacy layout).

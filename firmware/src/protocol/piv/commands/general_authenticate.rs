@@ -238,6 +238,12 @@ fn handle_asymmetric_auth(
             }
             let _ = resp.extend_from_slice(&sig);
 
+            // NIST SP 800-73-4 Part 2 §3.3.2 — PIN Always for slot 9C:
+            // clear pin_verified after each successful Digital Signature use.
+            if key_ref == 0x9C {
+                state.pin_verified = false;
+            }
+
             return ApduResponse::ok(&resp);
         }
     }

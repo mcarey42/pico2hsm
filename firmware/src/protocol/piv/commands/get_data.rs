@@ -53,7 +53,7 @@ pub fn handle(state: &PivState, cmd: &ApduCommand<'_>) -> ApduResponse {
         // X.509 Certificate for Card Authentication (9E): 5FC101
         [0x5F, 0xC1, 0x01] => get_stored_object(state, 0x01),
         // Security Object: 5FC106
-        [0x5F, 0xC1, 0x06] => ApduResponse::err(0x6A82),
+        [0x5F, 0xC1, 0x06] => build_security_object(),
         // Key History Object: 5FC10C
         [0x5F, 0xC1, 0x0C] => ApduResponse::err(0x6A82),
         // Retired slots (5FC10D - 5FC120): not found
@@ -78,10 +78,14 @@ fn build_chuid(state: &PivState) -> ApduResponse {
     let len_pos = resp.len();
     let _ = resp.push(0x00); // placeholder
 
-    // FASC-N (tag 0x30) - 25 bytes, fixed test pattern
+    // FASC-N (tag 0x30) - 25 bytes.
+    // FIPS 201-2 Appendix B non-federal agency test FASC-N:
+    //   Agency Code = 9999, System Code = 9999, Credential Number = 999999,
+    //   CS = 0, ICI = 0, PI = 9999999999, OC = 1, OI = 9999, POA = 1.
+    // Encoded per ANSI/INCITS 225 4-bit BCD packing with SS/FS/ES sentinels
+    // and LRC as defined in FIPS 201-2 Appendix B.
     let _ = resp.push(0x30);
     let _ = resp.push(25);
-    // Fixed FASC-N: all 0x99... (non-federal test value per NIST)
     let fascn: [u8; 25] = [
         0xD4, 0xE7, 0x39, 0xDA, 0x73, 0x9C, 0xED, 0x39,
         0xCE, 0x73, 0x9D, 0x83, 0x68, 0x58, 0x21, 0x08,
@@ -201,6 +205,44 @@ fn build_discovery() -> ApduResponse {
     let _ = resp.push(0x02);
     let _ = resp.push(0x40); // bit 6 = global PIN is primary
     let _ = resp.push(0x20); // PUK available
+
+    ApduResponse::ok(&resp)
+}
+
+/// Build a synthetic Security Object (tag 5FC106).
+///
+/// Per NIST SP 800-73-4 Part 1 §3.2 the Security Object contains a mapping of
+/// content signing certificate slots to their SHA-1 hashes.  This minimal
+/// implementation returns an empty mapping (no content signing certificates),
+/// which is compliant for a device with no content signing certificates loaded.
+///
+/// Encoding (wrapped in tag 0x53):
+///   BA <len> <mapping_data>  — mapping-of-DG, empty for no certs
+///   BB <len> <security_object_data> — currently empty
+///   FE 00  — Error Detection Code
+fn build_security_object() -> ApduResponse {
+    let mut resp = heapless::Vec::<u8, 64>::new();
+
+    // Outer tag 0x53 (content wrapper)
+    let _ = resp.push(0x53);
+    let len_pos = resp.len();
+    let _ = resp.push(0x00); // placeholder length
+
+    // Mapping of Data Elements (tag 0xBA) — empty (no content signing certs)
+    let _ = resp.push(0xBA);
+    let _ = resp.push(0x00);
+
+    // Security Object (tag 0xBB) — empty
+    let _ = resp.push(0xBB);
+    let _ = resp.push(0x00);
+
+    // Error Detection Code (tag 0xFE) — empty
+    let _ = resp.push(0xFE);
+    let _ = resp.push(0x00);
+
+    // Patch the outer length
+    let inner_len = resp.len() - len_pos - 1;
+    resp[len_pos] = inner_len as u8;
 
     ApduResponse::ok(&resp)
 }

@@ -12,16 +12,24 @@ use pico2hsm_core::apdu::{
 };
 
 use crate::protocol::sc_hsm::ScHsmState;
+use crate::security::pin::PinState;
 
 /// INS byte for RESET RETRY COUNTER.
 pub const INS_RESET_RETRY: u8 = 0x2C;
 
-fn hash_pin(pin: &[u8], out: &mut [u8; 32]) {
-    use sha2::{Digest, Sha256};
-    let mut h = Sha256::new();
-    h.update(pin);
-    let result = h.finalize();
-    out.copy_from_slice(&result);
+/// Generate 16 random bytes for a new PIN salt.
+fn gen_salt() -> [u8; 16] {
+    use crate::protocol::sc_hsm::FwRng;
+    use rand_core::RngCore;
+    let mut rng = FwRng;
+    let mut salt = [0u8; 16];
+    rng.fill_bytes(&mut salt);
+    salt
+}
+
+/// Compute PBKDF2-HMAC-SHA256 of `pin` using `salt`.
+fn hash_pin_pbkdf2(pin: &[u8], salt: &[u8; 16]) -> [u8; 32] {
+    PinState::hash_pin(pin, b"pico2hsm-device", salt)
 }
 
 /// Handle a RESET RETRY COUNTER APDU command with flash persistence.
@@ -54,12 +62,12 @@ pub fn handle(state: &mut ScHsmState, cmd: &ApduCommand<'_>) -> ApduResponse {
             if new_pin.len() < 4 || new_pin.len() > 16 {
                 return ApduResponse::err(SW_WRONG_LENGTH);
             }
-            let mut new_hash = [0u8; 32];
-            hash_pin(new_pin, &mut new_hash);
-            state.user_pin_hash = Some(new_hash);
+            // Generate a fresh salt and compute PBKDF2 hash (P1-1 fix).
+            let new_salt = gen_salt();
+            state.user_pin_salt = new_salt;
+            state.user_pin_hash = Some(hash_pin_pbkdf2(new_pin, &new_salt));
             state.pin_retry_count = 3;
             state.pin_verified = false;
-            // TODO (Agent 7): persist new PIN hash to storage
             ApduResponse::ok(&[])
         }
 

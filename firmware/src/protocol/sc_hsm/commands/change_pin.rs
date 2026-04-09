@@ -16,25 +16,31 @@ use pico2hsm_core::apdu::{
 };
 
 use crate::protocol::sc_hsm::ScHsmState;
+use crate::security::pin::PinState;
 use super::verify::{P2_USER_PIN, P2_SO_PIN};
 
 /// INS byte for CHANGE REFERENCE DATA.
 pub const INS_CHANGE_PIN: u8 = 0x24;
 
-fn hash_pin(pin: &[u8], out: &mut [u8; 32]) {
-    use sha2::{Digest, Sha256};
-    let mut h = Sha256::new();
-    h.update(pin);
-    let result = h.finalize();
-    out.copy_from_slice(&result);
+/// Generate 16 random bytes for a new PIN salt.
+fn gen_salt() -> [u8; 16] {
+    use crate::protocol::sc_hsm::FwRng;
+    use rand_core::RngCore;
+    let mut rng = FwRng;
+    let mut salt = [0u8; 16];
+    rng.fill_bytes(&mut salt);
+    salt
 }
 
-fn verify_pin_hash(pin: &[u8], stored: &[u8; 32]) -> bool {
-    use sha2::{Digest, Sha256};
-    let mut h = Sha256::new();
-    h.update(pin);
-    let computed = h.finalize();
-    computed.as_slice().ct_eq(stored).into()
+/// Compute PBKDF2-HMAC-SHA256 of `pin` using `salt`.
+fn hash_pin_pbkdf2(pin: &[u8], salt: &[u8; 16]) -> [u8; 32] {
+    PinState::hash_pin(pin, b"pico2hsm-device", salt)
+}
+
+/// Verify `pin` against `stored` using PBKDF2 (constant time).
+fn verify_pin_pbkdf2(pin: &[u8], salt: &[u8; 16], stored: &[u8; 32]) -> bool {
+    let computed = PinState::hash_pin(pin, b"pico2hsm-device", salt);
+    computed.ct_eq(stored).into()
 }
 
 fn find_tlv<'a>(data: &'a [u8], tag: u8) -> Option<&'a [u8]> {
@@ -107,7 +113,8 @@ pub fn handle(state: &mut ScHsmState, cmd: &ApduCommand<'_>) -> ApduResponse {
                 Some(h) => *h,
                 None => return ApduResponse::err(SW_SECURITY_STATUS),
             };
-            if !verify_pin_hash(old_pin, &stored) {
+            let old_salt = state.user_pin_salt;
+            if !verify_pin_pbkdf2(old_pin, &old_salt, &stored) {
                 state.pin_verified = false;
                 state.pin_retry_count = state.pin_retry_count.saturating_sub(1);
                 if state.pin_retry_count == 0 {
@@ -115,9 +122,10 @@ pub fn handle(state: &mut ScHsmState, cmd: &ApduCommand<'_>) -> ApduResponse {
                 }
                 return ApduResponse::err(0x63C0 | (state.pin_retry_count as u16 & 0x0F));
             }
-            let mut new_hash = [0u8; 32];
-            hash_pin(new_pin, &mut new_hash);
-            state.user_pin_hash = Some(new_hash);
+            // Generate a fresh salt for the new PIN.
+            let new_salt = gen_salt();
+            state.user_pin_salt = new_salt;
+            state.user_pin_hash = Some(hash_pin_pbkdf2(new_pin, &new_salt));
             state.pin_retry_count = 3;
             state.pin_verified = false; // require re-verify after change
             ApduResponse::ok(&[])
@@ -131,7 +139,8 @@ pub fn handle(state: &mut ScHsmState, cmd: &ApduCommand<'_>) -> ApduResponse {
                 Some(h) => *h,
                 None => return ApduResponse::err(SW_SECURITY_STATUS),
             };
-            if !verify_pin_hash(old_pin, &stored) {
+            let old_salt = state.so_pin_salt;
+            if !verify_pin_pbkdf2(old_pin, &old_salt, &stored) {
                 state.so_pin_verified = false;
                 state.so_pin_retry_count = state.so_pin_retry_count.saturating_sub(1);
                 if state.so_pin_retry_count == 0 {
@@ -139,9 +148,10 @@ pub fn handle(state: &mut ScHsmState, cmd: &ApduCommand<'_>) -> ApduResponse {
                 }
                 return ApduResponse::err(0x63C0 | (state.so_pin_retry_count as u16 & 0x0F));
             }
-            let mut new_hash = [0u8; 32];
-            hash_pin(new_pin, &mut new_hash);
-            state.so_pin_hash = Some(new_hash);
+            // Generate a fresh salt for the new SO-PIN.
+            let new_salt = gen_salt();
+            state.so_pin_salt = new_salt;
+            state.so_pin_hash = Some(hash_pin_pbkdf2(new_pin, &new_salt));
             state.so_pin_retry_count = 5;
             state.so_pin_verified = false;
             ApduResponse::ok(&[])
