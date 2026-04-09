@@ -30,9 +30,11 @@ pub fn handle(state: &mut ScHsmState, cmd: &ApduCommand<'_>) -> ApduResponse {
             return ApduResponse::err(SW_WRONG_DATA);
         }
         let raw: &[u8; 32] = cmd.data.try_into().unwrap();
+        crate::cdc_log!("KEY_DOMAIN import_share_raw: required={} imported={}", state.dkek_shares_required, state.dkek_shares_imported);
         match state.dkek.import_share_raw(raw) {
             Ok(DkekImportResult::Complete) => {
                 state.dkek_shares_imported = state.dkek.shares_total();
+                crate::cdc_log!("KEY_DOMAIN DKEK Complete: is_ready={}", state.dkek.is_ready());
                 // sc-hsm-tool asserts apdu.resplen >= sizeof(key_check_value) + 2.
                 // key_check_value is 8 bytes, so we must return at least 10 bytes:
                 //   [remaining(1), total(1), kcv(8)]

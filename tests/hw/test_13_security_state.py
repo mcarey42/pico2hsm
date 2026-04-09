@@ -27,9 +27,17 @@ log = logging.getLogger(__name__)
 SELECT_SC_HSM = "00A404000BE82B0601040181C31F020100"
 SELECT_PIV    = "00A4040009A00000030800001000"
 
-# LIST KEYS: CLA=0x80 INS=0x58 P1=0x00 P2=0xFF Le=0x00
-# Requires PIN-verified session; returns 6982 or 6985 if not authenticated.
-LIST_KEYS = "805800FF00"
+# EXPORT KEY (INS=0x72) with key_ref=0x7F — 5-byte Case 2S APDU (Le only).
+# Requires PIN-verified session; returns SW_SECURITY_STATUS (0x6982) when not
+# authenticated.  key_ref=0x7F (127) will never exist, so when PIN IS verified
+# we get a different non-9000 error (6985 DKEK not ready, or 6A82 not found),
+# not 9000.  The assertion in step 2 is only on the UNverified path.
+#
+# Must be 5 bytes (Case 2S: CLA INS P1 P2 Le) so opensc-tool forwards it
+# to the card without rejecting it as an invalid extended APDU.
+#
+# (LIST KEYS INS=0x58 intentionally skips PIN; cannot be used here.)
+AUTH_REQUIRED = "80727F0000"  # 5-byte APDU: Le=0x00 → 256
 
 
 # ---------------------------------------------------------------------------
@@ -68,28 +76,29 @@ class TestSelectClearsAuth:
     def test_select_clears_pin_verified(
         self, runner: CLIRunner, config: dict, initialized_device
     ) -> None:
-        """Re-SELECT SC-HSM AID must clear pin_verified; LIST KEYS must then fail."""
+        """Re-SELECT SC-HSM AID must clear pin_verified; AUTH_REQUIRED must then fail."""
         verify_apdu = _verify_pin_apdu(config["pin"])
 
-        # Step 1: SELECT + VERIFY + LIST KEYS — must succeed
+        # Step 1: SELECT + VERIFY — PIN must be accepted.
+        # After this the device has pin_verified=True in RAM.
         r = runner.send_apdu(
-            SELECT_SC_HSM, verify_apdu, LIST_KEYS,
-            reader=0, save_as="13_select_verify_list",
+            SELECT_SC_HSM, verify_apdu,
+            reader=0, save_as="13_select_verify",
         )
         sws = _parse_sw(r.stdout)
         log.info("Step 1 SWs: %s", [f"{sw:04X}" for sw in sws])
-        # Last SW should be 9000 (LIST KEYS success)
         assert _last_sw(r.stdout) == 0x9000, (
-            f"LIST KEYS after VERIFY should succeed, got SW={_last_sw(r.stdout):04X}"
+            f"VERIFY should succeed, got SW={_last_sw(r.stdout):04X}"
         )
 
-        # Step 2: re-SELECT + LIST KEYS without re-verifying — must fail
+        # Step 2: fresh opensc-tool invocation → SELECT (clears auth) + AUTH_REQUIRED.
+        # SELECT AID must clear pin_verified; AUTH_REQUIRED must then return 6982/6985.
         r2 = runner.send_apdu(
-            SELECT_SC_HSM, LIST_KEYS,
-            reader=0, save_as="13_reselect_list_no_verify",
+            SELECT_SC_HSM, AUTH_REQUIRED,
+            reader=0, save_as="13_reselect_auth_required",
         )
         sw = _last_sw(r2.stdout)
-        log.info("Step 2 LIST KEYS after re-SELECT: SW=%04X", sw)
+        log.info("Step 2 AUTH_REQUIRED after re-SELECT (no VERIFY): SW=%04X", sw)
         assert sw == 0x6982 or sw == 0x6985, (
             f"Expected SW=6982 or 6985 after re-SELECT, got {sw:04X}"
         )
@@ -97,10 +106,12 @@ class TestSelectClearsAuth:
     def test_double_select_still_requires_verify(
         self, runner: CLIRunner, config: dict, initialized_device
     ) -> None:
-        """Two consecutive SELECTs must still require VERIFY before LIST KEYS."""
-        # SELECT twice, then LIST KEYS — should fail
+        """Two consecutive SELECTs must still require VERIFY before AUTH_REQUIRED."""
+        # SELECT twice (no VERIFY), then AUTH_REQUIRED — should fail with 6982/6985.
+        # This also covers the common OpenSC pattern where SELECT AID is sent
+        # twice (card detection + explicit select).
         r = runner.send_apdu(
-            SELECT_SC_HSM, SELECT_SC_HSM, LIST_KEYS,
+            SELECT_SC_HSM, SELECT_SC_HSM, AUTH_REQUIRED,
             reader=0, save_as="13_double_select",
         )
         sw = _last_sw(r.stdout)
@@ -137,7 +148,7 @@ class TestAppletSwitchClearsAuth:
         # Step 3: Switch back to SC-HSM — should clear pin_verified
         # Step 4: LIST KEYS without re-verifying — must fail
         r2 = runner.send_apdu(
-            SELECT_SC_HSM, LIST_KEYS,
+            SELECT_SC_HSM, AUTH_REQUIRED,
             reader=0, save_as="13_schsm_after_piv",
         )
         sw = _last_sw(r2.stdout)
@@ -172,7 +183,7 @@ class TestAppletSwitchClearsAuth:
 
         # Step 3: Switch back to SC-HSM + LIST KEYS — must fail
         r2 = runner.send_apdu(
-            SELECT_SC_HSM, LIST_KEYS,
+            SELECT_SC_HSM, AUTH_REQUIRED,
             reader=0, save_as="13_schsm_after_openpgp",
         )
         sw = _last_sw(r2.stdout)

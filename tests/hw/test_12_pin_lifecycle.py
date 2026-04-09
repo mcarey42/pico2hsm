@@ -83,8 +83,17 @@ def _verify_pin_apdu(pin: str) -> str:
 
 
 def _verify_sopin_apdu(so_pin: str) -> str:
-    """Build a VERIFY SO-PIN APDU from an ASCII SO-PIN string."""
-    so_bytes = so_pin.encode()
+    """Build a VERIFY SO-PIN APDU.
+
+    sc-hsm-tool encodes --so-pin as 16 hex digits representing 8 raw bytes.
+    VERIFY must send those same 8 raw bytes so the SHA-256 matches what
+    INITIALIZE stored.
+    """
+    # so_pin is a 16-char hex string (e.g. "3537363231383830"); decode to 8 bytes.
+    try:
+        so_bytes = bytes.fromhex(so_pin)
+    except ValueError:
+        so_bytes = so_pin.encode()
     return f"00200088{len(so_bytes):02X}{so_bytes.hex()}"
 
 

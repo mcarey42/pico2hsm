@@ -48,8 +48,8 @@ log = logging.getLogger(__name__)
 pytestmark = pytest.mark.hw
 
 DKEK_PASSPHRASE = "dkek-roundtrip-test"
-KEY_REF = "30"          # key slot 0x30, avoids collision with slots 01-11
 KEY_LABEL = "dkek-test"
+KEY_ID = "30"   # PKCS#15 CKA_ID passed to pkcs11-tool --id (hex string)
 
 
 # ---------------------------------------------------------------------------
@@ -109,6 +109,57 @@ def _create_dkek_share(share_path: Path, passphrase: str) -> None:
     )
     assert share_path.exists(), f"DKEK share file not created at {share_path}"
     log.info("DKEK share created: %s", share_path)
+
+
+def _get_first_key_slot(reader: int = 0) -> int | None:
+    """Return the first device key slot number from LIST KEYS, or None if no keys.
+
+    SC-HSM LIST KEYS (CLA=0x80 INS=0x58 P1=0x00 P2=0xFF Le=0x00) returns
+    pairs of bytes [hi, lo] where hi identifies the file type:
+      0xCC = key blob → lo is the key reference (device slot number)
+      0xC4 = PRKD descriptor → lo is the key reference
+
+    The device slot number (CC xx) is what sc-hsm-tool --key-reference expects.
+    This is NOT the same as the PKCS#15 CKA_ID passed to pkcs11-tool --id.
+    """
+    SELECT_SC_HSM_HEX = "00A404000BE82B0601040181C31F020100"
+    LIST_KEYS_HEX = "805800FF00"
+    result = subprocess.run(
+        ["opensc-tool", f"-r{reader}", "-s", SELECT_SC_HSM_HEX, "-s", LIST_KEYS_HEX],
+        capture_output=True, timeout=10,
+    )
+    output = result.stdout.decode(errors="replace")
+    # Parse the last Received block (response to LIST KEYS)
+    blocks: list[bytearray] = []
+    current: bytearray | None = None
+    for line in output.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("Received"):
+            current = bytearray()
+        elif stripped.startswith("Sending") and current is not None:
+            blocks.append(current)
+            current = None
+        elif current is not None:
+            tokens = [t for t in stripped.split()
+                      if len(t) == 2 and all(c in "0123456789abcdefABCDEF" for c in t)]
+            for tok in tokens[:16]:
+                current.append(int(tok, 16))
+    if current is not None:
+        blocks.append(current)
+    if not blocks:
+        return None
+    resp = blocks[-1]
+    # Walk pairs looking for 0xCC (key blob), skip slot 0 (device sentinel)
+    # and reserved slots (>= 0xF0).  Slot 0 is pre-populated by INITIALIZE as
+    # a sentinel to prevent sc_hsm_determine_free_id from assigning it;
+    # it has no actual key material and cannot be wrapped.
+    i = 0
+    while i + 1 < len(resp):
+        hi, lo = resp[i], resp[i + 1]
+        if hi == 0xCC and lo != 0x00 and lo < 0xF0:
+            return lo
+        i += 2
+    return None
 
 
 def _import_dkek_share(share_path: Path, passphrase: str) -> None:
@@ -175,20 +226,28 @@ class TestDkekWrapUnwrapRoundtrip:
         passphrase = dkek_initialized_device["passphrase"]
 
         # 1. Generate a P-256 key on the device
-        log.info("Generating P-256 key (id=%s) for wrap/unwrap test...", KEY_REF)
+        log.info("Generating P-256 key (pkcs15-id=%s) for wrap/unwrap test...", KEY_ID)
         keygen = runner.pkcs11_tool(
             "--login",
             "--pin", config["pin"],
             "--keypairgen",
             "--key-type", "EC:prime256v1",
-            "--id", KEY_REF,
+            "--id", KEY_ID,
             "--label", KEY_LABEL,
             save_as="11_keygen",
         )
         assert keygen.returncode == 0, (
             f"Key generation failed: rc={keygen.returncode}\n{keygen.stderr}"
         )
-        log.info("Key generated (id=%s)", KEY_REF)
+        log.info("Key generated (pkcs15-id=%s)", KEY_ID)
+
+        # Discover the actual device key slot (device-assigned, not PKCS#15 id).
+        # OpenSC's sc_hsm_determine_free_id picks the first free slot; after
+        # fresh initialization the first key always lands in slot 1, but we
+        # query to be safe.
+        device_slot = _get_first_key_slot(reader=0)
+        assert device_slot is not None, "Could not detect device key slot after keygen"
+        log.info("Device key slot (for wrap/unwrap): %d (0x%02X)", device_slot, device_slot)
 
         # 2. Export the public key (to verify after restore)
         pubkey_der_path = tmp_path / "pubkey_original.der"
@@ -197,7 +256,7 @@ class TestDkekWrapUnwrapRoundtrip:
             "--pin", config["pin"],
             "--read-object",
             "--type", "pubkey",
-            "--id", KEY_REF,
+            "--id", KEY_ID,
             "--output-file", str(pubkey_der_path),
             save_as="11_pubkey_export",
         )
@@ -214,11 +273,11 @@ class TestDkekWrapUnwrapRoundtrip:
         ).decode("ascii")
         log.info("Original public key exported (%d bytes DER)", len(original_pub_der))
 
-        # 3. Wrap (export) the key
+        # 3. Wrap (export) the key using the actual device slot number
         wrap_file = tmp_path / "wrapped_key.bin"
         wrap = runner.sc_hsm_tool(
             "--wrap-key", str(wrap_file),
-            "--key-reference", str(int(KEY_REF, 16)),
+            "--key-reference", str(device_slot),
             "--pin", config["pin"],
             save_as="11_wrap_key",
         )
@@ -237,17 +296,17 @@ class TestDkekWrapUnwrapRoundtrip:
         # 5. Re-import the same DKEK share
         _import_dkek_share(share_path, passphrase)
 
-        # 6. Unwrap (restore) the key
+        # 6. Unwrap (restore) the key — restore to same device slot
         unwrap = runner.sc_hsm_tool(
             "--unwrap-key", str(wrap_file),
-            "--key-reference", str(int(KEY_REF, 16)),
+            "--key-reference", str(device_slot),
             "--pin", config["pin"],
             save_as="11_unwrap_key",
         )
         assert unwrap.returncode == 0, (
             f"Unwrap key failed: rc={unwrap.returncode}\n{unwrap.stderr}"
         )
-        log.info("Key unwrapped (restored) to slot %s", KEY_REF)
+        log.info("Key unwrapped (restored) to slot %d (0x%02X)", device_slot, device_slot)
 
         # 7. Sign something with the restored key
         msg_file = tmp_path / "message.bin"
@@ -259,7 +318,7 @@ class TestDkekWrapUnwrapRoundtrip:
             "--pin", config["pin"],
             "--sign",
             "--mechanism", "ECDSA-SHA256",
-            "--id", KEY_REF,
+            "--id", KEY_ID,
             "--input-file", str(msg_file),
             "--output-file", str(sig_file),
             save_as="11_sign_after_restore",
@@ -322,7 +381,7 @@ class TestDkekDifferentSharesIncompatible:
             "--pin", config["pin"],
             "--keypairgen",
             "--key-type", "EC:prime256v1",
-            "--id", KEY_REF,
+            "--id", KEY_ID,
             "--label", "dkek-mismatch-test",
             save_as="11_mismatch_keygen",
         )
@@ -330,10 +389,15 @@ class TestDkekDifferentSharesIncompatible:
             f"Key generation failed: {keygen.stderr}"
         )
 
+        # Detect the actual device slot assigned to this key
+        mismatch_slot = _get_first_key_slot(reader=0)
+        assert mismatch_slot is not None, "Could not detect device key slot after mismatch keygen"
+        log.info("Mismatch test key in device slot %d (0x%02X)", mismatch_slot, mismatch_slot)
+
         wrap_file = tmp_path / "wrapped_share_a.bin"
         wrap = runner.sc_hsm_tool(
             "--wrap-key", str(wrap_file),
-            "--key-reference", str(int(KEY_REF, 16)),
+            "--key-reference", str(mismatch_slot),
             "--pin", config["pin"],
             save_as="11_mismatch_wrap",
         )
@@ -349,7 +413,7 @@ class TestDkekDifferentSharesIncompatible:
         # Attempt to unwrap — must fail because the DKEK does not match
         unwrap = runner.sc_hsm_tool(
             "--unwrap-key", str(wrap_file),
-            "--key-reference", str(int(KEY_REF, 16)),
+            "--key-reference", str(mismatch_slot),
             "--pin", config["pin"],
             save_as="11_mismatch_unwrap",
         )
