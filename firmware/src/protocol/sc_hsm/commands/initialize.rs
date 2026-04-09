@@ -231,6 +231,9 @@ pub fn handle(state: &mut ScHsmState, store: &mut dyn crate::storage::KeyStore, 
         }
     }
 
+    // Persist PIN/SO-PIN/PUK state to flash.
+    crate::protocol::sc_hsm::ScHsm::save_pin_to_store(state, store);
+
     crate::cdc_log!("SC-HSM INITIALIZE complete");
     ApduResponse::ok(&[])
 }

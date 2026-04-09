@@ -74,9 +74,120 @@ static APDU_CHANNEL: Channel<SpinlockRawMutex<29>, heapless::Vec<u8, 4096>, 1> =
 #[cfg(target_arch = "arm")]
 static RESP_CHANNEL: Channel<SpinlockRawMutex<30>, heapless::Vec<u8, 4098>, 1> = Channel::new();
 
+/// Core1 → Core0: flash operation requests.
+/// Uses RP2350 hardware spinlock 27.
+#[cfg(target_arch = "arm")]
+static FLASH_REQ: Channel<SpinlockRawMutex<27>, FlashOp, 1> = Channel::new();
+/// Core0 → Core1: flash operation results.
+/// Uses RP2350 hardware spinlock 26.
+#[cfg(target_arch = "arm")]
+static FLASH_RESP: Channel<SpinlockRawMutex<26>, Result<(), pico2hsm_core::error::HsmError>, 1> =
+    Channel::new();
+
+/// Flash operation request — sent from core1 to core0 for flash persistence.
+///
+/// Core1 cannot call `embassy_rp::flash` directly (the `in_ram()` function
+/// asserts `core_id == 0`).  Instead, the dispatcher queues flash ops and
+/// sends them to core0 via `FLASH_REQ` after each APDU dispatch completes.
+#[cfg(target_arch = "arm")]
+enum FlashOp {
+    /// Encrypt and persist a key object to flash.
+    SaveKey(pico2hsm_firmware::security::key_management::KeyObject),
+    /// Delete a key from persistent storage.
+    EraseKey(pico2hsm_core::key::KeyId),
+    /// Wipe ALL keys. Called by INITIALIZE only.
+    WipeAll,
+    /// Wipe only keys owned by the given applet.
+    WipeByOwner(pico2hsm_core::key::AppletId),
+    /// Reload keys from flash into the dispatcher (USB reconnect / reset).
+    /// Core0 calls `dispatcher.load_keys_from_store(store)` via the raw
+    /// pointer while core1 is awaiting the response.
+    ReloadKeys,
+}
+
+/// A `KeyStore` implementation that queues flash operations instead of
+/// executing them immediately.  Used by the core1 dispatcher to collect
+/// flash ops during APDU processing, then drain them to core0 afterwards.
+#[cfg(target_arch = "arm")]
+struct FlashQueueKeyStore {
+    ops: heapless::Vec<FlashOp, 8>,
+}
+
+#[cfg(target_arch = "arm")]
+impl FlashQueueKeyStore {
+    fn new() -> Self {
+        FlashQueueKeyStore {
+            ops: heapless::Vec::new(),
+        }
+    }
+
+    fn drain(&mut self) -> heapless::Vec<FlashOp, 8> {
+        core::mem::replace(&mut self.ops, heapless::Vec::new())
+    }
+}
+
+#[cfg(target_arch = "arm")]
+impl pico2hsm_firmware::storage::KeyStore for FlashQueueKeyStore {
+    fn save_key(
+        &mut self,
+        obj: &pico2hsm_firmware::security::key_management::KeyObject,
+    ) -> Result<(), pico2hsm_core::error::HsmError> {
+        // Clone the KeyObject by reconstructing it field by field.
+        let mut copy = pico2hsm_firmware::security::key_management::KeyObject::new(
+            obj.key_type,
+            obj.key_id,
+            obj.owner,
+            obj.algorithm,
+        );
+        copy.key_domain = obj.key_domain;
+        copy.key_flags = obj.key_flags;
+        copy.use_count = obj.use_count;
+        copy.generation = obj.generation;
+        copy.timestamp_ms = obj.timestamp_ms;
+        let _ = copy.private_key.extend_from_slice(&obj.private_key);
+        let _ = copy.public_key.extend_from_slice(&obj.public_key);
+        let _ = self.ops.push(FlashOp::SaveKey(copy));
+        Ok(())
+    }
+
+    fn fetch_key(
+        &mut self,
+        _key_id: pico2hsm_core::key::KeyId,
+    ) -> Result<Option<pico2hsm_firmware::security::key_management::KeyObject>, pico2hsm_core::error::HsmError>
+    {
+        // Keys are already in the Dispatcher's in-memory state.
+        Ok(None)
+    }
+
+    fn erase_key(
+        &mut self,
+        key_id: pico2hsm_core::key::KeyId,
+    ) -> Result<(), pico2hsm_core::error::HsmError> {
+        let _ = self.ops.push(FlashOp::EraseKey(key_id));
+        Ok(())
+    }
+
+    fn wipe_all(&mut self) -> Result<(), pico2hsm_core::error::HsmError> {
+        let _ = self.ops.push(FlashOp::WipeAll);
+        Ok(())
+    }
+
+    fn wipe_by_owner(
+        &mut self,
+        owner: pico2hsm_core::key::AppletId,
+    ) -> Result<(), pico2hsm_core::error::HsmError> {
+        let _ = self.ops.push(FlashOp::WipeByOwner(owner));
+        Ok(())
+    }
+
+    fn enumerate_keys(&self) -> heapless::Vec<pico2hsm_core::key::KeyId, 512> {
+        // In-memory state is authoritative; flash enumeration not needed.
+        heapless::Vec::new()
+    }
+}
+
 /// One-time initialised key store — lives for the duration of the firmware.
-/// Owned by core1 dispatcher task; initialised by the board run function before
-/// spawning core1.
+/// Owned by core0 for flash writes; core1 accesses via FLASH_REQ/FLASH_RESP.
 #[cfg(target_arch = "arm")]
 static KEYSTORE_CELL: StaticCell<pico2hsm_firmware::storage::BoardKeyStore> = StaticCell::new();
 
@@ -93,17 +204,32 @@ static KEY_COUNT: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::n
 static DISPATCHER_CELL: StaticCell<pico2hsm_firmware::apdu::dispatcher::Dispatcher> =
     StaticCell::new();
 
+/// Wrapper around a raw pointer to Dispatcher that implements `Send`.
+///
+/// SAFETY: The Dispatcher is initialized on core0, then exclusively used by
+/// core1 (except during ReloadKeys, where core0 writes through the pointer
+/// while core1 is blocked awaiting FLASH_RESP). This exclusive access pattern
+/// makes cross-core transfer safe.
+#[cfg(target_arch = "arm")]
+struct DispatcherPtr(*mut pico2hsm_firmware::apdu::dispatcher::Dispatcher);
+#[cfg(target_arch = "arm")]
+unsafe impl Send for DispatcherPtr {}
+
 /// APDU dispatcher task — runs on core1 so that blocking ECC crypto does not
 /// starve the USB driver which runs cooperatively on core0.
 ///
-/// `store` is the persistent key store initialised by the board run function.
+/// Takes a raw pointer to the `Dispatcher` which was initialized and loaded
+/// from the keystore by core0 before spawning core1.  Core0 never touches the
+/// Dispatcher after this point, so the mutable reference is exclusive.
+///
+/// Flash writes are delegated to core0 via `FLASH_REQ`/`FLASH_RESP` channels
+/// because `embassy_rp::flash` asserts `core_id == 0`.
 #[cfg(target_arch = "arm")]
 #[embassy_executor::task]
 async fn dispatcher_task(
-    store: &'static mut pico2hsm_firmware::storage::BoardKeyStore,
+    ptr_wrapper: DispatcherPtr,
 ) {
-    use pico2hsm_firmware::apdu::dispatcher::Dispatcher;
-    use pico2hsm_firmware::storage::KeyStore;
+    let dispatcher_ptr = ptr_wrapper.0;
     // Core1 must not call defmt: embassy-rp's critical_section uses Spinlock31; if Core1
     // holds it while spinning for RTT buffer space, Core0 blocks with interrupts disabled
     // and USB processing stalls entirely.
@@ -112,8 +238,10 @@ async fn dispatcher_task(
     // reseed() does not call defmt, so it is safe to call here on Core1.
     let _ = pico2hsm_firmware::crypto::rng::reseed();
 
-    let dispatcher: &'static mut Dispatcher = DISPATCHER_CELL.init(Dispatcher::new());
-    dispatcher.load_keys_from_store(store);
+    // SAFETY: dispatcher_ptr was initialized on core0 and core0 never accesses
+    // the Dispatcher after spawning core1.  The pointer is valid for the
+    // lifetime of the firmware (backed by StaticCell in BSS).
+    let dispatcher = unsafe { &mut *dispatcher_ptr };
 
     loop {
         let apdu_bytes = APDU_CHANNEL.receive().await;
@@ -122,15 +250,29 @@ async fn dispatcher_task(
         // here would block on BLOCK_IF_FULL mode and deadlock both cores.
         if apdu_bytes.is_empty() {
             // Empty APDU = reset signal issued by core0 on USB disconnect.
-            *dispatcher = Dispatcher::new();
-            dispatcher.load_keys_from_store(store);
+            // Reset in-memory state and ask core0 to reload keys from flash.
+            *dispatcher = pico2hsm_firmware::apdu::dispatcher::Dispatcher::new();
+            // Signal core0 to reload keys from store into the fresh dispatcher.
+            // Core0 will call dispatcher.load_keys_from_store(store) via the raw
+            // pointer.  This is safe because core1 is awaiting FLASH_RESP and
+            // not touching the dispatcher.
+            FLASH_REQ.send(FlashOp::ReloadKeys).await;
+            let _ = FLASH_RESP.receive().await;
             let _ = RESP_CHANNEL.send(heapless::Vec::new()).await;
         } else {
-            let response = dispatcher.dispatch_with_store(&apdu_bytes, store);
+            let mut q = FlashQueueKeyStore::new();
+            let response = dispatcher.dispatch_with_store(&apdu_bytes, &mut q);
+            // Drain queued flash ops BEFORE sending the response back to core0.
+            // Core0 is in its select loop awaiting RESP_CHANNEL, so it will
+            // process FLASH_REQ messages during that wait.
+            for op in q.drain() {
+                FLASH_REQ.send(op).await;
+                let _ = FLASH_RESP.receive().await;
+            }
             let _ = RESP_CHANNEL.send(response).await;
         }
         KEY_COUNT.store(
-            store.enumerate_keys().len().min(255) as u8,
+            dispatcher.in_memory_key_count(),
             core::sync::atomic::Ordering::Relaxed,
         );
     }
@@ -280,6 +422,52 @@ async fn main(_spawner: Spawner) {
     }
 }
 
+// ─── Flash operation handler (core0) ─────────────────────────────────────────
+
+/// Execute a flash operation on core0 where `embassy_rp::flash` is permitted.
+///
+/// For `ReloadKeys`, the dispatcher pointer is used to reload keys from the
+/// store into the freshly-reset dispatcher.  This is safe because core1 is
+/// blocked awaiting `FLASH_RESP` and not touching the dispatcher.
+#[cfg(target_arch = "arm")]
+fn handle_flash_op(
+    op: FlashOp,
+    store: &mut pico2hsm_firmware::storage::BoardKeyStore,
+    dispatcher_ptr: *mut pico2hsm_firmware::apdu::dispatcher::Dispatcher,
+) -> Result<(), pico2hsm_core::error::HsmError> {
+    use pico2hsm_firmware::storage::KeyStore;
+    match op {
+        FlashOp::SaveKey(ref obj) => {
+            let result = store.save_key(obj);
+            defmt::info!("FLASH_SVC: save_key 0x{:08x} => {}", obj.key_id,
+                if result.is_ok() { "ok" } else { "FAIL" });
+            result
+        }
+        FlashOp::EraseKey(kid) => {
+            let result = store.erase_key(kid);
+            defmt::info!("FLASH_SVC: erase_key 0x{:08x} => {}", kid.0,
+                if result.is_ok() { "ok" } else { "FAIL" });
+            result
+        }
+        FlashOp::WipeAll => {
+            defmt::info!("FLASH_SVC: wipe_all");
+            store.wipe_all()
+        }
+        FlashOp::WipeByOwner(owner) => {
+            defmt::info!("FLASH_SVC: wipe_by_owner {:?}", owner as u8);
+            store.wipe_by_owner(owner)
+        }
+        FlashOp::ReloadKeys => {
+            defmt::info!("FLASH_SVC: reload_keys");
+            // SAFETY: core1 is blocked on FLASH_RESP.receive() and will not
+            // touch the dispatcher until we send the response.
+            let dispatcher = unsafe { &mut *dispatcher_ptr };
+            dispatcher.load_keys_from_store(store);
+            Ok(())
+        }
+    }
+}
+
 // ─── RP2350-One main function ─────────────────────────────────────────────────
 
 #[cfg(all(target_arch = "arm", any(feature = "rp2350_one_4m", feature = "rp2350_one_16m")))]
@@ -382,14 +570,22 @@ async fn run_one_board(p: embassy_rp::Peripherals) {
     defmt::info!("pico2hsm (RP2350-One): USB CCID+CDC ready, entering main loop");
     board.led().set_status(LedStatus::Ready);
 
-    // ── Spawn APDU dispatcher on core1 ───────────────────────────────────────
-    // Blocking ECC crypto (P-384 sign ≈ 2–3 s) must not starve the USB driver.
-    // By running the dispatcher on core1 and awaiting the response channel on
-    // core0, the Embassy executor on core0 continues to poll `usb.run()` while
-    // core1 computes.
+    // ── Init dispatcher on core0, then spawn core1 ─────────────────────────
+    // The Dispatcher is initialized and keys loaded from flash on core0 (where
+    // flash reads via XIP are safe).  A raw pointer is passed to core1 which
+    // exclusively owns the Dispatcher after this point.
+    let dispatcher_ref: &'static mut pico2hsm_firmware::apdu::dispatcher::Dispatcher =
+        DISPATCHER_CELL.init(pico2hsm_firmware::apdu::dispatcher::Dispatcher::new());
+    {
+        use pico2hsm_firmware::storage::KeyStore as _;
+        dispatcher_ref.load_keys_from_store(store);
+    }
+    let dispatcher_ptr = dispatcher_ref as *mut pico2hsm_firmware::apdu::dispatcher::Dispatcher;
+    let dispatcher_send = DispatcherPtr(dispatcher_ptr);
+
     spawn_core1(p.CORE1, unsafe { &mut *addr_of_mut!(CORE1_STACK) }, move || {
         let executor = CORE1_EXECUTOR.init(embassy_executor::Executor::new());
-        executor.run(|spawner| spawner.spawn(dispatcher_task(store).expect("dispatcher task")));
+        executor.run(|spawner| spawner.spawn(dispatcher_task(dispatcher_send).expect("dispatcher task")));
     });
 
     // ── Concurrent USB + CCID command loop (core0) ───────────────────────────
@@ -406,15 +602,19 @@ async fn run_one_board(p: embassy_rp::Peripherals) {
                         board.led().set_status(LedStatus::Busy);
                         let _ = APDU_CHANNEL.send(apdu_bytes).await;
                         let response = {
-                            use embassy_futures::select::{select, Either};
+                            use embassy_futures::select::{select3, Either3};
                             loop {
-                                match select(RESP_CHANNEL.receive(), embassy_time::Timer::after_millis(1500)).await {
-                                    Either::First(r) => break r,
-                                    Either::Second(_) => {
+                                match select3(RESP_CHANNEL.receive(), embassy_time::Timer::after_millis(1500), FLASH_REQ.receive()).await {
+                                    Either3::First(r) => break r,
+                                    Either3::Second(_) => {
                                         if let Err(CcidError::UsbDisconnected) = ccid.send_time_extension().await {
                                             let _ = RESP_CHANNEL.receive().await;
                                             break heapless::Vec::new();
                                         }
+                                    }
+                                    Either3::Third(op) => {
+                                        let result = handle_flash_op(op, store, dispatcher_ptr);
+                                        FLASH_RESP.send(result).await;
                                     }
                                 }
                             }
@@ -631,12 +831,19 @@ async fn run_geek_board(p: embassy_rp::Peripherals) {
     // Set provisioning status for display.
     // (qmi_ok/sd_ok left as None — geek board doesn't track individual store health yet)
 
-    // ── CHECKPOINT 7 — spawn core1 dispatcher, then run USB + CCID on core0 ──
-    // NOTE: CORE1_STACK and CORE1_EXECUTOR are module-level statics shared by
-    // all board variants; only one board function runs per firmware build.
+    // ── CHECKPOINT 7 — init dispatcher on core0, spawn core1 ──────────────
+    let dispatcher_ref: &'static mut pico2hsm_firmware::apdu::dispatcher::Dispatcher =
+        DISPATCHER_CELL.init(pico2hsm_firmware::apdu::dispatcher::Dispatcher::new());
+    {
+        use pico2hsm_firmware::storage::KeyStore as _;
+        dispatcher_ref.load_keys_from_store(store);
+    }
+    let dispatcher_ptr = dispatcher_ref as *mut pico2hsm_firmware::apdu::dispatcher::Dispatcher;
+    let dispatcher_send = DispatcherPtr(dispatcher_ptr);
+
     spawn_core1(p.CORE1, unsafe { &mut *addr_of_mut!(CORE1_STACK) }, move || {
         let executor = CORE1_EXECUTOR.init(embassy_executor::Executor::new());
-        executor.run(|spawner| spawner.spawn(dispatcher_task(store).expect("dispatcher task")));
+        executor.run(|spawner| spawner.spawn(dispatcher_task(dispatcher_send).expect("dispatcher task")));
     });
 
     let usb_fut = usb.run();
@@ -687,15 +894,19 @@ async fn run_geek_board(p: embassy_rp::Peripherals) {
 
                         // Wait for core1 response (with time extensions every 1.5s)
                         let response = {
-                            use embassy_futures::select::{select, Either};
+                            use embassy_futures::select::{select3, Either3};
                             loop {
-                                match select(RESP_CHANNEL.receive(), embassy_time::Timer::after_millis(1500)).await {
-                                    Either::First(r) => break r,
-                                    Either::Second(_) => {
+                                match select3(RESP_CHANNEL.receive(), embassy_time::Timer::after_millis(1500), FLASH_REQ.receive()).await {
+                                    Either3::First(r) => break r,
+                                    Either3::Second(_) => {
                                         if let Err(CcidError::UsbDisconnected) = ccid.send_time_extension().await {
                                             let _ = RESP_CHANNEL.receive().await;
                                             break heapless::Vec::new();
                                         }
+                                    }
+                                    Either3::Third(op) => {
+                                        let result = handle_flash_op(op, store, dispatcher_ptr);
+                                        FLASH_RESP.send(result).await;
                                     }
                                 }
                             }
@@ -877,10 +1088,20 @@ async fn run_pico2_board(p: embassy_rp::Peripherals) {
     defmt::info!("pico2hsm (Pico 2): USB CCID+CDC ready, entering main loop");
     board.led().set_status(LedStatus::Ready);
 
+    // ── Init dispatcher on core0, then spawn core1 ─────────────────────────
+    let dispatcher_ref: &'static mut pico2hsm_firmware::apdu::dispatcher::Dispatcher =
+        DISPATCHER_CELL.init(pico2hsm_firmware::apdu::dispatcher::Dispatcher::new());
+    {
+        use pico2hsm_firmware::storage::KeyStore as _;
+        dispatcher_ref.load_keys_from_store(store);
+    }
+    let dispatcher_ptr = dispatcher_ref as *mut pico2hsm_firmware::apdu::dispatcher::Dispatcher;
+    let dispatcher_send = DispatcherPtr(dispatcher_ptr);
+
     defmt::info!("core0: spawning core1");
     spawn_core1(p.CORE1, unsafe { &mut *addr_of_mut!(CORE1_STACK) }, move || {
         let executor = CORE1_EXECUTOR.init(embassy_executor::Executor::new());
-        executor.run(|spawner| spawner.spawn(dispatcher_task(store).expect("dispatcher task")));
+        executor.run(|spawner| spawner.spawn(dispatcher_task(dispatcher_send).expect("dispatcher task")));
     });
     defmt::info!("core0: core1 spawned, building usb_fut");
 
@@ -901,15 +1122,19 @@ async fn run_pico2_board(p: embassy_rp::Peripherals) {
                         // the APDU reaches Core1, causing a permanent hang.
                         let _ = APDU_CHANNEL.send(apdu_bytes).await;
                         let response = {
-                            use embassy_futures::select::{select, Either};
+                            use embassy_futures::select::{select3, Either3};
                             loop {
-                                match select(RESP_CHANNEL.receive(), embassy_time::Timer::after_millis(1500)).await {
-                                    Either::First(r) => break r,
-                                    Either::Second(_) => {
+                                match select3(RESP_CHANNEL.receive(), embassy_time::Timer::after_millis(1500), FLASH_REQ.receive()).await {
+                                    Either3::First(r) => break r,
+                                    Either3::Second(_) => {
                                         if let Err(CcidError::UsbDisconnected) = ccid.send_time_extension().await {
                                             let _ = RESP_CHANNEL.receive().await;
                                             break heapless::Vec::new();
                                         }
+                                    }
+                                    Either3::Third(op) => {
+                                        let result = handle_flash_op(op, store, dispatcher_ptr);
+                                        FLASH_RESP.send(result).await;
                                     }
                                 }
                             }
@@ -1135,10 +1360,19 @@ async fn run_waveshare_lcd_board(p: embassy_rp::Peripherals) {
         update_status_display(disp, spi, &mut dc, &mut cs, &mut ws2812_writer, &display_state).await;
     }
 
-    // ── Spawn APDU dispatcher on core1 ───────────────────────────────────────
+    // ── Init dispatcher on core0, then spawn core1 ─────────────────────────
+    let dispatcher_ref: &'static mut pico2hsm_firmware::apdu::dispatcher::Dispatcher =
+        DISPATCHER_CELL.init(pico2hsm_firmware::apdu::dispatcher::Dispatcher::new());
+    {
+        use pico2hsm_firmware::storage::KeyStore as _;
+        dispatcher_ref.load_keys_from_store(store);
+    }
+    let dispatcher_ptr = dispatcher_ref as *mut pico2hsm_firmware::apdu::dispatcher::Dispatcher;
+    let dispatcher_send = DispatcherPtr(dispatcher_ptr);
+
     spawn_core1(p.CORE1, unsafe { &mut *addr_of_mut!(CORE1_STACK) }, move || {
         let executor = CORE1_EXECUTOR.init(embassy_executor::Executor::new());
-        executor.run(|spawner| spawner.spawn(dispatcher_task(store).expect("dispatcher task")));
+        executor.run(|spawner| spawner.spawn(dispatcher_task(dispatcher_send).expect("dispatcher task")));
     });
 
     // ── Concurrent USB + CCID command loop (core0) ───────────────────────────
@@ -1192,15 +1426,19 @@ async fn run_waveshare_lcd_board(p: embassy_rp::Peripherals) {
                         let _ = APDU_CHANNEL.send(apdu_bytes).await;
                         // Wait for response with time-extension support.
                         let response = {
-                            use embassy_futures::select::{select, Either};
+                            use embassy_futures::select::{select3, Either3};
                             loop {
-                                match select(RESP_CHANNEL.receive(), embassy_time::Timer::after_millis(1500)).await {
-                                    Either::First(r) => break r,
-                                    Either::Second(_) => {
+                                match select3(RESP_CHANNEL.receive(), embassy_time::Timer::after_millis(1500), FLASH_REQ.receive()).await {
+                                    Either3::First(r) => break r,
+                                    Either3::Second(_) => {
                                         if let Err(CcidError::UsbDisconnected) = ccid.send_time_extension().await {
                                             let _ = RESP_CHANNEL.receive().await;
                                             break heapless::Vec::new();
                                         }
+                                    }
+                                    Either3::Third(op) => {
+                                        let result = handle_flash_op(op, store, dispatcher_ptr);
+                                        FLASH_RESP.send(result).await;
                                     }
                                 }
                             }

@@ -52,20 +52,13 @@ pub fn handle(state: &mut ScHsmState, store: &mut dyn KeyStore, cmd: &ApduComman
 
     // Try to load key from persistent store first, then fall back to in-memory.
     // Also retrieve key_flags to enforce NO_EXPORT.
-    //
-    // TODO(H1): Flash-persisted keys (`KeyObject`) do not yet store key_flags
-    // in their on-disk format — the header is a fixed 20-byte layout and
-    // changing it requires a flash format migration (P2K4).  Keys loaded from
-    // flash therefore default to key_flags=0x00 (exportable).  Once the flash
-    // format is extended, remove this default and read the stored flags.
     let (private_key_bytes, algo_byte, key_flags) = match store.fetch_key(full_key_id) {
         Ok(Some(key_obj)) => {
-            // Got a key from flash. Extract private key and algorithm byte.
-            // Flash format does not yet store key_flags; default to 0x00 (exportable).
+            // Got a key from flash — key_flags is persisted since P2K4.
             let algo = key_obj.algorithm as u8;
             let mut priv_data: heapless::Vec<u8, 2400> = heapless::Vec::new();
             let _ = priv_data.extend_from_slice(&key_obj.private_key);
-            (priv_data, algo, 0x00u8)
+            (priv_data, algo, key_obj.key_flags)
         }
         _ => {
             // Fall back to in-memory key lookup (EC keys).
@@ -102,7 +95,7 @@ pub fn handle(state: &mut ScHsmState, store: &mut dyn KeyStore, cmd: &ApduComman
 
     // Wrap key under DKEK.
     let mut rng = FwRng;
-    match state.dkek.wrap(&private_key_bytes, algo_byte, 0x01, &mut rng) {
+    match state.dkek.wrap(&private_key_bytes, algo_byte, key_flags, &mut rng) {
         Ok(wrapped) => ApduResponse::ok(&wrapped),
         Err(_) => ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
     }

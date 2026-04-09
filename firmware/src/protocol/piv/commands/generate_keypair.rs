@@ -183,6 +183,7 @@ pub fn handle_with_store(
                 key_domain: 0,
                 use_count: 0,
                 generation: 0,
+                key_flags: 0,
                 timestamp_ms: 0,
                 private_key: heapless::Vec::new(),
                 public_key: heapless::Vec::new(),

@@ -1,11 +1,11 @@
 //! Key management — SC-HSM key object format, wrap/unwrap, per-key KEK derivation.
 //!
-//! # Key object on-storage format (P2K3)
+//! # Key object on-storage format (P2K4)
 //! Each key is stored as an AES-256-GCM encrypted blob at logical address
 //! `0xCC00 + key_id` (managed by the storage layer). The blob layout is:
 //!
 //! ```text
-//! [4]   magic            b"P2K3"  (was b"P2K2" before generation field)
+//! [4]   magic            b"P2K4"  (was b"P2K3" before key_flags field)
 //! [1]   key_type         KeyType repr (0x01-0x04)
 //! [4]   key_id           little-endian u32 (partition|applet|reserved|proto_ref)
 //! [1]   algorithm        AlgorithmId repr
@@ -13,10 +13,11 @@
 //! [1]   key_domain       domain tag (0 = default)
 //! [4]   use_count        big-endian u32
 //! [4]   generation       big-endian u32 (new in P2K3; 0 for P2K2 blobs)
+//! [1]   key_flags        key access conditions (new in P2K4; 0 for P2K3/P2K2 blobs)
 //! [N]   private_key      raw private key scalar / symmetric key
 //! [2]   pub_len          big-endian u16 (0 if no public key)
 //! [M]   public_key       raw public key bytes (may be 0 bytes)
-//! ---  (header = first 20 bytes, used as GCM AAD; payload encrypted in-place)
+//! ---  (header = first 21 bytes, used as GCM AAD; payload encrypted in-place)
 //! [16]  GCM tag          appended by AES-256-GCM encrypt
 //! [12]  nonce            appended after tag
 //! ```
@@ -55,19 +56,28 @@ use aes_gcm::{
 // Constants
 // ---------------------------------------------------------------------------
 
-/// Magic header for stored key blobs (v3: added generation counter).
+/// Magic header for stored key blobs (v4: added key_flags byte).
 ///
 /// History:
 ///   - `P2K2` — original u32 key ID format (no generation counter).
-///   - `P2K3` — added 4-byte `generation` field after `use_count`.
+///   - `P2K3` — added 4-byte `generation` field after `use_count` (20-byte header).
+///   - `P2K4` — added 1-byte `key_flags` after `generation` (21-byte header).
 ///
-/// Data written with `P2K2` is handled by backward-compat logic in
-/// `decrypt()` (generation defaults to 0). Firmware that writes `P2K3`
-/// cannot be read by older `P2K2`-only builds — re-INITIALIZE required.
-pub const KEY_MAGIC: [u8; 4] = *b"P2K3";
+/// Data written with `P2K2` or `P2K3` is handled by backward-compat logic in
+/// `decrypt()` (missing fields default to 0). Firmware that writes `P2K4`
+/// cannot be read by older builds — re-INITIALIZE required after upgrade.
+///
+/// **AAD migration**: each magic version uses a different header size as GCM AAD,
+/// so blobs written with one magic cannot be decrypted using another magic's
+/// header size. The `decrypt()` function selects the correct AAD size based on
+/// the magic it finds.
+pub const KEY_MAGIC: [u8; 4] = *b"P2K4";
 
-/// Previous magic header — accepted on read with generation defaulting to 0.
+/// Legacy magic header (v2) — accepted on read with generation=0, key_flags=0.
 pub const KEY_MAGIC_V2: [u8; 4] = *b"P2K2";
+
+/// Legacy magic header (v3) — accepted on read with key_flags=0.
+pub const KEY_MAGIC_V3: [u8; 4] = *b"P2K3";
 
 /// Maximum number of key slots (key_id 0x01–0xFF).
 pub const MAX_KEYS: usize = 255;
@@ -243,6 +253,12 @@ pub struct KeyObject {
     /// Blobs written with the old `P2K2` magic will deserialize with
     /// `generation = 0`.
     pub generation:  u32,
+    /// Key access conditions byte (SC-HSM TLV tag 0xD4).
+    ///
+    /// Bit layout: 0=ALLOW_SIGN, 1=ALLOW_DECRYPT, 2=ALLOW_DERIVE, 3=NO_EXPORT.
+    /// Default 0x00 = all operations allowed, exportable.
+    /// Persisted in flash since P2K4; older blobs (P2K2/P2K3) default to 0.
+    pub key_flags:   u8,
     /// Daemon-assigned HLC timestamp (ms since epoch), 0 for legacy/locally-generated keys.
     pub timestamp_ms: u64,
     /// Raw private key scalar or symmetric key bytes (zeroized on drop).
@@ -257,6 +273,7 @@ impl Zeroize for KeyObject {
         self.public_key.zeroize();
         self.use_count = 0;
         self.generation = 0;
+        self.key_flags = 0;
         self.timestamp_ms = 0;
         self.key_id = 0;
         self.owner.zeroize();
@@ -286,6 +303,7 @@ impl KeyObject {
             key_domain: 0,
             use_count: 0,
             generation: 0,
+            key_flags: 0,
             timestamp_ms: 0,
             private_key: heapless::Vec::new(),
             public_key: heapless::Vec::new(),
@@ -298,10 +316,10 @@ impl KeyObject {
 
     /// Serialise the fixed metadata header into `buf` (AAD portion).
     ///
-    /// Layout (20 bytes, P2K3):
+    /// Layout (21 bytes, P2K4):
     ///   magic(4) | key_type(1) | key_id(4) | algorithm(1) |
-    ///   key_size(1) | key_domain(1) | use_count(4) | generation(4)
-    fn write_header(&self, buf: &mut [u8; 20]) {
+    ///   key_size(1) | key_domain(1) | use_count(4) | generation(4) | key_flags(1)
+    fn write_header(&self, buf: &mut [u8; 21]) {
         buf[0..4].copy_from_slice(&KEY_MAGIC);
         buf[4] = self.key_type as u8;
         buf[5..9].copy_from_slice(&self.key_id.to_le_bytes());
@@ -310,6 +328,7 @@ impl KeyObject {
         buf[11] = self.key_domain;
         buf[12..16].copy_from_slice(&self.use_count.to_be_bytes());
         buf[16..20].copy_from_slice(&self.generation.to_be_bytes());
+        buf[20] = self.key_flags;
     }
 
     // -----------------------------------------------------------------------
@@ -319,7 +338,7 @@ impl KeyObject {
     /// Encrypt this key object into a storage blob.
     ///
     /// The returned buffer contains:
-    /// `header(20) || priv_key(N) || pub_len(2) || pub_key(M) || tag(16) || nonce(12)`
+    /// `header(21) || priv_key(N) || pub_len(2) || pub_key(M) || tag(16) || nonce(12)`
     ///
     /// where `header` also acts as the GCM AAD so any tampering with metadata
     /// is detected on decryption.
@@ -332,7 +351,7 @@ impl KeyObject {
         let kek = derive_key_encryption_key(smk, (self.key_id & 0xFF) as u8)?;
 
         // Build AAD = header bytes.
-        let mut header = [0u8; 20];
+        let mut header = [0u8; 21];
         self.write_header(&mut header);
 
         // Build plaintext = priv_key || pub_len(2) || pub_key
@@ -346,19 +365,19 @@ impl KeyObject {
 
         // GCM payload buffer (plaintext -> ciphertext in-place)
         let mut ct_buf: heapless::Vec<u8, 1200> = heapless::Vec::new();
-        // Start with the 20-byte header (included in blob, used as GCM AAD)
+        // Start with the 21-byte header (included in blob, used as GCM AAD)
         ct_buf.extend_from_slice(&header).map_err(|_| KeyError::BufferTooSmall)?;
         ct_buf.extend_from_slice(&self.private_key).map_err(|_| KeyError::BufferTooSmall)?;
         let pub_len_bytes = (pub_len as u16).to_be_bytes();
         ct_buf.extend_from_slice(&pub_len_bytes).map_err(|_| KeyError::BufferTooSmall)?;
         ct_buf.extend_from_slice(&self.public_key).map_err(|_| KeyError::BufferTooSmall)?;
 
-        // Encrypt the payload portion (everything after the 20-byte header) in-place.
+        // Encrypt the payload portion (everything after the 21-byte header) in-place.
         let cipher = Aes256Gcm::new_from_slice(&*kek)
             .map_err(|_| KeyError::EncryptFailure)?;
         let nonce_arr = GcmNonce::from_slice(nonce);
 
-        const HEADER_SIZE: usize = 20;
+        const HEADER_SIZE: usize = 21;
         let tag = cipher
             .encrypt_in_place_detached(nonce_arr, &header, &mut ct_buf.as_mut_slice()[HEADER_SIZE..])
             .map_err(|_| KeyError::EncryptFailure)?;
@@ -380,8 +399,9 @@ impl KeyObject {
     /// `key_id` is the full u32 internal key ID; the low byte (proto_ref) is
     /// used for KEK derivation and must match the blob header.
     ///
-    /// Supports both `P2K3` (20-byte header with generation) and the legacy
-    /// `P2K2` (16-byte header, generation defaults to 0).
+    /// Supports `P2K4` (21-byte header with key_flags), `P2K3` (20-byte header
+    /// with generation, key_flags defaults to 0), and the legacy `P2K2`
+    /// (16-byte header, generation and key_flags default to 0).
     pub fn decrypt(blob: &[u8], key_id: u32, smk: &[u8; 32]) -> Result<Self, KeyError> {
         // Minimum: header(16) + tag(16) + nonce(12) = 44 bytes (P2K2 minimum)
         if blob.len() < 44 {
@@ -389,12 +409,13 @@ impl KeyObject {
         }
 
         // Determine header version from the magic bytes.
-        let is_v3 = bool::from(blob[0..4].ct_eq(&KEY_MAGIC));
+        let is_v4 = bool::from(blob[0..4].ct_eq(&KEY_MAGIC));
+        let is_v3 = bool::from(blob[0..4].ct_eq(&KEY_MAGIC_V3));
         let is_v2 = bool::from(blob[0..4].ct_eq(&KEY_MAGIC_V2));
-        if !is_v3 && !is_v2 {
+        if !is_v4 && !is_v3 && !is_v2 {
             return Err(KeyError::BadMagic);
         }
-        let header_size: usize = if is_v3 { 20 } else { 16 };
+        let header_size: usize = if is_v4 { 21 } else if is_v3 { 20 } else { 16 };
 
         if blob.len() < header_size + TAG_SIZE + NONCE_SIZE {
             return Err(KeyError::InvalidFormat);
@@ -421,12 +442,15 @@ impl KeyObject {
         let domain    = header[11];
         let use_count = u32::from_be_bytes(header[12..16].try_into().unwrap());
 
-        // Parse generation (P2K3 only; defaults to 0 for P2K2 blobs).
-        let generation = if is_v3 {
+        // Parse generation (P2K3/P2K4; defaults to 0 for P2K2 blobs).
+        let generation = if is_v4 || is_v3 {
             u32::from_be_bytes(header[16..20].try_into().unwrap())
         } else {
             0
         };
+
+        // Parse key_flags (P2K4 only; defaults to 0 for P2K2/P2K3 blobs).
+        let key_flags = if is_v4 { header[20] } else { 0 };
 
         // Sanity: the key_id in the blob must match the requested key_id.
         if stored_key_id != key_id {
@@ -490,6 +514,7 @@ impl KeyObject {
             key_domain: domain,
             use_count,
             generation,
+            key_flags,
             timestamp_ms: 0,
             private_key: heapless::Vec::new(),
             public_key: heapless::Vec::new(),
@@ -635,6 +660,7 @@ impl KeyObject {
             key_domain: 0,
             use_count:  0,
             generation: 0,
+            key_flags:  0,
             timestamp_ms: 0,
             private_key: heapless::Vec::new(),
             public_key: heapless::Vec::new(),

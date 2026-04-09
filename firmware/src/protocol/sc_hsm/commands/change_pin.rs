@@ -55,6 +55,15 @@ fn find_tlv<'a>(data: &'a [u8], tag: u8) -> Option<&'a [u8]> {
     None
 }
 
+/// Handle a CHANGE REFERENCE DATA APDU command with flash persistence.
+pub fn handle_with_store(state: &mut ScHsmState, store: &mut dyn crate::storage::KeyStore, cmd: &ApduCommand<'_>) -> ApduResponse {
+    let resp = handle(state, cmd);
+    if resp.sw == SW_OK {
+        crate::protocol::sc_hsm::ScHsm::save_pin_to_store(state, store);
+    }
+    resp
+}
+
 /// Handle a CHANGE REFERENCE DATA APDU command.
 pub fn handle(state: &mut ScHsmState, cmd: &ApduCommand<'_>) -> ApduResponse {
     // P1=0x00: old||new concatenated (no TLV)

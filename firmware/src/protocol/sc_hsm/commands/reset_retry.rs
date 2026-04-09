@@ -24,6 +24,15 @@ fn hash_pin(pin: &[u8], out: &mut [u8; 32]) {
     out.copy_from_slice(&result);
 }
 
+/// Handle a RESET RETRY COUNTER APDU command with flash persistence.
+pub fn handle_with_store(state: &mut ScHsmState, store: &mut dyn crate::storage::KeyStore, cmd: &ApduCommand<'_>) -> ApduResponse {
+    let resp = handle(state, cmd);
+    if resp.sw == pico2hsm_core::apdu::SW_OK {
+        crate::protocol::sc_hsm::ScHsm::save_pin_to_store(state, store);
+    }
+    resp
+}
+
 /// Handle a RESET RETRY COUNTER APDU command.
 pub fn handle(state: &mut ScHsmState, cmd: &ApduCommand<'_>) -> ApduResponse {
     // Requires SO-PIN verified or equivalent authority

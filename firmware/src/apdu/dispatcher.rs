@@ -73,6 +73,19 @@ impl Dispatcher {
         }
     }
 
+    /// Return the total number of in-memory keys across all applets, clamped to u8.
+    ///
+    /// Used by core1 to update the `KEY_COUNT` atomic without needing access
+    /// to the flash keystore (which lives on core0).
+    pub fn in_memory_key_count(&self) -> u8 {
+        let mut count = self.sc_hsm.state.keys.len();
+        #[cfg(feature = "rsa")]
+        {
+            count += self.sc_hsm.state.rsa_keys.len();
+        }
+        count.min(255) as u8
+    }
+
     /// Load all persisted keys from flash into the in-memory key cache.
     ///
     /// Called at session start and on USB reconnect (new Dispatcher).
@@ -83,6 +96,10 @@ impl Dispatcher {
             // Only load SC-HSM keys (applet byte == 0) here.
             // PIV and OpenPGP are loaded via their own load_from_store methods below.
             if kid.applet_byte() != 0 {
+                continue;
+            }
+            // Skip PIN sentinel (proto_ref 0xFF) — loaded separately below.
+            if kid.proto_ref() == 0xFF {
                 continue;
             }
             match store.fetch_key(*kid) {
@@ -102,6 +119,9 @@ impl Dispatcher {
 
         // Load OpenPGP keys and PIN state.
         self.openpgp.load_from_store(store);
+
+        // Load SC-HSM PIN state from flash sentinel.
+        ScHsm::load_pin_state_from_store(&mut self.sc_hsm.state, store);
     }
 
     /// Dispatch a raw APDU byte slice with access to persistent storage.
@@ -305,7 +325,7 @@ fn push_key_object_to_state(
             key_id: obj.key_id,
             key_type: core_key_type,
             algo,
-            key_flags: 0, // TODO(H1): flash format does not store key_flags yet
+            key_flags: obj.key_flags,
             private_key_der: heapless::Vec::new(),
             modulus: heapless::Vec::new(),
             exponent: heapless::Vec::new(),
@@ -335,7 +355,7 @@ fn push_key_object_to_state(
         key_id: obj.key_id,
         key_type: core_key_type,
         algo,
-        key_flags: 0,
+        key_flags: obj.key_flags,
         private_key: heapless::Vec::new(),
         public_key: heapless::Vec::new(),
     };

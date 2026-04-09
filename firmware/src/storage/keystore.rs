@@ -102,6 +102,7 @@ impl<Chip: FlashChip> KeyStore for FlashKeyStore<Chip> {
         obj_copy.key_domain = obj.key_domain;
         obj_copy.use_count = obj.use_count;
         obj_copy.generation = obj.generation.saturating_add(1);
+        obj_copy.key_flags = obj.key_flags;
         obj_copy.private_key.extend_from_slice(&obj.private_key)
             .map_err(|_| HsmError::Crypto(CryptoError::EncryptFailure))?;
         obj_copy.public_key.extend_from_slice(&obj.public_key)

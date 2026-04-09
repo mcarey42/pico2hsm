@@ -802,6 +802,7 @@ pub fn handle(state: &mut ScHsmState, store: &mut dyn crate::storage::KeyStore, 
                 _ => AlgorithmId::RsaDecrypt,
             };
             let mut key_obj = KeyObject::new(KmType::Rsa, key_id, pico2hsm_core::key::AppletId::ScHsm, km_algo);
+            key_obj.key_flags = key_flags;
             let _ = key_obj.private_key.extend_from_slice(&pair.private_key_der);
             // Store modulus || exponent in public_key for future reconstruction.
             // Layout: [2-byte modulus_len BE] || modulus || exponent
@@ -856,6 +857,7 @@ pub fn handle(state: &mut ScHsmState, store: &mut dyn crate::storage::KeyStore, 
             None => return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
         };
         let mut key_obj = KeyObject::new(KmType::Ec, key_id, pico2hsm_core::key::AppletId::ScHsm, km_algo);
+        key_obj.key_flags = key_flags;
         let _ = key_obj.private_key.extend_from_slice(&pair.private_key);
         let _ = key_obj.public_key.extend_from_slice(&pair.public_key);
         let _ = store.save_key(&key_obj); // best-effort; InvalidCore is silent on Core1

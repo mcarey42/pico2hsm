@@ -75,7 +75,7 @@ pub fn handle(state: &mut ScHsmState, store: &mut dyn KeyStore, cmd: &ApduComman
     };
 
     // Unwrap key blob under DKEK.
-    let (key_material, algo_id, _key_flags) = match state.dkek.unwrap(&blob_data) {
+    let (key_material, algo_id, key_flags) = match state.dkek.unwrap(&blob_data) {
         Ok(result) => result,
         Err(_) => return ApduResponse::err(SW_WRONG_DATA),
     };
@@ -102,6 +102,7 @@ pub fn handle(state: &mut ScHsmState, store: &mut dyn KeyStore, cmd: &ApduComman
 
     // Build KeyObject for persistent storage.
     let mut key_obj = KeyObject::new(km_type, full_key_id.0, AppletId::ScHsm, km_algo);
+    key_obj.key_flags = key_flags;
     let _ = key_obj.private_key.extend_from_slice(&key_material);
 
     // Persist to flash (best-effort; flash writes fail with InvalidCore on Core1
@@ -136,7 +137,7 @@ pub fn handle(state: &mut ScHsmState, store: &mut dyn KeyStore, cmd: &ApduComman
         key_id: full_key_id.0,
         key_type: core_key_type,
         algo: algo_id,
-        key_flags: 0,
+        key_flags,
         private_key: heapless::Vec::new(),
         public_key: heapless::Vec::new(),
     };

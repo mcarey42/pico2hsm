@@ -33,8 +33,12 @@ pub fn handle(state: &mut ScHsmState, cmd: &ApduCommand<'_>) -> ApduResponse {
     }
     #[cfg(feature = "rsa")]
     for key in &state.rsa_keys {
+        let rsa_proto_ref = (key.key_id & 0xFF) as u8;
+        if rsa_proto_ref >= 0xF0 {
+            continue;
+        }
         let _ = resp.push(0xCC);
-        let _ = resp.push((key.key_id & 0xFF) as u8); // proto_ref byte
+        let _ = resp.push(rsa_proto_ref);
     }
     // Also expose PRKD (C4 xx) and EE-cert (CE xx) EF entries so that
     // SELECT by those file IDs succeeds and sc_pkcs15emu_sc_hsm_add_prkd

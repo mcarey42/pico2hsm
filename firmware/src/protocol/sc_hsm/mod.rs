@@ -385,6 +385,8 @@ impl ScHsm {
             generate_key::INS_GENERATE_KEY => generate_key::handle(&mut self.state, store, cmd),
             export_key::INS_EXPORT_KEY => export_key::handle(&mut self.state, store, cmd),
             import_key::INS_IMPORT_KEY => import_key::handle(&mut self.state, store, cmd),
+            change_pin::INS_CHANGE_PIN => change_pin::handle_with_store(&mut self.state, store, cmd),
+            reset_retry::INS_RESET_RETRY => reset_retry::handle_with_store(&mut self.state, store, cmd),
             extras::INS_EXTRAS => extras::handle(&mut self.state, store, cmd),
             // All other commands fall through to the stateless dispatch.
             _ => self.dispatch(cmd),
@@ -443,6 +445,66 @@ impl ScHsm {
 }
 
 impl ScHsm {
+    /// KeyId for the SC-HSM PIN state sentinel in flash.
+    pub fn sc_hsm_pin_key_id() -> pico2hsm_core::key::KeyId {
+        pico2hsm_core::key::KeyId::sc_hsm(0, 0xFF)
+    }
+
+    /// Serialize and persist the SC-HSM PIN/SO-PIN/PUK state to flash.
+    ///
+    /// Stored as a Generic key object at `KeyId::sc_hsm(0, 0xFF)`.
+    /// Layout (101 bytes total):
+    ///   [0..32]   user_pin_hash (all zeros if None)
+    ///   [32]      pin_retry_count
+    ///   [33..65]  so_pin_hash (all zeros if None)
+    ///   [65]      so_pin_retry_count
+    ///   [66..98]  puk_hash (all zeros if None)
+    ///   [98]      puk_retry_count
+    ///   [99]      initialized (1 = true, 0 = false)
+    ///   [100]     reserved (0x00)
+    pub fn save_pin_to_store(state: &ScHsmState, store: &mut dyn crate::storage::KeyStore) {
+        use crate::security::key_management::{AlgorithmId, KeyObject, KeyType as KmKeyType};
+        use pico2hsm_core::key::AppletId;
+
+        let mut buf: heapless::Vec<u8, 128> = heapless::Vec::new();
+        let user_hash = state.user_pin_hash.unwrap_or([0u8; 32]);
+        let _ = buf.extend_from_slice(&user_hash);
+        let _ = buf.push(state.pin_retry_count);
+        let so_hash = state.so_pin_hash.unwrap_or([0u8; 32]);
+        let _ = buf.extend_from_slice(&so_hash);
+        let _ = buf.push(state.so_pin_retry_count);
+        let puk_hash = state.puk_hash.unwrap_or([0u8; 32]);
+        let _ = buf.extend_from_slice(&puk_hash);
+        let _ = buf.push(state.puk_retry_count);
+        let _ = buf.push(state.initialized as u8);
+        let _ = buf.push(0x00); // reserved
+
+        let kid = Self::sc_hsm_pin_key_id();
+        let mut obj = KeyObject::new(KmKeyType::Generic, kid.0, AppletId::ScHsm, AlgorithmId::AesGcm);
+        let _ = obj.private_key.extend_from_slice(&buf);
+        let _ = store.save_key(&obj);
+    }
+
+    /// Load PIN/SO-PIN/PUK state from flash into `state`.
+    pub fn load_pin_state_from_store(state: &mut ScHsmState, store: &mut dyn crate::storage::KeyStore) {
+        let kid = Self::sc_hsm_pin_key_id();
+        if let Ok(Some(obj)) = store.fetch_key(kid) {
+            let b = &obj.private_key;
+            if b.len() >= 101 {
+                let user_hash: [u8; 32] = b[0..32].try_into().unwrap_or([0u8; 32]);
+                state.user_pin_hash = if user_hash == [0u8; 32] { None } else { Some(user_hash) };
+                state.pin_retry_count = b[32];
+                let so_hash: [u8; 32] = b[33..65].try_into().unwrap_or([0u8; 32]);
+                state.so_pin_hash = if so_hash == [0u8; 32] { None } else { Some(so_hash) };
+                state.so_pin_retry_count = b[65];
+                let puk_hash: [u8; 32] = b[66..98].try_into().unwrap_or([0u8; 32]);
+                state.puk_hash = if puk_hash == [0u8; 32] { None } else { Some(puk_hash) };
+                state.puk_retry_count = b[98];
+                state.initialized = b[99] != 0;
+            }
+        }
+    }
+
     /// Process a raw APDU with access to persistent storage.
     ///
     /// All key-mutating commands (INITIALIZE, GENERATE KEY PAIR, DELETE FILE)
