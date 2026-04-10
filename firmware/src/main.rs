@@ -46,6 +46,10 @@ use panic_probe as _;
 #[cfg(target_arch = "arm")]
 use core::ptr::addr_of_mut;
 #[cfg(target_arch = "arm")]
+extern "C" {
+    static __ebss: u8;
+}
+#[cfg(target_arch = "arm")]
 use embassy_rp::multicore::{Stack, spawn_core1};
 #[cfg(target_arch = "arm")]
 use embassy_rp::spinlock_mutex::SpinlockRawMutex;
@@ -343,8 +347,26 @@ async fn main(_spawner: Spawner) {
         }
     }
 
-    defmt::info!("pico2hsm: peripherals initialised");
+    // ── MSPLIM — hardware stack overflow detection for Core0 ──────────────────
+    // Core0 stack grows downward from 0x20082000; BSS ends at _ebss.  Set the
+    // limit 16 KB above _ebss so any overflow is caught well before it corrupts
+    // BSS.  Also enable UsageFault so STKOF surfaces cleanly in probe-rs.
+    #[cfg(target_arch = "arm")]
+    unsafe {
+        let ebss = core::ptr::addr_of!(__ebss) as u32;
+        cortex_m::register::msplim::write(ebss + 16384);
 
+        // Enable UsageFault handler so STKOF fires as UsageFault, not HardFault.
+        // SHCSR bit 18 = USGFAULTENA.
+        (*cortex_m::peripheral::SCB::PTR)
+            .shcsr
+            .modify(|v| v | (1 << 18));
+
+        defmt::info!("core0: MSPLIM set to 0x{:08X} (__ebss=0x{:08X})",
+            ebss + 16384, ebss);
+    }
+
+    defmt::info!("pico2hsm: peripherals initialised");
 
     // ── Pico 2: security + OTP + board loop ──────────────────────────────────
     #[cfg(feature = "pico2_4m")]
@@ -575,7 +597,7 @@ async fn run_one_board(p: embassy_rp::Peripherals) {
     // flash reads via XIP are safe).  A raw pointer is passed to core1 which
     // exclusively owns the Dispatcher after this point.
     let dispatcher_ref: &'static mut pico2hsm_firmware::apdu::dispatcher::Dispatcher =
-        DISPATCHER_CELL.init(pico2hsm_firmware::apdu::dispatcher::Dispatcher::new());
+        pico2hsm_firmware::apdu::dispatcher::Dispatcher::init_in_place(DISPATCHER_CELL.uninit());
     {
         use pico2hsm_firmware::storage::KeyStore as _;
         dispatcher_ref.load_keys_from_store(store);
@@ -584,6 +606,15 @@ async fn run_one_board(p: embassy_rp::Peripherals) {
     let dispatcher_send = DispatcherPtr(dispatcher_ptr);
 
     spawn_core1(p.CORE1, unsafe { &mut *addr_of_mut!(CORE1_STACK) }, move || {
+        // MSPLIM — hardware stack overflow detection for Core1.
+        // CORE1_STACK is 128 KB; set limit 8 KB above bottom for early warning.
+        // No defmt here — Core1 defmt contends on Spinlock31 with Core0 USB.
+        #[cfg(target_arch = "arm")]
+        unsafe {
+            let stack_bottom = core::ptr::addr_of!(CORE1_STACK) as u32;
+            cortex_m::register::msplim::write(stack_bottom + 8192);
+        }
+
         let executor = CORE1_EXECUTOR.init(embassy_executor::Executor::new());
         executor.run(|spawner| spawner.spawn(dispatcher_task(dispatcher_send).expect("dispatcher task")));
     });
@@ -833,7 +864,7 @@ async fn run_geek_board(p: embassy_rp::Peripherals) {
 
     // ── CHECKPOINT 7 — init dispatcher on core0, spawn core1 ──────────────
     let dispatcher_ref: &'static mut pico2hsm_firmware::apdu::dispatcher::Dispatcher =
-        DISPATCHER_CELL.init(pico2hsm_firmware::apdu::dispatcher::Dispatcher::new());
+        pico2hsm_firmware::apdu::dispatcher::Dispatcher::init_in_place(DISPATCHER_CELL.uninit());
     {
         use pico2hsm_firmware::storage::KeyStore as _;
         dispatcher_ref.load_keys_from_store(store);
@@ -842,6 +873,15 @@ async fn run_geek_board(p: embassy_rp::Peripherals) {
     let dispatcher_send = DispatcherPtr(dispatcher_ptr);
 
     spawn_core1(p.CORE1, unsafe { &mut *addr_of_mut!(CORE1_STACK) }, move || {
+        // MSPLIM — hardware stack overflow detection for Core1.
+        // CORE1_STACK is 128 KB; set limit 8 KB above bottom for early warning.
+        // No defmt here — Core1 defmt contends on Spinlock31 with Core0 USB.
+        #[cfg(target_arch = "arm")]
+        unsafe {
+            let stack_bottom = core::ptr::addr_of!(CORE1_STACK) as u32;
+            cortex_m::register::msplim::write(stack_bottom + 8192);
+        }
+
         let executor = CORE1_EXECUTOR.init(embassy_executor::Executor::new());
         executor.run(|spawner| spawner.spawn(dispatcher_task(dispatcher_send).expect("dispatcher task")));
     });
@@ -1090,7 +1130,7 @@ async fn run_pico2_board(p: embassy_rp::Peripherals) {
 
     // ── Init dispatcher on core0, then spawn core1 ─────────────────────────
     let dispatcher_ref: &'static mut pico2hsm_firmware::apdu::dispatcher::Dispatcher =
-        DISPATCHER_CELL.init(pico2hsm_firmware::apdu::dispatcher::Dispatcher::new());
+        pico2hsm_firmware::apdu::dispatcher::Dispatcher::init_in_place(DISPATCHER_CELL.uninit());
     {
         use pico2hsm_firmware::storage::KeyStore as _;
         dispatcher_ref.load_keys_from_store(store);
@@ -1100,6 +1140,15 @@ async fn run_pico2_board(p: embassy_rp::Peripherals) {
 
     defmt::info!("core0: spawning core1");
     spawn_core1(p.CORE1, unsafe { &mut *addr_of_mut!(CORE1_STACK) }, move || {
+        // MSPLIM — hardware stack overflow detection for Core1.
+        // CORE1_STACK is 128 KB; set limit 8 KB above bottom for early warning.
+        // No defmt here — Core1 defmt contends on Spinlock31 with Core0 USB.
+        #[cfg(target_arch = "arm")]
+        unsafe {
+            let stack_bottom = core::ptr::addr_of!(CORE1_STACK) as u32;
+            cortex_m::register::msplim::write(stack_bottom + 8192);
+        }
+
         let executor = CORE1_EXECUTOR.init(embassy_executor::Executor::new());
         executor.run(|spawner| spawner.spawn(dispatcher_task(dispatcher_send).expect("dispatcher task")));
     });
@@ -1362,7 +1411,7 @@ async fn run_waveshare_lcd_board(p: embassy_rp::Peripherals) {
 
     // ── Init dispatcher on core0, then spawn core1 ─────────────────────────
     let dispatcher_ref: &'static mut pico2hsm_firmware::apdu::dispatcher::Dispatcher =
-        DISPATCHER_CELL.init(pico2hsm_firmware::apdu::dispatcher::Dispatcher::new());
+        pico2hsm_firmware::apdu::dispatcher::Dispatcher::init_in_place(DISPATCHER_CELL.uninit());
     {
         use pico2hsm_firmware::storage::KeyStore as _;
         dispatcher_ref.load_keys_from_store(store);
@@ -1371,6 +1420,15 @@ async fn run_waveshare_lcd_board(p: embassy_rp::Peripherals) {
     let dispatcher_send = DispatcherPtr(dispatcher_ptr);
 
     spawn_core1(p.CORE1, unsafe { &mut *addr_of_mut!(CORE1_STACK) }, move || {
+        // MSPLIM — hardware stack overflow detection for Core1.
+        // CORE1_STACK is 128 KB; set limit 8 KB above bottom for early warning.
+        // No defmt here — Core1 defmt contends on Spinlock31 with Core0 USB.
+        #[cfg(target_arch = "arm")]
+        unsafe {
+            let stack_bottom = core::ptr::addr_of!(CORE1_STACK) as u32;
+            cortex_m::register::msplim::write(stack_bottom + 8192);
+        }
+
         let executor = CORE1_EXECUTOR.init(embassy_executor::Executor::new());
         executor.run(|spawner| spawner.spawn(dispatcher_task(dispatcher_send).expect("dispatcher task")));
     });

@@ -73,6 +73,28 @@ impl Dispatcher {
         }
     }
 
+    /// Initialise a Dispatcher directly in the provided `MaybeUninit` slot,
+    /// avoiding an 82 KB stack temporary.
+    ///
+    /// In debug builds the compiler does not perform Named Return Value
+    /// Optimisation, so `Dispatcher::new()` would place the full ~82 KB
+    /// struct on the Core0 machine stack before `memcpy`-ing it to the
+    /// destination.  With only ~113 KB of stack this overflows into BSS
+    /// and corrupts wakers / async state.
+    ///
+    /// This method uses `addr_of_mut!` to write each field individually
+    /// into the destination, keeping peak stack usage under 1 KB.
+    pub fn init_in_place(dest: &mut core::mem::MaybeUninit<Self>) -> &mut Self {
+        let ptr = dest.as_mut_ptr();
+        unsafe {
+            core::ptr::addr_of_mut!((*ptr).active).write(ActiveProtocol::None);
+            core::ptr::addr_of_mut!((*ptr).sc_hsm).write(ScHsm::new());
+            core::ptr::addr_of_mut!((*ptr).piv).write(Piv::new());
+            core::ptr::addr_of_mut!((*ptr).openpgp).write(OpenPgp::new());
+            &mut *ptr
+        }
+    }
+
     /// Return the total number of in-memory keys across all applets, clamped to u8.
     ///
     /// Used by core1 to update the `KEY_COUNT` atomic without needing access
