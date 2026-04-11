@@ -543,30 +543,31 @@ async fn run_one_board(p: embassy_rp::Peripherals) {
     let mut board = Rp2350OneBoard::new(spi0, spi1);
     board.led().set_status(LedStatus::Busy);
 
-    // ── Storage initialization (rp2350_one: RAID-1 SPI flash pair) ───────────
-    // TODO (board-storage wiring): The SPI buses spi0/spi1 are consumed by
-    // Rp2350OneBoard::new() above and stored as board.spi0/board.spi1.  To use
-    // them for SpiFlash storage, the board struct would need to be refactored
-    // so that SPI buses are either:
-    //   a) consumed into SpiFlash before board construction (requires a LED-only
-    //      board constructor), or
-    //   b) extracted from the board struct (partial move; incompatible with
-    //      subsequent board.led() calls in the CCID loop).
-    // For now we initialise the keystore with AnyChip::Empty (no physical chips)
-    // so that the storage infrastructure compiles and the dispatcher_task()
-    // parameter is wired in.  Real SPI flash wiring will be added once the board
-    // struct is refactored.
+    // ── Storage initialization (rp2350_one: internal QMI flash) ───────────────
+    // TODO (board-storage wiring): SPI0/SPI1 external flash (RAID-1) requires
+    // board struct refactor to separate LED from SPI ownership.  For now, use
+    // the RP2350 internal QMI flash (upper 2 MB partition) via the AnyChip::SdCard
+    // slot (third type parameter is QmiFlash).
     let smk_bytes = pico2hsm_firmware::security::otp::derive_smk()
         .unwrap_or([0u8; 32]);
     let smk = zeroize::Zeroizing::new(smk_bytes);
+
+    let qmi_flash = embassy_rp::flash::Flash::<
+        _,
+        embassy_rp::flash::Blocking,
+        { pico2hsm_firmware::storage::flash_chip::QMI_FLASH_SIZE },
+    >::new_blocking(p.FLASH);
+    let qmi = pico2hsm_firmware::storage::flash_chip::QmiFlash::new(qmi_flash);
+
     let mut fs = pico2hsm_firmware::storage::filesystem::KeyFilesystem::new();
-    // No chips added — degraded mode (all key operations will fail gracefully).
+    let _ = fs.add_chip(pico2hsm_firmware::storage::AnyChip::SdCard(qmi));
     let sm = pico2hsm_firmware::storage::StorageManager::new(fs);
     let mut ks = pico2hsm_firmware::storage::FlashKeyStore::new(sm, smk);
     match ks.init() {
-        Ok(()) => defmt::info!("KeyStore: initialized (rp2350_one — degraded, no chips)"),
-        Err(_) => defmt::warn!("KeyStore: init failed — degraded mode"),
+        Ok(()) => defmt::info!("KeyStore: initialized (rp2350_one internal flash)"),
+        Err(_) => defmt::warn!("KeyStore: init failed — degraded mode (blank flash?)"),
     }
+    debug_dump_storage(&ks);
     let store: &'static mut _ = KEYSTORE_CELL.init(ks);
 
     // ── USB CCID + CDC-ACM serial transport ─────────────────────────────────
@@ -867,23 +868,30 @@ async fn run_geek_board(p: embassy_rp::Peripherals) {
     serial_ln!("LED=Ready — entering main loop");
     defmt::info!("pico2hsm (RP2350-Geek): USB CCID ready, entering main loop");
 
-    // ── Storage initialization (rp2350_geek: RAID-1 SPI flash pair) ──────────
-    // TODO (board-storage wiring): Same constraint as rp2350_one — spi0/spi1
-    // are owned by Rp2350GeekBoard.  Real SPI flash wiring requires a board
-    // struct refactor (separate LED from SPI ownership) so that the buses can
-    // be consumed into SpiFlash instances.  For now, initialise with no chips
-    // (AnyChip::Empty) so the storage plumbing compiles and the store parameter
-    // is wired to the dispatcher.
-    serial_ln!("KeyStore init (degraded — no chips)...");
+    // ── Storage initialization (rp2350_geek: internal QMI flash) ──────────────
+    // TODO (board-storage wiring): SPI0/SPI1 external flash (RAID-1) requires
+    // board struct refactor to separate LED from SPI ownership.  For now, use
+    // the RP2350 internal QMI flash (upper 2 MB partition) via the AnyChip::SdCard
+    // slot (third type parameter is QmiFlash).
+    serial_ln!("KeyStore init (QMI internal flash)...");
     let smk_bytes = pico2hsm_firmware::security::otp::derive_smk()
         .unwrap_or([0u8; 32]);
     let smk = zeroize::Zeroizing::new(smk_bytes);
-    let fs = pico2hsm_firmware::storage::filesystem::KeyFilesystem::new();
+
+    let qmi_flash = embassy_rp::flash::Flash::<
+        _,
+        embassy_rp::flash::Blocking,
+        { pico2hsm_firmware::storage::flash_chip::QMI_FLASH_SIZE },
+    >::new_blocking(p.FLASH);
+    let qmi = pico2hsm_firmware::storage::flash_chip::QmiFlash::new(qmi_flash);
+
+    let mut fs = pico2hsm_firmware::storage::filesystem::KeyFilesystem::new();
+    let _ = fs.add_chip(pico2hsm_firmware::storage::AnyChip::SdCard(qmi));
     let sm = pico2hsm_firmware::storage::StorageManager::new(fs);
     let mut ks = pico2hsm_firmware::storage::FlashKeyStore::new(sm, smk);
     match ks.init() {
-        Ok(()) => serial_ln!("KeyStore ok (degraded — no chips)"),
-        Err(_) => serial_ln!("KeyStore init failed"),
+        Ok(()) => serial_ln!("KeyStore ok (QMI internal flash)"),
+        Err(_) => serial_ln!("KeyStore init failed — degraded mode"),
     }
     let store: &'static mut _ = KEYSTORE_CELL.init(ks);
 
@@ -1392,15 +1400,23 @@ async fn run_waveshare_lcd_board(p: embassy_rp::Peripherals) {
         KEYSTORE_CELL.init(ks)
     };
 
-    // waveshare_rp2350_lcd_16m: degraded QMI (no chips wired).
+    // waveshare_rp2350_lcd_16m: internal QMI flash keystore (upper 2 MB).
     #[cfg(not(feature = "waveshare_rp2350_lcd_sdcard"))]
     let store: &'static mut _ = {
-        let fs = pico2hsm_firmware::storage::filesystem::KeyFilesystem::new();
+        let qmi_flash = embassy_rp::flash::Flash::<
+            _,
+            embassy_rp::flash::Blocking,
+            { pico2hsm_firmware::storage::flash_chip::QMI_FLASH_SIZE },
+        >::new_blocking(p.FLASH);
+        let qmi = pico2hsm_firmware::storage::flash_chip::QmiFlash::new(qmi_flash);
+
+        let mut fs = pico2hsm_firmware::storage::filesystem::KeyFilesystem::new();
+        let _ = fs.add_chip(qmi);
         let sm = pico2hsm_firmware::storage::StorageManager::new(fs);
         let mut ks = pico2hsm_firmware::storage::FlashKeyStore::new(sm, smk);
         match ks.init() {
-            Ok(()) => defmt::info!("KeyStore: initialized (waveshare_rp2350_lcd — degraded, no chips)"),
-            Err(_) => defmt::warn!("KeyStore: init failed — degraded mode"),
+            Ok(()) => defmt::info!("KeyStore: initialized (waveshare_rp2350_lcd_16m internal flash)"),
+            Err(_) => defmt::warn!("KeyStore: init failed — degraded mode (blank flash?)"),
         }
         KEYSTORE_CELL.init(ks)
     };

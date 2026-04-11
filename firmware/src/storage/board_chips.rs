@@ -79,12 +79,8 @@ pub type BoardChip = AnyChip<
 
 /// The RP2350-LCD-1.47-B has a 16 MB W25Q128JVSIQ on QSPI.  The SPI0 bus
 /// drives the LCD (write-only, no keystore flash chips wired) and SPI1 drives
-/// the SD card.  Until QmiFlash is wired via p.FLASH (see run_waveshare_lcd_board
-/// TODO), use QmiFlash directly as the BoardChip type so the type system
-/// stays consistent with pico2_4m while keeping storage in degraded mode.
-///
-/// TODO (board-storage wiring): switch to QmiFlash and initialise it from
-/// p.FLASH once the storage wiring is completed.
+/// the SD card.  QmiFlash is initialised from p.FLASH in run_waveshare_lcd_board
+/// (upper 2 MB keystore partition, same layout as pico2_4m).
 #[cfg(all(target_arch = "arm", feature = "waveshare_rp2350_lcd_16m"))]
 pub type BoardChip = QmiFlash;
 

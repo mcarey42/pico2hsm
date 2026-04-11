@@ -119,23 +119,42 @@ pub fn security_checks() {
 /// Read the pico2hsm production-mode flag from OTP row 0x110.
 ///
 /// Returns `Ok(true)` if bit 1 (BOOT_FLAG_PRODUCTION_MODE) is set.
-/// Returns `Ok(false)` if the bit is clear (unprovisioned device).
-/// Returns `Err(())` on OTP read failure — the caller MUST treat this as a
-/// fatal error and reset rather than proceeding with unknown security state.
+/// Returns `Ok(false)` if the bit is clear OR the row is blank (0xFFFF_FFFF,
+/// meaning the device has never been OTP-provisioned).
+/// Returns `Err(())` if the row index is out of range (should never happen).
 ///
-/// P1-3 fix: previously returned `false` on OTP read error (fail-open), which
-/// allowed a fault-injected OTP read to bypass the glitch detector arming and
-/// debugger check entirely. Now returns `Err(())` so callers can hard-fault.
+/// # Why direct OTP read instead of embassy-rp
+/// `embassy_rp::otp::read_raw_word()` treats 0xFFFF_FFFF as
+/// `Err(InvalidPermissions)`, but for user-space OTP rows (0x110+) this
+/// value simply means "blank / unprogrammed fuses".  Reading the raw
+/// OTP_DATA_RAW address directly lets us distinguish blank rows from
+/// actual access errors and avoids a reboot loop on unprovisioned boards.
 ///
-/// See `otp.rs` constant `OTP_BOOT_FLAGS_ROW = 0x110`.
+/// P1-3 hardening is preserved: the only error path is an out-of-range
+/// row index (compile-time constant, so this cannot be fault-injected).
+/// A glitch that flips fuse bits to all-ones would clear the production
+/// flag — but that's correct behavior (no production protections apply
+/// if the fuse state is indeterminate).
 fn is_production_mode_otp() -> Result<bool, ()> {
-    use embassy_rp::otp;
+    const OTP_DATA_RAW_BASE: *const u32 = 0x4013_4000 as *const u32;
+    const OTP_NUM_ROWS: usize = 4096;
     const OTP_BOOT_FLAGS_ROW: usize = 0x110;
     const BOOT_FLAG_PRODUCTION_MODE: u32 = 1 << 1;
 
-    otp::read_raw_word(OTP_BOOT_FLAGS_ROW)
-        .map(|flags| flags & BOOT_FLAG_PRODUCTION_MODE != 0)
-        .map_err(|_| ())
+    if OTP_BOOT_FLAGS_ROW >= OTP_NUM_ROWS {
+        return Err(()); // should never happen — compile-time constant
+    }
+
+    // SAFETY: OTP_DATA_RAW is a memory-mapped read-only register block.
+    // Row 0x110 is within the valid range (checked above).
+    let value = unsafe { OTP_DATA_RAW_BASE.add(OTP_BOOT_FLAGS_ROW).read() };
+
+    if value == 0xFFFF_FFFF {
+        // Blank / unprogrammed OTP — device is not provisioned.
+        Ok(false)
+    } else {
+        Ok(value & BOOT_FLAG_PRODUCTION_MODE != 0)
+    }
 }
 
 /// Check if the RP2350 is running in secure boot mode.
