@@ -79,7 +79,8 @@ fn gen_salt() -> [u8; 16] {
 ///   0x91  User PIN retry counter (1 byte)
 ///   0x92  DKEK share count (1 byte, 0 = no DKEK)
 pub fn handle(state: &mut ScHsmState, store: &mut dyn crate::storage::KeyStore, cmd: &ApduCommand<'_>) -> ApduResponse {
-    crate::cdc_log!("SC-HSM INITIALIZE start");
+    crate::CORE1_PROGRESS.store(30, core::sync::atomic::Ordering::Relaxed);
+    // cdc_log removed — CriticalSectionRawMutex is single-core only, unsafe on core1
     if cmd.p1 != 0x00 || cmd.p2 != 0x00 {
         return ApduResponse::err(SW_WRONG_DATA);
     }
@@ -198,10 +199,12 @@ pub fn handle(state: &mut ScHsmState, store: &mut dyn crate::storage::KeyStore, 
 
     // Wipe only SC-HSM-owned keys from persistent flash keystore.
     // Degraded flash does not fail the INITIALIZE command.
+    crate::CORE1_PROGRESS.store(31, core::sync::atomic::Ordering::Relaxed);
     let _ = store.wipe_by_owner(AppletId::ScHsm); // best-effort; InvalidCore returns Ok(()) on Core1
 
     // Generate device identity P-256 keypair for DKEK exchange.
     // Stored at reserved slot 0xFE; public key written to EF 0x2F02.
+    crate::CORE1_PROGRESS.store(32, core::sync::atomic::Ordering::Relaxed);
     {
         use crate::crypto::asymmetric::generate_ec_keypair;
         use crate::protocol::sc_hsm::{FwRng, InMemoryKey, EfEntry};
@@ -217,7 +220,9 @@ pub fn handle(state: &mut ScHsmState, store: &mut dyn crate::storage::KeyStore, 
                 let mut key_obj = KeyObject::new(KmType::Ec, dev_identity_key_id, AppletId::ScHsm, AlgorithmId::EcdsaP256);
                 let _ = key_obj.private_key.extend_from_slice(&pair.private_key);
                 let _ = key_obj.public_key.extend_from_slice(&pair.public_key);
+                crate::CORE1_PROGRESS.store(80, core::sync::atomic::Ordering::Relaxed);
                 let _ = store.save_key(&key_obj); // best-effort
+                crate::CORE1_PROGRESS.store(81, core::sync::atomic::Ordering::Relaxed);
             }
 
             // Store in in-memory key store.
@@ -246,9 +251,11 @@ pub fn handle(state: &mut ScHsmState, store: &mut dyn crate::storage::KeyStore, 
     }
 
     // Persist PIN/SO-PIN/PUK state to flash.
+    crate::CORE1_PROGRESS.store(33, core::sync::atomic::Ordering::Relaxed);
     crate::protocol::sc_hsm::ScHsm::save_pin_to_store(state, store);
+    crate::CORE1_PROGRESS.store(39, core::sync::atomic::Ordering::Relaxed);
 
-    crate::cdc_log!("SC-HSM INITIALIZE complete");
+    // cdc_log removed — CriticalSectionRawMutex is single-core only, unsafe on core1
     ApduResponse::ok(&[])
 }
 

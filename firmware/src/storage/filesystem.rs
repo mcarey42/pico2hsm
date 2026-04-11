@@ -512,14 +512,22 @@ impl<Chip: FlashChip> KeyFilesystem<Chip> {
 
             let mut sector_buf = [0xFFu8; SECTOR_SIZE];
 
-            // Compute CRC over header (excluding crc32 field) + ciphertext.
-            let crc = compute_object_crc32_for_header(&header, chunk);
-            header.crc32 = crc;
-
+            // Write header (with crc32=0) and ciphertext into the sector buffer
+            // first, then compute CRC over the padded sector.  The read path
+            // rounds plaintext_len up to a 256-byte boundary, so the CRC must
+            // cover the same padded extent (including trailing 0xFF bytes).
             write_header(&mut sector_buf, &header);
             if !chunk.is_empty() {
                 sector_buf[HEADER_SIZE..HEADER_SIZE + chunk.len()].copy_from_slice(chunk);
             }
+            let padded_len = (chunk.len() + 255) & !255;
+            let crc = compute_object_crc32(
+                &sector_buf[..HEADER_SIZE],
+                &sector_buf[HEADER_SIZE..HEADER_SIZE + padded_len],
+            );
+            header.crc32 = crc;
+            // Re-write header with the computed CRC.
+            write_header(&mut sector_buf, &header);
 
             // Write via WAL using chip 0 as the WAL chip (simple strategy).
             let target_sector = free_sector + s;
@@ -709,13 +717,6 @@ pub fn write_sector<C: FlashChip>(chip: &mut C, addr: u32, data: &[u8; SECTOR_SI
         chip.write_page(page_addr, &data[p * PAGE_SIZE..(p + 1) * PAGE_SIZE])?;
     }
     Ok(())
-}
-
-/// Compute CRC32 for an ObjectHeader + ciphertext chunk (helper used during writes).
-fn compute_object_crc32_for_header(header: &ObjectHeader, ciphertext: &[u8]) -> u32 {
-    let mut hdr_bytes = [0u8; HEADER_SIZE];
-    write_header(&mut hdr_bytes, header);
-    compute_object_crc32(&hdr_bytes, ciphertext)
 }
 
 /// Convert a `u8` key-type tag to a `KeyType`.

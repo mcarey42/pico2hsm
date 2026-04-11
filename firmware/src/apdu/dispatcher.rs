@@ -174,6 +174,7 @@ impl Dispatcher {
         }
 
         // Route all active protocols through the storage-aware path.
+        crate::CORE1_PROGRESS.store(20, core::sync::atomic::Ordering::Relaxed);
         let raw_resp: Vec<u8, 4096> = match self.active {
             ActiveProtocol::ScHsm => self.sc_hsm.process_apdu_with_store(raw_apdu, store),
             ActiveProtocol::Piv => self.piv.process_apdu_with_store(raw_apdu, store),

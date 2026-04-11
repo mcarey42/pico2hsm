@@ -49,8 +49,9 @@ pub const SW_CLASS_NOT_SUPPORTED: u16 = 0x6E00;
 /// A parsed ISO 7816-4 APDU command.
 ///
 /// The `data` field borrows directly from the input buffer — no copy is made.
-/// `le` is `None` when no Le byte is present, `Some(0)` for Le=0x00 (256
-/// bytes expected), and `Some(n)` otherwise.
+/// `le` is `None` when no Le byte is present, `Some(n)` for a specific
+/// limit.  Short APDU Le=0x00 is pre-resolved to `Some(256)`.  Extended
+/// APDU Le=0x0000 is stored as `Some(0)`, meaning 65536 ("return all data").
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApduCommand<'a> {
     /// Class byte (CLA).

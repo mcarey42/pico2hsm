@@ -60,12 +60,16 @@ use static_cell::StaticCell;
 
 // ─── Core1 stack and executor (ARM only) ─────────────────────────────────────
 
-/// Stack for the core1 Embassy executor.  Peak usage ~65 KB: ScHsmState holds
-/// 16 × 2 KB EF entries inline (~38 KB total state) plus multiple 4 KB response
-/// Vec<u8, 4096> temporaries across the dispatch call chain (~16 KB peak).
-/// 128 KB gives ~2× headroom over measured peak usage.
+/// Stack for the core1 Embassy executor.  Debug-mode peak usage ~125 KB:
+/// ScHsmState holds ~38 KB inline, plus the INITIALIZE handler in debug
+/// builds accumulates PBKDF2 intermediates, P-256 keygen temporaries,
+/// multiple KeyObject / EcKeyPair / EfEntry copies, and 4 KB response
+/// buffers without reusing stack slots (opt-level=1 no NRVO).
+/// 160 KB gives ~1.3× headroom; release builds use far less.
+/// NOTE: Increasing beyond 160 KB squeezes Core0's stack below 64 KB,
+/// which is needed for init_in_place (ScHsm::new ~40 KB temporary).
 #[cfg(target_arch = "arm")]
-static mut CORE1_STACK: Stack<131072> = Stack::new();
+static mut CORE1_STACK: Stack<163840> = Stack::new();
 #[cfg(target_arch = "arm")]
 static CORE1_EXECUTOR: StaticCell<embassy_executor::Executor> = StaticCell::new();
 
@@ -136,6 +140,7 @@ impl pico2hsm_firmware::storage::KeyStore for FlashQueueKeyStore {
         &mut self,
         obj: &pico2hsm_firmware::security::key_management::KeyObject,
     ) -> Result<(), pico2hsm_core::error::HsmError> {
+        CORE1_PROGRESS.store(70, core::sync::atomic::Ordering::Relaxed);
         // Clone the KeyObject by reconstructing it field by field.
         let mut copy = pico2hsm_firmware::security::key_management::KeyObject::new(
             obj.key_type,
@@ -143,6 +148,7 @@ impl pico2hsm_firmware::storage::KeyStore for FlashQueueKeyStore {
             obj.owner,
             obj.algorithm,
         );
+        CORE1_PROGRESS.store(71, core::sync::atomic::Ordering::Relaxed);
         copy.key_domain = obj.key_domain;
         copy.key_flags = obj.key_flags;
         copy.use_count = obj.use_count;
@@ -150,7 +156,9 @@ impl pico2hsm_firmware::storage::KeyStore for FlashQueueKeyStore {
         copy.timestamp_ms = obj.timestamp_ms;
         let _ = copy.private_key.extend_from_slice(&obj.private_key);
         let _ = copy.public_key.extend_from_slice(&obj.public_key);
+        CORE1_PROGRESS.store(72, core::sync::atomic::Ordering::Relaxed);
         let _ = self.ops.push(FlashOp::SaveKey(copy));
+        CORE1_PROGRESS.store(73, core::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
 
@@ -199,6 +207,10 @@ static KEYSTORE_CELL: StaticCell<pico2hsm_firmware::storage::BoardKeyStore> = St
 /// Read by core0 board runners to display key count on LCD.
 #[cfg(target_arch = "arm")]
 static KEY_COUNT: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// Re-export for convenient access in this binary crate.
+#[cfg(target_arch = "arm")]
+use pico2hsm_firmware::CORE1_PROGRESS;
 
 /// Dispatcher — stored in BSS outside the async task state machine so that
 /// the `dispatcher_task` pool does not need to hold the full 50 KB Dispatcher
@@ -264,16 +276,21 @@ async fn dispatcher_task(
             let _ = FLASH_RESP.receive().await;
             let _ = RESP_CHANNEL.send(heapless::Vec::new()).await;
         } else {
+            CORE1_PROGRESS.store(10, core::sync::atomic::Ordering::Relaxed);
             let mut q = FlashQueueKeyStore::new();
             let response = dispatcher.dispatch_with_store(&apdu_bytes, &mut q);
+            CORE1_PROGRESS.store(40, core::sync::atomic::Ordering::Relaxed);
             // Drain queued flash ops BEFORE sending the response back to core0.
             // Core0 is in its select loop awaiting RESP_CHANNEL, so it will
             // process FLASH_REQ messages during that wait.
             for op in q.drain() {
+                CORE1_PROGRESS.store(50, core::sync::atomic::Ordering::Relaxed);
                 FLASH_REQ.send(op).await;
                 let _ = FLASH_RESP.receive().await;
             }
+            CORE1_PROGRESS.store(60, core::sync::atomic::Ordering::Relaxed);
             let _ = RESP_CHANNEL.send(response).await;
+            CORE1_PROGRESS.store(0, core::sync::atomic::Ordering::Relaxed);
         }
         KEY_COUNT.store(
             dispatcher.in_memory_key_count(),
@@ -354,7 +371,11 @@ async fn main(_spawner: Spawner) {
     #[cfg(target_arch = "arm")]
     unsafe {
         let ebss = core::ptr::addr_of!(__ebss) as u32;
-        cortex_m::register::msplim::write(ebss + 16384);
+        // Core0 stack occupies the gap between __ebss and 0x20082000 (520 KB SRAM end).
+        // Guard zone: 4 KB above BSS — any stack overflow past this fires UsageFault.
+        // With 160 KB Core1 stack: __ebss ≈ 0x2006CA00, giving ~84 KB Core0 stack
+        // minus 4 KB guard = 80 KB usable.  Embassy USB + CCID + init_in_place need ~60 KB.
+        cortex_m::register::msplim::write(ebss + 4096);
 
         // Enable UsageFault handler so STKOF fires as UsageFault, not HardFault.
         // SHCSR bit 18 = USGFAULTENA.
@@ -363,7 +384,7 @@ async fn main(_spawner: Spawner) {
             .modify(|v| v | (1 << 18));
 
         defmt::info!("core0: MSPLIM set to 0x{:08X} (__ebss=0x{:08X})",
-            ebss + 16384, ebss);
+            ebss + 4096, ebss);
     }
 
     defmt::info!("pico2hsm: peripherals initialised");
@@ -607,12 +628,17 @@ async fn run_one_board(p: embassy_rp::Peripherals) {
 
     spawn_core1(p.CORE1, unsafe { &mut *addr_of_mut!(CORE1_STACK) }, move || {
         // MSPLIM — hardware stack overflow detection for Core1.
-        // CORE1_STACK is 128 KB; set limit 8 KB above bottom for early warning.
+        // CORE1_STACK is 192 KB; set limit 8 KB above bottom for early warning.
+        // Also enable UsageFault so STKOF surfaces as UsageFault, not HardFault.
         // No defmt here — Core1 defmt contends on Spinlock31 with Core0 USB.
         #[cfg(target_arch = "arm")]
         unsafe {
             let stack_bottom = core::ptr::addr_of!(CORE1_STACK) as u32;
             cortex_m::register::msplim::write(stack_bottom + 8192);
+            // SHCSR bit 18 = USGFAULTENA
+            (*cortex_m::peripheral::SCB::PTR)
+                .shcsr
+                .modify(|v| v | (1 << 18));
         }
 
         let executor = CORE1_EXECUTOR.init(embassy_executor::Executor::new());
@@ -638,6 +664,8 @@ async fn run_one_board(p: embassy_rp::Peripherals) {
                                 match select3(RESP_CHANNEL.receive(), embassy_time::Timer::after_millis(1500), FLASH_REQ.receive()).await {
                                     Either3::First(r) => break r,
                                     Either3::Second(_) => {
+                                        let progress = CORE1_PROGRESS.load(core::sync::atomic::Ordering::Relaxed);
+                                        defmt::warn!("time ext: core1 progress={}", progress);
                                         if let Err(CcidError::UsbDisconnected) = ccid.send_time_extension().await {
                                             let _ = RESP_CHANNEL.receive().await;
                                             break heapless::Vec::new();
@@ -874,12 +902,17 @@ async fn run_geek_board(p: embassy_rp::Peripherals) {
 
     spawn_core1(p.CORE1, unsafe { &mut *addr_of_mut!(CORE1_STACK) }, move || {
         // MSPLIM — hardware stack overflow detection for Core1.
-        // CORE1_STACK is 128 KB; set limit 8 KB above bottom for early warning.
+        // CORE1_STACK is 192 KB; set limit 8 KB above bottom for early warning.
+        // Also enable UsageFault so STKOF surfaces as UsageFault, not HardFault.
         // No defmt here — Core1 defmt contends on Spinlock31 with Core0 USB.
         #[cfg(target_arch = "arm")]
         unsafe {
             let stack_bottom = core::ptr::addr_of!(CORE1_STACK) as u32;
             cortex_m::register::msplim::write(stack_bottom + 8192);
+            // SHCSR bit 18 = USGFAULTENA
+            (*cortex_m::peripheral::SCB::PTR)
+                .shcsr
+                .modify(|v| v | (1 << 18));
         }
 
         let executor = CORE1_EXECUTOR.init(embassy_executor::Executor::new());
@@ -939,6 +972,8 @@ async fn run_geek_board(p: embassy_rp::Peripherals) {
                                 match select3(RESP_CHANNEL.receive(), embassy_time::Timer::after_millis(1500), FLASH_REQ.receive()).await {
                                     Either3::First(r) => break r,
                                     Either3::Second(_) => {
+                                        let progress = CORE1_PROGRESS.load(core::sync::atomic::Ordering::Relaxed);
+                                        defmt::warn!("time ext: core1 progress={}", progress);
                                         if let Err(CcidError::UsbDisconnected) = ccid.send_time_extension().await {
                                             let _ = RESP_CHANNEL.receive().await;
                                             break heapless::Vec::new();
@@ -1141,12 +1176,17 @@ async fn run_pico2_board(p: embassy_rp::Peripherals) {
     defmt::info!("core0: spawning core1");
     spawn_core1(p.CORE1, unsafe { &mut *addr_of_mut!(CORE1_STACK) }, move || {
         // MSPLIM — hardware stack overflow detection for Core1.
-        // CORE1_STACK is 128 KB; set limit 8 KB above bottom for early warning.
+        // CORE1_STACK is 192 KB; set limit 8 KB above bottom for early warning.
+        // Also enable UsageFault so STKOF surfaces as UsageFault, not HardFault.
         // No defmt here — Core1 defmt contends on Spinlock31 with Core0 USB.
         #[cfg(target_arch = "arm")]
         unsafe {
             let stack_bottom = core::ptr::addr_of!(CORE1_STACK) as u32;
             cortex_m::register::msplim::write(stack_bottom + 8192);
+            // SHCSR bit 18 = USGFAULTENA
+            (*cortex_m::peripheral::SCB::PTR)
+                .shcsr
+                .modify(|v| v | (1 << 18));
         }
 
         let executor = CORE1_EXECUTOR.init(embassy_executor::Executor::new());
@@ -1176,6 +1216,8 @@ async fn run_pico2_board(p: embassy_rp::Peripherals) {
                                 match select3(RESP_CHANNEL.receive(), embassy_time::Timer::after_millis(1500), FLASH_REQ.receive()).await {
                                     Either3::First(r) => break r,
                                     Either3::Second(_) => {
+                                        let progress = CORE1_PROGRESS.load(core::sync::atomic::Ordering::Relaxed);
+                                        defmt::warn!("time ext: core1 progress={}", progress);
                                         if let Err(CcidError::UsbDisconnected) = ccid.send_time_extension().await {
                                             let _ = RESP_CHANNEL.receive().await;
                                             break heapless::Vec::new();
@@ -1421,12 +1463,17 @@ async fn run_waveshare_lcd_board(p: embassy_rp::Peripherals) {
 
     spawn_core1(p.CORE1, unsafe { &mut *addr_of_mut!(CORE1_STACK) }, move || {
         // MSPLIM — hardware stack overflow detection for Core1.
-        // CORE1_STACK is 128 KB; set limit 8 KB above bottom for early warning.
+        // CORE1_STACK is 192 KB; set limit 8 KB above bottom for early warning.
+        // Also enable UsageFault so STKOF surfaces as UsageFault, not HardFault.
         // No defmt here — Core1 defmt contends on Spinlock31 with Core0 USB.
         #[cfg(target_arch = "arm")]
         unsafe {
             let stack_bottom = core::ptr::addr_of!(CORE1_STACK) as u32;
             cortex_m::register::msplim::write(stack_bottom + 8192);
+            // SHCSR bit 18 = USGFAULTENA
+            (*cortex_m::peripheral::SCB::PTR)
+                .shcsr
+                .modify(|v| v | (1 << 18));
         }
 
         let executor = CORE1_EXECUTOR.init(embassy_executor::Executor::new());
@@ -1489,6 +1536,8 @@ async fn run_waveshare_lcd_board(p: embassy_rp::Peripherals) {
                                 match select3(RESP_CHANNEL.receive(), embassy_time::Timer::after_millis(1500), FLASH_REQ.receive()).await {
                                     Either3::First(r) => break r,
                                     Either3::Second(_) => {
+                                        let progress = CORE1_PROGRESS.load(core::sync::atomic::Ordering::Relaxed);
+                                        defmt::warn!("time ext: core1 progress={}", progress);
                                         if let Err(CcidError::UsbDisconnected) = ccid.send_time_extension().await {
                                             let _ = RESP_CHANNEL.receive().await;
                                             break heapless::Vec::new();

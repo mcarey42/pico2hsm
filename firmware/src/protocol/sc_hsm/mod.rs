@@ -570,6 +570,7 @@ impl ScHsm {
         use crate::security::key_management::{AlgorithmId, KeyObject, KeyType as KmKeyType};
         use pico2hsm_core::key::AppletId;
 
+        crate::CORE1_PROGRESS.store(34, core::sync::atomic::Ordering::Relaxed);
         let mut buf: heapless::Vec<u8, 256> = heapless::Vec::new();
         let user_hash = state.user_pin_hash.unwrap_or([0u8; 32]);
         let _ = buf.extend_from_slice(&user_hash);
@@ -586,10 +587,14 @@ impl ScHsm {
         let _ = buf.push(state.initialized as u8);
         let _ = buf.push(0x00); // reserved
 
+        crate::CORE1_PROGRESS.store(35, core::sync::atomic::Ordering::Relaxed);
         let kid = Self::sc_hsm_pin_key_id();
         let mut obj = KeyObject::new(KmKeyType::Generic, kid.0, AppletId::ScHsm, AlgorithmId::AesGcm);
+        crate::CORE1_PROGRESS.store(36, core::sync::atomic::Ordering::Relaxed);
         let _ = obj.private_key.extend_from_slice(&buf);
+        crate::CORE1_PROGRESS.store(37, core::sync::atomic::Ordering::Relaxed);
         let _ = store.save_key(&obj);
+        crate::CORE1_PROGRESS.store(38, core::sync::atomic::Ordering::Relaxed);
     }
 
     /// Load PIN/SO-PIN/PUK state from flash into `state`.
@@ -643,7 +648,10 @@ impl ScHsm {
                 // handler itself.
                 if !is_get_response && r.sw == SW_OK {
                     if let Some(le_val) = le {
-                        let le_usize = if le_val == 0 { 256 } else { le_val as usize };
+                        // Short APDUs: parser already converts Le=0x00 → 256.
+                        // Extended APDUs: Le=0x0000 stored as 0, meaning 65536
+                        // ("return all data") — don't truncate.
+                        let le_usize = if le_val == 0 { r.data.len() } else { le_val as usize };
                         if r.data.len() > le_usize {
                             // Store overflow bytes in pending buffer for GET RESPONSE.
                             self.state.pending_response.clear();
@@ -681,7 +689,7 @@ impl HsmProtocol for ScHsm {
                 // handler itself.
                 if !is_get_response && r.sw == SW_OK {
                     if let Some(le_val) = le {
-                        let le_usize = if le_val == 0 { 256 } else { le_val as usize };
+                        let le_usize = if le_val == 0 { r.data.len() } else { le_val as usize };
                         if r.data.len() > le_usize {
                             self.state.pending_response.clear();
                             self.state.pending_response_offset = 0;

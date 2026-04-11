@@ -109,10 +109,13 @@ def _wait_for_device(timeout: float = 25.0) -> bool:
 def _reset_device() -> None:
     """Reset the device via probe-rs and wait for USB re-enumeration."""
     log.info("Resetting device via probe-rs...")
-    result = subprocess.run(
-        ["probe-rs", "reset", "--chip", "RP235x"],
-        capture_output=True, timeout=15,
-    )
+    cmd = ["probe-rs", "reset", "--chip", "RP235x"]
+    # When multiple debug probes are connected, probe-rs needs a selector.
+    # Accept the same VID:PID:Serial format via PROBE_RS_PROBE env var.
+    probe_sel = os.environ.get("PROBE_RS_PROBE")
+    if probe_sel:
+        cmd.extend(["--probe", probe_sel])
+    result = subprocess.run(cmd, capture_output=True, timeout=15)
     if result.returncode != 0:
         log.warning(
             "probe-rs reset returned rc=%d: %s",

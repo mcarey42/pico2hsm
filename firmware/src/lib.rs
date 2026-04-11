@@ -36,6 +36,11 @@ pub mod display;
 // On ARM, the real implementations live in transport::cdc_serial and are exported via
 // #[macro_export] from that module. On x86_64 the transport module is not compiled,
 // so we define the stubs here directly at the crate root.
+/// Core1 dispatch progress breadcrumb for cross-core debugging.
+/// Written by core1 at each dispatch stage; read by core0 during time-extension
+/// logging to diagnose hangs without defmt (which deadlocks on core1).
+pub static CORE1_PROGRESS: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
 #[cfg(not(target_arch = "arm"))]
 #[macro_export]
 macro_rules! cdc_log   { ($($arg:tt)*) => {{}} }
