@@ -87,12 +87,15 @@ pub const MAX_IN_MEMORY_SYM_KEYS: usize = 8;
 pub const MAX_RSA_IN_MEMORY_KEYS: usize = 4;
 
 /// Maximum number of EF (elementary file) entries stored in RAM.
-/// Reduced from 16 to 8 to save ~16 KB BSS (each entry contains a
-/// 2048-byte inline Vec).  SC-HSM only needs a handful of EF files
-/// (DevAut cert, C.DevAut, etc.).
-pub const MAX_EF_FILES: usize = 8;
+/// Reduced from 8 to 4 — SC-HSM uses 2-4 EF files in practice
+/// (DevAut cert, C.DevAut, etc.).  Saves ~4 KB BSS.
+pub const MAX_EF_FILES: usize = 4;
 /// Maximum size of a single EF data blob (bytes).
-pub const MAX_EF_DATA: usize = 2048;
+/// Reduced from 2048 to 1024 — typical certs are under 1 KB.
+pub const MAX_EF_DATA: usize = 1024;
+
+/// Maximum number of entries in the V2 DKEK exchange challenge replay cache.
+pub const MAX_EXCHANGE_CHALLENGE_CACHE: usize = 8;
 
 /// An in-memory (volatile) EF (elementary file) entry.
 ///
@@ -324,8 +327,8 @@ pub struct ScHsmState {
     /// Peer's ephemeral pub stored during V2 exchange for channel binding.
     pub exchange_peer_ephem_pub: Option<[u8; 65]>,
     /// Replay cache for V2 exchange challenges (RAM only, cleared on reset).
-    pub exchange_challenge_cache: [[u8; 32]; 16],
-    /// Number of valid entries in exchange_challenge_cache (capped at 16).
+    pub exchange_challenge_cache: [[u8; 32]; MAX_EXCHANGE_CHALLENGE_CACHE],
+    /// Number of valid entries in exchange_challenge_cache (capped at MAX_EXCHANGE_CHALLENGE_CACHE).
     pub exchange_challenge_cache_count: u8,
     /// Ring-buffer write pointer for the challenge replay cache.
     /// Incremented unconditionally on every write; mod 16 gives the slot.
@@ -388,7 +391,7 @@ impl ScHsmState {
             exchange_ephem_pub: None,
             exchange_challenge: None,
             exchange_peer_ephem_pub: None,
-            exchange_challenge_cache: [[0u8; 32]; 16],
+            exchange_challenge_cache: [[0u8; 32]; MAX_EXCHANGE_CHALLENGE_CACHE],
             exchange_challenge_cache_count: 0,
             exchange_challenge_cache_write_idx: 0,
             generation: 0,

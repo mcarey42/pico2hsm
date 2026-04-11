@@ -174,20 +174,22 @@ impl Dispatcher {
 
         // Route all active protocols through the storage-aware path.
         crate::CORE1_PROGRESS.store(20, core::sync::atomic::Ordering::Relaxed);
-        let raw_resp: Vec<u8, 4096> = match self.active {
-            ActiveProtocol::ScHsm => self.sc_hsm.process_apdu_with_store(raw_apdu, store),
-            ActiveProtocol::Piv => self.piv.process_apdu_with_store(raw_apdu, store),
-            ActiveProtocol::OpenPgp => self.openpgp.process_apdu_with_store(raw_apdu, store),
-            ActiveProtocol::None => {
-                return pico2hsm_core::apdu::ApduResponse::err(
-                    pico2hsm_core::apdu::SW_INS_NOT_SUPPORTED,
-                )
-                .serialize()
-            }
-        };
-
         let mut out: Vec<u8, 4098> = Vec::new();
-        let _ = out.extend_from_slice(&raw_resp);
+        {
+            let raw_resp: Vec<u8, 4096> = match self.active {
+                ActiveProtocol::ScHsm => self.sc_hsm.process_apdu_with_store(raw_apdu, store),
+                ActiveProtocol::Piv => self.piv.process_apdu_with_store(raw_apdu, store),
+                ActiveProtocol::OpenPgp => self.openpgp.process_apdu_with_store(raw_apdu, store),
+                ActiveProtocol::None => {
+                    return pico2hsm_core::apdu::ApduResponse::err(
+                        pico2hsm_core::apdu::SW_INS_NOT_SUPPORTED,
+                    )
+                    .serialize()
+                }
+            };
+            let _ = out.extend_from_slice(&raw_resp);
+            // raw_resp (4096 bytes on stack) is dropped here, before `out` is returned.
+        }
         out
     }
 
@@ -210,20 +212,23 @@ impl Dispatcher {
             return resp.serialize();
         }
 
-        // Forward to the active protocol.
-        let raw_resp: Vec<u8, 4096> = match self.active {
-            ActiveProtocol::ScHsm => self.sc_hsm.process_apdu(raw_apdu),
-            ActiveProtocol::Piv => self.piv.process_apdu(raw_apdu),
-            ActiveProtocol::OpenPgp => self.openpgp.process_apdu(raw_apdu),
-            ActiveProtocol::None => {
-                // No AID selected yet — return INS not supported
-                return ApduResponse::err(SW_INS_NOT_SUPPORTED).serialize();
-            }
-        };
-
-        // Convert 4096-byte Vec to 4098-byte Vec (add room for SW if needed).
+        // Forward to the active protocol, then widen into the 4098-byte output.
+        // The intermediate Vec<u8, 4096> is scoped so it is dropped before return,
+        // allowing the compiler to reclaim its stack slot.
         let mut out: Vec<u8, 4098> = Vec::new();
-        let _ = out.extend_from_slice(&raw_resp);
+        {
+            let raw_resp: Vec<u8, 4096> = match self.active {
+                ActiveProtocol::ScHsm => self.sc_hsm.process_apdu(raw_apdu),
+                ActiveProtocol::Piv => self.piv.process_apdu(raw_apdu),
+                ActiveProtocol::OpenPgp => self.openpgp.process_apdu(raw_apdu),
+                ActiveProtocol::None => {
+                    // No AID selected yet — return INS not supported
+                    return ApduResponse::err(SW_INS_NOT_SUPPORTED).serialize();
+                }
+            };
+            let _ = out.extend_from_slice(&raw_resp);
+            // raw_resp (4096 bytes on stack) is dropped here, before `out` is returned.
+        }
         out
     }
 

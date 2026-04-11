@@ -569,7 +569,7 @@ fn handle_get_key_manifest(state: &mut ScHsmState, store: &mut dyn KeyStore, _cm
     // Each entry: key_ref(1) || algo(1) || key_flags(1) || deleted(1) || timestamp_ms_BE(8) || pubkey_hash(32) = 44 bytes
     // Max: 256 entries * 44 = 11264 — but realistically we have at most ~16 in-memory + flash keys.
     // Use a heapless Vec with reasonable max.
-    let mut manifest: heapless::Vec<u8, 2816> = heapless::Vec::new(); // 64 entries * 44
+    let mut manifest: heapless::Vec<u8, 1408> = heapless::Vec::new(); // 32 entries * 44
 
     // Iterate in-memory EC keys.
     for key in state.keys.iter() {
@@ -819,10 +819,11 @@ fn check_and_add_challenge(state: &mut ScHsmState, challenge: &[u8; 32]) -> bool
         }
     }
     // Add to cache with ring-buffer eviction.
-    let idx = (state.exchange_challenge_cache_write_idx % 16) as usize;
+    let cap = crate::protocol::sc_hsm::MAX_EXCHANGE_CHALLENGE_CACHE as u8;
+    let idx = (state.exchange_challenge_cache_write_idx % cap) as usize;
     state.exchange_challenge_cache[idx] = *challenge;
     state.exchange_challenge_cache_write_idx = state.exchange_challenge_cache_write_idx.wrapping_add(1);
-    if state.exchange_challenge_cache_count < 16 {
+    if state.exchange_challenge_cache_count < cap {
         state.exchange_challenge_cache_count += 1;
     }
     true
@@ -1370,29 +1371,29 @@ mod tests {
     fn test_challenge_cache_full_rotation() {
         let mut state = ScHsmState::new();
 
-        // Fill cache with 16 unique challenges (slots 0..15).
-        for i in 0u8..16 {
+        // Fill cache with 8 unique challenges (slots 0..7).
+        for i in 0u8..8 {
             let mut c = [0u8; 32];
             c[0] = i;
             assert!(check_and_add_challenge(&mut state, &c), "challenge {} should succeed", i);
         }
-        assert_eq!(state.exchange_challenge_cache_count, 16);
+        assert_eq!(state.exchange_challenge_cache_count, 8);
 
-        // Add a 17th challenge — this should evict slot 0 (challenge with c[0]=0).
-        let mut c17 = [0u8; 32];
-        c17[0] = 0x10; // 16
-        assert!(check_and_add_challenge(&mut state, &c17), "17th challenge should succeed");
+        // Add a 9th challenge — this should evict slot 0 (challenge with c[0]=0).
+        let mut c9 = [0u8; 32];
+        c9[0] = 0x08; // 8
+        assert!(check_and_add_challenge(&mut state, &c9), "9th challenge should succeed");
 
-        // The 17th challenge should be found (it was just inserted in slot 0).
-        assert!(!check_and_add_challenge(&mut state, &c17), "17th challenge should be detected as replay");
+        // The 9th challenge should be found (it was just inserted in slot 0).
+        assert!(!check_and_add_challenge(&mut state, &c9), "9th challenge should be detected as replay");
 
         // Challenge 0 (c[0]=0) was evicted from slot 0 and should NOT be detected.
         let c0 = [0u8; 32];
         assert!(check_and_add_challenge(&mut state, &c0), "evicted challenge 0 should be accepted as new");
-        // c0 was written to slot 1 (write_idx=18, 18%16=2 — wait, 17%16=1), evicting challenge 1.
+        // c0 was written to slot 1 (write_idx=10, 10%8=2 — wait, 9%8=1), evicting challenge 1.
 
-        // Challenges 2..15 should still be in the cache (slots 2..15 untouched).
-        for i in 2u8..16 {
+        // Challenges 2..7 should still be in the cache (slots 2..7 untouched).
+        for i in 2u8..8 {
             let mut c = [0u8; 32];
             c[0] = i;
             assert!(!check_and_add_challenge(&mut state, &c), "challenge {} should still be in cache", i);
@@ -1403,10 +1404,10 @@ mod tests {
         c1[0] = 1;
         assert!(check_and_add_challenge(&mut state, &c1), "evicted challenge 1 should be accepted as new");
 
-        // Verify write pointer advances correctly: after 19 inserts (16+3),
-        // write_idx should be 19.
-        assert_eq!(state.exchange_challenge_cache_write_idx, 19);
-        assert_eq!(state.exchange_challenge_cache_count, 16);
+        // Verify write pointer advances correctly: after 11 inserts (8+3),
+        // write_idx should be 11.
+        assert_eq!(state.exchange_challenge_cache_write_idx, 11);
+        assert_eq!(state.exchange_challenge_cache_count, 8);
     }
 
     #[test]

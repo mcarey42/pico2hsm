@@ -297,9 +297,11 @@ impl<'d, D: Driver<'d>> CcidTransport<'d, D> {
     ///
     /// The returned `Vec` contains the raw APDU bytes (CLA INS P1 P2 ...).
     pub async fn recv_apdu(&mut self) -> Result<Vec<u8, 4096>, CcidError> {
-        // Persistent receive buffer for multi-packet CCID messages
+        // Single receive buffer for multi-packet CCID messages.
+        // After extracting the APDU payload from an XfrBlock, the 10-byte
+        // CCID header is stripped in-place and the same buffer is returned,
+        // avoiding a second 4096-byte stack allocation.
         let mut raw: Vec<u8, 4096> = Vec::new();
-        let mut apdu_buf: Vec<u8, 4096> = Vec::new();
 
         loop {
             // ── Read CCID message from bulk-OUT endpoint ──────────────────
@@ -315,7 +317,6 @@ impl<'d, D: Driver<'d>> CcidTransport<'d, D> {
                 }
                 PC_TO_RDR_ICCPOWEROFF => {
                     self.handle_power_off(header.seq).await?;
-                    apdu_buf.clear();
                 }
                 PC_TO_RDR_GETSLOTSTATUS => {
                     self.handle_get_slot_status(header.seq).await?;
@@ -340,17 +341,17 @@ impl<'d, D: Driver<'d>> CcidTransport<'d, D> {
                     // dwFeatures = 0x000400FE includes bit 0x00040000 (Short and
                     // Extended APDU level exchange). The host sends a raw APDU as
                     // the XfrBlock payload — no T=1 framing at the CCID layer.
-                    let payload = &raw[CCID_HEADER_LEN..];
-                    if payload.is_empty() {
+                    if raw.len() <= CCID_HEADER_LEN {
                         let resp = self.build_slot_status(header.seq, 0x40, 0x00);
                         self.write_response(&resp).await?;
                     } else {
                         self.pending_seq = header.seq;
-                        apdu_buf.clear();
-                        apdu_buf
-                            .extend_from_slice(payload)
-                            .map_err(|_| CcidError::BufferOverflow)?;
-                        return Ok(apdu_buf);
+                        // Strip the 10-byte CCID header in-place: copy payload
+                        // bytes down to the start of the buffer, then truncate.
+                        let payload_len = raw.len() - CCID_HEADER_LEN;
+                        raw.copy_within(CCID_HEADER_LEN.., 0);
+                        raw.truncate(payload_len);
+                        return Ok(raw);
                     }
                 }
                 _ => {
