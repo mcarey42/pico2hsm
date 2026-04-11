@@ -17,7 +17,9 @@ from .errors import ProtocolError
 # ---------------------------------------------------------------------------
 INS_SELECT = 0xA4
 INS_READ_BINARY = 0xB0
+INS_READ_BINARY_ODD = 0xB1
 INS_UPDATE_BINARY = 0xD6
+INS_WRITE_DATA = 0xD7
 INS_VERIFY = 0x20
 INS_CHANGE_PIN = 0x24
 INS_RESET_RETRY = 0x2C
@@ -280,6 +282,35 @@ def build_select_ef(fid: int) -> bytes:
     return _encode_apdu(0x00, INS_SELECT, 0x02, 0x0C, data)
 
 
+def build_read_binary_odd(offset: int = 0, le: int = 0) -> bytes:
+    """Build READ BINARY ODD APDU (INS=0xB1, SC-HSM proprietary).
+
+    Reads from the currently selected EF (set by build_select_ef).
+    Uses TLV-encoded offset: 54 02 <off_hi> <off_lo>.
+    """
+    data = bytes([0x54, 0x02, (offset >> 8) & 0xFF, offset & 0xFF])
+    return _encode_apdu(0x00, INS_READ_BINARY_ODD, 0x00, 0x00, data, le=le)
+
+
+def build_write_data(fid: int, offset: int, payload: bytes) -> bytes:
+    """Build WRITE DATA APDU (INS=0xD7, SC-HSM proprietary).
+
+    Writes payload to the EF at fid starting at offset.
+    TLV format: 54 02 <off_hi> <off_lo> 53 <BER-len> <payload>
+    """
+    tlv = bytes([0x54, 0x02, (offset >> 8) & 0xFF, offset & 0xFF, 0x53])
+    # BER-TLV length encoding
+    plen = len(payload)
+    if plen < 128:
+        tlv += bytes([plen])
+    elif plen < 256:
+        tlv += bytes([0x81, plen])
+    else:
+        tlv += bytes([0x82, (plen >> 8) & 0xFF, plen & 0xFF])
+    tlv += payload
+    return _encode_apdu(0x80, INS_WRITE_DATA, (fid >> 8) & 0xFF, fid & 0xFF, tlv)
+
+
 def build_list_keys() -> bytes:
     """Build LIST PUBLIC KEY OBJECTS APDU.
 
@@ -302,19 +333,21 @@ def build_external_auth(auth_data: bytes) -> bytes:
 
 
 def build_import_key(key_id: int, key_data: bytes) -> bytes:
-    """Build IMPORT KEY APDU (INS=0x74).
+    """Build IMPORT KEY APDU (INS=0x74, P1=key_ref, P2=0x93).
 
     key_data should be a DKEK-wrapped key blob.
+    sc-hsm-tool sends: 80 74 <key_ref> 93 <len> <wrapped_blob>
     """
-    return _encode_apdu(0x80, INS_IMPORT_KEY, 0x00, key_id, key_data)
+    return _encode_apdu(0x80, INS_IMPORT_KEY, key_id, 0x93, key_data)
 
 
 def build_export_key(key_id: int) -> bytes:
-    """Build EXPORT KEY APDU (INS=0x72).
+    """Build EXPORT KEY APDU (INS=0x72, P1=key_ref, P2=0x92).
 
     Returns the DKEK-wrapped key blob.
+    sc-hsm-tool sends: 80 72 <key_ref> 92 00
     """
-    return _encode_apdu(0x80, INS_EXPORT_KEY, 0x00, key_id, le=0)
+    return _encode_apdu(0x80, INS_EXPORT_KEY, key_id, 0x92, le=0)
 
 
 def build_delete_file(fid: int) -> bytes:

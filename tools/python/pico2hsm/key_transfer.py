@@ -9,7 +9,10 @@ from typing import Optional
 
 from .device import Pico2HSM
 from .errors import Pico2HSMError
-from .protocol import build_export_key, build_import_key, build_delete_key
+from .protocol import (
+    build_export_key, build_import_key, build_delete_key,
+    build_select_ef, build_read_binary_odd, build_write_data,
+)
 
 try:
     from .cluster import SyncPlan, SyncResult, diff_manifests
@@ -121,6 +124,45 @@ _MAX_BLOB_SIZE = 4096
 _KCV_IV_SIZE = 24  # KCV(8) + IV(16)
 
 
+def read_ef(device: Pico2HSM, fid: int) -> Optional[bytes]:
+    """Read an EF file from the device via SELECT + READ BINARY ODD.
+
+    Returns the file data, or None if the file does not exist (SW=6A82).
+    """
+    try:
+        device.transmit(build_select_ef(fid))
+    except Exception:
+        return None
+
+    chunks = []
+    offset = 0
+    while True:
+        apdu = build_read_binary_odd(offset, le=0)
+        try:
+            data, sw = device.transmit(apdu)
+        except Exception:
+            break
+        if not data:
+            break
+        chunks.append(data)
+        offset += len(data)
+        if len(data) < 256:
+            break
+    return b"".join(chunks) if chunks else None
+
+
+def write_ef(device: Pico2HSM, fid: int, data: bytes) -> None:
+    """Write data to an EF file via WRITE DATA (INS=0xD7).
+
+    Writes in chunks to stay within APDU size limits.
+    """
+    chunk_size = 220  # safe limit for short APDU
+    for offset in range(0, len(data), chunk_size):
+        chunk = data[offset:offset + chunk_size]
+        apdu = build_write_data(fid, offset, chunk)
+        device.transmit(apdu)
+
+
 def export_key_from_device(device: Pico2HSM, key_ref: int) -> bytes:
     """Export a DKEK-wrapped key blob from the device.
 
@@ -140,6 +182,40 @@ def export_key_from_device(device: Pico2HSM, key_ref: int) -> bytes:
         )
     logger.info("Exported key ref=%d (%d bytes)", key_ref, len(data))
     return data
+
+
+def export_key_with_metadata(
+    device: Pico2HSM, key_ref: int
+) -> tuple[bytes, Optional[bytes], Optional[bytes]]:
+    """Export a DKEK-wrapped key blob, PRKD, and CVC certificate.
+
+    Returns (wrapped_blob, prkd_data, cvc_data).
+    prkd_data and cvc_data may be None if not available.
+
+    Both PRKD (C4xx) and CVC (CExx) are required for OpenSC/pkcs11-tool
+    to recognise the imported key.  The PRKD may be dynamically generated
+    by the firmware or stored as an EF file.
+    """
+    blob = export_key_from_device(device, key_ref)
+    prkd = read_ef(device, 0xC400 | key_ref)
+    if prkd:
+        logger.info("Read PRKD for key ref=%d (%d bytes)", key_ref, len(prkd))
+    cvc = read_ef(device, 0xCE00 | key_ref)
+    if cvc:
+        logger.info("Read CVC for key ref=%d (%d bytes)", key_ref, len(cvc))
+    return blob, prkd, cvc
+
+
+# Keep old name as alias for backwards compatibility
+def export_key_with_cvc(
+    device: Pico2HSM, key_ref: int
+) -> tuple[bytes, Optional[bytes]]:
+    """Export a DKEK-wrapped key blob and its CVC certificate.
+
+    Deprecated: use export_key_with_metadata() which also returns the PRKD.
+    """
+    blob, _prkd, cvc = export_key_with_metadata(device, key_ref)
+    return blob, cvc
 
 
 def import_key_to_device(
@@ -177,6 +253,43 @@ def import_key_to_device(
     if sw != 0x9000:
         raise Pico2HSMError(f"IMPORT KEY ref={key_ref} failed (SW={sw:04X})")
     logger.info("Imported key ref=%d (%d bytes, SW=%04X)", key_ref, len(wrapped_blob), sw)
+
+
+def import_key_with_metadata(
+    device: Pico2HSM,
+    key_ref: int,
+    wrapped_blob: bytes,
+    prkd_data: Optional[bytes] = None,
+    cvc_data: Optional[bytes] = None,
+) -> None:
+    """Import a DKEK-wrapped key blob with PRKD and CVC certificate.
+
+    Both PRKD (C4xx) and CVC (CExx) must be written as EF files for
+    OpenSC/pkcs11-tool to recognise the key.  The PRKD provides the
+    PKCS#15 PrivateKeyDescription (label, usage flags), and the CVC
+    provides the public key and curve parameters.
+    """
+    import_key_to_device(device, key_ref, wrapped_blob)
+    if prkd_data:
+        write_ef(device, 0xC400 | key_ref, prkd_data)
+        logger.info("Wrote PRKD for key ref=%d (%d bytes)", key_ref, len(prkd_data))
+    if cvc_data:
+        write_ef(device, 0xCE00 | key_ref, cvc_data)
+        logger.info("Wrote CVC for key ref=%d (%d bytes)", key_ref, len(cvc_data))
+
+
+# Keep old name as alias
+def import_key_with_cvc(
+    device: Pico2HSM,
+    key_ref: int,
+    wrapped_blob: bytes,
+    cvc_data: Optional[bytes] = None,
+) -> None:
+    """Import a DKEK-wrapped key blob and its CVC certificate.
+
+    Deprecated: use import_key_with_metadata() which also writes the PRKD.
+    """
+    import_key_with_metadata(device, key_ref, wrapped_blob, cvc_data=cvc_data)
 
 
 def delete_key_from_device(device: Pico2HSM, key_ref: int) -> None:
@@ -226,8 +339,8 @@ def transfer_keys(
     # Transfer missing keys
     for key_ref in plan.missing_on_secondary:
         try:
-            blob = export_key_from_device(primary, key_ref)
-            import_key_to_device(secondary, key_ref, blob)
+            blob, prkd, cvc = export_key_with_metadata(primary, key_ref)
+            import_key_with_metadata(secondary, key_ref, blob, prkd, cvc)
             keys_transferred += 1
             logger.info("Transferred key ref=%d (missing on secondary)", key_ref)
         except Exception as e:
@@ -251,8 +364,8 @@ def transfer_keys(
                 except Exception as e:
                     logger.warning("Could not back up conflicting key ref=%d: %s", key_ref, e)
 
-            blob = export_key_from_device(primary, key_ref)
-            import_key_to_device(secondary, key_ref, blob)
+            blob, prkd, cvc = export_key_with_metadata(primary, key_ref)
+            import_key_with_metadata(secondary, key_ref, blob, prkd, cvc)
             conflicts_resolved += 1
             logger.info("Resolved conflict for key ref=%d (primary wins)", key_ref)
         except Exception as e:
