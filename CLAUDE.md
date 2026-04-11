@@ -87,16 +87,19 @@ cargo build --release --no-default-features \
     --features pico2_4m,applet-piv,applet-openpgp,applet-openpgp-curve25519
 ```
 
-**Flash / RAM budget (release, pico2_4m):**
-- Current SC-HSM only: 366 KB flash / 377 KB RAM (18% / 73% of device limits)
-- + PIV (3DES new, all curves already in): +18–27 KB flash / +2 KB RAM
-- + OpenPGP NIST-ECC only: +10–15 KB flash / +2 KB RAM
-- + `applet-openpgp-curve25519` (curve25519-dalek, entirely new): +45–60 KB flash / 0 KB RAM
-- Worst case all three + curve25519: ~476 KB flash (23%) / ~383 KB RAM (74%)
+**Flash / RAM budget (release, all applets + RSA + curve25519, v0.9.9):**
 
-Flash is not a concern.  RAM is the metric to watch; the 128 KB core1 stack and the
-SC-HSM key caches dominate; applet state structs are small by comparison.
-Current BSS budget (waveshare_rp2350_lcd_16m, all applets): ~308 KB / 520 KB (59%).
+| Board | Flash | RAM | SRAM % |
+|---|---|---|---|
+| Pico 2 4MB | 522 KB | 398 KB | 77% |
+| RP2350-One 4MB/16MB | 529 KB | 398 KB | 77% |
+| RP2350-Geek 16MB/SDCard | 539 KB | 466 KB | 90% |
+| Waveshare LCD 16MB | 539 KB | 477 KB | 92% |
+| Waveshare LCD SDCard | 542 KB | 470 KB | 90% |
+
+Flash is not a concern.  RAM is the metric to watch; the 160 KB core1 stack and the
+display framebuffers (63 KB Geek, 110 KB Waveshare LCD) dominate on display boards.
+Non-display boards have ~122 KB free SRAM; Waveshare LCD 16MB is the tightest at ~43 KB free.
 
 **Storage namespace — implemented:**
 
@@ -113,8 +116,9 @@ bits  7–0:  proto_ref     (u8)  — protocol-level key reference
 ```
 
 Constructors: `KeyId::sc_hsm(partition, key_ref)`, `KeyId::piv(key_ref)`,
-`KeyId::openpgp(slot)`.  Flash magic `"P2K2"` surfaces old pre-u32 data as
-incompatible (re-INITIALIZE required after firmware update from older builds).
+`KeyId::openpgp(slot)`.  Flash magic `"P2K4"` is the current format (with `key_flags` byte); `"P2K2"` and
+`"P2K3"` are recognized as legacy and surfaced as incompatible (re-INITIALIZE
+required after firmware update from older builds).
 
 **Still required before PIV/OpenPGP command handlers:**
 Per-applet PIN slots in flash.  SC-HSM already has a PIN slot; PIV needs its own;

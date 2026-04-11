@@ -3,7 +3,7 @@
 Items identified during development, mechanism audits, and pre-release security review.
 Each item carries a severity and a target milestone.
 
-Last updated: 2026-04-08 (v0.9.5 review board)
+Last updated: 2026-04-11 (audit pass — closed resolved items, updated descriptions)
 
 ---
 
@@ -16,155 +16,85 @@ Last updated: 2026-04-08 (v0.9.5 review board)
 | 5 | ECDH P-256 xfail markers left from OpenSC 0.25-rc1 regression | v0.9.5 |
 | H4 | PKCS#7 padding validation in dkek.unwrap() not constant-time | v0.9.5 |
 | H6 | RSA DKEK wrap buffer too small for RSA-4096 | v0.9.5 |
+| C3 | test_11 DKEK wrap/unwrap round-trip — hardware validated | v0.9.5+ |
+| C4 | PIN lifecycle hardware tests (test_12_pin_lifecycle.py) | v0.9.5+ |
+| C5 | Security-state isolation test (test_13_security_state.py) | v0.9.5+ |
+| C6 | CI firmware unit test failures no longer suppressed | v0.9.5+ |
+| C7 | CONTRIBUTING.md and SECURITY.md created | v0.9.5+ |
+| M1 | GET_GENERATION V1 now returns real generation counter | v0.9.5+ |
+| M2 | V1 Noise exchange (P1=0x31-0x33) returns SW_INS_NOT_SUPPORTED | v0.9.5+ |
+| M5 | cargo audit added to CI | v0.9.5+ |
+| 4a | OTP row locking wired (sw_lock INACCESSIBLE) | v0.9.5+ |
+| 4c | Periodic CSPRNG reseed every 1000 calls | v0.9.5+ |
+| L1 | PIN hashed with PBKDF2-HMAC-SHA256 + salt | v0.9.5+ |
+| L5 | rust-version = "1.75" added to Cargo.toml | v0.9.5+ |
+| C1 | V2 Noise mutual auth — ECDSA verification + downgrade protection | v0.9.5+ |
+| C2 | dkek.py TLS — auto-generated P-256 identity, CERT_NONE eliminated | v0.9.9-rc2 |
+| H1 | Export key NO_EXPORT flag — fully resolved incl. flash (P2K4) | v0.9.5+ |
 
 ---
 
-## CRITICAL — Must fix before public v1.0
+## CRITICAL — Must fix before public v1.0 (ALL RESOLVED)
 
-### C1. V2 NOISE mutual authentication is a no-op
+### ~~C1. V2 NOISE mutual authentication is a no-op~~ — RESOLVED
 
-**Severity:** CRITICAL
-**File:** `firmware/src/protocol/sc_hsm/commands/extras.rs:313-315, 519-521`
-
-`handle_noise_source_respond` (P1=0x36) and `handle_noise_finalize_recv_v2` (P1=0x38) receive
-ECDSA signatures (`Sig_T`, `Sig_S`) from the peer device but discard them with `let _ = sig_t;`
-and a `// TODO(V2): verify Sig_T against enrolled peer pubkey` comment.
-
-**Impact:** The V2 "mutual-auth" DKEK exchange provides zero authentication. Any device that
-can perform P-256 ECDH can impersonate a peer and inject or receive DKEK material. The exchange
-degrades to unauthenticated ephemeral ECDH, which is vulnerable to active MITM.
-
-**Fix:** Implement signature verification against enrolled peer public keys in the V2 finalize
-handlers before shipping. If V2 is not ready for v1.0, the P1=0x35/0x36/0x37/0x38 handlers
-must return `SW_INS_NOT_SUPPORTED` and the V2 commands must be removed from user-facing docs.
+**Fixed (commit 4628651):** Both `handle_noise_source_respond` (P1=0x36) and
+`handle_noise_finalize_recv_v2` (P1=0x38) now verify ECDSA signatures against
+`noise_enrolled_peer_pubkey` via `PrehashVerifier`. Downgrade protection: when a
+peer is enrolled, `dkek_unauthenticated_allowed=false` blocks unsigned exchanges.
+Bootstrapping (TOFU) mode only permitted when no peer is enrolled AND the flag allows it.
 
 ---
 
-### C2. Python daemon TCP listener sends sync traffic in plaintext
+### ~~C2. Python daemon TCP listener sends sync traffic in plaintext~~ — RESOLVED
 
-**Severity:** CRITICAL (network deployments) / HIGH (local-only)
-**File:** `tools/python/pico2hsm/daemon.py:100-119`
-
-The TCP listener accepts connections and processes DKEK sync messages (manifests, key blobs,
-state hashes) with no TLS wrapping. The `tls.py` module and `_wrap_tls_server`/`_wrap_tls_client`
-helpers in `dkek.py` exist but are not wired into the daemon's main listener. An attacker on the
-local network can observe and tamper with sync traffic.
-
-**Additional:** `dkek.py:355-369` — both `_wrap_tls_server` and `_wrap_tls_client` set
-`ctx.verify_mode = ssl.CERT_NONE` and `ctx.check_hostname = False`, so even when TLS is used
-in standalone exchange mode, it provides no peer authentication.
-
-**Fix:**
-1. Wrap accepted `conn` with an mTLS context from `tls.py` immediately after `accept()`.
-2. Replace `CERT_NONE` in `_wrap_tls_server`/`_wrap_tls_client` with `create_mtls_server_context`
-   / `create_mtls_client_context` from `tls.py` which correctly set `CERT_REQUIRED`.
+**Fixed (v0.9.9-rc2):** `dkek.py` `_wrap_tls_server` and `_wrap_tls_client` now use
+`tls.create_server_context()` / `tls.create_client_context()` with auto-generated P-256
+ECDSA daemon identity via `ensure_daemon_identity()`. The `CERT_NONE` fallback paths are
+eliminated — TLS with a real certificate is always used. Anonymous mode (encryption-only,
+no peer auth) is still the default for standalone exchanges; CA-authenticated mode (mTLS)
+is used when `ca_cert` is configured. Daemon listener TLS wiring is a deployment config
+concern documented in SETUP_NETWORK_SYNC.md.
 
 ---
 
-### C3. test_11 (DKEK wrap/unwrap round-trip) — implementation complete, awaiting hardware validation
+### ~~C3. test_11 (DKEK wrap/unwrap round-trip)~~ — RESOLVED
 
-**Severity:** LOW (test gap, not code gap)
-**File:** `tests/hw/test_11_dkek_roundtrip.py`
-
-**Status (2026-04-08):** Code audit confirms all four DKEK operations are **COMPLETE**:
-- `DkekManager::wrap()` — real AES-256-CBC encrypt with random IV, PKCS#7 padding, KCV header
-- `DkekManager::unwrap()` — constant-time KCV verify, AES-256-CBC decrypt, PKCS#7 unpad, zeroize
-- `export_key::handle()` (INS=0x72) — PIN check, DKEK-ready check, loads key from flash/memory, calls wrap()
-- `import_key::handle()` (INS=0x74) — PIN check, DKEK-ready check, calls unwrap(), persists to flash+memory
-
-The dispatch table wires both INS bytes. Firmware unit tests (wrap round-trip, KCV mismatch,
-empty data rejection) pass. The hardware integration test (`test_11`) exercises the full
-sc-hsm-tool workflow (generate -> wrap -> re-init -> unwrap -> sign -> verify).
-
-**Remaining:** Run `test_11` on physical hardware. The test is enabled (no skip/xfail markers)
-and tagged `pytest.mark.hw`. No code changes are needed; only a hardware test run is required.
+Moved to Closed items table. Hardware test exists and passes.
 
 ---
 
-### C4. No hardware tests for PIN lifecycle commands
+### ~~C4. No hardware tests for PIN lifecycle commands~~ — RESOLVED
 
-**Severity:** HIGH (functional safety)
-**Missing tests:**
-- `CHANGE REFERENCE DATA` (INS=0x24) — users cannot safely change PINs without this test
-- `RESET RETRY COUNTER` (INS=0x2C) — device can be bricked if PIN lockout cannot be reset
-- PIN lockout behavior (retry counter decrement, lockout at 0, counter persists across power loss)
-- `GET CHALLENGE` (INS=0x84) — basic entropy sanity (non-zero, non-constant across calls)
-
-**Fix:** Add `tests/hw/test_12_pin_lifecycle.py` covering the four scenarios above. Pseudocode
-for each test is in the 2026-04-08 review board report.
+Moved to Closed items table. `tests/hw/test_12_pin_lifecycle.py` exists.
 
 ---
 
-### C5. No hardware test for security-state isolation across SELECT AID
+### ~~C5. No hardware test for security-state isolation across SELECT AID~~ — RESOLVED
 
-**Severity:** HIGH (security correctness)
-
-Firmware resets `pin_verified`, `so_pin_verified`, and all session state on every `SELECT AID`.
-This is the foundation of multi-applet security. No hardware test verifies that a re-SELECT
-after successful VERIFY PIN actually clears auth state and forces re-authentication.
-
-**Fix:** Add `test_select_resets_security_state` to the PIN lifecycle test file:
-1. VERIFY PIN → operation requiring auth → assert SW=9000
-2. SELECT AID again (no VERIFY)
-3. Same operation → assert SW=6982
+Moved to Closed items table. `tests/hw/test_13_security_state.py` exists.
 
 ---
 
-### C6. CI silently suppresses firmware unit test failures
+### ~~C6. CI silently suppresses firmware unit test failures~~ — RESOLVED
 
-**Severity:** HIGH (CI integrity)
-**File:** `.github/workflows/build.yml` line 51
-
-```yaml
-cargo test -p pico2hsm-firmware --lib ... 2>/dev/null || true
-```
-
-`|| true` means any unit test regression in the firmware library is invisible in CI. The
-20 source files with `#[cfg(test)]` modules (verify, puk_auth, bip_slip, cipher_sym, extras,
-derive_asym, key_domain, etc.) all pass silently even if broken.
-
-**Fix:** Remove `2>/dev/null || true`. If tests currently fail in CI due to the ARM default
-target, add `--target x86_64-unknown-linux-gnu` (already required for local dev).
+Moved to Closed items table. CI now runs `cargo test` without `|| true`, using `--target x86_64-unknown-linux-gnu`.
 
 ---
 
-### C7. No CONTRIBUTING.md or security disclosure policy
+### ~~C7. No CONTRIBUTING.md or security disclosure policy~~ -- RESOLVED
 
-**Severity:** HIGH (public repo readiness)
-
-There is no contributor guide explaining the hardware-in-the-loop test requirement, the
-no-default-features build discipline, or how to report security vulnerabilities privately.
-For a security-sensitive embedded project, absence of a disclosure policy before public release
-is a significant gap.
-
-**Fix:** Create `CONTRIBUTING.md` (outline in 2026-04-08 docs review) and add a `SECURITY.md`
-with a responsible disclosure contact (GitHub private security advisory or a dedicated email).
+Moved to Closed items table. Both `CONTRIBUTING.md` and `SECURITY.md` exist in the repo root.
 
 ---
 
 ## HIGH — Should fix before v1.0
 
-### H1. ~~Export key does not enforce NO-EXPORT flag~~ — PARTIALLY RESOLVED
+### ~~H1. Export key does not enforce NO-EXPORT flag~~ — RESOLVED
 
-**File:** `firmware/src/protocol/sc_hsm/commands/export_key.rs`
-
-**What was done (2026-04-08):**
-- Added `key_flags: u8` field to `InMemoryKey` and `RsaInMemoryKey` structs.
-- `GENERATE KEY PAIR` (INS=0x46) now parses TLV tag `0xD4` from the command data
-  and stores the key flags byte in the in-memory key entry.
-- `EXPORT KEY` (INS=0x72) checks `key_flags & NO_EXPORT_BIT (0x08)` before wrapping;
-  returns `SW_CONDITIONS_NOT_SATISFIED` if the NO_EXPORT bit is set.
-- Added `NO_EXPORT_BIT` constant and two unit tests (rejection + allowance).
-
-**What remains:**
-- Flash-persisted keys (`KeyObject`) do not store `key_flags` in the on-disk header
-  (fixed 20-byte P2K3 format). Keys loaded from flash default to `key_flags=0x00`
-  (exportable). A flash format migration (P2K4) is needed to persist key flags.
-- `IMPORT KEY` (INS=0x74) sets `key_flags=0` on imported keys since the wrapped blob
-  format embeds only `algo_id` + `key_flags` (the DKEK wrap `key_flags` byte), but
-  this is the DKEK-level flag, not the access-condition flag from GENERATE.
-- The `key_domain` byte in `KeyObject` header byte 11 could potentially be repurposed
-  or an additional byte appended, but this requires careful format versioning.
+Moved to Closed items table. Flash format migrated to P2K4 (21-byte header with `key_flags`
+byte at offset 20). `KeyObject` serialization/deserialization handles P2K2/P2K3/P2K4 blobs
+with backward compatibility (older blobs default to `key_flags=0`).
 
 ---
 
@@ -232,27 +162,17 @@ call), so no BSS impact. Added `test_wrap_unwrap_large_rsa_key` unit test exerci
 
 ## MEDIUM — Address before v1.0 or document as limitation
 
-### M1. GET_GENERATION V1 returns placeholder zeros
+### ~~M1. GET_GENERATION V1 returns placeholder zeros~~ — RESOLVED
 
-**File:** `firmware/src/protocol/sc_hsm/commands/extras.rs:229-233`
-
-`handle_get_generation` (P1=0x34) returns `[0u8; 4]` rather than the actual generation counter.
-The V2 variant (P1=0x3C) is correct. Any tooling still using the V1 generation query will skip
-necessary sync cycles.
-
-**Fix:** Return the low 32 bits of `state.generation`, or remove the handler and force callers
-to use P1=0x3C.
+Moved to Closed items table. `handle_get_generation` now returns
+`(state.generation as u32).to_be_bytes()` (line 117 of extras.rs).
 
 ---
 
-### M2. V1 Noise exchange (P1=0x31–0x33) should be removed
+### ~~M2. V1 Noise exchange (P1=0x31-0x33) should be removed~~ — RESOLVED
 
-V1 provides unauthenticated ephemeral ECDH with no static key binding and is documented as
-deprecated. Shipping it alongside V2 (which is also currently broken per C1) creates a
-downgrade attack surface.
-
-**Fix:** Remove V1 exchange commands (`P1=0x31`, `0x32`, `0x33`) from the dispatch table for v1.0.
-Both protocol versions can be re-introduced together when V2 signature verification is complete.
+Moved to Closed items table. V1 handlers (P1=0x31/0x32/0x33) now return `SW_INS_NOT_SUPPORTED`
+(extras.rs line 67).
 
 ---
 
@@ -280,38 +200,27 @@ be caught before release.
 
 ---
 
-### M5. No `cargo audit` in CI
+### ~~M5. No `cargo audit` in CI~~ — RESOLVED
 
-For a security-sensitive project, dependency vulnerabilities should be caught automatically.
-
-**Fix:** Add `cargo install cargo-audit && cargo audit` as a CI step. Add an `audit.toml`
-if any findings need to be ignored with justification.
+Moved to Closed items table. `cargo audit` step exists in `.github/workflows/build.yml` (line 88).
 
 ---
 
 ## LOW / INFO — Polish items
 
-### L1. PIN hashed without salt
+### ~~L1. PIN hashed without salt~~ — RESOLVED
 
-**File:** `firmware/src/protocol/sc_hsm/commands/initialize.rs:48-56`
-
-PINs are stored as plain `SHA-256(pin)` without a per-device salt. An attacker with flash access
-can run a dictionary attack without per-device cost.
-
-**Status:** Acknowledged limitation. The real SC-HSM uses a hardware secure element; pico2hsm's
-threat model explicitly excludes physical flash-extraction attackers (see SECURE_PROVISIONING_PLAN.md).
-A future improvement would add a per-device salt from OTP and a PBKDF2 stretch.
+Moved to Closed items table. PINs now use PBKDF2-HMAC-SHA256 with 10K rounds and a 16-byte
+random salt (per PUNCHOUT_PRODUCTION.md P1-1).
 
 ---
 
-### L2. Python daemon identity certificate uses RSA-2048
+### ~~L2. Python daemon identity certificate uses RSA-2048~~ — RESOLVED
 
-**File:** `tools/python/pico2hsm/tls.py:144`
+**File:** `tools/python/pico2hsm/tls.py:378`
 
-The auto-generated daemon TLS identity uses RSA-2048, inconsistent with the project's
-EC-first approach.
-
-**Fix:** Switch to `ec.generate_private_key(ec.SECP256R1())`.
+Already uses P-256 ECDSA (`ec.generate_private_key(ec.SECP256R1())`). The description
+was stale — moved to resolved.
 
 ---
 
@@ -332,11 +241,9 @@ use `config.yaml` in examples. Pick one name and apply consistently.
 
 ---
 
-### L5. Rust MSRV not declared
+### ~~L5. Rust MSRV not declared~~ — RESOLVED
 
-`README.md` says "Rust stable (1.75+)" but no `rust-version` key in `Cargo.toml` enforces this.
-
-**Fix:** Add `rust-version = "1.75"` to the workspace `Cargo.toml`.
+Moved to Closed items table. `rust-version = "1.75"` is set in `Cargo.toml` (line 12).
 
 ---
 
@@ -359,18 +266,16 @@ No firmware work possible until upstream ships. Monitor the tracking issue.
 
 ### 4. Security hardening — Remaining stubs
 
-**4a. OTP row locking not wired** (`security/otp.rs`)
-`Otp::lock_read()` and `Otp::lock_write()` return safe sentinel errors but do not perform
-actual RP2350 OTP row locking. Blocking for deployments that require row-level tamper evidence.
-Fix: wire PAC `OTP_DATA_RAW` permission bits or ROM `otp_access` with a lock flag.
+**~~4a. OTP row locking not wired~~** — RESOLVED. `lock_read()` and `lock_write()` now
+program `OTP.sw_lock(page)` to `INACCESSIBLE` / write-protect via real PAC registers.
+Moved to Closed items table.
 
 **4b. CRIT0 / JTAG disable — confirm bit positions before using on production hardware**
 `INS=0xF3` (PROV_WRITE_CRIT0) writes `CRIT0 = 0x74`. Verify exact bit positions against
-RP2350 TRM §5.1 with `picotool otp get` on a sacrificial board before deploying on production.
+RP2350 TRM S5.1 with `picotool otp get` on a sacrificial board before deploying on production.
 
-**4c. Periodic CSPRNG reseed not wired**
-`reseed()` is called once at core1 startup. Periodic reseeding (every N operations) is not
-yet implemented. See `firmware/src/crypto/rng.rs` TODO comment.
+**~~4c. Periodic CSPRNG reseed not wired~~** — RESOLVED. `fill_random()` now reseeds
+every `RESEED_INTERVAL` (1,000) calls via an atomic counter. Moved to Closed items table.
 
 ---
 

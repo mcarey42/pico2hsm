@@ -160,6 +160,33 @@ fi
 pip3 install -e "$PYTHON_PKG_DIR" 2>&1 | tail -1
 ok "Python package installed"
 
+# ---- Generate TLS daemon identity ----
+info "Generating TLS daemon identity..."
+
+CERT_DIR="/etc/pico2hsm/certs"
+CERT_FILE="${CERT_DIR}/daemon.crt"
+KEY_FILE="${CERT_DIR}/daemon.key"
+
+if [ -f "$CERT_FILE" ] && [ -f "$KEY_FILE" ]; then
+    ok "TLS identity already exists: $CERT_FILE"
+else
+    python3 -c "
+from pathlib import Path
+from pico2hsm.tls import ensure_daemon_identity
+cert, key = ensure_daemon_identity(Path('${CERT_DIR}'))
+print(f'cert={cert}  key={key}')
+" 2>&1
+    if [ -f "$CERT_FILE" ]; then
+        chown root:pico2hsm "$CERT_FILE"
+        chmod 644 "$CERT_FILE"
+        chown root:pico2hsm "$KEY_FILE"
+        chmod 600 "$KEY_FILE"
+        ok "Generated P-256 ECDSA TLS identity (10-year self-signed)"
+    else
+        warn "TLS identity generation failed. The daemon will auto-generate on first run."
+    fi
+fi
+
 # ---- Install hsm_daemon.py ----
 info "Installing hsm_daemon.py..."
 

@@ -376,18 +376,20 @@ def _wrap_tls_client(
     """Wrap a client socket with TLS. Uses daemon identity cert if provided."""
     from .tls import create_client_context
 
-    if cert_path and key_path:
-        ctx = create_client_context(
-            cert_path=cert_path,
-            key_path=key_path,
-            ca_cert=ca_cert,
-            peer_name=hostname,
-        )
-    else:
-        # No identity cert -- anonymous encryption-only client
-        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
+    if not cert_path or not key_path:
+        # Auto-generate daemon identity if none provided
+        from pathlib import Path as _Path
+        from .tls import ensure_daemon_identity
+        _config_dir = _Path.home() / ".pico2hsm"
+        cert_path, key_path = ensure_daemon_identity(_config_dir)
+        cert_path, key_path = str(cert_path), str(key_path)
+
+    ctx = create_client_context(
+        cert_path=cert_path,
+        key_path=key_path,
+        ca_cert=ca_cert,
+        peer_name=hostname,
+    )
 
     server_hostname = hostname if ca_cert else None
     return ctx.wrap_socket(conn, server_hostname=server_hostname)
