@@ -563,16 +563,17 @@ impl OpenPgp {
         }
 
         // Load key objects for OpenPGP slots.
-        let ids = store.enumerate_keys();
-        for kid in ids.iter() {
-            // Only OpenPGP keys (applet byte == 2), skip PIN sentinels.
-            if kid.applet_byte() != AppletId::OpenPgp as u8 {
-                continue;
+        let mut openpgp_ids: heapless::Vec<pico2hsm_core::key::KeyId, 8> = heapless::Vec::new();
+        store.for_each_key(&mut |kid| {
+            if kid.applet_byte() == AppletId::OpenPgp as u8 {
+                let slot = kid.proto_ref();
+                if slot != 0xFE && slot != 0xFF {
+                    let _ = openpgp_ids.push(kid);
+                }
             }
+        });
+        for kid in openpgp_ids.iter() {
             let slot = kid.proto_ref();
-            if slot == 0xFE || slot == 0xFF {
-                continue; // PIN records
-            }
 
             if let Ok(Some(obj)) = store.fetch_key(*kid) {
                 if !matches!(obj.key_type, KmKeyType::Ec) {

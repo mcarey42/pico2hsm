@@ -598,7 +598,7 @@ fn handle_get_key_manifest(state: &mut ScHsmState, store: &mut dyn KeyStore, _cm
         let _ = manifest.extend_from_slice(&pubkey_hash);
     }
 
-    // Iterate flash keys via store.enumerate_keys().
+    // Iterate flash keys via store.enumerate_keys() (capped at 64).
     let flash_keys = store.enumerate_keys();
     for kid in flash_keys.iter() {
         let key_ref = (kid.0 & 0xFF) as u8;
@@ -1245,7 +1245,8 @@ mod tests {
         fn erase_key(&mut self, _: KeyId) -> Result<(), pico2hsm_core::error::HsmError> { Ok(()) }
         fn wipe_all(&mut self) -> Result<(), pico2hsm_core::error::HsmError> { Ok(()) }
         fn wipe_by_owner(&mut self, _: AppletId) -> Result<(), pico2hsm_core::error::HsmError> { Ok(()) }
-        fn enumerate_keys(&self) -> heapless::Vec<KeyId, 512> { heapless::Vec::new() }
+        fn enumerate_keys(&self) -> heapless::Vec<KeyId, 64> { heapless::Vec::new() }
+        fn for_each_key(&self, _f: &mut dyn FnMut(KeyId)) {}
     }
 
     /// Create a ScHsmState with a device static key (key_ref=0xFE) and PIN verified.

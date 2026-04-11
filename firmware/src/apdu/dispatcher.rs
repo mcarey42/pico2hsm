@@ -112,18 +112,17 @@ impl Dispatcher {
     ///
     /// Called at session start and on USB reconnect (new Dispatcher).
     pub fn load_keys_from_store(&mut self, store: &mut dyn crate::storage::KeyStore) {
-        let ids = store.enumerate_keys();
+        // Collect SC-HSM key IDs to load (applet byte == 0, not PIN sentinel).
+        // Uses for_each_key to avoid a large stack Vec, then collects into a
+        // small Vec for the fetch loop (which needs &mut store).
+        let mut sc_hsm_ids: heapless::Vec<pico2hsm_core::key::KeyId, 64> = heapless::Vec::new();
+        store.for_each_key(&mut |kid| {
+            if kid.applet_byte() == 0 && kid.proto_ref() != 0xFF {
+                let _ = sc_hsm_ids.push(kid);
+            }
+        });
         let mut loaded = 0usize;
-        for kid in ids.iter() {
-            // Only load SC-HSM keys (applet byte == 0) here.
-            // PIV and OpenPGP are loaded via their own load_from_store methods below.
-            if kid.applet_byte() != 0 {
-                continue;
-            }
-            // Skip PIN sentinel (proto_ref 0xFF) — loaded separately below.
-            if kid.proto_ref() == 0xFF {
-                continue;
-            }
+        for kid in sc_hsm_ids.iter() {
             match store.fetch_key(*kid) {
                 Ok(Some(obj)) => {
                     push_key_object_to_state(&mut self.sc_hsm.state, obj);

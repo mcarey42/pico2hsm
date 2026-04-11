@@ -595,7 +595,7 @@ impl<Chip: FlashChip> KeyFilesystem<Chip> {
     /// Returns a `Vec` of `KeyRecord` objects.  The `label` and
     /// `access_counter` fields are left at their defaults since they are
     /// not stored by the filesystem layer.
-    pub fn list_keys(&self) -> heapless::Vec<KeyRecord, 512> {
+    pub fn list_keys(&self) -> heapless::Vec<KeyRecord, 64> {
         let mut out = heapless::Vec::new();
         for key_id in self.directory.list_keys() {
             if let Some(entry) = self.directory.find(key_id) {

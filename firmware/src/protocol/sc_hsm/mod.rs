@@ -61,9 +61,10 @@ impl crate::storage::KeyStore for LocalNullStore {
     fn wipe_by_owner(&mut self, _: AppletId) -> Result<(), HsmError> {
         Ok(())
     }
-    fn enumerate_keys(&self) -> heapless::Vec<KeyId, 512> {
+    fn enumerate_keys(&self) -> heapless::Vec<KeyId, 64> {
         heapless::Vec::new()
     }
+    fn for_each_key(&self, _f: &mut dyn FnMut(KeyId)) {}
 }
 
 /// AID for SmartCard-HSM (pico2hsm variant).
@@ -86,7 +87,10 @@ pub const MAX_IN_MEMORY_SYM_KEYS: usize = 8;
 pub const MAX_RSA_IN_MEMORY_KEYS: usize = 4;
 
 /// Maximum number of EF (elementary file) entries stored in RAM.
-pub const MAX_EF_FILES: usize = 16;
+/// Reduced from 16 to 8 to save ~16 KB BSS (each entry contains a
+/// 2048-byte inline Vec).  SC-HSM only needs a handful of EF files
+/// (DevAut cert, C.DevAut, etc.).
+pub const MAX_EF_FILES: usize = 8;
 /// Maximum size of a single EF data blob (bytes).
 pub const MAX_EF_DATA: usize = 2048;
 

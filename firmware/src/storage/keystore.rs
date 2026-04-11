@@ -63,7 +63,18 @@ pub trait KeyStore {
     fn wipe_by_owner(&mut self, owner: AppletId) -> Result<(), HsmError>;
 
     /// List all key IDs currently in persistent storage.
-    fn enumerate_keys(&self) -> Vec<KeyId, 512>;
+    ///
+    /// Returns a fixed-capacity vector of up to 64 key IDs.  Most devices
+    /// will have far fewer than 64 keys; the previous 512-entry capacity
+    /// wasted 2 KB of stack on every call.
+    fn enumerate_keys(&self) -> Vec<KeyId, 64>;
+
+    /// Invoke `f` for each key ID in persistent storage.
+    ///
+    /// Preferred over `enumerate_keys()` when the caller only needs to
+    /// iterate — avoids allocating even the 64-entry Vec on the stack.
+    /// Uses `&mut dyn FnMut` instead of `impl FnMut` for dyn-compatibility.
+    fn for_each_key(&self, f: &mut dyn FnMut(KeyId));
 }
 
 // ─── FlashKeyStore<Chip> ──────────────────────────────────────────────────────
@@ -140,8 +151,7 @@ impl<Chip: FlashChip> KeyStore for FlashKeyStore<Chip> {
     fn fetch_key(&mut self, key_id: KeyId) -> Result<Option<KeyObject>, HsmError> {
         // Check whether the key exists in the directory first so we can
         // return Ok(None) cleanly instead of propagating a ReadError.
-        let key_ids = self.storage.list_keys();
-        if !key_ids.iter().any(|k| k.0 == key_id.0) {
+        if !self.storage.key_exists(key_id) {
             return Ok(None);
         }
 
@@ -184,8 +194,14 @@ impl<Chip: FlashChip> KeyStore for FlashKeyStore<Chip> {
         Ok(())
     }
 
-    fn enumerate_keys(&self) -> Vec<KeyId, 512> {
-        self.storage.list_keys()
+    fn enumerate_keys(&self) -> Vec<KeyId, 64> {
+        let mut out = Vec::new();
+        self.storage.for_each_key(&mut |kid| { let _ = out.push(kid); });
+        out
+    }
+
+    fn for_each_key(&self, f: &mut dyn FnMut(KeyId)) {
+        self.storage.for_each_key(f);
     }
 }
 
@@ -219,8 +235,12 @@ impl KeyStore for NullKeyStore {
         Ok(())
     }
 
-    fn enumerate_keys(&self) -> Vec<KeyId, 512> {
+    fn enumerate_keys(&self) -> Vec<KeyId, 64> {
         Vec::new()
+    }
+
+    fn for_each_key(&self, _f: &mut dyn FnMut(KeyId)) {
+        // No keys in the null store.
     }
 }
 
@@ -279,6 +299,7 @@ impl<P: KeyStore, S: KeyStore> HybridKeyStore<P, S> {
     /// syncing the remaining keys.
     pub fn resync(&mut self) -> Result<(), HsmError> {
         crate::cdc_log!("HYBRID resync start");
+        // Collect key IDs first (we need &mut self for fetch_key below).
         let key_ids = self.primary.enumerate_keys();
         let mut any_failed = false;
 
@@ -327,11 +348,11 @@ impl<P: KeyStore, S: KeyStore> HybridKeyStore<P, S> {
             return Ok(());
         }
 
-        // Probe the secondary by enumerating keys — this exercises the SD
+        // Probe the secondary by iterating keys — this exercises the SD
         // card read path without writing. If the card is removed or broken,
-        // enumerate_keys will typically return an empty list or the underlying
+        // for_each_key will typically iterate nothing or the underlying
         // driver will error (caught by the resync attempt below).
-        let _ = self.secondary.enumerate_keys();
+        self.secondary.for_each_key(&mut |_| {});
 
         // Attempt a full resync. If it succeeds, degraded is cleared inside resync().
         match self.resync() {
@@ -480,9 +501,14 @@ impl<P: KeyStore, S: KeyStore> KeyStore for HybridKeyStore<P, S> {
         Ok(())
     }
 
-    fn enumerate_keys(&self) -> Vec<KeyId, 512> {
+    fn enumerate_keys(&self) -> Vec<KeyId, 64> {
         // Primary is authoritative.
         self.primary.enumerate_keys()
+    }
+
+    fn for_each_key(&self, f: &mut dyn FnMut(KeyId)) {
+        // Primary is authoritative.
+        self.primary.for_each_key(f);
     }
 }
 

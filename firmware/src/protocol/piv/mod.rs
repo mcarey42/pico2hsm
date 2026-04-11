@@ -33,7 +33,9 @@ pub const PIV_AID: &[u8] = &[0xA0, 0x00, 0x00, 0x03, 0x08, 0x00, 0x00, 0x10, 0x0
 pub const MAX_PIV_KEYS: usize = 4;
 
 /// Maximum number of stored PIV data objects (certificates, CHUID, CCC, etc.).
-pub const MAX_PIV_DATA_OBJECTS: usize = 8;
+/// Reduced from 8 to 4 to save ~8 KB BSS (each object contains a 2048-byte
+/// inline Vec).  PIV only needs: CHUID, CCC, printed info, and one certificate.
+pub const MAX_PIV_DATA_OBJECTS: usize = 4;
 
 /// Maximum size of a single PIV data object in bytes.
 pub const MAX_PIV_DATA_SIZE: usize = 2048;
@@ -427,15 +429,13 @@ impl Piv {
             Self::load_pin_state_from_store(&mut self.state, store);
 
             // Load key objects for PIV slots.
-            let ids = store.enumerate_keys();
-            for kid in ids.iter() {
-                // Only PIV keys (applet byte == 1), skip PIN sentinel (0xFF).
-                if kid.applet_byte() != AppletId::Piv as u8 {
-                    continue;
+            let mut piv_ids: heapless::Vec<pico2hsm_core::key::KeyId, 16> = heapless::Vec::new();
+            store.for_each_key(&mut |kid| {
+                if kid.applet_byte() == AppletId::Piv as u8 && kid.proto_ref() != 0xFF {
+                    let _ = piv_ids.push(kid);
                 }
-                if kid.proto_ref() == 0xFF {
-                    continue; // PIN record sentinel
-                }
+            });
+            for kid in piv_ids.iter() {
 
                 if let Ok(Some(obj)) = store.fetch_key(*kid) {
                     use crate::security::key_management::{AlgorithmId, KeyType as KmKeyType};

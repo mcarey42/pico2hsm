@@ -34,6 +34,8 @@
 
 // ─── ARM-only imports ─────────────────────────────────────────────────────────
 
+#[allow(unused_imports)]
+use pico2hsm_firmware::{serial_println, serial_print, serial_fmt};
 #[cfg(target_arch = "arm")]
 use defmt_rtt as _;
 #[cfg(target_arch = "arm")]
@@ -192,9 +194,12 @@ impl pico2hsm_firmware::storage::KeyStore for FlashQueueKeyStore {
         Ok(())
     }
 
-    fn enumerate_keys(&self) -> heapless::Vec<pico2hsm_core::key::KeyId, 512> {
+    fn enumerate_keys(&self) -> heapless::Vec<pico2hsm_core::key::KeyId, 64> {
         // In-memory state is authoritative; flash enumeration not needed.
         heapless::Vec::new()
+    }
+    fn for_each_key(&self, _f: &mut dyn FnMut(pico2hsm_core::key::KeyId)) {
+        // In-memory state is authoritative; flash enumeration not needed.
     }
 }
 
@@ -733,59 +738,43 @@ async fn run_geek_board(p: embassy_rp::Peripherals) {
     // probe session).  Without serial output we can't distinguish that halt
     // from a clock/flash/allocator failure.
     // Partial field moves from `p` are fine within the owning function.
-    let mut dbg = Uart::new_blocking(p.UART1, p.PIN_4, p.PIN_5, UartConfig::default());
-
-    // ── Serial helper macros ─────────────────────────────────────────────────
-    macro_rules! serial_ln {
-        ($msg:literal) => {{
-            let _ = dbg.blocking_write(b"[GEEK] ");
-            let _ = dbg.blocking_write($msg.as_bytes());
-            let _ = dbg.blocking_write(b"\r\n");
-        }};
-    }
-    macro_rules! serial_fmt {
-        ($($arg:tt)*) => {{
-            use core::fmt::Write as _;
-            let mut _buf = heapless::String::<256>::new();
-            let _ = core::write!(_buf, "[GEEK] {}\r\n", core::format_args!($($arg)*));
-            let _ = dbg.blocking_write(_buf.as_bytes());
-        }};
-    }
-
-    let _ = dbg.blocking_write(b"\r\n\r\n");
-    serial_ln!("=== pico2hsm RP2350-Geek boot ===");
-    serial_ln!("UART1 GPIO4=TX GPIO5=RX 115200 8N1");
+    // ── UART1 init for serial_debug macros ─────────────────────────────────
+    // Must happen before any serial_println!/serial_fmt! calls.
+    let _dbg = Uart::new_blocking(p.UART1, p.PIN_4, p.PIN_5, UartConfig::default());
+    pico2hsm_firmware::serial_debug::uart1_write_bytes(b"\r\n\r\n");
+    serial_println!("=== pico2hsm RP2350-Geek boot ===");
+    serial_println!("UART1 GPIO4=TX GPIO5=RX 115200 8N1");
 
     // ── Security checks ──────────────────────────────────────────────────────
-    serial_ln!("security_checks()...");
+    serial_println!("security_checks()...");
     pico2hsm_firmware::security::boot::security_checks();
-    serial_ln!("security_checks() ok");
+    serial_println!("security_checks() ok");
 
     // ── Allocator ────────────────────────────────────────────────────────────
-    serial_ln!("allocator init...");
+    serial_println!("allocator init...");
     pico2hsm_firmware::allocator::init();
-    serial_ln!("allocator ok");
+    serial_println!("allocator ok");
 
     // ── OTP ──────────────────────────────────────────────────────────────────
-    serial_ln!("OTP init...");
+    serial_println!("OTP init...");
     let otp = pico2hsm_firmware::security::otp::Otp::new();
     let provisioned = otp.is_provisioned();
     let prod_mode = otp.is_production_mode();
     serial_fmt!("OTP ok: provisioned={} production_mode={}", provisioned, prod_mode);
     defmt::info!("OTP: provisioned={}, production_mode={}", provisioned, prod_mode);
 
-    serial_ln!("OTP derive_smk...");
+    serial_println!("OTP derive_smk...");
     match pico2hsm_firmware::security::otp::derive_smk() {
-        Ok(_) => serial_ln!("derive_smk ok"),
-        Err(_) => serial_ln!("derive_smk failed (unprovisioned — continuing)"),
+        Ok(_) => serial_println!("derive_smk ok"),
+        Err(_) => serial_println!("derive_smk failed (unprovisioned — continuing)"),
     }
 
     // ── CHECKPOINT 0 ─────────────────────────────────────────────────────────
-    serial_ln!("--- run_geek_board ---");
+    serial_println!("--- run_geek_board ---");
     defmt::info!("Board: RP2350-Geek initialising");
 
     // ── CHECKPOINT 1 — SPI buses ─────────────────────────────────────────────
-    serial_ln!("SPI0 init (SCK=18 MOSI=19 MISO=20)...");
+    serial_println!("SPI0 init (SCK=18 MOSI=19 MISO=20)...");
     let mut spi0_cfg = SpiConfig::default();
     spi0_cfg.frequency = SPI_FREQ_HZ;
     spi0_cfg.phase = Phase::CaptureOnFirstTransition;
@@ -796,7 +785,7 @@ async fn run_geek_board(p: embassy_rp::Peripherals) {
     // SPI1 LCD bus — Async/DMA mode so flush() yields to the executor during
     // the ~17 ms 63 KB framebuffer transfer, keeping USB alive.
     // DMA_CH3=TX, DMA_CH4=RX (RX is unused — LCD is write-only).
-    serial_ln!("SPI1 init (SCK=10 MOSI=11 MISO=12, async DMA)...");
+    serial_println!("SPI1 init (SCK=10 MOSI=11 MISO=12, async DMA)...");
     let mut spi1_cfg = SpiConfig::default();
     spi1_cfg.frequency = pico2hsm_firmware::board::rp2350_geek::LCD_SPI_FREQ_HZ;
     spi1_cfg.phase = Phase::CaptureOnFirstTransition;
@@ -805,10 +794,10 @@ async fn run_geek_board(p: embassy_rp::Peripherals) {
     serial_fmt!("SPI1 ok @ {} Hz (async DMA)", pico2hsm_firmware::board::rp2350_geek::LCD_SPI_FREQ_HZ);
 
     // ── CHECKPOINT 2 — board struct ──────────────────────────────────────────
-    serial_ln!("Board struct init...");
+    serial_println!("Board struct init...");
     let mut board = Rp2350GeekBoard::new(spi0, spi1);
     board.led().set_status(LedStatus::Busy);
-    serial_ln!("Board ok, LED=Busy");
+    serial_println!("Board ok, LED=Busy");
 
     #[cfg(feature = "rp2350_geek_sdcard")]
     {
@@ -816,9 +805,9 @@ async fn run_geek_board(p: embassy_rp::Peripherals) {
         defmt::info!("SDCard slot active — CS on GPIO {}", pico2hsm_firmware::board::rp2350_geek::SDCARD0_CS);
     }
     // ── CHECKPOINT 3 — USB driver ────────────────────────────────────────────
-    serial_ln!("USB driver init...");
+    serial_println!("USB driver init...");
     let usb_driver = UsbDriver::new(p.USB, Irqs);
-    serial_ln!("USB driver ok");
+    serial_println!("USB driver ok");
 
     let mut usb_config = UsbConfig::new(USB_VID, USB_PID);
     usb_config.manufacturer = Some("pico2hsm");
@@ -834,7 +823,7 @@ async fn run_geek_board(p: embassy_rp::Peripherals) {
     let mut cdc_state = CdcAcmState::new();
 
     // ── CHECKPOINT 4 — USB descriptor builder ───────────────────────────────
-    serial_ln!("USB builder init...");
+    serial_println!("USB builder init...");
     let mut config_descriptor_buf = [0u8; 512];  // bump to 512 for CDC+CCID
     let mut bos_descriptor_buf = [0u8; 256];
     let mut msos_descriptor_buf = [0u8; 256];
@@ -848,24 +837,24 @@ async fn run_geek_board(p: embassy_rp::Peripherals) {
         &mut msos_descriptor_buf,
         &mut control_buf,
     );
-    serial_ln!("USB builder ok");
+    serial_println!("USB builder ok");
 
     // ── CHECKPOINT 5 — CCID class registration ───────────────────────────────
-    serial_ln!("CCID class register...");
+    serial_println!("CCID class register...");
     let mut ccid = CcidTransport::new(&mut builder);
-    serial_ln!("CCID class ok");
+    serial_println!("CCID class ok");
 
     // CDC-ACM serial logger — /dev/ttyACMx for daemon diagnostics + debug.
     let cdc_class = CdcAcmClass::new(&mut builder, &mut cdc_state, 64);
     let (mut cdc_sender, _) = cdc_class.split();
 
     // ── CHECKPOINT 6 — finalise USB device ──────────────────────────────────
-    serial_ln!("USB device build...");
+    serial_println!("USB device build...");
     let mut usb = builder.build();
-    serial_ln!("USB device ok");
+    serial_println!("USB device ok");
 
     board.led().set_status(LedStatus::Ready);
-    serial_ln!("LED=Ready — entering main loop");
+    serial_println!("LED=Ready — entering main loop");
     defmt::info!("pico2hsm (RP2350-Geek): USB CCID ready, entering main loop");
 
     // ── Storage initialization (rp2350_geek: internal QMI flash) ──────────────
@@ -873,7 +862,7 @@ async fn run_geek_board(p: embassy_rp::Peripherals) {
     // board struct refactor to separate LED from SPI ownership.  For now, use
     // the RP2350 internal QMI flash (upper 2 MB partition) via the AnyChip::SdCard
     // slot (third type parameter is QmiFlash).
-    serial_ln!("KeyStore init (QMI internal flash)...");
+    serial_println!("KeyStore init (QMI internal flash)...");
     let smk_bytes = pico2hsm_firmware::security::otp::derive_smk()
         .unwrap_or([0u8; 32]);
     let smk = zeroize::Zeroizing::new(smk_bytes);
@@ -890,8 +879,8 @@ async fn run_geek_board(p: embassy_rp::Peripherals) {
     let sm = pico2hsm_firmware::storage::StorageManager::new(fs);
     let mut ks = pico2hsm_firmware::storage::FlashKeyStore::new(sm, smk);
     match ks.init() {
-        Ok(()) => serial_ln!("KeyStore ok (QMI internal flash)"),
-        Err(_) => serial_ln!("KeyStore init failed — degraded mode"),
+        Ok(()) => serial_println!("KeyStore ok (QMI internal flash)"),
+        Err(_) => serial_println!("KeyStore init failed — degraded mode"),
     }
     let store: &'static mut _ = KEYSTORE_CELL.init(ks);
 
@@ -940,9 +929,9 @@ async fn run_geek_board(p: embassy_rp::Peripherals) {
 
     let ccid_fut = async {
         loop {
-            serial_ln!("waiting for USB connect...");
+            serial_println!("waiting for USB connect...");
             ccid.wait_connected().await;
-            serial_ln!("USB connected");
+            serial_println!("USB connected");
             display_state.status = LedStatus::Ready;
             pico2hsm_firmware::display::render(board.led(), &display_state, &layout);
             board.led().flush().await;

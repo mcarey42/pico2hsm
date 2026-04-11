@@ -320,9 +320,27 @@ impl<Chip: FlashChip> StorageManager<Chip> {
         self.filesystem.delete_key(key_id)
     }
 
-    /// List all key IDs.
-    pub fn list_keys(&self) -> heapless::Vec<KeyId, 512> {
-        self.filesystem.directory.list_keys().collect()
+    /// Check whether a key ID exists in the directory.
+    pub fn key_exists(&self, key_id: KeyId) -> bool {
+        self.filesystem.directory.find(key_id).is_some()
+    }
+
+    /// List all key IDs (capped at 64 entries).
+    pub fn list_keys(&self) -> heapless::Vec<KeyId, 64> {
+        let mut out = heapless::Vec::new();
+        for kid in self.filesystem.directory.list_keys() {
+            if out.push(kid).is_err() {
+                break; // Vec full
+            }
+        }
+        out
+    }
+
+    /// Invoke `f` for each key ID without allocating a Vec.
+    pub fn for_each_key(&self, f: &mut dyn FnMut(KeyId)) {
+        for kid in self.filesystem.directory.list_keys() {
+            f(kid);
+        }
     }
 
     /// Get the health state of a specific chip.
@@ -494,14 +512,9 @@ impl<Chip: FlashChip> StorageManager<Chip> {
             .map_err(HsmError::Storage)
     }
 
-    /// List all key records (legacy API).
-    pub fn list_key_records(&self) -> heapless::Vec<KeyRecord, 128> {
-        let all = self.filesystem.list_keys();
-        let mut out = heapless::Vec::new();
-        for r in all.iter().take(128) {
-            let _ = out.push(r.clone());
-        }
-        out
+    /// List all key records (legacy API, capped at 64 entries).
+    pub fn list_key_records(&self) -> heapless::Vec<KeyRecord, 64> {
+        self.filesystem.list_keys()
     }
 
     /// Wipe ALL keys from persistent storage. Called only by INITIALIZE.

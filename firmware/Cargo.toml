@@ -17,14 +17,15 @@ test = false
 
 [features]
 default = ["rp2350_one_4m", "rsa", "applet-piv", "applet-openpgp-curve25519"]
-rp2350_one_4m = []
-rp2350_one_16m = []
-rp2350_geek_16m = []
-rp2350_geek_sdcard = []
+rp2350_one_4m = ["uart-debug"]
+rp2350_one_16m = ["uart-debug"]
+rp2350_geek_16m = ["uart-debug"]
+rp2350_geek_sdcard = ["uart-debug"]
 pico2_4m = []
-waveshare_rp2350_lcd_16m = []
+waveshare_rp2350_lcd_16m = ["uart-debug"]
 # Waveshare RP2350-LCD-1.47-B: single SD card keystore on SPI1 (CS=GPIO15)
-waveshare_rp2350_lcd_sdcard = []
+waveshare_rp2350_lcd_sdcard = ["uart-debug"]
+uart-debug = []     # UART1 PAC-direct debug output — implied by probe-less boards
 rsa = ["dep:rsa", "dep:embedded-alloc"]  # RSA support — adds ~1MB to binary; disabled by default
 debug = []         # Debug mode: enables memory dump APDUs, disables secure boot enforcement
 applet-piv = ["dep:des"]                 # PIV applet (NIST SP 800-73-4); adds 3DES (~10 KB)

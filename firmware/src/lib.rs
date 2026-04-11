@@ -15,6 +15,7 @@ pub mod apdu;
 pub mod crypto;
 pub mod protocol;
 pub mod security;
+pub mod serial_debug;
 
 // These modules depend on embassy-rp / embassy-usb / embassy-time which
 // only compile for ARM bare-metal targets. They are excluded from host tests.

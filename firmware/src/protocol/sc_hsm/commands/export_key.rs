@@ -117,7 +117,8 @@ mod tests {
         fn erase_key(&mut self, _: KeyId) -> Result<(), HsmError> { Ok(()) }
         fn wipe_all(&mut self) -> Result<(), HsmError> { Ok(()) }
         fn wipe_by_owner(&mut self, _: AppletId) -> Result<(), HsmError> { Ok(()) }
-        fn enumerate_keys(&self) -> heapless::Vec<KeyId, 512> { heapless::Vec::new() }
+        fn enumerate_keys(&self) -> heapless::Vec<KeyId, 64> { heapless::Vec::new() }
+        fn for_each_key(&self, _f: &mut dyn FnMut(KeyId)) {}
     }
 
     /// Create a state with DKEK ready (single share of all-0xAA).
