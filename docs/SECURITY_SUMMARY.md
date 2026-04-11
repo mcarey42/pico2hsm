@@ -8,11 +8,16 @@ Python daemon transport security, and provisioning subsystem review.
 
 ## Executive Summary
 
-All CRITICAL and HIGH severity issues identified during the pre-release security review have
-been resolved. The firmware implements defense-in-depth across cryptographic operations, PIN
-handling, key storage, and inter-device communication. Two MEDIUM items remain open (fuzz
-testing, Python CI) along with cosmetic LOW items. No blocking security issues remain for
-public RC2 testing.
+One CRITICAL item remains partially open: C1 (V2 Noise mutual auth) has verification code
+but no enrollment mechanism — the peer pubkey field is never populated, so signature checks
+are dead code. This is non-blocking for RC2 because the daemon uses TLS-encrypted TCP for
+DKEK sync, not the V2 on-device Noise protocol. One new HIGH item was identified: Core1 has
+no watchdog timeout (H7).
+
+All other CRITICAL and HIGH severity issues are resolved. The firmware implements
+defense-in-depth across cryptographic operations, PIN handling, key storage, and inter-device
+communication. Two MEDIUM items remain open (fuzz testing, Python CI) along with cosmetic LOW
+items.
 
 ---
 
@@ -22,7 +27,7 @@ public RC2 testing.
 
 | ID | Issue | Fix |
 |----|-------|-----|
-| C1 | V2 Noise mutual auth signatures discarded | ECDSA verification via `PrehashVerifier` + downgrade protection (`dkek_unauthenticated_allowed` flag) |
+| C1 | V2 Noise mutual auth signatures discarded | **PARTIAL** — ECDSA verification code present but `noise_enrolled_peer_pubkey` is never populated (no enrollment command). Dead code. Non-blocking for RC2 (daemon uses TLS TCP, not V2 Noise). |
 | C2 | Daemon TCP listener sends sync traffic in plaintext | `dkek.py` uses `ensure_daemon_identity()` for auto-generated P-256 ECDSA certs; `CERT_NONE` fallback eliminated |
 | C3 | No DKEK wrap/unwrap round-trip test | `test_11_dkek.py` hardware test exists and passes |
 | C4 | No PIN lifecycle hardware tests | `test_12_pin_lifecycle.py` covers full PIN lifecycle |
@@ -108,6 +113,8 @@ public RC2 testing.
 
 | Severity | ID | Description | Action |
 |----------|----|-------------|--------|
+| CRITICAL | C1 | V2 Noise enrollment missing — verification code is dead code | Add enrollment command (~80 lines) + persist peer pubkey |
+| HIGH | H7 | Core1 has no watchdog — infinite crypto loop requires power cycle | Add max time-extension count or hardware watchdog |
 | MEDIUM | M3 | No hardware test for malformed/hostile APDUs | Add parametrized fuzz test |
 | MEDIUM | M4 | CI does not build or test Python daemon | Add `pip install -e tools/python && pytest` CI step |
 | LOW | L3 | Python version inconsistency (3.9+ vs 3.10+) | Standardize docs on 3.10+ |
