@@ -316,6 +316,7 @@ fn push_key_object_to_state(
 
     #[cfg(feature = "rsa")]
     if is_rsa {
+        use pico2hsm_core::key::KeyType as CoreKeyType;
         use crate::protocol::sc_hsm::{RsaInMemoryKey, MAX_RSA_IN_MEMORY_KEYS};
         if state.rsa_keys.len() >= MAX_RSA_IN_MEMORY_KEYS {
             #[cfg(target_arch = "arm")]
@@ -341,7 +342,19 @@ fn push_key_object_to_state(
             return;
         };
 
-        let core_key_type = km_algo_to_core_key_type(obj.algorithm);
+        // Infer RSA key size from modulus length rather than algorithm ID.
+        // AlgorithmId represents operations (e.g. RsaPkcs1Sha256), not key sizes,
+        // so km_algo_to_core_key_type cannot distinguish RSA-2048/3072/4096.
+        let core_key_type = match modulus_bytes.len() {
+            256 => CoreKeyType::RsaPrivate2048,
+            384 => CoreKeyType::RsaPrivate3072,
+            512 => CoreKeyType::RsaPrivate4096,
+            _ => {
+                #[cfg(target_arch = "arm")]
+                defmt::warn!("RSA key {} unknown modulus size {}, skipping", obj.key_id, modulus_bytes.len());
+                return;
+            }
+        };
         let algo = obj.algorithm as u8;
 
         let mut entry = RsaInMemoryKey {

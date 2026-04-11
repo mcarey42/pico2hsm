@@ -735,6 +735,9 @@ fn key_type_from_u8(tag: u8) -> Option<KeyType> {
         10 => Some(KeyType::Aes192),
         11 => Some(KeyType::Aes256),
         12 => Some(KeyType::Bip32Master),
+        13 => Some(KeyType::Ed25519),
+        14 => Some(KeyType::X25519),
+        15 => Some(KeyType::RsaPrivate3072),
         _ => None,
     }
 }

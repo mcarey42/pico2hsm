@@ -96,7 +96,7 @@ pub struct EcKeyPair {
 #[derive(Zeroize)]
 #[zeroize(drop)]
 pub struct RsaKeyPair {
-    /// `RsaPrivate2048` or `RsaPrivate4096`.
+    /// `RsaPrivate2048`, `RsaPrivate3072`, or `RsaPrivate4096`.
     pub key_type: KeyType,
     /// DER-encoded PKCS#1 `RSAPrivateKey` (≤1200 bytes for 2048-bit, ≤2350 bytes for 4096-bit).
     pub private_key_der: Vec<u8, 2400>,
@@ -302,7 +302,8 @@ pub fn x25519_ecdh(
 /// - `private_key_der`: PKCS#1 DER-encoded `RSAPrivateKey` structure.
 /// - `public_key_der`: PKCS#1 DER-encoded `RSAPublicKey` structure.
 ///
-/// Key sizes: 2048 bits (`RsaPrivate2048`) or 4096 bits (`RsaPrivate4096`).
+/// Key sizes: 2048 bits (`RsaPrivate2048`), 3072 bits (`RsaPrivate3072`),
+/// or 4096 bits (`RsaPrivate4096`).
 ///
 /// # Performance
 /// RSA key generation is computationally intensive.  On a Cortex-M33 at
@@ -320,6 +321,7 @@ pub fn generate_rsa_keypair(
 
     let bits: usize = match key_type {
         KeyType::RsaPrivate2048 => 2048,
+        KeyType::RsaPrivate3072 => 3072,
         KeyType::RsaPrivate4096 => 4096,
         _ => return Err(CryptoError::UnsupportedAlgorithm),
     };

@@ -132,6 +132,11 @@ pub enum KeyType {
     Ed25519,
     /// X25519 private key (32 bytes).
     X25519,
+    /// RSA private key, 3072-bit modulus.
+    ///
+    /// Placed at the end of the enum (discriminant 15) to preserve flash
+    /// serialization compatibility — existing stored keys use discriminants 0–14.
+    RsaPrivate3072,
 }
 
 impl KeyType {
@@ -139,6 +144,7 @@ impl KeyType {
     pub fn raw_key_len(&self) -> usize {
         match self {
             KeyType::RsaPrivate2048 => 1192, // PKCS#1 DER, ~1192 bytes
+            KeyType::RsaPrivate3072 => 1770, // PKCS#1 DER, ~1770 bytes
             KeyType::RsaPrivate4096 => 2350, // PKCS#1 DER, ~2350 bytes (capped at MAX_KEY_BYTES)
             KeyType::EcPrivateP256 => 32,
             KeyType::EcPrivateP384 => 48,

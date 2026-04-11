@@ -122,7 +122,7 @@ pub struct InMemorySymKey {
 pub struct RsaInMemoryKey {
     /// Full u32 internal key ID (structured: partition | applet | reserved | proto_ref).
     pub key_id: u32,
-    /// Key type: `RsaPrivate2048` or `RsaPrivate4096`.
+    /// Key type: `RsaPrivate2048`, `RsaPrivate3072`, or `RsaPrivate4096`.
     pub key_type: CoreKeyType,
     /// SC-HSM AlgorithmId byte used during keygen (e.g. 0x05 = RSA-2048, 0x07 = RSA-4096).
     pub algo: u8,

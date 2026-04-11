@@ -400,6 +400,7 @@ fn algo_from_order_tag(data: &[u8]) -> Option<u8> {
                 let bits = ((data[i + 2] as u16) << 8) | (data[i + 3] as u16);
                 match bits {
                     0x0800 => return Some(0x05), // RSA-2048
+                    0x0C00 => return Some(0x06), // RSA-3072
                     0x1000 => return Some(0x07), // RSA-4096
                     _ => {}
                 }
@@ -421,6 +422,8 @@ fn algo_to_key_type(algo: u8) -> Option<CoreKeyType> {
         #[cfg(feature = "rsa")]
         0x05 => Some(CoreKeyType::RsaPrivate2048), // RSA-2048
         #[cfg(feature = "rsa")]
+        0x06 => Some(CoreKeyType::RsaPrivate3072), // RSA-3072
+        #[cfg(feature = "rsa")]
         0x07 => Some(CoreKeyType::RsaPrivate4096), // RSA-4096
         _ => None,
     }
@@ -429,7 +432,7 @@ fn algo_to_key_type(algo: u8) -> Option<CoreKeyType> {
 /// Returns true when `key_type` is an RSA type.
 #[allow(dead_code)]
 fn is_rsa_key_type(kt: CoreKeyType) -> bool {
-    matches!(kt, CoreKeyType::RsaPrivate2048 | CoreKeyType::RsaPrivate4096)
+    matches!(kt, CoreKeyType::RsaPrivate2048 | CoreKeyType::RsaPrivate3072 | CoreKeyType::RsaPrivate4096)
 }
 
 /// Number of bytes needed to DER-encode a length value.

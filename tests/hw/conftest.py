@@ -75,9 +75,19 @@ RSA_KEY_SLOTS: list[dict] = [
         "sig_len":     256,    # RSA-2048 signature = 256 bytes
     },
     {
+        "name":        "rsa3072",
+        "key_size":    3072,
+        "key_id":      "11",   # slot 0x0B — after rsa2048
+        "mechanism_pkcs": "SHA256-RSA-PKCS",
+        "mechanism_pss":  "SHA256-RSA-PKCS-PSS",
+        "mechanism_enc":  "RSA-PKCS",
+        "hash":        "sha256",
+        "sig_len":     384,    # RSA-3072 signature = 384 bytes
+    },
+    {
         "name":        "rsa4096",
         "key_size":    4096,
-        "key_id":      "11",   # slot 0x0B — after rsa2048
+        "key_id":      "12",   # slot 0x0C — after rsa3072
         "mechanism_pkcs": "SHA256-RSA-PKCS",
         "mechanism_pss":  "SHA256-RSA-PKCS-PSS",
         "mechanism_enc":  "RSA-PKCS",
