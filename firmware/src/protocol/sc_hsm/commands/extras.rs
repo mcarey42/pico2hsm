@@ -18,6 +18,7 @@
 //! - P1=0x3A: GET_STATE_HASH
 //! - P1=0x3B: SIGN_ENROLLMENT
 //! - P1=0x3C: GET_GENERATION_V2
+//! - P1=0x3D: ENROLL_PEER_PUBKEY (SO-PIN required)
 
 use pico2hsm_core::apdu::{
     ApduCommand, ApduResponse, SW_CONDITIONS_NOT_SATISFIED, SW_SECURITY_STATUS, SW_WRONG_DATA,
@@ -49,6 +50,12 @@ pub fn handle(state: &mut ScHsmState, store: &mut dyn KeyStore, cmd: &ApduComman
                 return ApduResponse::err(SW_SECURITY_STATUS);
             }
             handle_sign_enrollment(state, store, cmd)
+        }
+        0x3D => {
+            if !state.so_pin_verified {
+                return ApduResponse::err(SW_SECURITY_STATUS);
+            }
+            handle_enroll_peer_pubkey(state, store, cmd)
         }
 
         // All remaining sub-commands require PIN authentication.
@@ -714,6 +721,45 @@ fn handle_sign_enrollment(state: &mut ScHsmState, store: &mut dyn KeyStore, cmd:
     };
 
     ApduResponse::ok(&sig_bytes)
+}
+
+// ---------------------------------------------------------------------------
+// P1=0x3D  ENROLL_PEER_PUBKEY (SO-PIN required)
+// ---------------------------------------------------------------------------
+
+/// Enroll (or re-enroll) a peer device's static P-256 public key for V2
+/// Noise mutual authentication.  Once enrolled, unauthenticated DKEK
+/// exchanges are permanently locked out.
+///
+/// Input: 65-byte uncompressed P-256 public key (0x04 || x || y).
+/// Returns: SW 9000 on success.
+///
+/// SO-PIN VERIFY is required before calling this command (checked in the
+/// dispatch match above).  Re-enrollment (overwriting an existing peer)
+/// is allowed with SO-PIN to support HSM replacement scenarios.
+fn handle_enroll_peer_pubkey(state: &mut ScHsmState, store: &mut dyn KeyStore, cmd: &ApduCommand<'_>) -> ApduResponse {
+    // Validate input length: must be exactly 65 bytes (uncompressed P-256).
+    if cmd.data.len() != 65 {
+        return ApduResponse::err(SW_WRONG_LENGTH);
+    }
+
+    // Validate that the pubkey is a valid point on P-256.
+    if p256::ecdsa::VerifyingKey::from_sec1_bytes(cmd.data).is_err() {
+        return ApduResponse::err(SW_WRONG_DATA);
+    }
+
+    // Store the peer pubkey in volatile state.
+    let mut pubkey = [0u8; 65];
+    pubkey.copy_from_slice(cmd.data);
+    state.noise_enrolled_peer_pubkey = Some(pubkey);
+
+    // Permanently lock out unauthenticated DKEK exchanges.
+    state.dkek_unauthenticated_allowed = false;
+
+    // Persist to flash so the enrollment survives power cycles.
+    crate::protocol::sc_hsm::ScHsm::save_peer_pubkey_to_store(state, store);
+
+    ApduResponse::ok(&[])
 }
 
 // ---------------------------------------------------------------------------
@@ -1420,8 +1466,8 @@ mod tests {
         // Duplicate is rejected.
         assert!(!check_and_add_challenge(&mut state, &challenge_a));
 
-        // Fill remaining 15 slots with distinct challenges.
-        for i in 1u8..16 {
+        // Fill remaining slots with distinct challenges (cache is MAX_EXCHANGE_CHALLENGE_CACHE).
+        for i in 1u8..(crate::protocol::sc_hsm::MAX_EXCHANGE_CHALLENGE_CACHE as u8) {
             let mut c = [0u8; 32];
             c[0] = i;
             assert!(check_and_add_challenge(&mut state, &c));
@@ -1618,5 +1664,146 @@ mod tests {
         let key2 = derive_session_key_v2(&shared_secret, &ephem1, &ephem3, &challenge).unwrap();
 
         assert_ne!(*key1, *key2, "different ephem pubkeys should produce different session keys");
+    }
+
+    // -----------------------------------------------------------------------
+    // ENROLL_PEER_PUBKEY tests (P1=0x3D)
+    // -----------------------------------------------------------------------
+
+    /// Generate a valid P-256 public key for enrollment tests.
+    fn generate_test_p256_pubkey() -> [u8; 65] {
+        use crate::crypto::asymmetric::generate_ec_keypair;
+        let mut rng = crate::protocol::sc_hsm::FwRng;
+        let pair = generate_ec_keypair(CoreKeyType::EcPrivateP256, &mut rng).unwrap();
+        let mut pubkey = [0u8; 65];
+        pubkey.copy_from_slice(&pair.public_key);
+        pubkey
+    }
+
+    #[test]
+    fn test_enroll_peer_pubkey_requires_sopin() {
+        let mut state = state_with_device_key();
+        state.so_pin_verified = false;
+        let mut store = NullStore;
+
+        let pubkey = generate_test_p256_pubkey();
+        let cmd = ApduCommand {
+            cla: 0x80,
+            ins: INS_EXTRAS,
+            p1: 0x3D,
+            p2: 0x00,
+            data: &pubkey,
+            le: None,
+        };
+
+        let resp = handle(&mut state, &mut store, &cmd);
+        assert_eq!(resp.sw, SW_SECURITY_STATUS, "should require SO-PIN");
+    }
+
+    #[test]
+    fn test_enroll_peer_pubkey_validates_key_wrong_length() {
+        let mut state = state_with_device_key();
+        let mut store = NullStore;
+
+        // Too short (32 bytes instead of 65).
+        let short_data = [0x04u8; 32];
+        let cmd = ApduCommand {
+            cla: 0x80,
+            ins: INS_EXTRAS,
+            p1: 0x3D,
+            p2: 0x00,
+            data: &short_data,
+            le: None,
+        };
+
+        let resp = handle(&mut state, &mut store, &cmd);
+        assert_eq!(resp.sw, SW_WRONG_LENGTH, "wrong length should be rejected");
+    }
+
+    #[test]
+    fn test_enroll_peer_pubkey_validates_key_not_on_curve() {
+        let mut state = state_with_device_key();
+        let mut store = NullStore;
+
+        // 65 bytes starting with 0x04 but invalid point.
+        let mut bad_key = [0u8; 65];
+        bad_key[0] = 0x04;
+        bad_key[1] = 0xFF; // Not a valid P-256 point.
+        let cmd = ApduCommand {
+            cla: 0x80,
+            ins: INS_EXTRAS,
+            p1: 0x3D,
+            p2: 0x00,
+            data: &bad_key,
+            le: None,
+        };
+
+        let resp = handle(&mut state, &mut store, &cmd);
+        assert_eq!(resp.sw, SW_WRONG_DATA, "invalid point should be rejected");
+    }
+
+    #[test]
+    fn test_enroll_peer_pubkey_stores_key() {
+        let mut state = state_with_device_key();
+        let mut store = NullStore;
+
+        let pubkey = generate_test_p256_pubkey();
+        let cmd = ApduCommand {
+            cla: 0x80,
+            ins: INS_EXTRAS,
+            p1: 0x3D,
+            p2: 0x00,
+            data: &pubkey,
+            le: None,
+        };
+
+        assert!(state.noise_enrolled_peer_pubkey.is_none());
+        let resp = handle(&mut state, &mut store, &cmd);
+        assert_eq!(resp.sw, 0x9000, "enrollment should succeed");
+        assert_eq!(state.noise_enrolled_peer_pubkey.unwrap(), pubkey);
+    }
+
+    #[test]
+    fn test_enroll_peer_pubkey_re_enrollment() {
+        let mut state = state_with_device_key();
+        let mut store = NullStore;
+
+        let pubkey1 = generate_test_p256_pubkey();
+        let pubkey2 = generate_test_p256_pubkey();
+
+        // Enroll first key.
+        let cmd1 = ApduCommand {
+            cla: 0x80, ins: INS_EXTRAS, p1: 0x3D, p2: 0x00,
+            data: &pubkey1, le: None,
+        };
+        let resp1 = handle(&mut state, &mut store, &cmd1);
+        assert_eq!(resp1.sw, 0x9000);
+        assert_eq!(state.noise_enrolled_peer_pubkey.unwrap(), pubkey1);
+
+        // Re-enroll with second key (SO-PIN still verified).
+        let cmd2 = ApduCommand {
+            cla: 0x80, ins: INS_EXTRAS, p1: 0x3D, p2: 0x00,
+            data: &pubkey2, le: None,
+        };
+        let resp2 = handle(&mut state, &mut store, &cmd2);
+        assert_eq!(resp2.sw, 0x9000);
+        assert_eq!(state.noise_enrolled_peer_pubkey.unwrap(), pubkey2, "re-enrollment should overwrite");
+    }
+
+    #[test]
+    fn test_enroll_peer_locks_unauthenticated() {
+        let mut state = state_with_device_key();
+        let mut store = NullStore;
+
+        assert!(state.dkek_unauthenticated_allowed, "should start as allowed");
+
+        let pubkey = generate_test_p256_pubkey();
+        let cmd = ApduCommand {
+            cla: 0x80, ins: INS_EXTRAS, p1: 0x3D, p2: 0x00,
+            data: &pubkey, le: None,
+        };
+        let resp = handle(&mut state, &mut store, &cmd);
+        assert_eq!(resp.sw, 0x9000);
+        assert!(!state.dkek_unauthenticated_allowed, "should be locked after enrollment");
     }
 }

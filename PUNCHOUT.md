@@ -28,8 +28,9 @@ Last updated: 2026-04-11 (audit pass — closed resolved items, updated descript
 | 4c | Periodic CSPRNG reseed every 1000 calls | v0.9.5+ |
 | L1 | PIN hashed with PBKDF2-HMAC-SHA256 + salt | v0.9.5+ |
 | L5 | rust-version = "1.75" added to Cargo.toml | v0.9.5+ |
-| C1-partial | V2 Noise ECDSA verification code exists (commit 4628651) — enrollment mechanism missing | — |
+| C1 | V2 Noise peer enrollment (P1=0x3D) + SO-PIN gate + flash persistence | v0.9.9-rc2 |
 | C2 | dkek.py TLS — auto-generated P-256 identity, CERT_NONE eliminated | v0.9.9-rc2 |
+| H7 | Core1 watchdog — RNG heartbeat + 4.5s stall detection | v0.9.9-rc2 |
 | H1 | Export key NO_EXPORT flag — fully resolved incl. flash (P2K4) | v0.9.5+ |
 | L3 | Python version standardized to 3.10+ across all docs | v0.9.9-rc2 |
 | L4 | Config file name standardized to daemon.yaml | v0.9.9-rc2 |
@@ -39,34 +40,18 @@ Last updated: 2026-04-11 (audit pass — closed resolved items, updated descript
 
 ## CRITICAL — Must fix before public v1.0
 
-### C1. V2 NOISE mutual authentication — verification code exists, enrollment missing
+### ~~C1. V2 NOISE mutual authentication — enrollment missing~~ — RESOLVED
 
-**Severity:** CRITICAL
-**File:** `firmware/src/protocol/sc_hsm/commands/extras.rs:199, 434, 549`
-**File:** `firmware/src/protocol/sc_hsm/mod.rs:343, 398`
+**Fixed (v0.9.9-rc2):** Added `ENROLL_PEER_PUBKEY` command (P1=0x3D, SO-PIN gated).
 
-**Status (2026-04-11):** Partially fixed. Commit 4628651 added ECDSA signature
-verification in `handle_noise_source_respond` (P1=0x36, line 199) and
-`handle_noise_finalize_recv_v2` (P1=0x38, line 434) using `PrehashVerifier`.
-However, `noise_enrolled_peer_pubkey` is initialized to `None` (line 398) and
-**is never set to `Some()`** — no enrollment command populates it.
-
-The `if let Some(ref peer_pubkey)` branch is dead code. All exchanges fall through
-to the unauthenticated path. After the first successful exchange, line 549-550
-sets `dkek_unauthenticated_allowed = false`, which paradoxically blocks all
-subsequent V2 exchanges (safe failure — denies rather than allows).
-
-**Fix (estimated ~80 lines):**
-1. Add `handle_enroll_peer_pubkey` (new P1 code, e.g. 0x3A) that receives a
-   65-byte P-256 pubkey, validates it via `VerifyingKey::from_sec1_bytes()`,
-   and stores it in `state.noise_enrolled_peer_pubkey`.
-2. Persist the enrolled peer pubkey to flash so it survives power cycles.
-3. Add unit tests + Python integration test.
-
-**Workaround (RC2):** V1 Noise exchange (P1=0x31-0x33) is disabled. The daemon
-uses its own TLS-encrypted TCP transport for DKEK sync, not the V2 on-device
-Noise protocol. V2 Noise is only relevant for direct device-to-device exchange
-without a host daemon. For RC2 testing, this is non-blocking.
+- `handle_enroll_peer_pubkey()` in extras.rs: validates 65-byte P-256 pubkey via
+  `VerifyingKey::from_sec1_bytes()`, stores in `state.noise_enrolled_peer_pubkey`,
+  permanently locks out unauthenticated exchanges.
+- Flash persistence: peer pubkey stored as `KeyId::sc_hsm(0, 0xFC)` Generic key
+  object; loaded at boot in `dispatcher.rs`; cleared by INITIALIZE.
+- Re-enrollment with SO-PIN supported (HSM replacement scenario).
+- 6 unit tests + Python hardware integration test (`test_15_enroll_peer_pubkey.py`).
+- The existing ECDSA verification code in P1=0x36 and P1=0x38 is now reachable.
 
 ---
 
@@ -184,19 +169,13 @@ call), so no BSS impact. Added `test_wrap_unwrap_large_rsa_key` unit test exerci
 
 ---
 
-### H7. Core1 has no watchdog — infinite crypto loop requires power cycle
+### ~~H7. Core1 has no watchdog — infinite crypto loop requires power cycle~~ — RESOLVED
 
-**Severity:** HIGH
-**File:** `firmware/src/main.rs` (time extension loop)
-
-Core0 sends CCID time-extension messages every 1.5s while waiting for Core1.
-If Core1 enters an infinite loop (e.g., degenerate RSA prime candidate), Core0
-sends extensions indefinitely. The host eventually times out (~30-60s), but the
-device never recovers without a power cycle.
-
-**Fix:** Add a maximum time-extension count (~30 = 45s) after which Core0
-returns an error SW and resets Core1 state. Alternatively, configure the RP2350
-hardware watchdog on Core1.
+**Fixed (v0.9.9-rc2):** Heartbeat-based watchdog via `WATCHDOG_HEARTBEAT` AtomicU32.
+`FwRng::fill_bytes()` increments the heartbeat on every call, providing automatic
+liveness signaling during RSA keygen (thousands of RNG calls), ECDSA sign, and
+all crypto. Core0 checks heartbeat progress every 1.5s; after 3 consecutive stalls
+(4.5s with no RNG activity), returns SW 6F00. Safe for RSA-4096 (~16 min).
 
 ---
 

@@ -143,6 +143,9 @@ impl Dispatcher {
 
         // Load SC-HSM PIN state from flash sentinel.
         ScHsm::load_pin_state_from_store(&mut self.sc_hsm.state, store);
+
+        // Load enrolled peer pubkey for V2 Noise mutual auth.
+        ScHsm::load_peer_pubkey_from_store(&mut self.sc_hsm.state, store);
     }
 
     /// Dispatch a raw APDU byte slice with access to persistent storage.

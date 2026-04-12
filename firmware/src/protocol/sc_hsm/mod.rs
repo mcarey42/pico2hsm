@@ -633,6 +633,54 @@ impl ScHsm {
         }
     }
 
+    /// KeyId for the enrolled peer public key in flash.
+    pub fn sc_hsm_peer_pubkey_key_id() -> pico2hsm_core::key::KeyId {
+        pico2hsm_core::key::KeyId::sc_hsm(0, 0xFC)
+    }
+
+    /// Persist the enrolled peer public key to flash.
+    ///
+    /// Stored as a Generic key object at `KeyId::sc_hsm(0, 0xFC)`.
+    /// Layout:
+    ///   [0..65]  peer P-256 uncompressed public key (04 || x || y)
+    ///   [65]     dkek_unauthenticated_allowed (0 = locked, 1 = allowed)
+    pub fn save_peer_pubkey_to_store(state: &ScHsmState, store: &mut dyn crate::storage::KeyStore) {
+        use crate::security::key_management::{AlgorithmId, KeyObject, KeyType as KmKeyType};
+        use pico2hsm_core::key::AppletId;
+
+        let kid = Self::sc_hsm_peer_pubkey_key_id();
+
+        if let Some(ref pubkey) = state.noise_enrolled_peer_pubkey {
+            let mut buf: heapless::Vec<u8, 128> = heapless::Vec::new();
+            let _ = buf.extend_from_slice(pubkey);
+            let _ = buf.push(state.dkek_unauthenticated_allowed as u8);
+
+            let mut obj = KeyObject::new(KmKeyType::Generic, kid.0, AppletId::ScHsm, AlgorithmId::AesGcm);
+            let _ = obj.private_key.extend_from_slice(&buf);
+            let _ = store.save_key(&obj);
+        } else {
+            // No peer enrolled — erase from flash if present.
+            let _ = store.erase_key(kid);
+        }
+    }
+
+    /// Load the enrolled peer public key from flash into `state`.
+    pub fn load_peer_pubkey_from_store(state: &mut ScHsmState, store: &mut dyn crate::storage::KeyStore) {
+        let kid = Self::sc_hsm_peer_pubkey_key_id();
+        if let Ok(Some(obj)) = store.fetch_key(kid) {
+            let b = &obj.private_key;
+            if b.len() >= 66 {
+                let mut pubkey = [0u8; 65];
+                pubkey.copy_from_slice(&b[0..65]);
+                // Validate the key is still a valid P-256 point before trusting it.
+                if p256::ecdsa::VerifyingKey::from_sec1_bytes(&pubkey).is_ok() {
+                    state.noise_enrolled_peer_pubkey = Some(pubkey);
+                    state.dkek_unauthenticated_allowed = b[65] != 0;
+                }
+            }
+        }
+    }
+
     /// Process a raw APDU with access to persistent storage.
     ///
     /// All key-mutating commands (INITIALIZE, GENERATE KEY PAIR, DELETE FILE)

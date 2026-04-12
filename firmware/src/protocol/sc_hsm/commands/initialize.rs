@@ -197,6 +197,10 @@ pub fn handle(state: &mut ScHsmState, store: &mut dyn crate::storage::KeyStore, 
     state.exchange_ephem_priv = None;
     state.exchange_ephem_pub = None;
 
+    // Clear enrolled peer pubkey and reset unauthenticated DKEK mode.
+    state.noise_enrolled_peer_pubkey = None;
+    state.dkek_unauthenticated_allowed = true;
+
     // Wipe only SC-HSM-owned keys from persistent flash keystore.
     // Degraded flash does not fail the INITIALIZE command.
     crate::CORE1_PROGRESS.store(31, core::sync::atomic::Ordering::Relaxed);

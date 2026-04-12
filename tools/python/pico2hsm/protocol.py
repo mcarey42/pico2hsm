@@ -458,6 +458,7 @@ EXTRAS_GET_KEY_MANIFEST       = 0x39
 EXTRAS_GET_STATE_HASH         = 0x3A
 EXTRAS_SIGN_ENROLLMENT        = 0x3B
 EXTRAS_GET_GENERATION_V2      = 0x3C
+EXTRAS_ENROLL_PEER_PUBKEY     = 0x3D
 
 
 def build_noise_target_init(source_static_pub: bytes) -> bytes:
@@ -511,6 +512,16 @@ def build_sign_enrollment(tls_fingerprint: bytes, cluster_id: bytes) -> bytes:
 def build_get_generation_v2() -> bytes:
     """INS=0x54, P1=0x3C."""
     return build_extras(EXTRAS_GET_GENERATION_V2)
+
+
+def build_enroll_peer_pubkey(peer_pubkey: bytes) -> bytes:
+    """INS=0x54, P1=0x3D: enroll a peer P-256 public key for V2 Noise auth.
+
+    peer_pubkey must be 65 bytes (uncompressed P-256: 04 || x || y).
+    Requires SO-PIN VERIFY before calling.
+    """
+    assert len(peer_pubkey) == 65
+    return build_extras(EXTRAS_ENROLL_PEER_PUBKEY, peer_pubkey)
 
 
 # ---------------------------------------------------------------------------
