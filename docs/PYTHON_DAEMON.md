@@ -139,7 +139,7 @@ On systems without udev (macOS, some containers), the polling fallback is used a
 
 ## 4. Configuration
 
-The daemon reads a YAML configuration file. Default location: `~/.pico2hsm/config.json` (despite the `.json` extension, the loader uses `yaml.safe_load`, so both YAML and JSON are accepted).
+The daemon reads a YAML configuration file. Default location: `~/.pico2hsm/daemon.yaml`. The loader uses `yaml.safe_load`, so both YAML and JSON are accepted.
 
 ### 4.1 PeerConfig Fields
 
@@ -177,7 +177,7 @@ Validation rules:
 ### 4.3 Example: Single-Node (Standalone)
 
 ```yaml
-# ~/.pico2hsm/config.yaml
+# ~/.pico2hsm/daemon.yaml
 # No peers, no TCP listener -- just USB monitoring and health checks.
 listen_port: 0
 state_dir: "~/.pico2hsm"
@@ -189,7 +189,7 @@ sync_on_connect: false
 **Node A** (primary, at 192.168.1.10):
 
 ```yaml
-# /etc/pico2hsm/config.yaml on Node A
+# /etc/pico2hsm/daemon.yaml on Node A
 listen_address: "0.0.0.0"
 listen_port: 7890
 state_dir: "/var/lib/pico2hsm"
@@ -213,7 +213,7 @@ peers:
 **Node B** (secondary, at 192.168.1.11):
 
 ```yaml
-# /etc/pico2hsm/config.yaml on Node B
+# /etc/pico2hsm/daemon.yaml on Node B
 listen_address: "0.0.0.0"
 listen_port: 7890
 state_dir: "/var/lib/pico2hsm"
@@ -265,14 +265,14 @@ hsm_daemon.py enroll-peer hsm-secondary 192.168.1.11:7890 --cert /path/to/cert.p
 **Foreground (for debugging):**
 
 ```sh
-python tools/python/hsm_daemon.py start --config /etc/pico2hsm/config.yaml
+python tools/python/hsm_daemon.py start --config /etc/pico2hsm/daemon.yaml
 ```
 
 **Background with PID file:**
 
 ```sh
 python tools/python/hsm_daemon.py start \
-    --config /etc/pico2hsm/config.yaml \
+    --config /etc/pico2hsm/daemon.yaml \
     --pid-file /run/pico2hsm/daemon.pid \
     --quorum 1
 ```
@@ -283,7 +283,7 @@ Options:
 
 | Flag | Default | Description |
 |---|---|---|
-| `--config FILE` | `~/.pico2hsm/config.json` | Path to YAML/JSON config file |
+| `--config FILE` | `~/.pico2hsm/daemon.yaml` | Path to YAML/JSON config file |
 | `--pid-file PATH` | (none -- foreground) | Write PID here and fork to background |
 | `--quorum N` | `1` | Number of devices that must confirm the current generation before syncing a lagging device. `1` means sync immediately |
 
@@ -308,13 +308,13 @@ Signal handlers are only registered when running on the main thread. If the daem
 
 ```sh
 # Print enrolled devices and their sync status
-hsm_daemon.py status --config /etc/pico2hsm/config.yaml
+hsm_daemon.py status --config /etc/pico2hsm/daemon.yaml
 
 # Check if all connected devices have matching state roots
-hsm_daemon.py verify-sync --config /etc/pico2hsm/config.yaml
+hsm_daemon.py verify-sync --config /etc/pico2hsm/daemon.yaml
 
 # Dump the full state.json to stdout
-hsm_daemon.py export-state --config /etc/pico2hsm/config.yaml
+hsm_daemon.py export-state --config /etc/pico2hsm/daemon.yaml
 
 # Enroll a remote peer
 hsm_daemon.py enroll-peer node-b 192.168.1.11:7890 --cert /path/to/cert.pem
@@ -366,7 +366,7 @@ ExecStartPre=/usr/bin/mkdir -p /run/pico2hsm
 ExecStartPre=/usr/bin/chown pico2hsm:pico2hsm /run/pico2hsm
 
 ExecStart=/usr/bin/python3 /opt/pico2hsm/tools/python/hsm_daemon.py start \
-    --config /etc/pico2hsm/config.yaml \
+    --config /etc/pico2hsm/daemon.yaml \
     --pid-file /run/pico2hsm/daemon.pid \
     --quorum 1
 

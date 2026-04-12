@@ -42,7 +42,7 @@ OS="$(uname -s)"
 if [ "$OS" = "Darwin" ]; then
     warn "macOS detected. systemd is not available on macOS."
     warn "The Python package will be installed, but you must start the daemon manually:"
-    warn "  hsm_daemon.py start --config ~/.pico2hsm/config.yaml"
+    warn "  hsm_daemon.py start --config ~/.pico2hsm/daemon.yaml"
     warn ""
     MACOS=1
 else
@@ -60,15 +60,15 @@ info "Checking prerequisites..."
 
 MISSING=0
 
-# Python 3.9+
+# Python 3.10+
 if command -v python3 >/dev/null 2>&1; then
     PY_VERSION=$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
     PY_MAJOR=$(echo "$PY_VERSION" | cut -d. -f1)
     PY_MINOR=$(echo "$PY_VERSION" | cut -d. -f2)
-    if [ "$PY_MAJOR" -ge 3 ] && [ "$PY_MINOR" -ge 9 ]; then
+    if [ "$PY_MAJOR" -ge 3 ] && [ "$PY_MINOR" -ge 10 ]; then
         ok "Python $PY_VERSION"
     else
-        err "Python 3.9+ required (found $PY_VERSION)"
+        err "Python 3.10+ required (found $PY_VERSION)"
         MISSING=1
     fi
 else
@@ -266,7 +266,7 @@ if [ "$MACOS" -eq 0 ]; then
     echo ""
 else
     echo "  3. Start the daemon manually:"
-    echo "       hsm_daemon.py start --config ~/.pico2hsm/config.yaml"
+    echo "       hsm_daemon.py start --config ~/.pico2hsm/daemon.yaml"
     echo ""
 fi
 echo "  Documentation: ${SCRIPT_DIR}/docs/PYTHON_DAEMON.md"

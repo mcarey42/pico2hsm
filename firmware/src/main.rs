@@ -216,6 +216,8 @@ static KEY_COUNT: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::n
 /// Re-export for convenient access in this binary crate.
 #[cfg(target_arch = "arm")]
 use pico2hsm_firmware::CORE1_PROGRESS;
+#[cfg(target_arch = "arm")]
+use pico2hsm_firmware::{WATCHDOG_HEARTBEAT, WATCHDOG_STALL_LIMIT};
 
 /// Dispatcher — stored in BSS outside the async task state machine so that
 /// the `dispatcher_task` pool does not need to hold the full 50 KB Dispatcher
@@ -666,12 +668,30 @@ async fn run_one_board(p: embassy_rp::Peripherals) {
                         let _ = APDU_CHANNEL.send(apdu_bytes).await;
                         let response = {
                             use embassy_futures::select::{select3, Either3};
+                            let mut stall_count: u32 = 0;
+                            let mut last_heartbeat = WATCHDOG_HEARTBEAT.load(core::sync::atomic::Ordering::Relaxed);
                             loop {
                                 match select3(RESP_CHANNEL.receive(), embassy_time::Timer::after_millis(1500), FLASH_REQ.receive()).await {
                                     Either3::First(r) => break r,
                                     Either3::Second(_) => {
                                         let progress = CORE1_PROGRESS.load(core::sync::atomic::Ordering::Relaxed);
-                                        defmt::warn!("time ext: core1 progress={}", progress);
+                                        let heartbeat = WATCHDOG_HEARTBEAT.load(core::sync::atomic::Ordering::Relaxed);
+                                        if heartbeat == last_heartbeat {
+                                            stall_count += 1;
+                                            defmt::warn!("time ext: core1 progress={} heartbeat={} STALL {}/{}", progress, heartbeat, stall_count, WATCHDOG_STALL_LIMIT);
+                                            if stall_count >= WATCHDOG_STALL_LIMIT {
+                                                defmt::error!("watchdog: core1 stuck — aborting APDU");
+                                                // Return SW 6F00 (internal error) to unblock the host.
+                                                let mut err_resp = heapless::Vec::<u8, 4098>::new();
+                                                let _ = err_resp.push(0x6F);
+                                                let _ = err_resp.push(0x00);
+                                                break err_resp;
+                                            }
+                                        } else {
+                                            stall_count = 0;
+                                            last_heartbeat = heartbeat;
+                                            defmt::warn!("time ext: core1 progress={} heartbeat={}", progress, heartbeat);
+                                        }
                                         if let Err(CcidError::UsbDisconnected) = ccid.send_time_extension().await {
                                             let _ = RESP_CHANNEL.receive().await;
                                             break heapless::Vec::new();
@@ -965,12 +985,30 @@ async fn run_geek_board(p: embassy_rp::Peripherals) {
                         // Wait for core1 response (with time extensions every 1.5s)
                         let response = {
                             use embassy_futures::select::{select3, Either3};
+                            let mut stall_count: u32 = 0;
+                            let mut last_heartbeat = WATCHDOG_HEARTBEAT.load(core::sync::atomic::Ordering::Relaxed);
                             loop {
                                 match select3(RESP_CHANNEL.receive(), embassy_time::Timer::after_millis(1500), FLASH_REQ.receive()).await {
                                     Either3::First(r) => break r,
                                     Either3::Second(_) => {
                                         let progress = CORE1_PROGRESS.load(core::sync::atomic::Ordering::Relaxed);
-                                        defmt::warn!("time ext: core1 progress={}", progress);
+                                        let heartbeat = WATCHDOG_HEARTBEAT.load(core::sync::atomic::Ordering::Relaxed);
+                                        if heartbeat == last_heartbeat {
+                                            stall_count += 1;
+                                            defmt::warn!("time ext: core1 progress={} heartbeat={} STALL {}/{}", progress, heartbeat, stall_count, WATCHDOG_STALL_LIMIT);
+                                            if stall_count >= WATCHDOG_STALL_LIMIT {
+                                                defmt::error!("watchdog: core1 stuck — aborting APDU");
+                                                // Return SW 6F00 (internal error) to unblock the host.
+                                                let mut err_resp = heapless::Vec::<u8, 4098>::new();
+                                                let _ = err_resp.push(0x6F);
+                                                let _ = err_resp.push(0x00);
+                                                break err_resp;
+                                            }
+                                        } else {
+                                            stall_count = 0;
+                                            last_heartbeat = heartbeat;
+                                            defmt::warn!("time ext: core1 progress={} heartbeat={}", progress, heartbeat);
+                                        }
                                         if let Err(CcidError::UsbDisconnected) = ccid.send_time_extension().await {
                                             let _ = RESP_CHANNEL.receive().await;
                                             break heapless::Vec::new();
@@ -1209,12 +1247,30 @@ async fn run_pico2_board(p: embassy_rp::Peripherals) {
                         let _ = APDU_CHANNEL.send(apdu_bytes).await;
                         let response = {
                             use embassy_futures::select::{select3, Either3};
+                            let mut stall_count: u32 = 0;
+                            let mut last_heartbeat = WATCHDOG_HEARTBEAT.load(core::sync::atomic::Ordering::Relaxed);
                             loop {
                                 match select3(RESP_CHANNEL.receive(), embassy_time::Timer::after_millis(1500), FLASH_REQ.receive()).await {
                                     Either3::First(r) => break r,
                                     Either3::Second(_) => {
                                         let progress = CORE1_PROGRESS.load(core::sync::atomic::Ordering::Relaxed);
-                                        defmt::warn!("time ext: core1 progress={}", progress);
+                                        let heartbeat = WATCHDOG_HEARTBEAT.load(core::sync::atomic::Ordering::Relaxed);
+                                        if heartbeat == last_heartbeat {
+                                            stall_count += 1;
+                                            defmt::warn!("time ext: core1 progress={} heartbeat={} STALL {}/{}", progress, heartbeat, stall_count, WATCHDOG_STALL_LIMIT);
+                                            if stall_count >= WATCHDOG_STALL_LIMIT {
+                                                defmt::error!("watchdog: core1 stuck — aborting APDU");
+                                                // Return SW 6F00 (internal error) to unblock the host.
+                                                let mut err_resp = heapless::Vec::<u8, 4098>::new();
+                                                let _ = err_resp.push(0x6F);
+                                                let _ = err_resp.push(0x00);
+                                                break err_resp;
+                                            }
+                                        } else {
+                                            stall_count = 0;
+                                            last_heartbeat = heartbeat;
+                                            defmt::warn!("time ext: core1 progress={} heartbeat={}", progress, heartbeat);
+                                        }
                                         if let Err(CcidError::UsbDisconnected) = ccid.send_time_extension().await {
                                             let _ = RESP_CHANNEL.receive().await;
                                             break heapless::Vec::new();
@@ -1537,12 +1593,30 @@ async fn run_waveshare_lcd_board(p: embassy_rp::Peripherals) {
                         // Wait for response with time-extension support.
                         let response = {
                             use embassy_futures::select::{select3, Either3};
+                            let mut stall_count: u32 = 0;
+                            let mut last_heartbeat = WATCHDOG_HEARTBEAT.load(core::sync::atomic::Ordering::Relaxed);
                             loop {
                                 match select3(RESP_CHANNEL.receive(), embassy_time::Timer::after_millis(1500), FLASH_REQ.receive()).await {
                                     Either3::First(r) => break r,
                                     Either3::Second(_) => {
                                         let progress = CORE1_PROGRESS.load(core::sync::atomic::Ordering::Relaxed);
-                                        defmt::warn!("time ext: core1 progress={}", progress);
+                                        let heartbeat = WATCHDOG_HEARTBEAT.load(core::sync::atomic::Ordering::Relaxed);
+                                        if heartbeat == last_heartbeat {
+                                            stall_count += 1;
+                                            defmt::warn!("time ext: core1 progress={} heartbeat={} STALL {}/{}", progress, heartbeat, stall_count, WATCHDOG_STALL_LIMIT);
+                                            if stall_count >= WATCHDOG_STALL_LIMIT {
+                                                defmt::error!("watchdog: core1 stuck — aborting APDU");
+                                                // Return SW 6F00 (internal error) to unblock the host.
+                                                let mut err_resp = heapless::Vec::<u8, 4098>::new();
+                                                let _ = err_resp.push(0x6F);
+                                                let _ = err_resp.push(0x00);
+                                                break err_resp;
+                                            }
+                                        } else {
+                                            stall_count = 0;
+                                            last_heartbeat = heartbeat;
+                                            defmt::warn!("time ext: core1 progress={} heartbeat={}", progress, heartbeat);
+                                        }
                                         if let Err(CcidError::UsbDisconnected) = ccid.send_time_extension().await {
                                             let _ = RESP_CHANNEL.receive().await;
                                             break heapless::Vec::new();

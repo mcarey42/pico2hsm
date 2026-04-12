@@ -203,7 +203,10 @@ ssh-add -s /usr/lib/opensc-pkcs11.so
 ssh -I /usr/lib/opensc-pkcs11.so user@host
 ```
 
-On macOS, the PKCS#11 library is at `/usr/local/lib/opensc-pkcs11.so` (Homebrew).
+On macOS, the PKCS#11 library path depends on your architecture:
+- **Intel Mac (Homebrew):** `/usr/local/lib/opensc-pkcs11.so`
+- **Apple Silicon (Homebrew):** `/opt/homebrew/lib/opensc-pkcs11.so`
+- **Auto-detect:** `$(brew --prefix)/lib/opensc-pkcs11.so`
 
 ### OpenPGP card (GPG, email signing)
 

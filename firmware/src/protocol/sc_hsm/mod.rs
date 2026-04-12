@@ -187,6 +187,9 @@ impl rand_core::RngCore for FwRng {
     }
 
     fn fill_bytes(&mut self, dest: &mut [u8]) {
+        // Bump the watchdog heartbeat so Core0 knows Core1 is making progress
+        // during long-running crypto (RSA keygen, ECDSA sign, etc.).
+        crate::WATCHDOG_HEARTBEAT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         #[cfg(target_arch = "arm")]
         {
             let _ = crate::crypto::rng::fill_random(dest);

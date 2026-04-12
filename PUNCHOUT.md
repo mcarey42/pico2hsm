@@ -31,6 +31,9 @@ Last updated: 2026-04-11 (audit pass — closed resolved items, updated descript
 | C1-partial | V2 Noise ECDSA verification code exists (commit 4628651) — enrollment mechanism missing | — |
 | C2 | dkek.py TLS — auto-generated P-256 identity, CERT_NONE eliminated | v0.9.9-rc2 |
 | H1 | Export key NO_EXPORT flag — fully resolved incl. flash (P2K4) | v0.9.5+ |
+| L3 | Python version standardized to 3.10+ across all docs | v0.9.9-rc2 |
+| L4 | Config file name standardized to daemon.yaml | v0.9.9-rc2 |
+| L6 | macOS opensc-pkcs11 path shows both Intel and Apple Silicon | v0.9.9-rc2 |
 
 ---
 
@@ -213,10 +216,10 @@ Moved to Closed items table. V1 handlers (P1=0x31/0x32/0x33) now return `SW_INS_
 
 ---
 
-### M3. No hardware test for malformed/hostile APDUs
+### M3. No hardware test for malformed/hostile APDUs — POST-RC2
 
 A security device must not hang, panic, or return unexpected SW codes when receiving truncated
-data, wrong CLA bytes, or oversized payloads.
+data, wrong CLA bytes, or oversized payloads. Deferred to post-RC2 work.
 
 **Fix:** Add a parametrized `test_malformed_apdu_rejected_gracefully` test (full pseudocode
 in 2026-04-08 review board report). Minimum cases: truncated GENERATE KEYPAIR TLV, wrong CLA,
@@ -224,16 +227,11 @@ oversized SIGN data, empty VERIFY PIN, oversized EXTRAS payload.
 
 ---
 
-### M4. CI does not build or test the Python daemon
+### ~~M4. CI does not build or test the Python daemon~~ — DEFERRED
 
-The GitHub Actions workflow builds firmware and runs Rust unit tests but never installs or imports
-the Python daemon package. A broken `setup.py`, missing `__init__.py`, or import error would not
-be caught before release.
-
-**Fix:** Add a CI step:
-```yaml
-- run: pip install -e tools/python && python -m pytest tools/python/tests/ -x -q
-```
+Deferred. CI runner has no hardware HSM devices, so integration tests cannot
+run in CI. The Python package is validated manually during the RC testing
+procedure (see `docs/TESTING_PROCEDURE.md` Phase 6).
 
 ---
 
@@ -261,20 +259,18 @@ was stale — moved to resolved.
 
 ---
 
-### L3. Python version inconsistency across docs
+### ~~L3. Python version inconsistency across docs~~ -- RESOLVED
 
-`SETUP_LOCAL_CLUSTER.md` says Python 3.9+; `SETUP_NETWORK_SYNC.md` says Python 3.10+.
-
-**Fix:** Standardize on 3.10+ (f-string `=` syntax used in daemon.py requires 3.8+; actual
-minimum is 3.9 for `zoneinfo`; 3.10 is a safe, supported, and widely available target).
-Update all docs to say Python 3.10+.
+**Fixed (v0.9.9-rc2):** All docs now say Python 3.10+. `install.sh` version check updated
+from 3.9+ to 3.10+.
 
 ---
 
-### L4. `install.sh` installs `daemon.yaml` but docs reference `config.yaml`
+### ~~L4. `install.sh` installs `daemon.yaml` but docs reference `config.yaml`~~ -- RESOLVED
 
-**File:** `install.sh` installs the example config as `/etc/pico2hsm/daemon.yaml`; setup guides
-use `config.yaml` in examples. Pick one name and apply consistently.
+**Fixed (v0.9.9-rc2):** Standardized on `daemon.yaml` everywhere. Updated all `--config`
+examples in SETUP_LOCAL_CLUSTER.md, SETUP_NETWORK_SYNC.md, PYTHON_DAEMON.md,
+MIRRORED_CLUSTER_SETUP.md, VERIFICATION.md, and install.sh.
 
 ---
 
@@ -284,10 +280,11 @@ Moved to Closed items table. `rust-version = "1.75"` is set in `Cargo.toml` (lin
 
 ---
 
-### L6. macOS opensc-pkcs11 path in SINGLE_DEVICE_SETUP.md may be wrong
+### ~~L6. macOS opensc-pkcs11 path in SINGLE_DEVICE_SETUP.md may be wrong~~ -- RESOLVED
 
-Homebrew on Apple Silicon installs to `/opt/homebrew/lib/`, not `/usr/local/lib/`.
-The doc should show both paths or use `$(brew --prefix)/lib/opensc-pkcs11.so`.
+**Fixed (v0.9.9-rc2):** SINGLE_DEVICE_SETUP.md now shows both Intel (`/usr/local/lib/`)
+and Apple Silicon (`/opt/homebrew/lib/`) paths, plus the auto-detect form
+`$(brew --prefix)/lib/opensc-pkcs11.so`.
 
 ---
 
@@ -307,9 +304,24 @@ No firmware work possible until upstream ships. Monitor the tracking issue.
 program `OTP.sw_lock(page)` to `INACCESSIBLE` / write-protect via real PAC registers.
 Moved to Closed items table.
 
-**4b. CRIT0 / JTAG disable — confirm bit positions before using on production hardware**
-`INS=0xF3` (PROV_WRITE_CRIT0) writes `CRIT0 = 0x74`. Verify exact bit positions against
-RP2350 TRM S5.1 with `picotool otp get` on a sacrificial board before deploying on production.
+**4b. CRIT0 / JTAG disable — WRONG ROW AND WRONG REGISTER (upgraded to HIGH)**
+
+**Severity:** HIGH (pre-production)
+
+Two bugs confirmed by SVD/PAC analysis (2026-04-11):
+
+1. **Wrong row:** `CRIT0_ROW = 0x18` writes to `randid2` (private random number), not CRIT0.
+2. **Wrong register:** The target bits (DEBUG_DISABLE, GLITCH_DETECTOR_ENABLE,
+   GLITCH_DETECTOR_SENS) are in **CRIT1** (row 0x40), not CRIT0 (row 0x38).
+
+Value `0x74` is correct for CRIT1 bit layout. Affected files:
+- `provisioning.rs:294` — `CRIT0_ROW = 0x18` → should be `CRIT1_ROW = 0x40`
+- `boot.rs:269` — `RP2350_CRIT0_ROW = 0x18` → should be `RP2350_CRIT1_ROW = 0x40`
+- `docs/SECURE_PROVISIONING_PLAN.md` — references "CRIT0 row 0x18"
+
+**Additional concern:** CRIT1 uses RBIT-8 redundancy (rows 0x40-0x47). Must verify
+whether `embassy_rp::otp::write_raw_word` handles 8-way redundancy or if all 8 copies
+need explicit writes. Do NOT fix until RBIT-8 handling is confirmed on hardware.
 
 **~~4c. Periodic CSPRNG reseed not wired~~** — RESOLVED. `fill_random()` now reseeds
 every `RESEED_INTERVAL` (1,000) calls via an atomic counter. Moved to Closed items table.

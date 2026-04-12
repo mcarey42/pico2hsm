@@ -187,7 +187,7 @@ sudo chown pico2hsm:pico2hsm /var/lib/pico2hsm
 
 # Start the daemon briefly to generate the identity cert
 python3 tools/python/hsm_daemon.py start \
-  --config /etc/pico2hsm/config.yaml
+  --config /etc/pico2hsm/daemon.yaml
 # Press Ctrl-C after you see "TCP listener started" in the log
 ```
 
@@ -203,7 +203,7 @@ sudo mkdir -p /var/lib/pico2hsm
 sudo chown pico2hsm:pico2hsm /var/lib/pico2hsm
 
 python3 tools/python/hsm_daemon.py start \
-  --config /etc/pico2hsm/config.yaml
+  --config /etc/pico2hsm/daemon.yaml
 # Ctrl-C after cert is generated
 ```
 
@@ -258,7 +258,7 @@ openssl x509 -in /etc/pico2hsm/certs/host-b.crt -fingerprint -sha256 -noout
 
 ## 5. Configuration -- Host A (Primary)
 
-Create `/etc/pico2hsm/config.yaml` on Host A:
+Create `/etc/pico2hsm/daemon.yaml` on Host A:
 
 ```yaml
 # Host A -- Primary node
@@ -300,7 +300,7 @@ peers:
 
 ## 6. Configuration -- Host B (Secondary)
 
-Create `/etc/pico2hsm/config.yaml` on Host B:
+Create `/etc/pico2hsm/daemon.yaml` on Host B:
 
 ```yaml
 # Host B -- Secondary node
@@ -398,11 +398,11 @@ If you have not set up the systemd unit file, run in the foreground:
 ```sh
 # Host A (in a terminal or tmux session)
 python3 /opt/pico2hsm/tools/python/hsm_daemon.py start \
-  --config /etc/pico2hsm/config.yaml
+  --config /etc/pico2hsm/daemon.yaml
 
 # Host B (in a terminal or tmux session)
 python3 /opt/pico2hsm/tools/python/hsm_daemon.py start \
-  --config /etc/pico2hsm/config.yaml
+  --config /etc/pico2hsm/daemon.yaml
 ```
 
 See [PYTHON_DAEMON.md](PYTHON_DAEMON.md) section 6 for the full
@@ -464,7 +464,7 @@ peer:
 python3 tools/python/hsm_daemon.py enroll-peer \
   "hsm-secondary" "192.168.1.11:7890" \
   --cert /etc/pico2hsm/certs/host-b.crt \
-  --config /etc/pico2hsm/config.yaml
+  --config /etc/pico2hsm/daemon.yaml
 ```
 
 This adds a peer entry to the config file with the given name, address,
@@ -475,7 +475,7 @@ file manually (edit the config to add `public_key_file`).
 
 ```sh
 python3 tools/python/hsm_daemon.py status \
-  --config /etc/pico2hsm/config.yaml
+  --config /etc/pico2hsm/daemon.yaml
 ```
 
 Expected output:
@@ -495,7 +495,7 @@ Enrolled devices: 2
 ```sh
 # On either host
 python3 tools/python/hsm_daemon.py status \
-  --config /etc/pico2hsm/config.yaml
+  --config /etc/pico2hsm/daemon.yaml
 ```
 
 Both devices should show the same generation counter and `sync=success`.
@@ -554,7 +554,7 @@ operations each device has processed.
 ```sh
 # On either host (requires both devices connected, or one device per host)
 python3 tools/python/hsm_daemon.py verify-sync \
-  --config /etc/pico2hsm/config.yaml
+  --config /etc/pico2hsm/daemon.yaml
 ```
 
 Expected output when in sync:
@@ -750,28 +750,28 @@ Before putting the cluster into production, verify each item:
 
 ```sh
 # Start daemon (foreground)
-python3 tools/python/hsm_daemon.py start --config /etc/pico2hsm/config.yaml
+python3 tools/python/hsm_daemon.py start --config /etc/pico2hsm/daemon.yaml
 
 # Start daemon (background with PID file)
 python3 tools/python/hsm_daemon.py start \
-  --config /etc/pico2hsm/config.yaml \
+  --config /etc/pico2hsm/daemon.yaml \
   --pid-file /run/pico2hsm/daemon.pid
 
 # Stop daemon
 python3 tools/python/hsm_daemon.py stop --pid-file /run/pico2hsm/daemon.pid
 
 # Check cluster status
-python3 tools/python/hsm_daemon.py status --config /etc/pico2hsm/config.yaml
+python3 tools/python/hsm_daemon.py status --config /etc/pico2hsm/daemon.yaml
 
 # Verify sync
-python3 tools/python/hsm_daemon.py verify-sync --config /etc/pico2hsm/config.yaml
+python3 tools/python/hsm_daemon.py verify-sync --config /etc/pico2hsm/daemon.yaml
 
 # Export full state
-python3 tools/python/hsm_daemon.py export-state --config /etc/pico2hsm/config.yaml
+python3 tools/python/hsm_daemon.py export-state --config /etc/pico2hsm/daemon.yaml
 
 # Enroll a remote peer
 python3 tools/python/hsm_daemon.py enroll-peer \
   "peer-name" "192.168.1.11:7890" \
   --cert /path/to/cert.pem \
-  --config /etc/pico2hsm/config.yaml
+  --config /etc/pico2hsm/daemon.yaml
 ```

@@ -42,6 +42,22 @@ pub mod display;
 /// logging to diagnose hangs without defmt (which deadlocks on core1).
 pub static CORE1_PROGRESS: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
 
+/// Watchdog heartbeat counter incremented by Core1 during long-running crypto
+/// operations (via `FwRng::fill_bytes` — called thousands of times during RSA
+/// prime generation and before each ECDSA sign).  Core0 monitors this in the
+/// time-extension loop: if the heartbeat has not changed for several consecutive
+/// 1.5 s intervals, Core1 is assumed stuck and the APDU is aborted with an
+/// error response.
+///
+/// `Relaxed` ordering is sufficient: RP2350 is cache-coherent across cores and
+/// we only need eventual visibility, not ordering with other memory operations.
+pub static WATCHDOG_HEARTBEAT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// Maximum consecutive time-extension intervals (1.5 s each) where the watchdog
+/// heartbeat has not changed before Core0 declares Core1 stuck and aborts the
+/// APDU.  3 intervals = 4.5 seconds of no RNG activity.
+pub const WATCHDOG_STALL_LIMIT: u32 = 3;
+
 #[cfg(not(target_arch = "arm"))]
 #[macro_export]
 macro_rules! cdc_log   { ($($arg:tt)*) => {{}} }

@@ -215,7 +215,7 @@ USB device connections and triggers sync when a secondary device appears.
 
 ### Configuration
 
-Create `~/.pico2hsm/config.yaml`:
+Create `~/.pico2hsm/daemon.yaml`:
 
 ```yaml
 listen_port: 7890
@@ -243,7 +243,7 @@ device using the daemon's enrollment command.
 
 ```sh
 python3 tools/python/hsm_daemon.py start \
-  --config ~/.pico2hsm/config.yaml
+  --config ~/.pico2hsm/daemon.yaml
 ```
 
 The daemon:
@@ -256,7 +256,7 @@ The daemon:
 
 ```sh
 python3 tools/python/hsm_daemon.py status \
-  --config ~/.pico2hsm/config.yaml
+  --config ~/.pico2hsm/daemon.yaml
 ```
 
 ### Stopping the daemon

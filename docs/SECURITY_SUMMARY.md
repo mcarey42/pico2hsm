@@ -117,9 +117,9 @@ items.
 | HIGH | H7 | Core1 has no watchdog — infinite crypto loop requires power cycle | Add max time-extension count or hardware watchdog |
 | MEDIUM | M3 | No hardware test for malformed/hostile APDUs | Add parametrized fuzz test |
 | MEDIUM | M4 | CI does not build or test Python daemon | Add `pip install -e tools/python && pytest` CI step |
-| LOW | L3 | Python version inconsistency (3.9+ vs 3.10+) | Standardize docs on 3.10+ |
-| LOW | L4 | `install.sh` uses `daemon.yaml`, docs use `config.yaml` | Pick one name |
-| LOW | L6 | macOS opensc-pkcs11 path may be wrong for Apple Silicon | Show both paths |
+| ~~LOW~~ | ~~L3~~ | ~~Python version inconsistency (3.9+ vs 3.10+)~~ | Resolved v0.9.9-rc2 |
+| ~~LOW~~ | ~~L4~~ | ~~`install.sh` uses `daemon.yaml`, docs use `config.yaml`~~ | Resolved v0.9.9-rc2 |
+| ~~LOW~~ | ~~L6~~ | ~~macOS opensc-pkcs11 path may be wrong for Apple Silicon~~ | Resolved v0.9.9-rc2 |
 | INFO | 4b | CRIT0/JTAG disable bit positions unverified on production boards | Verify with `picotool otp get` on sacrificial board |
 | BLOCKED | 3 | Brainpool curves blocked on upstream `bp-curves` crate | Monitor RustCrypto/elliptic-curves#1114 |
 

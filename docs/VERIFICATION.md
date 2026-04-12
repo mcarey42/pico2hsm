@@ -357,7 +357,7 @@ running, or no sync has been attempted.
 ### 5.4 Cluster sync via daemon CLI
 
 ```sh
-python3 tools/python/hsm_daemon.py verify-sync --config /etc/pico2hsm/config.yaml
+python3 tools/python/hsm_daemon.py verify-sync --config /etc/pico2hsm/daemon.yaml
 ```
 
 See section 3.2 for expected output.

@@ -33,10 +33,10 @@ Verify each item before proceeding. Every command below should succeed.
   # Should print: OpenSC 0.23.0 or later
   ```
 
-- [ ] **Python 3.9+**
+- [ ] **Python 3.10+**
   ```sh
   python3 --version
-  # Should print: Python 3.9.x or later
+  # Should print: Python 3.10.x or later
   ```
 
 - [ ] **Both readers visible**
@@ -271,10 +271,10 @@ sudo mkdir -p /etc/pico2hsm/keys
 sudo mkdir -p /etc/pico2hsm
 ```
 
-Create `/etc/pico2hsm/config.yaml` with the following content:
+Create `/etc/pico2hsm/daemon.yaml` with the following content:
 
 ```yaml
-# /etc/pico2hsm/config.yaml -- Local two-device cluster
+# /etc/pico2hsm/daemon.yaml -- Local two-device cluster
 #
 # listen_address: Bind address for the TCP listener. Use 127.0.0.1 for
 #   local-only operation (no remote peers).
@@ -349,7 +349,7 @@ ExecStartPre=/usr/bin/mkdir -p /run/pico2hsm
 ExecStartPre=/usr/bin/chown pico2hsm:pico2hsm /run/pico2hsm
 
 ExecStart=/usr/bin/python3 /opt/pico2hsm/tools/python/hsm_daemon.py start \
-    --config /etc/pico2hsm/config.yaml \
+    --config /etc/pico2hsm/daemon.yaml \
     --pid-file /run/pico2hsm/daemon.pid \
     --quorum 1
 
@@ -427,7 +427,7 @@ Or use the daemon CLI:
 
 ```sh
 python3 tools/python/hsm_daemon.py verify-sync \
-  --config /etc/pico2hsm/config.yaml
+  --config /etc/pico2hsm/daemon.yaml
 
 # Expected output:
 #   device-0: root=a1b2c3d4...
@@ -521,21 +521,21 @@ If the daemon is not running, or you prefer to sync manually:
 
 ```sh
 python3 tools/python/hsm_daemon.py sync secondary \
-  --config /etc/pico2hsm/config.yaml
+  --config /etc/pico2hsm/daemon.yaml
 ```
 
 ### Check sync status
 
 ```sh
 python3 tools/python/hsm_daemon.py verify-sync \
-  --config /etc/pico2hsm/config.yaml
+  --config /etc/pico2hsm/daemon.yaml
 ```
 
 ### View cluster health
 
 ```sh
 python3 tools/python/hsm_daemon.py status \
-  --config /etc/pico2hsm/config.yaml
+  --config /etc/pico2hsm/daemon.yaml
 
 # Expected output:
 # Enrolled devices: 2
@@ -547,7 +547,7 @@ python3 tools/python/hsm_daemon.py status \
 
 ```sh
 python3 tools/python/hsm_daemon.py export-state \
-  --config /etc/pico2hsm/config.yaml
+  --config /etc/pico2hsm/daemon.yaml
 ```
 
 ### Replace a failed device
@@ -585,7 +585,7 @@ If one device fails, the surviving device continues to operate independently. To
 5. Verify state roots match:
    ```sh
    python3 tools/python/hsm_daemon.py verify-sync \
-     --config /etc/pico2hsm/config.yaml
+     --config /etc/pico2hsm/daemon.yaml
    ```
 
 6. Update the daemon config if the replacement device has a different identity key, then restart the daemon:
