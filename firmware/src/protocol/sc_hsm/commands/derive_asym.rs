@@ -13,6 +13,7 @@ use pico2hsm_core::apdu::{
 };
 
 use crate::protocol::sc_hsm::ScHsmState;
+use crate::storage::KeyStore;
 
 /// INS byte for DERIVE ASYMMETRIC KEY (shared with DECIPHER).
 pub const INS_DERIVE_ASYM: u8 = 0x62;
@@ -21,7 +22,7 @@ pub const INS_DERIVE_ASYM: u8 = 0x62;
 pub const P1_DERIVE: u8 = 0x01;
 
 /// Handle a DERIVE ASYMMETRIC KEY APDU command.
-pub fn handle(state: &mut ScHsmState, cmd: &ApduCommand<'_>) -> ApduResponse {
+pub fn handle(state: &mut ScHsmState, store: &mut dyn KeyStore, cmd: &ApduCommand<'_>) -> ApduResponse {
     // Require PIN authentication
     if !state.pin_verified {
         return ApduResponse::err(SW_SECURITY_STATUS);
@@ -38,29 +39,23 @@ pub fn handle(state: &mut ScHsmState, cmd: &ApduCommand<'_>) -> ApduResponse {
 
     let full_key_id = pico2hsm_core::key::KeyId::sc_hsm(0, source_key_id).0;
 
-    // Try EC key first, then symmetric key.
-    let key_bytes_opt: Option<heapless::Vec<u8, 66>> = if let Some(k) =
-        state.keys.iter().find(|k| k.key_id == full_key_id)
-    {
-        let mut v: heapless::Vec<u8, 66> = heapless::Vec::new();
-        if v.extend_from_slice(&k.private_key).is_err() {
-            return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED);
-        }
-        Some(v)
-    } else if let Some(k) = state.sym_keys.iter().find(|k| k.key_id == full_key_id) {
-        let mut v: heapless::Vec<u8, 66> = heapless::Vec::new();
-        if v.extend_from_slice(&k.raw_key).is_err() {
-            return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED);
-        }
-        Some(v)
-    } else {
-        None
-    };
-
-    let key_bytes = match key_bytes_opt {
-        Some(b) => b,
+    // Check metadata index for the key
+    let _meta = match state.key_index.iter().find(|m| m.key_id == full_key_id) {
+        Some(m) => *m,
         None => return ApduResponse::err(SW_FILE_NOT_FOUND),
     };
+
+    // Load key material from flash
+    let key_obj = match store.fetch_key(pico2hsm_core::key::KeyId(full_key_id)) {
+        Ok(Some(obj)) => obj,
+        _ => return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
+    };
+
+    // Use private_key bytes (works for both EC and symmetric keys)
+    let mut key_bytes: heapless::Vec<u8, 66> = heapless::Vec::new();
+    if key_bytes.extend_from_slice(&key_obj.private_key).is_err() {
+        return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED);
+    }
 
     let mut output = [0u8; 32];
     match crate::crypto::kdf::hkdf_sha256(&[], &key_bytes, cmd.data, &mut output) {
@@ -78,10 +73,47 @@ mod tests {
     use super::*;
     use pico2hsm_core::{
         apdu::{SW_CONDITIONS_NOT_SATISFIED, SW_FILE_NOT_FOUND, SW_OK, SW_SECURITY_STATUS},
-        key::{KeyId, KeyType as CoreKeyType},
+        key::{AppletId, KeyId},
     };
 
-    use crate::protocol::sc_hsm::{InMemoryKey, InMemorySymKey, ScHsmState};
+    use crate::protocol::sc_hsm::{KeyMeta, ScHsmState};
+    use crate::security::key_management::{AlgorithmId, KeyObject, KeyType as KmType};
+
+    /// Test key store that holds a single KeyObject and returns it on fetch_key.
+    struct TestStore {
+        obj: Option<KeyObject>,
+    }
+
+    impl TestStore {
+        fn new(obj: KeyObject) -> Self {
+            Self { obj: Some(obj) }
+        }
+        fn empty() -> Self {
+            Self { obj: None }
+        }
+    }
+
+    impl crate::storage::KeyStore for TestStore {
+        fn save_key(&mut self, _: &KeyObject) -> Result<(), pico2hsm_core::error::HsmError> { Ok(()) }
+        fn fetch_key(&mut self, key_id: KeyId) -> Result<Option<KeyObject>, pico2hsm_core::error::HsmError> {
+            if let Some(ref obj) = self.obj {
+                if obj.key_id == key_id.0 {
+                    // Clone the KeyObject fields manually
+                    let mut clone = KeyObject::new(obj.key_type, obj.key_id, obj.owner, obj.algorithm);
+                    clone.key_flags = obj.key_flags;
+                    let _ = clone.private_key.extend_from_slice(&obj.private_key);
+                    let _ = clone.public_key.extend_from_slice(&obj.public_key);
+                    return Ok(Some(clone));
+                }
+            }
+            Ok(None)
+        }
+        fn erase_key(&mut self, _: KeyId) -> Result<(), pico2hsm_core::error::HsmError> { Ok(()) }
+        fn wipe_all(&mut self) -> Result<(), pico2hsm_core::error::HsmError> { Ok(()) }
+        fn wipe_by_owner(&mut self, _: AppletId) -> Result<(), pico2hsm_core::error::HsmError> { Ok(()) }
+        fn enumerate_keys(&self) -> heapless::Vec<KeyId, 64> { heapless::Vec::new() }
+        fn for_each_key(&self, _f: &mut dyn FnMut(KeyId)) {}
+    }
 
     /// Build a minimal APDU raw buffer: [CLA, INS, P1, P2, Lc, data...]
     fn make_apdu(ins: u8, p1: u8, p2: u8, data: &[u8]) -> heapless::Vec<u8, 128> {
@@ -99,106 +131,107 @@ mod tests {
         make_apdu(INS_DERIVE_ASYM, P1_DERIVE, 0x00, info)
     }
 
-    fn make_state_with_ec_key(key_proto_ref: u8) -> ScHsmState {
+    fn make_state_and_store_with_ec_key(key_proto_ref: u8) -> (ScHsmState, TestStore) {
         let mut state = ScHsmState::new();
         state.pin_verified = true;
         state.current_key_id = Some(key_proto_ref);
 
         let full_key_id = KeyId::sc_hsm(0, key_proto_ref).0;
-        let mut private_key: heapless::Vec<u8, 66> = heapless::Vec::new();
-        // 32 bytes of fake EC private key
+
+        // Push metadata into key_index
+        let meta = KeyMeta { key_id: full_key_id, key_type: 0, algo: 0x13, key_flags: 0 };
+        state.key_index.push(meta).unwrap();
+
+        // Create a KeyObject with fake EC private key
+        let mut key_obj = KeyObject::new(KmType::Ec, full_key_id, AppletId::ScHsm, AlgorithmId::EcdsaP256);
         for i in 0..32u8 {
-            private_key.push(i + 1).unwrap();
+            let _ = key_obj.private_key.push(i + 1);
         }
-        let key = InMemoryKey {
-            key_id: full_key_id,
-            key_type: CoreKeyType::EcPrivateP256,
-            algo: 0x13,
-            key_flags: 0,
-            private_key,
-            public_key: heapless::Vec::new(),
-        };
-        state.keys.push(key).unwrap();
-        state
+
+        (state, TestStore::new(key_obj))
     }
 
-    fn make_state_with_sym_key(key_proto_ref: u8) -> ScHsmState {
+    fn make_state_and_store_with_sym_key(key_proto_ref: u8) -> (ScHsmState, TestStore) {
         let mut state = ScHsmState::new();
         state.pin_verified = true;
         state.current_key_id = Some(key_proto_ref);
 
         let full_key_id = KeyId::sc_hsm(0, key_proto_ref).0;
-        let mut raw_key: heapless::Vec<u8, 32> = heapless::Vec::new();
-        // 32 bytes of fake AES-256 key
+
+        // Push metadata into key_index
+        let meta = KeyMeta { key_id: full_key_id, key_type: 0, algo: 0x60, key_flags: 0 };
+        state.key_index.push(meta).unwrap();
+
+        // Create a KeyObject with fake AES-256 key
+        let mut key_obj = KeyObject::new(KmType::Aes, full_key_id, AppletId::ScHsm, AlgorithmId::AesCbc);
         for i in 0..32u8 {
-            raw_key.push(0xA0 ^ i).unwrap();
+            let _ = key_obj.private_key.push(0xA0 ^ i);
         }
-        let sym_key = InMemorySymKey {
-            key_id: full_key_id,
-            raw_key,
-        };
-        state.sym_keys.push(sym_key).unwrap();
-        state
+
+        (state, TestStore::new(key_obj))
     }
 
     #[test]
     fn test_derive_requires_pin() {
         let mut state = ScHsmState::new();
+        let mut store = TestStore::empty();
         // pin_verified = false (default)
         state.current_key_id = Some(0x01);
         let raw = derive_apdu(b"test-info");
         let cmd = pico2hsm_core::apdu::ApduCommand::parse(&raw).unwrap();
-        let resp = handle(&mut state, &cmd);
+        let resp = handle(&mut state, &mut store, &cmd);
         assert_eq!(resp.sw, SW_SECURITY_STATUS);
     }
 
     #[test]
     fn test_derive_no_mse_key_id() {
         let mut state = ScHsmState::new();
+        let mut store = TestStore::empty();
         state.pin_verified = true;
         // current_key_id = None (default)
         let raw = derive_apdu(b"test-info");
         let cmd = pico2hsm_core::apdu::ApduCommand::parse(&raw).unwrap();
-        let resp = handle(&mut state, &cmd);
+        let resp = handle(&mut state, &mut store, &cmd);
         assert_eq!(resp.sw, SW_CONDITIONS_NOT_SATISFIED);
     }
 
     #[test]
     fn test_derive_key_not_found() {
         let mut state = ScHsmState::new();
+        let mut store = TestStore::empty();
         state.pin_verified = true;
         state.current_key_id = Some(0x01);
-        // No key inserted into state.keys or state.sym_keys
+        // No key in key_index or store
         let raw = derive_apdu(b"test-info");
         let cmd = pico2hsm_core::apdu::ApduCommand::parse(&raw).unwrap();
-        let resp = handle(&mut state, &cmd);
+        let resp = handle(&mut state, &mut store, &cmd);
         assert_eq!(resp.sw, SW_FILE_NOT_FOUND);
     }
 
     #[test]
     fn test_derive_ec_key_returns_32_bytes() {
-        let mut state = make_state_with_ec_key(0x01);
+        let (mut state, mut store) = make_state_and_store_with_ec_key(0x01);
         let raw = derive_apdu(b"app-context");
         let cmd = pico2hsm_core::apdu::ApduCommand::parse(&raw).unwrap();
-        let resp = handle(&mut state, &cmd);
+        let resp = handle(&mut state, &mut store, &cmd);
         assert_eq!(resp.sw, SW_OK);
         assert_eq!(resp.data.len(), 32, "derived output must be 32 bytes");
     }
 
     #[test]
     fn test_derive_sym_key_returns_32_bytes() {
-        let mut state = make_state_with_sym_key(0x02);
+        let (mut state, mut store) = make_state_and_store_with_sym_key(0x02);
         let raw = derive_apdu(b"sym-context");
         let cmd = pico2hsm_core::apdu::ApduCommand::parse(&raw).unwrap();
-        let resp = handle(&mut state, &cmd);
+        let resp = handle(&mut state, &mut store, &cmd);
         assert_eq!(resp.sw, SW_OK);
         assert_eq!(resp.data.len(), 32, "derived output must be 32 bytes");
     }
 
     #[test]
     fn test_derive_different_info_different_output() {
-        let mut state1 = make_state_with_ec_key(0x01);
-        let mut state2 = make_state_with_ec_key(0x01);
+        let (mut state1, mut store1) = make_state_and_store_with_ec_key(0x01);
+        let (mut state2, mut store2) = make_state_and_store_with_ec_key(0x01);
 
         let raw1 = derive_apdu(b"context-A");
         let raw2 = derive_apdu(b"context-B");
@@ -206,8 +239,8 @@ mod tests {
         let cmd1 = pico2hsm_core::apdu::ApduCommand::parse(&raw1).unwrap();
         let cmd2 = pico2hsm_core::apdu::ApduCommand::parse(&raw2).unwrap();
 
-        let resp1 = handle(&mut state1, &cmd1);
-        let resp2 = handle(&mut state2, &cmd2);
+        let resp1 = handle(&mut state1, &mut store1, &cmd1);
+        let resp2 = handle(&mut state2, &mut store2, &cmd2);
 
         assert_eq!(resp1.sw, SW_OK);
         assert_eq!(resp2.sw, SW_OK);

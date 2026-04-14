@@ -9,7 +9,7 @@
 //! - External flash: 16 MB on QSPI
 //! - Status display: 1.14" SPI ST7789 LCD on SPI1 (135×240 px, landscape 240×135)
 //!   ST7789 is a write-only display: data flows MOSI only, MISO unused.
-//!   Display uses COLMOD=0x55 (16-bit RGB565) with colour inversion (INVON).
+//!   Display uses COLMOD=0x33 (12-bit RGB444) with colour inversion (INVON).
 //!   Visible area is 240×135 with column offset 52 and row offset 40.
 //! - SPI1 LCD pins: SCK=GPIO10, MOSI=GPIO11
 //!   DC=GPIO8, CS=GPIO9, RST=GPIO12, BL=GPIO25
@@ -33,7 +33,7 @@
 //! | BL     |  25  | Backlight enable (active-high) |
 //!
 //! # ST7789 init sequence
-//! SWRESET → delay 150 ms → SLPOUT → delay 255 ms → COLMOD(0x55 = RGB565) →
+//! SWRESET → delay 150 ms → SLPOUT → delay 255 ms → COLMOD(0x33 = RGB444) →
 //! MADCTL(0x70 = landscape, BGR) → CASET(52..291) → RASET(40..174) →
 //! INVON → NORON → DISPON.
 //!
@@ -119,7 +119,16 @@ const CYCLES_PER_MS: u32 = 150_000;
 
 // ─── Software framebuffer ─────────────────────────────────────────────────────
 
-/// 240×135 RGB565 framebuffer — 2 bytes per pixel, row-major, big-endian.
+/// 240×135 RGB444 framebuffer — 3 bytes per 2 pixels (packed), row-major.
+///
+/// Two pixels are packed into 3 bytes (ST7789 "Interface II" RGB444):
+///   Byte 0: [R1₃R1₂R1₁R1₀ | G1₃G1₂G1₁G1₀]
+///   Byte 1: [B1₃B1₂B1₁B1₀ | R2₃R2₂R2₁R2₀]
+///   Byte 2: [G2₃G2₂G2₁G2₀ | B2₃B2₂B2₁B2₀]
+///
+/// 240×135 = 32 400 pixels → 48 600 bytes (saves ~16 KB vs RGB565's 64 800).
+/// Both dimensions are even, so rows always end on a pixel-pair boundary.
+///
 /// Owned exclusively by `St7789StatusDisplay::flush()` and the `DrawTarget` impl.
 ///
 /// # Safety
@@ -127,15 +136,15 @@ const CYCLES_PER_MS: u32 = 150_000;
 /// impl and `flush()`).  No other task or core touches this buffer, so there is
 /// no concurrent mutation.
 #[cfg(target_arch = "arm")]
-static mut FRAMEBUF: [u8; (LCD_WIDTH as usize) * (LCD_HEIGHT as usize) * 2] =
-    [0u8; (LCD_WIDTH as usize) * (LCD_HEIGHT as usize) * 2];
+static mut FRAMEBUF: [u8; (LCD_WIDTH as usize) * (LCD_HEIGHT as usize) * 3 / 2] =
+    [0u8; (LCD_WIDTH as usize) * (LCD_HEIGHT as usize) * 3 / 2];
 
 // ─── LED / display driver ─────────────────────────────────────────────────────
 
 /// ST7789 status display driver for the Waveshare RP2350-Geek.
 ///
 /// Drives the 1.14" 240×135 ST7789 LCD over SPI1.  On each `set_status()`
-/// call the entire screen is filled with a solid RGB565 colour that encodes
+/// call the entire screen is filled with a solid RGB444 colour that encodes
 /// the current HSM state.
 ///
 /// # GPIO ownership
@@ -223,8 +232,8 @@ impl St7789StatusDisplay {
     /// from the old frame to the new frame during this call — no intermediate
     /// blank-screen state is ever visible.
     ///
-    /// The 63 KB framebuffer write uses `spi.write().await` (DMA-backed) so
-    /// the Embassy executor is not blocked during the ~17 ms transfer.  Small
+    /// The 48 KB framebuffer write uses `spi.write().await` (DMA-backed) so
+    /// the Embassy executor is not blocked during the ~13 ms transfer.  Small
     /// command/window writes use `blocking_write()` which is fine on an Async
     /// SPI bus and requires no async context.
     pub async fn flush(&mut self) {
@@ -248,7 +257,7 @@ impl St7789StatusDisplay {
         self.dc.set_high();
 
         // SAFETY: FRAMEBUF is only accessed from core0; no concurrent mutation.
-        // DMA write: yields to executor during the ~17 ms transfer.
+        // DMA write: yields to executor during the ~13 ms transfer.
         let _ = self.spi.write(unsafe { &*(&raw const FRAMEBUF) }).await;
 
         self.cs_deassert();
@@ -320,8 +329,9 @@ impl St7789StatusDisplay {
         let _ = self.spi.blocking_write(&[ST7789_RAMWR]);
         self.dc.set_high();
 
-        // 320 × 240 = 76 800 pixels.  Write in 320-pixel (640-byte) row chunks.
-        let row_buf = [0u8; 640]; // all zeros = black
+        // 320 × 240 = 76 800 pixels → 115 200 bytes in RGB444 (3 bytes per 2 pixels).
+        // Write in 320-pixel (480-byte) row chunks — all zeros = black.
+        let row_buf = [0u8; 480]; // 320 pixels × 3/2 bytes = 480 bytes
         for _ in 0..240u16 {
             let _ = self.spi.blocking_write(&row_buf);
         }
@@ -335,7 +345,7 @@ impl St7789StatusDisplay {
     /// 1. Hardware reset pulse (RST low 10 ms, high 150 ms)
     /// 2. SWRESET + 150 ms
     /// 3. SLPOUT + 255 ms
-    /// 4. COLMOD = 0x55 (16-bit RGB565)
+    /// 4. COLMOD = 0x33 (12-bit RGB444)
     /// 5. MADCTL = 0x70 (landscape, MX+MV, BGR colour order for ST7789)
     /// 6. Full controller RAM clear (320 × 240 black pixels — eliminates border garbage)
     /// 7. CASET = 52..291  (column window for 240 px wide display)
@@ -360,9 +370,9 @@ impl St7789StatusDisplay {
         self.write_command(ST7789_SLPOUT);
         self.delay_ms(255);
 
-        // 16-bit RGB565 colour format
-        defmt::info!("ST7789: COLMOD 0x55 (RGB565)...");
-        self.write_command_data(ST7789_COLMOD, &[0x55]);
+        // 12-bit RGB444 colour format — saves ~25% framebuffer SRAM vs RGB565
+        defmt::info!("ST7789: COLMOD 0x33 (RGB444)...");
+        self.write_command_data(ST7789_COLMOD, &[0x33]);
         self.delay_ms(10);
 
         // Memory Access Control:
@@ -423,11 +433,11 @@ impl St7789StatusDisplay {
 
     // ── Screen fill ──────────────────────────────────────────────────────────
 
-    /// Fill the entire display with a solid RGB565 colour.
+    /// Fill the entire display with a solid RGB565 colour (converted to RGB444).
     ///
-    /// Sends 240 × 135 = 32 400 pixels in 64 800 bytes (two bytes per pixel).
-    /// To avoid a 64 KB stack allocation, pixels are written in 240-pixel
-    /// (480-byte) row chunks that fit comfortably in the call stack.
+    /// Sends 240 × 135 = 32 400 pixels in 48 600 bytes (3 bytes per 2 pixels).
+    /// To avoid a large stack allocation, pixels are written in 240-pixel
+    /// (360-byte) row chunks that fit comfortably in the call stack.
     fn fill_screen(&mut self, color: u16) {
         // Re-assert the column and row windows before RAMWR in case they were
         // disturbed by a previous partial write.
@@ -455,14 +465,23 @@ impl St7789StatusDisplay {
         let _ = self.spi.blocking_write(&[ST7789_RAMWR]);
         self.dc.set_high();
 
-        // Write rows one at a time — 480 bytes per row (240 pixels × 2 bytes).
-        // This keeps stack usage at ~480 bytes rather than ~65 KB.
-        let hi = (color >> 8) as u8;
-        let lo = (color & 0xFF) as u8;
-        let mut row_buf = [0u8; (LCD_WIDTH as usize) * 2];
-        for i in 0..(LCD_WIDTH as usize) {
-            row_buf[i * 2]     = hi;
-            row_buf[i * 2 + 1] = lo;
+        // Convert RGB565 to RGB444: extract top 4 bits of each channel.
+        let r = ((color >> 12) & 0x0F) as u8;
+        let g = ((color >> 7)  & 0x0F) as u8;
+        let b = ((color >> 1)  & 0x0F) as u8;
+
+        // Pack two identical pixels into 3 bytes (RGB444 Interface II):
+        //   Byte 0: R1G1, Byte 1: B1R2, Byte 2: G2B2
+        let byte0 = (r << 4) | g;
+        let byte1 = (b << 4) | r;
+        let byte2 = (g << 4) | b;
+
+        // Write rows one at a time — 360 bytes per row (240 pixels × 3/2 bytes).
+        let mut row_buf = [0u8; (LCD_WIDTH as usize) * 3 / 2]; // 360 bytes
+        for i in 0..(LCD_WIDTH as usize / 2) {
+            row_buf[i * 3]     = byte0;
+            row_buf[i * 3 + 1] = byte1;
+            row_buf[i * 3 + 2] = byte2;
         }
         for _ in 0..LCD_HEIGHT {
             let _ = self.spi.blocking_write(&row_buf);
@@ -514,6 +533,42 @@ use embedded_graphics::{
     Pixel,
 };
 
+// ─── RGB444 packing helpers ─────────────────────────────────────────────────
+
+/// Extract 4-bit R, G, B components from an RGB565 raw u16.
+///
+/// Takes the top 4 bits of each channel:
+///   R4 = bits 15–12 of the raw value (top 4 of 5-bit R)
+///   G4 = bits 10–7  (top 4 of 6-bit G)
+///   B4 = bits 4–1   (top 4 of 5-bit B)
+#[cfg(target_arch = "arm")]
+#[inline(always)]
+fn rgb565_to_rgb444(color: Rgb565) -> (u8, u8, u8) {
+    let raw: u16 = RawU16::from(color).into_inner();
+    let r = ((raw >> 12) & 0x0F) as u8;
+    let g = ((raw >> 7) & 0x0F) as u8;
+    let b = ((raw >> 1) & 0x0F) as u8;
+    (r, g, b)
+}
+
+/// Pack one pixel's RGB444 components into the framebuffer at `linear_idx`.
+///
+/// Two pixels share 3 bytes (ST7789 Interface II):
+///   Even pixel (i%2==0): byte[base]   = R1G1, byte[base+1] upper nibble = B1
+///   Odd pixel  (i%2==1): byte[base+1] lower nibble = R2, byte[base+2] = G2B2
+#[cfg(target_arch = "arm")]
+#[inline(always)]
+fn pack_pixel_444(fb: &mut [u8], linear_idx: usize, r: u8, g: u8, b: u8) {
+    let base = linear_idx / 2 * 3;
+    if linear_idx % 2 == 0 {
+        fb[base] = (r << 4) | g;
+        fb[base + 1] = (fb[base + 1] & 0x0F) | (b << 4);
+    } else {
+        fb[base + 1] = (fb[base + 1] & 0xF0) | r;
+        fb[base + 2] = (g << 4) | b;
+    }
+}
+
 #[cfg(target_arch = "arm")]
 impl OriginDimensions for St7789StatusDisplay {
     fn size(&self) -> Size {
@@ -540,10 +595,9 @@ impl DrawTarget for St7789StatusDisplay {
             {
                 continue;
             }
-            let raw: u16 = RawU16::from(color).into_inner();
-            let idx = (coord.y as usize * LCD_WIDTH as usize + coord.x as usize) * 2;
-            fb[idx]     = (raw >> 8) as u8;
-            fb[idx + 1] = (raw & 0xFF) as u8;
+            let (r, g, b) = rgb565_to_rgb444(color);
+            let linear = coord.y as usize * LCD_WIDTH as usize + coord.x as usize;
+            pack_pixel_444(fb, linear, r, g, b);
         }
         Ok(())
     }
@@ -569,10 +623,9 @@ impl DrawTarget for St7789StatusDisplay {
         let mut row = 0usize;
         for color in colors {
             if row >= area.size.height as usize { break; }
-            let raw: u16 = RawU16::from(color).into_inner();
-            let idx = ((y0 + row) * LCD_WIDTH as usize + (x0 + col)) * 2;
-            fb[idx]     = (raw >> 8) as u8;
-            fb[idx + 1] = (raw & 0xFF) as u8;
+            let (r, g, b) = rgb565_to_rgb444(color);
+            let linear = (y0 + row) * LCD_WIDTH as usize + (x0 + col);
+            pack_pixel_444(fb, linear, r, g, b);
             col += 1;
             if col >= w { col = 0; row += 1; }
         }
@@ -587,9 +640,7 @@ impl DrawTarget for St7789StatusDisplay {
             return Ok(());
         }
 
-        let raw: u16 = RawU16::from(color).into_inner();
-        let hi = (raw >> 8) as u8;
-        let lo = (raw & 0xFF) as u8;
+        let (r, g, b) = rgb565_to_rgb444(color);
 
         // SAFETY: FRAMEBUF is only accessed from core0 display code; no concurrent access.
         let fb = unsafe { &mut *(&raw mut FRAMEBUF) };
@@ -598,10 +649,9 @@ impl DrawTarget for St7789StatusDisplay {
         let w  = area.size.width as usize;
         let h  = area.size.height as usize;
         for row in y0..(y0 + h) {
-            let base = (row * LCD_WIDTH as usize + x0) * 2;
             for col in 0..w {
-                fb[base + col * 2]     = hi;
-                fb[base + col * 2 + 1] = lo;
+                let linear = row * LCD_WIDTH as usize + (x0 + col);
+                pack_pixel_444(fb, linear, r, g, b);
             }
         }
         Ok(())
@@ -636,7 +686,7 @@ pub type Rp2350GeekSpi0 =
 
 /// Async SPI1 type for the RP2350-Geek (LCD bus).
 /// Async mode enables DMA-backed `flush()` that yields to the Embassy executor
-/// during the ~17 ms 63 KB framebuffer transfer, preventing USB starvation.
+/// during the ~13 ms 48 KB framebuffer transfer, preventing USB starvation.
 /// Small command writes (1–5 bytes) still use `blocking_write()` which works
 /// on an Async SPI bus without requiring an async context.
 pub type Rp2350GeekSpi1 =

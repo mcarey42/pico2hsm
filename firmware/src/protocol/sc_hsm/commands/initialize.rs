@@ -172,23 +172,20 @@ pub fn handle(state: &mut ScHsmState, store: &mut dyn crate::storage::KeyStore, 
     state.challenge = None;
 
     state.initialized = true;
-    state.keys.clear();
-    #[cfg(feature = "rsa")]
-    state.rsa_keys.clear();
-    state.ef_files.clear();
+    state.key_index.clear();
+    state.ef_cache.clear();
+    state.op_buf.invalidate();
 
     // Slot 0 is reserved for the device authentication key on SC-HSM.
     // Pre-populate a sentinel entry so sc_hsm_determine_free_id skips it
     // and assigns user keys starting at slot 1.
-    let dev_key = crate::protocol::sc_hsm::InMemoryKey {
+    let dev_key_meta = crate::protocol::sc_hsm::KeyMeta {
         key_id: pico2hsm_core::key::KeyId::sc_hsm(0, 0).0,
-        key_type: pico2hsm_core::key::KeyType::EcPrivateP256,
+        key_type: pico2hsm_core::key::KeyType::EcPrivateP256 as u8,
         algo: 0x13,
         key_flags: 0,
-        private_key: heapless::Vec::new(),
-        public_key: heapless::Vec::new(),
     };
-    let _ = state.keys.push(dev_key);
+    let _ = state.key_index.push(dev_key_meta);
 
     // Reset DKEK state: init share collection for the requested count.
     state.dkek.init_shares(dkek_count);
@@ -211,7 +208,8 @@ pub fn handle(state: &mut ScHsmState, store: &mut dyn crate::storage::KeyStore, 
     crate::CORE1_PROGRESS.store(32, core::sync::atomic::Ordering::Relaxed);
     {
         use crate::crypto::asymmetric::generate_ec_keypair;
-        use crate::protocol::sc_hsm::{FwRng, InMemoryKey, EfEntry};
+        use crate::protocol::sc_hsm::FwRng;
+        use crate::security::key_management::{AlgorithmId, KeyObject, KeyType as KmType};
         use pico2hsm_core::key::KeyType as CoreKeyType;
 
         let mut rng = FwRng;
@@ -229,28 +227,36 @@ pub fn handle(state: &mut ScHsmState, store: &mut dyn crate::storage::KeyStore, 
                 crate::CORE1_PROGRESS.store(81, core::sync::atomic::Ordering::Relaxed);
             }
 
-            // Store in in-memory key store.
-            state.keys.retain(|k| k.key_id != dev_identity_key_id);
-            let mut entry = InMemoryKey {
+            // Push device identity key metadata to key_index.
+            state.key_index.retain(|m| m.key_id != dev_identity_key_id);
+            let dev_id_meta = crate::protocol::sc_hsm::KeyMeta {
                 key_id: dev_identity_key_id,
-                key_type: CoreKeyType::EcPrivateP256,
+                key_type: CoreKeyType::EcPrivateP256 as u8,
                 algo: 0x13, // EcdsaP256
                 key_flags: 0,
-                private_key: heapless::Vec::new(),
-                public_key: heapless::Vec::new(),
             };
-            let _ = entry.private_key.extend_from_slice(&pair.private_key);
-            let _ = entry.public_key.extend_from_slice(&pair.public_key);
-            let _ = state.keys.push(entry);
+            let _ = state.key_index.push(dev_id_meta);
 
-            // Store public key in EF 0x2F02 (EF.C.DevAut).
-            state.ef_files.retain(|ef| ef.file_id != 0x2F02);
-            let mut ef = EfEntry {
-                file_id: 0x2F02,
-                data: heapless::Vec::new(),
-            };
-            let _ = ef.data.extend_from_slice(&pair.public_key);
-            let _ = state.ef_files.push(ef);
+            // Store public key in EF 0x2F02 (EF.C.DevAut) via flash + ef_cache.
+            {
+                let ef_key_id = pico2hsm_core::key::KeyId::sc_hsm_ef(0, 0x2F, 0x02);
+                let _ = store.erase_key(ef_key_id);
+                let mut ef_obj = KeyObject::new(KmType::Generic, ef_key_id.0, AppletId::ScHsm, AlgorithmId::EcdsaP256);
+                let _ = ef_obj.private_key.extend_from_slice(&pair.public_key);
+                let _ = store.save_key(&ef_obj);
+                // Populate ef_cache so READ BINARY can serve this data.
+                state.ef_cache_put(ef_key_id.0, &pair.public_key);
+                // Push EfFile metadata to key_index.
+                state.key_index.retain(|m| m.key_id != ef_key_id.0);
+                let ef_meta = crate::protocol::sc_hsm::KeyMeta {
+                    key_id: ef_key_id.0,
+                    key_type: 16, // EfFile
+                    algo: 0x2F, // high byte of file_id 0x2F02
+                    key_flags: 0,
+                };
+                let _ = state.key_index.push(ef_meta);
+            }
+
         }
     }
 

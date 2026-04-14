@@ -210,10 +210,8 @@ impl<Chip: FlashChip> KeyStore for FlashKeyStore<Chip> {
 /// No-op key store for host-side (x86_64) unit tests.
 ///
 /// All operations succeed immediately without touching any flash.
-#[cfg(not(target_arch = "arm"))]
 pub struct NullKeyStore;
 
-#[cfg(not(target_arch = "arm"))]
 impl KeyStore for NullKeyStore {
     fn save_key(&mut self, _: &KeyObject) -> Result<(), HsmError> {
         Ok(())

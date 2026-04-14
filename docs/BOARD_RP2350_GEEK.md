@@ -13,7 +13,7 @@ build instructions for all three firmware variants are covered.
 | MCU               | RP2350A (Cortex-M33 dual-core, 150 MHz)  |
 | External flash    | 16 MB QSPI (W25Q128JV or equivalent)     |
 | Form factor       | USB-A dongle (no castellated edge)       |
-| Display           | 1.14" ST7789 LCD, 240×135 px, RGB565     |
+| Display           | 1.14" ST7789 LCD, 240×135 px, RGB444     |
 | SD card           | Optional (see variant table)             |
 | USB connector     | USB-A male (plug-in directly)            |
 
@@ -87,7 +87,7 @@ MISO is not connected to the ST7789 (write-only display).
 | Controller      | ST7789                             |
 | Panel size      | 1.14 inch                          |
 | Resolution      | 240 × 135 pixels (landscape)       |
-| Colour format   | RGB565 (16-bit, COLMOD = 0x55)     |
+| Colour format   | RGB444 (12-bit, COLMOD = 0x33)     |
 | Colour inversion| Required (INVON must be sent)      |
 | Column offset   | 52 (CASET start = 52, end = 291)   |
 | Row offset      | 40 (RASET start = 40, end = 174)   |
@@ -119,7 +119,7 @@ SWRESET (0x01)
 delay 150 ms
 SLPOUT  (0x11)
 delay 255 ms
-COLMOD  (0x3A) data=[0x55]   — 16-bit RGB565
+COLMOD  (0x3A) data=[0x33]   — 12-bit RGB444
 delay  10 ms
 MADCTL  (0x36) data=[0x70]   — MX | MV | BGR = landscape, correct colour order
 CASET   (0x2A) data=[0x00,0x34,0x01,0x23]   — columns 52..291
@@ -275,7 +275,7 @@ ST7789 LCD on this board and are not claimed anywhere else in the firmware.
 
 ### Screen fill performance
 
-`fill_screen()` writes 240 × 135 = 32,400 pixels (64,800 bytes) over SPI.
+`fill_screen()` writes 240 × 135 = 32,400 pixels (48,600 bytes in RGB444) over SPI.
 At 30 MHz with 8-bit transfers, theoretical minimum is ~17 ms per fill.
 In practice, including CS toggling and CASET/RASET commands, a full fill
 takes approximately 20–25 ms on hardware.  This is acceptable for status

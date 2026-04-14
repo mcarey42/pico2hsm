@@ -106,8 +106,34 @@ def _wait_for_device(timeout: float = 25.0) -> bool:
     return False
 
 
+def _kill_probe_rs_run() -> None:
+    """Kill any running ``probe-rs run`` process that holds the debug probe.
+
+    ``probe-rs run`` streams RTT output and keeps the debug interface locked.
+    A concurrent ``probe-rs reset`` will either fail or steal the connection
+    and kill the RTT stream unpredictably.  Killing it explicitly first gives
+    ``probe-rs reset`` a clean debug interface.
+    """
+    try:
+        # Only kill "probe-rs run" (RTT streaming), not "probe-rs reset".
+        result = subprocess.run(
+            ["pkill", "-f", "probe-rs run"],
+            capture_output=True, timeout=5,
+        )
+        if result.returncode == 0:
+            log.info("Killed probe-rs run (RTT monitor) to free debug probe")
+            time.sleep(1)  # let the USB interface settle
+        else:
+            log.debug("No probe-rs run process found (already stopped)")
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        pass
+
+
 def _reset_device() -> None:
     """Reset the device via probe-rs and wait for USB re-enumeration."""
+    # Kill any RTT-streaming probe-rs process first so the debug probe is free.
+    _kill_probe_rs_run()
+
     log.info("Resetting device via probe-rs...")
     cmd = ["probe-rs", "reset", "--chip", "RP235x"]
     # When multiple debug probes are connected, probe-rs needs a selector.

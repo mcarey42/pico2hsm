@@ -41,7 +41,6 @@ pub mod keystore;
 pub use keystore::KeyStore;
 pub use keystore::HybridKeyStore;
 
-#[cfg(not(target_arch = "arm"))]
 pub use keystore::NullKeyStore;
 
 // The following sub-modules use embassy-rp / embassy-time / defmt and can
@@ -290,7 +289,7 @@ impl<Chip: FlashChip> StorageManager<Chip> {
     pub fn read_key(
         &mut self,
         key_id: KeyId,
-    ) -> Result<heapless::Vec<u8, 2400>, StorageError> {
+    ) -> Result<heapless::Vec<u8, { crate::security::key_management::MAX_BLOB_SIZE }>, StorageError> {
         self.filesystem.read_key(key_id)
     }
 

@@ -16,7 +16,7 @@ use pico2hsm_core::{
     key::{AppletId, KeyId},
 };
 
-use crate::protocol::sc_hsm::{InMemorySymKey, ScHsmState};
+use crate::protocol::sc_hsm::{KeyMeta, ScHsmState};
 use crate::security::key_management::{AlgorithmId, KeyObject, KeyType};
 
 /// INS byte for GENERATE SYMMETRIC KEY.
@@ -78,27 +78,30 @@ pub fn handle(
     let full_key_id = KeyId::sc_hsm(0, key_id_proto).0;
     let algo = AlgorithmId::AesGcm; // canonical AES algorithm tag for storage
 
-    // Build in-memory symmetric key entry (replace any existing slot)
-    let mut raw_key: heapless::Vec<u8, 32> = heapless::Vec::new();
-    raw_key.extend_from_slice(&key_buf[..key_len]).ok();
-
-    // Replace existing entry with same key_id, or push a new one
-    let existing = state.sym_keys.iter_mut().find(|k| k.key_id == full_key_id);
-    if let Some(slot) = existing {
-        slot.raw_key = raw_key.clone();
-    } else if state.sym_keys.push(InMemorySymKey { key_id: full_key_id, raw_key: raw_key.clone() }).is_err() {
-        return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED);
-    }
+    // Determine the AES key type for metadata.
+    let aes_key_type = match key_len {
+        16 => pico2hsm_core::key::KeyType::Aes128,
+        24 => pico2hsm_core::key::KeyType::Aes192,
+        32 => pico2hsm_core::key::KeyType::Aes256,
+        _ => unreachable!(),
+    };
 
     // Persist to flash: build a KeyObject
     let mut obj = KeyObject::new(KeyType::Aes, full_key_id, AppletId::ScHsm, algo);
     obj.private_key.extend_from_slice(&key_buf[..key_len]).ok();
 
     if store.save_key(&obj).is_err() {
-        // Flash write failed — remove from in-memory store to keep consistency
-        state.sym_keys.retain(|k| k.key_id != full_key_id);
         return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED);
     }
+
+    // Update key_index metadata (replace any existing entry).
+    state.key_index.retain(|m| m.key_id != full_key_id);
+    let _ = state.key_index.push(KeyMeta {
+        key_id: full_key_id,
+        key_type: aes_key_type as u8,
+        algo: algo as u8,
+        key_flags: 0,
+    });
 
     state.generation = state.generation.wrapping_add(1);
     ApduResponse::ok(&[])
@@ -155,8 +158,8 @@ mod tests {
         let resp = handle(&mut state, &mut store, &cmd);
         assert_eq!(resp.sw, pico2hsm_core::apdu::SW_OK);
         let full_id = KeyId::sc_hsm(0, 0x01).0;
-        let sk = state.sym_keys.iter().find(|k| k.key_id == full_id).unwrap();
-        assert_eq!(sk.raw_key.len(), 16);
+        let meta = state.key_index.iter().find(|m| m.key_id == full_id).unwrap();
+        assert_eq!(meta.key_type, pico2hsm_core::key::KeyType::Aes128 as u8);
     }
 
     #[test]
@@ -168,8 +171,8 @@ mod tests {
         let resp = handle(&mut state, &mut store, &cmd);
         assert_eq!(resp.sw, pico2hsm_core::apdu::SW_OK);
         let full_id = KeyId::sc_hsm(0, 0x05).0;
-        let sk = state.sym_keys.iter().find(|k| k.key_id == full_id).unwrap();
-        assert_eq!(sk.raw_key.len(), 32);
+        let meta = state.key_index.iter().find(|m| m.key_id == full_id).unwrap();
+        assert_eq!(meta.key_type, pico2hsm_core::key::KeyType::Aes256 as u8);
     }
 
     #[test]
@@ -179,18 +182,13 @@ mod tests {
         let raw = gen_key_cmd(0x02, 0x84);
         let cmd = ApduCommand::parse(&raw).unwrap();
         handle(&mut state, &mut store, &cmd);
-        let key1 = {
-            let full_id = KeyId::sc_hsm(0, 0x02).0;
-            state.sym_keys.iter().find(|k| k.key_id == full_id).unwrap().raw_key.clone()
-        };
+        let full_id = KeyId::sc_hsm(0, 0x02).0;
+        assert_eq!(state.key_index.iter().filter(|m| m.key_id == full_id).count(), 1);
+
         // Generate again — should replace, not duplicate
         let cmd2 = ApduCommand::parse(&raw).unwrap();
         handle(&mut state, &mut store, &cmd2);
-        let full_id = KeyId::sc_hsm(0, 0x02).0;
-        assert_eq!(state.sym_keys.iter().filter(|k| k.key_id == full_id).count(), 1);
-        let key2 = state.sym_keys.iter().find(|k| k.key_id == full_id).unwrap().raw_key.clone();
-        // Keys should differ (PRNG advances)
-        assert_ne!(key1, key2);
+        assert_eq!(state.key_index.iter().filter(|m| m.key_id == full_id).count(), 1);
     }
 
     #[test]

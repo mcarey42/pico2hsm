@@ -5,5 +5,6 @@
 //! AID or default protocol.
 
 pub mod dispatcher;
+pub mod shared_buffer;
 
 pub use dispatcher::Dispatcher;

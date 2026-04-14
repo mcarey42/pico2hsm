@@ -21,8 +21,14 @@ const ALG_3DES: u8 = 0x03;
 const ALG_ECC_P256: u8 = 0x11;
 const ALG_ECC_P384: u8 = 0x14;
 
-/// Handle a GENERAL AUTHENTICATE APDU command.
+/// Handle a GENERAL AUTHENTICATE APDU command (non-store path).
 pub fn handle(state: &mut PivState, cmd: &ApduCommand<'_>) -> ApduResponse {
+    let mut null_store = crate::storage::NullKeyStore;
+    handle_with_store(state, &mut null_store, cmd)
+}
+
+/// Handle a GENERAL AUTHENTICATE APDU command with access to persistent storage.
+pub fn handle_with_store(state: &mut PivState, store: &mut dyn crate::storage::KeyStore, cmd: &ApduCommand<'_>) -> ApduResponse {
     let alg_id = cmd.p1;
     let key_ref = cmd.p2;
 
@@ -42,7 +48,7 @@ pub fn handle(state: &mut PivState, cmd: &ApduCommand<'_>) -> ApduResponse {
 
     match key_ref {
         0x9B => handle_mgmt_auth(state, alg_id, inner),
-        0x9A | 0x9C | 0x9D | 0x9E => handle_asymmetric_auth(state, alg_id, key_ref, inner),
+        0x9A | 0x9C | 0x9D | 0x9E => handle_asymmetric_auth(state, store, alg_id, key_ref, inner),
         0x82..=0x95 => ApduResponse::err(0x6A86), // retired slots: incorrect parameters
         _ => ApduResponse::err(0x6A86), // incorrect P2
     }
@@ -155,6 +161,7 @@ fn handle_mgmt_auth(state: &mut PivState, alg_id: u8, inner: &[u8]) -> ApduRespo
 /// Response: 7C { 82 <signature> }
 fn handle_asymmetric_auth(
     state: &mut PivState,
+    store: &mut dyn crate::storage::KeyStore,
     alg_id: u8,
     key_ref: u8,
     inner: &[u8],
@@ -190,22 +197,30 @@ fn handle_asymmetric_auth(
     // For signing: expect tag 82 (empty = compute response) and tag 81 (input data)
     if let Some(input) = tags.tag_81 {
         if tags.tag_82_empty {
-            // Look up the key
-            let piv_key_id = KeyId::piv(key_ref).0;
-            let key = match state.keys.iter().find(|k| k.key_id == piv_key_id) {
-                Some(k) => k,
+            // Look up the key from flash via store.
+            let piv_key_id = KeyId::piv(key_ref);
+
+            // Verify key exists in key_index.
+            let meta = match state.key_index.iter().find(|m| m.key_id == piv_key_id.0) {
+                Some(m) => m,
                 None => return ApduResponse::err(0x6A88), // reference data not found
             };
 
-            // Verify key type matches
-            if key.key_type != key_type {
+            // Verify key type matches.
+            if meta.key_type != key_type as u8 {
                 return ApduResponse::err(0x6A80);
             }
 
+            // Fetch key material from flash.
+            let key_obj = match store.fetch_key(piv_key_id) {
+                Ok(Some(obj)) => obj,
+                _ => return ApduResponse::err(0x6A88), // reference data not found
+            };
+
             // Copy private key to stack buffer
             let mut priv_buf = [0u8; 66];
-            let priv_len = key.private_key.len();
-            priv_buf[..priv_len].copy_from_slice(&key.private_key);
+            let priv_len = key_obj.private_key.len();
+            priv_buf[..priv_len].copy_from_slice(&key_obj.private_key);
 
             // Sign with ECDSA. Input is the raw hash digest.
             let mut rng = FwRng;

@@ -175,10 +175,6 @@ pub struct OpenPgpState {
     // --- Termination flag (set by TERMINATE DF, cleared by ACTIVATE FILE) ---
     pub terminated: bool,
 
-    // --- GET RESPONSE buffer (for large responses that exceed Le) ---
-    pub last_response: heapless::Vec<u8, 4096>,
-    /// Byte offset into `last_response` for the next GET RESPONSE chunk.
-    pub last_response_offset: usize,
 }
 
 impl OpenPgpState {
@@ -231,8 +227,6 @@ impl OpenPgpState {
             url: heapless::Vec::new(),
             cardholder_cert: heapless::Vec::new(),
             terminated: false,
-            last_response: heapless::Vec::new(),
-            last_response_offset: 0,
         }
     }
 
@@ -274,16 +268,9 @@ impl OpenPgp {
     }
 
     /// Dispatch an already-parsed APDU to the appropriate command handler.
+    ///
+    /// GET RESPONSE and Le-truncation are handled by the Dispatcher.
     fn dispatch(&mut self, cmd: &ApduCommand<'_>) -> ApduResponse {
-        // GET RESPONSE is always processed regardless of termination state.
-        if cmd.ins == get_response::INS_GET_RESPONSE {
-            return get_response::handle(&mut self.state, cmd);
-        }
-
-        // Non-GET-RESPONSE commands clear the pending response buffer.
-        self.state.last_response.clear();
-        self.state.last_response_offset = 0;
-
         // When terminated, only ACTIVATE FILE and SELECT are allowed.
         if self.state.terminated {
             match cmd.ins {
@@ -297,7 +284,7 @@ impl OpenPgp {
             }
         }
 
-        let raw = match cmd.ins {
+        match cmd.ins {
             select::INS_SELECT => select::handle(&mut self.state, cmd),
             verify::INS_VERIFY => verify::handle(&mut self.state, cmd),
             change_pin::INS_CHANGE_PIN => change_pin::handle(&mut self.state, cmd),
@@ -317,54 +304,18 @@ impl OpenPgp {
             terminate_activate::INS_TERMINATE_DF => {
                 terminate_activate::handle_terminate(&mut self.state, cmd)
             }
-            _ => return ApduResponse::err(SW_INS_NOT_SUPPORTED),
-        };
-
-        self.maybe_chain_response(raw, cmd.le)
-    }
-
-    /// If the response data exceeds Le, buffer the remainder and return SW=61xx.
-    fn maybe_chain_response(&mut self, resp: ApduResponse, le: Option<u16>) -> ApduResponse {
-        // Only chain successful responses with data.
-        if resp.sw != 0x9000 {
-            return resp;
+            _ => ApduResponse::err(SW_INS_NOT_SUPPORTED),
         }
-        let le_val = match le {
-            None => return resp, // no Le field — no truncation
-            Some(0) => 256usize,
-            Some(n) => n as usize,
-        };
-        if resp.data.len() <= le_val {
-            return resp;
-        }
-        // Store full response, return first le_val bytes with SW=0x61xx.
-        self.state.last_response.clear();
-        self.state.last_response_offset = 0;
-        let _ = self.state.last_response.extend_from_slice(&resp.data);
-        let chunk = &self.state.last_response[..le_val];
-        let mut out = heapless::Vec::<u8, 4096>::new();
-        let _ = out.extend_from_slice(chunk);
-        self.state.last_response_offset = le_val;
-        let remaining = self.state.last_response.len() - le_val;
-        let next_chunk = remaining.min(255) as u8;
-        ApduResponse::ok_more(&out, next_chunk)
     }
 
     /// Dispatch an APDU using the store-aware path for mutations.
+    ///
+    /// GET RESPONSE and Le-truncation are handled by the Dispatcher.
     fn dispatch_with_store(
         &mut self,
         cmd: &ApduCommand<'_>,
         store: &mut dyn crate::storage::KeyStore,
     ) -> ApduResponse {
-        // GET RESPONSE is always processed regardless of termination state.
-        if cmd.ins == get_response::INS_GET_RESPONSE {
-            return get_response::handle(&mut self.state, cmd);
-        }
-
-        // Non-GET-RESPONSE commands clear the pending response buffer.
-        self.state.last_response.clear();
-        self.state.last_response_offset = 0;
-
         // When terminated, only ACTIVATE FILE and SELECT are allowed.
         if self.state.terminated {
             match cmd.ins {
@@ -378,7 +329,7 @@ impl OpenPgp {
             }
         }
 
-        let raw = match cmd.ins {
+        match cmd.ins {
             generate_keypair::INS_GENERATE_KEYPAIR => {
                 generate_keypair::handle_with_store(&mut self.state, store, cmd)
             }
@@ -392,42 +343,10 @@ impl OpenPgp {
                 reset_retry_counter::handle_with_store(&mut self.state, store, cmd)
             }
             _ => {
-                // Fall through to the non-store dispatch (which will re-clear the buffer
-                // unnecessarily but that's safe; terminated check is done above).
-                // We call the inner raw dispatch to avoid double-chaining.
-                return self.dispatch_inner_no_clear(cmd);
+                // Fall through to the non-store dispatch.
+                self.dispatch(cmd)
             }
-        };
-
-        self.maybe_chain_response(raw, cmd.le)
-    }
-
-    /// Inner dispatch that skips the GET RESPONSE / termination / buffer-clear preamble.
-    /// Called from `dispatch_with_store` for commands that don't need store access.
-    fn dispatch_inner_no_clear(&mut self, cmd: &ApduCommand<'_>) -> ApduResponse {
-        let raw = match cmd.ins {
-            select::INS_SELECT => select::handle(&mut self.state, cmd),
-            verify::INS_VERIFY => verify::handle(&mut self.state, cmd),
-            change_pin::INS_CHANGE_PIN => change_pin::handle(&mut self.state, cmd),
-            reset_retry_counter::INS_RESET_RETRY_COUNTER => {
-                reset_retry_counter::handle(&mut self.state, cmd)
-            }
-            get_data::INS_GET_DATA => get_data::handle(&mut self.state, cmd),
-            put_data::INS_PUT_DATA | put_data::INS_PUT_DATA_ODD => {
-                put_data::handle(&mut self.state, cmd)
-            }
-            generate_keypair::INS_GENERATE_KEYPAIR => {
-                generate_keypair::handle(&mut self.state, cmd)
-            }
-            pso::INS_PSO => pso::handle(&mut self.state, cmd),
-            authenticate::INS_AUTHENTICATE => authenticate::handle(&mut self.state, cmd),
-            challenge::INS_CHALLENGE => challenge::handle(&mut self.state, cmd),
-            terminate_activate::INS_TERMINATE_DF => {
-                terminate_activate::handle_terminate(&mut self.state, cmd)
-            }
-            _ => return ApduResponse::err(SW_INS_NOT_SUPPORTED),
-        };
-        self.maybe_chain_response(raw, cmd.le)
+        }
     }
 
     /// Process a raw APDU with access to persistent storage.

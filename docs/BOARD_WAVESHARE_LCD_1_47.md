@@ -15,7 +15,7 @@ integrated 1.47" colour LCD and a single WS2812B RGB LED.
 | MCU             | RP2350A (dual Cortex-M33 + dual RISC-V, 150 MHz) |
 | SRAM            | 520 KB on-chip                                   |
 | External flash  | Winbond W25Q128JVSIQ 16 MB QSPI NOR              |
-| Display         | 1.47" ST7789V3 IPS, 172 × 320 pixels, RGB565     |
+| Display         | 1.47" ST7789V3 IPS, 172 × 320 pixels, RGB444     |
 | RGB LED         | Single WS2812B RGB LED                           |
 | SD card         | MicroSD slot (SPI1)                              |
 | USB             | USB 1.1 full-speed (USB-C connector)             |
@@ -85,7 +85,7 @@ QSPI flash (W25Q128) is connected to the RP2350A QSPI interface (not general GPI
 |-------------------|----------------------------------------------------------|
 | Physical panel    | 172 × 320 pixels (portrait)                              |
 | Firmware mode     | **Landscape 320 × 172** (MADCTL MY+MV = 0xA0)           |
-| Colour depth      | 16-bit RGB565                                            |
+| Colour depth      | 12-bit RGB444                                            |
 | CASET range       | 0x0000 – 0x013F (0–319, landscape width)                 |
 | RASET range       | 0x0022 – 0x00CD (34–205, landscape height with offset)   |
 | Column offset     | 34 — physical GRAM columns 0–33 are outside the panel    |
@@ -108,7 +108,7 @@ Hardware reset: RST high → low (10 ms) → high → wait 120 ms
 
 SWRESET  (01h)              Software reset                       150 ms delay
 SLPOUT   (11h)              Sleep out (enable oscillator)        255 ms delay
-COLMOD   (3Ah) 05h          16-bit/pixel RGB565
+COLMOD   (3Ah) 03h          12-bit/pixel RGB444
 MADCTL   (36h) A0h          Landscape: MY=1, MV=1 (90° CCW / 180° from 0x60)
 INVON    (21h)              Display inversion on (required for V3 panel)
 NORON    (13h)              Normal display mode
@@ -124,11 +124,11 @@ BL → high                   Backlight on (GPIO21)
 After `CASET`/`RASET`, send `RAMWR (2Ch)` then stream pixel data:
 - CS asserted (low) for the entire `RAMWR` + data transfer
 - DC high during data bytes
-- Each pixel: 2 bytes big-endian RGB565 (high byte first)
+- Each pixel pair: 3 bytes packed RGB444 (ST7789 Interface II)
 - Full-screen fill: 110 080 bytes, sent in 128-byte chunks
-- Framebuffer flush is **async** (`flush_display().await`): DMA_CH1/CH2 transfer the 110 KB in ~22 ms while yielding to the Embassy executor, keeping USB serviced
+- Framebuffer flush is **async** (`flush_display().await`): DMA_CH1/CH2 transfer the 83 KB in ~17 ms while yielding to the Embassy executor, keeping USB serviced
 
-### RGB565 status colours
+### Status colours (RGB565 values, converted to RGB444 internally)
 
 | `LedStatus`   | RGB565   | Hex    | Description        |
 |---------------|----------|--------|--------------------|
@@ -283,7 +283,7 @@ and returns immediately.  Actual LCD rendering and WS2812B updates require
 async operations and GPIO handles that cannot be stored in `St7789V3StatusDisplay`
 without changing the `WaveshareRp2350LcdBoard::new(spi0, spi1)` call site.
 
-SPI0 operates in async mode; `flush_display()` and `fill_screen()` are async and must be `.await`ed. The DMA transfer yields to the executor during the ~22 ms framebuffer write.
+SPI0 operates in async mode; `flush_display()` and `fill_screen()` are async and must be `.await`ed. The DMA transfer yields to the executor during the ~17 ms framebuffer write.
 
 The intended usage pattern in `run_waveshare_lcd_board()`:
 

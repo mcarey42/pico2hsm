@@ -29,8 +29,11 @@ use pico2hsm_core::apdu::{
     ApduCommand, ApduResponse, SW_CONDITIONS_NOT_SATISFIED, SW_OK, SW_SECURITY_STATUS,
     SW_WRONG_DATA,
 };
+use pico2hsm_core::key::{AppletId, KeyId};
 
-use crate::protocol::sc_hsm::{EfEntry, ScHsmState};
+use crate::protocol::sc_hsm::{KeyMeta, ScHsmState};
+use crate::security::key_management::{AlgorithmId, KeyObject, KeyType as KmType};
+use crate::storage::KeyStore;
 
 /// INS byte for WRITE DATA (SC-HSM extension).
 pub const INS_WRITE_DATA: u8 = 0xD7;
@@ -82,7 +85,7 @@ fn parse_write_tlv(data: &[u8]) -> Option<(usize, &[u8])> {
 }
 
 /// Handle a WRITE DATA APDU command.
-pub fn handle(state: &mut ScHsmState, cmd: &ApduCommand<'_>) -> ApduResponse {
+pub fn handle(state: &mut ScHsmState, store: &mut dyn KeyStore, cmd: &ApduCommand<'_>) -> ApduResponse {
     // Security requirement: reject if no PIN session is active.
     if !state.pin_verified && !state.so_pin_verified {
         return ApduResponse::err(SW_SECURITY_STATUS);
@@ -110,40 +113,72 @@ pub fn handle(state: &mut ScHsmState, cmd: &ApduCommand<'_>) -> ApduResponse {
         }
     };
 
-    write_at_offset(state, target_fid, offset, payload)
+    write_at_offset(state, store, target_fid, offset, payload)
 }
 
 /// Write `payload` to `file_id` at `offset` (create if needed).
+/// Persists to flash via `store` and updates `state.key_index` + `ef_cache`.
 fn write_at_offset(
     state: &mut ScHsmState,
+    store: &mut dyn KeyStore,
     file_id: u16,
     offset: usize,
     payload: &[u8],
 ) -> ApduResponse {
-    if let Some(entry) = state.ef_files.iter_mut().find(|e| e.file_id == file_id) {
-        if offset == 0 {
-            entry.data.clear();
-        } else {
-            // Pad with zeros up to offset if file is shorter.
-            while entry.data.len() < offset {
-                let _ = entry.data.push(0x00);
-            }
-            entry.data.truncate(offset);
-        }
-        let _ = entry.data.extend_from_slice(payload);
-        return ApduResponse::ok(&[]);
-    }
+    let file_id_hi = (file_id >> 8) as u8;
+    let file_id_lo = (file_id & 0xFF) as u8;
+    let key_id = KeyId::sc_hsm_ef(0, file_id_hi, file_id_lo);
 
-    // New entry: offset must be 0 for a fresh file.
-    if offset != 0 {
+    // Check if this EF already exists in key_index.
+    let exists = state.key_index.iter().any(|m| m.key_type == 16 && m.key_id == key_id.0);
+
+    // Build the complete data buffer by combining existing data with
+    // the new payload at the given offset.
+    let mut data_buf: heapless::Vec<u8, 4096> = heapless::Vec::new();
+    if exists && offset > 0 {
+        // Need existing data for offset writes — try ef_cache first,
+        // then fall back to flash via cross-core fetch_key RPC.
+        if let Some(existing) = state.ef_cache_get(key_id.0) {
+            let _ = data_buf.extend_from_slice(existing);
+        } else if let Ok(Some(obj)) = store.fetch_key(key_id) {
+            let _ = data_buf.extend_from_slice(&obj.private_key);
+        }
+        // Pad with zeros up to offset if shorter.
+        while data_buf.len() < offset {
+            let _ = data_buf.push(0x00);
+        }
+        data_buf.truncate(offset);
+    }
+    let _ = data_buf.extend_from_slice(payload);
+
+    if !exists && offset != 0 {
         return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED);
     }
-    let mut data_buf: heapless::Vec<u8, { crate::protocol::sc_hsm::MAX_EF_DATA }> =
-        heapless::Vec::new();
-    let _ = data_buf.extend_from_slice(payload);
-    let entry = EfEntry { file_id, data: data_buf };
-    match state.ef_files.push(entry) {
-        Ok(()) => ApduResponse::ok(&[]),
+
+    // Erase old entry if updating.
+    if exists {
+        let _ = store.erase_key(key_id);
+    }
+
+    let mut key_obj = KeyObject::new(KmType::Generic, key_id.0, AppletId::ScHsm, AlgorithmId::AesGcm);
+    let _ = key_obj.private_key.extend_from_slice(&data_buf);
+    match store.save_key(&key_obj) {
+        Ok(()) => {
+            // Update the in-memory EF cache so READ BINARY can serve
+            // this data back without hitting flash.
+            state.ef_cache_put(key_id.0, &data_buf);
+
+            if !exists {
+                let meta = KeyMeta {
+                    key_id: key_id.0,
+                    key_type: 16, // EfFile
+                    algo: file_id_hi, // high byte of file_id, used by list_keys to filter CE entries
+                    key_flags: 0,
+                };
+                let _ = state.key_index.push(meta);
+            }
+            ApduResponse::ok(&[])
+        }
         Err(_) => ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
     }
 }

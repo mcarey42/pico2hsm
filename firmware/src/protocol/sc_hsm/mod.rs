@@ -28,12 +28,6 @@ use pico2hsm_core::{
 };
 use zeroize::Zeroizing;
 
-/// INS byte for GET RESPONSE (ISO 7816-4 §7.6.1).
-///
-/// The host sends this to retrieve additional bytes when the card returned
-/// SW=0x61xx indicating that `XX` bytes remain in the response buffer.
-const INS_GET_RESPONSE: u8 = 0xC0;
-
 use crate::security::dkek::DkekManager;
 
 use commands::*;
@@ -76,95 +70,133 @@ pub const MAX_PIN_LEN: usize = 16;
 /// Maximum SO-PIN length in bytes.
 pub const MAX_SO_PIN_LEN: usize = 16;
 
-/// Maximum number of in-memory EC key slots.
-pub const MAX_IN_MEMORY_KEYS: usize = 16;
-
-/// Maximum number of in-memory symmetric key slots.
-pub const MAX_IN_MEMORY_SYM_KEYS: usize = 8;
-
-/// Maximum number of in-memory RSA key slots (feature-gated).
-#[cfg(feature = "rsa")]
-pub const MAX_RSA_IN_MEMORY_KEYS: usize = 4;
-
-/// Maximum number of EF (elementary file) entries stored in RAM.
-/// Reduced from 8 to 4 — SC-HSM uses 2-4 EF files in practice
-/// (DevAut cert, C.DevAut, etc.).  Saves ~4 KB BSS.
-pub const MAX_EF_FILES: usize = 4;
-/// Maximum size of a single EF data blob (bytes).
-/// Reduced from 2048 to 1024 — typical certs are under 1 KB.
-pub const MAX_EF_DATA: usize = 1024;
-
 /// Maximum number of entries in the V2 DKEK exchange challenge replay cache.
 pub const MAX_EXCHANGE_CHALLENGE_CACHE: usize = 8;
 
-/// An in-memory (volatile) EF (elementary file) entry.
-///
-/// Used by WRITE DATA (INS=0xD7) and READ BINARY (INS=0xB0) to store and
-/// retrieve arbitrary data files written by the host (e.g. EF.C.DevAut).
-pub struct EfEntry {
-    /// File identifier (P1 || P2 from the write command).
-    pub file_id: u16,
-    /// Raw file contents.
-    pub data: heapless::Vec<u8, MAX_EF_DATA>,
+/// What's currently in the operational buffer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpBufState {
+    /// Buffer is empty / invalid.
+    Empty,
+    /// Buffer holds decrypted data for this key, read from flash. Not modified.
+    Clean(u32),
+    /// Buffer holds modified data for this key. Must be flushed to flash before
+    /// loading a different object.
+    Dirty(u32),
 }
 
-/// An in-memory (volatile) symmetric key slot.
-///
-/// Holds a raw AES key (16, 24, or 32 bytes for AES-128/192/256).
-/// Keys are volatile — they are lost on reset and cleared on INITIALIZE.
-#[derive(Debug)]
-pub struct InMemorySymKey {
-    /// Full u32 internal key ID (structured: partition | applet | reserved | proto_ref).
+/// Lightweight metadata for a key or EF file stored in flash.
+/// Kept in RAM so LIST KEYS, SELECT, MSE SET, and PRKD generation
+/// can answer without touching flash.
+#[derive(Debug, Clone, Copy)]
+pub struct KeyMeta {
+    /// Full structured KeyId (partition | applet | reserved | proto_ref).
     pub key_id: u32,
-    /// Raw key bytes: 16 (AES-128), 24 (AES-192), or 32 (AES-256).
-    pub raw_key: heapless::Vec<u8, 32>,
-}
-
-/// An in-memory (volatile) RSA key slot.
-///
-/// Separate from `InMemoryKey` because RSA private keys are ~1200–2350 bytes
-/// (PKCS#1 DER for RSA-2048/4096) — too large to fit in `InMemoryKey.private_key`
-/// which is sized for the largest EC key (66 bytes for P-521).
-#[cfg(feature = "rsa")]
-pub struct RsaInMemoryKey {
-    /// Full u32 internal key ID (structured: partition | applet | reserved | proto_ref).
-    pub key_id: u32,
-    /// Key type: `RsaPrivate2048`, `RsaPrivate3072`, or `RsaPrivate4096`.
-    pub key_type: CoreKeyType,
-    /// SC-HSM AlgorithmId byte used during keygen (e.g. 0x05 = RSA-2048, 0x07 = RSA-4096).
+    /// CoreKeyType discriminant.
+    pub key_type: u8,
+    /// SC-HSM algorithm byte (e.g. 0x13 = EcdsaP256).
     pub algo: u8,
-    /// SC-HSM key flags byte (see `InMemoryKey::key_flags` for bit layout).
+    /// SC-HSM key flags (sign/decrypt/derive/exportable).
     pub key_flags: u8,
-    /// PKCS#1 DER-encoded `RSAPrivateKey` (≤1200 bytes for RSA-2048, ≤2350 bytes for RSA-4096).
-    pub private_key_der: heapless::Vec<u8, 2400>,
-    /// Raw RSA modulus, big-endian (256 bytes for RSA-2048, 512 bytes for RSA-4096).
-    pub modulus: heapless::Vec<u8, 512>,
-    /// Raw RSA public exponent, big-endian (3 bytes for e=65537).
-    pub exponent: heapless::Vec<u8, 4>,
 }
 
-/// An in-memory (volatile) key slot.
-///
-/// Keys are held in RAM and lost on reset; flash persistence is a future
-/// storage layer concern. This is sufficient for integration testing.
-#[derive(Debug)]
-pub struct InMemoryKey {
-    /// Full u32 internal key ID (structured: partition | applet | reserved | proto_ref).
+/// Cached EF file entry — stores actual file data in RAM so READ BINARY
+/// can serve it without flash access from Core1.
+#[derive(Clone)]
+pub struct EfCacheEntry {
+    /// Full structured KeyId for this EF (from `KeyId::sc_hsm_ef`).
     pub key_id: u32,
-    /// Key type used by the `crypto::asymmetric` functions.
-    pub key_type: CoreKeyType,
-    /// SC-HSM AlgorithmId byte (e.g. 0x13 = EcdsaP256, 0x23 = EcdhP256).
-    pub algo: u8,
-    /// SC-HSM key flags byte from GENERATE KEY PAIR TLV (tag 0xD4).
-    ///
-    /// Bit 0 = ALLOW_SIGN, Bit 1 = ALLOW_DECRYPT, Bit 2 = ALLOW_DERIVE,
-    /// Bit 3 = NO_EXPORT (if set, EXPORT KEY must be rejected).
-    /// Default 0x00 = all operations allowed, exportable.
-    pub key_flags: u8,
-    /// Raw private key scalar (big-endian), up to 66 bytes for P-521.
-    pub private_key: heapless::Vec<u8, 66>,
-    /// Uncompressed public key `04 || X || Y`, up to 133 bytes for P-521.
-    pub public_key: heapless::Vec<u8, 133>,
+    /// File data (certificates, PRKDs, etc.).  1024 bytes covers EC CVCs
+    /// for all curves including P-521 (~700 bytes) and RSA-2048 (~900 bytes).
+    pub data: heapless::Vec<u8, 1024>,
+}
+
+/// Single operational buffer for one-at-a-time key/EF access.
+///
+/// All key material and EF file data flows through this buffer.
+/// Since Core1 processes one APDU at a time, there is never concurrent
+/// access to multiple keys. The state machine ensures dirty data is
+/// flushed before a new object is loaded.
+pub struct OpBuffer {
+    /// Current buffer state.
+    pub state: OpBufState,
+    /// Decrypted key material or EF file content.
+    pub data: [u8; 4096],
+    /// Number of valid bytes in `data`.
+    pub len: usize,
+}
+
+impl OpBuffer {
+    pub const fn new() -> Self {
+        OpBuffer {
+            state: OpBufState::Empty,
+            data: [0u8; 4096],
+            len: 0,
+        }
+    }
+
+    /// Invalidate the buffer (set to Empty, zero data).
+    pub fn invalidate(&mut self) {
+        self.state = OpBufState::Empty;
+        self.len = 0;
+        // Zero the buffer to avoid leaking key material.
+        self.data.fill(0);
+    }
+
+    /// Check if the buffer currently holds data for the given key_id.
+    pub fn holds(&self, key_id: u32) -> bool {
+        match self.state {
+            OpBufState::Clean(id) | OpBufState::Dirty(id) => id == key_id,
+            OpBufState::Empty => false,
+        }
+    }
+
+    /// Check if the buffer is dirty (has unflushed modifications).
+    pub fn is_dirty(&self) -> bool {
+        matches!(self.state, OpBufState::Dirty(_))
+    }
+
+    /// Mark the current buffer contents as dirty (modified).
+    /// Panics if buffer is Empty.
+    pub fn mark_dirty(&mut self) {
+        match self.state {
+            OpBufState::Clean(id) => self.state = OpBufState::Dirty(id),
+            OpBufState::Dirty(_) => {} // already dirty
+            OpBufState::Empty => panic!("cannot mark empty buffer as dirty"),
+        }
+    }
+
+    /// Mark the buffer as clean (just flushed or freshly loaded).
+    pub fn mark_clean(&mut self, key_id: u32) {
+        self.state = OpBufState::Clean(key_id);
+    }
+
+    /// Get a reference to the valid data bytes.
+    pub fn as_slice(&self) -> &[u8] {
+        &self.data[..self.len]
+    }
+
+    /// Get a mutable reference to the valid data bytes.
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        &mut self.data[..self.len]
+    }
+
+    /// Load raw data into the buffer, marking it as Clean for the given key_id.
+    /// Caller is responsible for flushing any prior dirty state before calling this.
+    pub fn load_raw(&mut self, key_id: u32, data: &[u8]) {
+        let n = data.len().min(4096);
+        self.data[..n].copy_from_slice(&data[..n]);
+        self.len = n;
+        self.state = OpBufState::Clean(key_id);
+    }
+
+    /// Store new data into the buffer, marking it as Dirty for the given key_id.
+    pub fn store_dirty(&mut self, key_id: u32, data: &[u8]) {
+        let n = data.len().min(4096);
+        self.data[..n].copy_from_slice(&data[..n]);
+        self.len = n;
+        self.state = OpBufState::Dirty(key_id);
+    }
 }
 
 /// Platform-specific firmware RNG.
@@ -301,15 +333,14 @@ pub struct ScHsmState {
     /// SIGN_ENROLLMENT, preventing unauthenticated exchanges after enrollment.
     pub dkek_unauthenticated_allowed: bool,
 
-    /// In-memory (volatile) EC key store. Cleared on INITIALIZE.
-    pub keys: heapless::Vec<InMemoryKey, MAX_IN_MEMORY_KEYS>,
-    /// In-memory (volatile) RSA key store. Cleared on INITIALIZE.
-    #[cfg(feature = "rsa")]
-    pub rsa_keys: heapless::Vec<RsaInMemoryKey, MAX_RSA_IN_MEMORY_KEYS>,
-    /// In-memory (volatile) symmetric key store. Cleared on INITIALIZE.
-    pub sym_keys: heapless::Vec<InMemorySymKey, MAX_IN_MEMORY_SYM_KEYS>,
-    /// In-memory (volatile) EF store (written via WRITE DATA INS=0xD7).
-    pub ef_files: heapless::Vec<EfEntry, MAX_EF_FILES>,
+    /// Lightweight metadata index for all keys and EF files in flash.
+    /// Replaces the previous `keys`, `rsa_keys`, `sym_keys`, and `ef_files`
+    /// Vec fields. Key material stays in flash; only metadata lives in RAM.
+    pub key_index: heapless::Vec<KeyMeta, 32>,
+
+    /// Single operational buffer for key/EF data access.
+    /// Loaded on-demand from flash; flushed back when dirty.
+    pub op_buf: OpBuffer,
 
     /// Last non-zero file ID targeted by WRITE DATA.  OpenSC's sc_hsm_update_ef
     /// uses a two-step write protocol: first `D7 fid_hi fid_lo data(N)` (small
@@ -345,15 +376,16 @@ pub struct ScHsmState {
     /// None = unauthenticated mode (signature verification skipped).
     pub noise_enrolled_peer_pubkey: Option<[u8; 65]>,
 
-    /// GET RESPONSE buffer (ISO 7816-4 §7.6.1).
+    /// In-memory EF file data cache.
     ///
-    /// When a response data field exceeds the Le byte specified by the host,
-    /// the full response is stored here and SW=0x61xx is returned.  The host
-    /// then sends GET RESPONSE (INS=0xC0) to retrieve successive chunks.
-    /// Cleared on every non-GET-RESPONSE command.
-    pub pending_response: heapless::Vec<u8, 4096>,
-    /// Byte offset into `pending_response` for the next GET RESPONSE chunk.
-    pub pending_response_offset: usize,
+    /// Core1's `FlashQueueKeyStore::fetch_key()` always returns `Ok(None)` —
+    /// flash reads aren't possible during synchronous APDU dispatch.  This
+    /// cache stores EF file data written via WRITE DATA so that READ BINARY
+    /// can serve it back without hitting flash.
+    ///
+    /// Populated by: `write_data::write_at_offset` (on write), and
+    /// `load_keys_from_store` (on USB reconnect from flash).
+    pub ef_cache: heapless::Vec<EfCacheEntry, 16>,
 }
 
 impl ScHsmState {
@@ -383,11 +415,8 @@ impl ScHsmState {
             puk_retry_count: 10,
             ext_auth_retry_count: 5,
             dkek_unauthenticated_allowed: true,
-            keys: heapless::Vec::new(),
-            #[cfg(feature = "rsa")]
-            rsa_keys: heapless::Vec::new(),
-            sym_keys: heapless::Vec::new(),
-            ef_files: heapless::Vec::new(),
+            key_index: heapless::Vec::new(),
+            op_buf: OpBuffer::new(),
             write_target_file: None,
             dkek: DkekManager::new([0u8; 16]),
             exchange_ephem_priv: None,
@@ -399,9 +428,81 @@ impl ScHsmState {
             exchange_challenge_cache_write_idx: 0,
             generation: 0,
             noise_enrolled_peer_pubkey: None,
-            pending_response: heapless::Vec::new(),
-            pending_response_offset: 0,
+            ef_cache: heapless::Vec::new(),
         }
+    }
+
+    /// Initialise an `ScHsmState` directly into a destination pointer,
+    /// writing each field individually to avoid placing the full struct
+    /// (~9 KB with OpBuffer + ef_cache) on the stack.
+    pub fn init_in_place(dest: *mut Self) {
+        use core::ptr::addr_of_mut;
+        unsafe {
+            addr_of_mut!((*dest).current_file).write(None);
+            addr_of_mut!((*dest).pin_verified).write(false);
+            addr_of_mut!((*dest).so_pin_verified).write(false);
+            addr_of_mut!((*dest).pin_retry_count).write(3);
+            addr_of_mut!((*dest).so_pin_retry_count).write(5);
+            addr_of_mut!((*dest).current_key_id).write(None);
+            addr_of_mut!((*dest).current_algo).write(None);
+            addr_of_mut!((*dest).current_se_op).write(None);
+            addr_of_mut!((*dest).challenge).write(None);
+            addr_of_mut!((*dest).session_pin).write(None);
+            addr_of_mut!((*dest).initialized).write(false);
+            addr_of_mut!((*dest).hsm_label).write(String::new());
+            addr_of_mut!((*dest).options).write(0);
+            addr_of_mut!((*dest).dkek_shares_required).write(0);
+            addr_of_mut!((*dest).dkek_shares_imported).write(0);
+            addr_of_mut!((*dest).user_pin_hash).write(None);
+            addr_of_mut!((*dest).user_pin_salt).write([0u8; 16]);
+            addr_of_mut!((*dest).so_pin_hash).write(None);
+            addr_of_mut!((*dest).so_pin_salt).write([0u8; 16]);
+            addr_of_mut!((*dest).puk_hash).write(None);
+            addr_of_mut!((*dest).puk_salt).write([0u8; 16]);
+            addr_of_mut!((*dest).puk_retry_count).write(10);
+            addr_of_mut!((*dest).ext_auth_retry_count).write(5);
+            addr_of_mut!((*dest).dkek_unauthenticated_allowed).write(true);
+            addr_of_mut!((*dest).key_index).write(heapless::Vec::new());
+            addr_of_mut!((*dest).op_buf).write(OpBuffer::new());
+            addr_of_mut!((*dest).write_target_file).write(None);
+            addr_of_mut!((*dest).dkek).write(DkekManager::new([0u8; 16]));
+            addr_of_mut!((*dest).exchange_ephem_priv).write(None);
+            addr_of_mut!((*dest).exchange_ephem_pub).write(None);
+            addr_of_mut!((*dest).exchange_challenge).write(None);
+            addr_of_mut!((*dest).exchange_peer_ephem_pub).write(None);
+            addr_of_mut!((*dest).exchange_challenge_cache).write([[0u8; 32]; MAX_EXCHANGE_CHALLENGE_CACHE]);
+            addr_of_mut!((*dest).exchange_challenge_cache_count).write(0);
+            addr_of_mut!((*dest).exchange_challenge_cache_write_idx).write(0);
+            addr_of_mut!((*dest).generation).write(0);
+            addr_of_mut!((*dest).noise_enrolled_peer_pubkey).write(None);
+            addr_of_mut!((*dest).ef_cache).write(heapless::Vec::new());
+        }
+    }
+
+    /// Look up cached EF file data by key_id.
+    pub fn ef_cache_get(&self, key_id: u32) -> Option<&[u8]> {
+        self.ef_cache
+            .iter()
+            .find(|e| e.key_id == key_id)
+            .map(|e| e.data.as_slice())
+    }
+
+    /// Insert or replace EF file data in the cache.
+    pub fn ef_cache_put(&mut self, key_id: u32, data: &[u8]) {
+        self.ef_cache.retain(|e| e.key_id != key_id);
+        let mut entry = EfCacheEntry {
+            key_id,
+            data: heapless::Vec::new(),
+        };
+        // Truncate to cache entry capacity (1024 bytes).
+        let len = data.len().min(entry.data.capacity());
+        let _ = entry.data.extend_from_slice(&data[..len]);
+        let _ = self.ef_cache.push(entry);
+    }
+
+    /// Remove an EF file from the cache.
+    pub fn ef_cache_remove(&mut self, key_id: u32) {
+        self.ef_cache.retain(|e| e.key_id != key_id);
     }
 
     /// Set the device ID on the DKEK manager.
@@ -424,6 +525,16 @@ impl ScHsm {
         ScHsm { state: ScHsmState::new() }
     }
 
+    /// Initialise an `ScHsm` directly into a destination pointer, avoiding
+    /// a large stack temporary.  `ScHsmState` contains ~9 KB of inline
+    /// buffers (OpBuffer 4 KB, ef_cache 4 KB) that overflow the stack
+    /// when constructed via `ScHsm::new()` in debug builds.
+    pub fn init_in_place(dest: *mut Self) {
+        unsafe {
+            ScHsmState::init_in_place(core::ptr::addr_of_mut!((*dest).state));
+        }
+    }
+
     /// Dispatch an already-parsed APDU to the appropriate command handler,
     /// with access to persistent storage for key-mutating commands.
     fn dispatch_with_store(
@@ -431,13 +542,6 @@ impl ScHsm {
         cmd: &ApduCommand<'_>,
         store: &mut dyn crate::storage::KeyStore,
     ) -> ApduResponse {
-        // GET RESPONSE passes through to dispatch() which handles pending buffer.
-        // All other commands routed here (which don't fall through to dispatch)
-        // must clear the pending buffer so a stale buffer is not left around.
-        if cmd.ins != INS_GET_RESPONSE {
-            self.state.pending_response.clear();
-            self.state.pending_response_offset = 0;
-        }
         match cmd.ins {
             initialize::INS_INITIALIZE => initialize::handle(&mut self.state, store, cmd),
             generate_keypair::INS_GENERATE_KEYPAIR => {
@@ -459,6 +563,26 @@ impl ScHsm {
             change_pin::INS_CHANGE_PIN => change_pin::handle_with_store(&mut self.state, store, cmd),
             reset_retry::INS_RESET_RETRY => reset_retry::handle_with_store(&mut self.state, store, cmd),
             extras::INS_EXTRAS => extras::handle(&mut self.state, store, cmd),
+            // File commands that need flash access.
+            read_binary::INS_READ_BINARY => read_binary::handle(&mut self.state, store, cmd),
+            read_binary::INS_READ_BINARY_ODD => read_binary::handle_odd(&mut self.state, store, cmd),
+            update_binary::INS_UPDATE_BINARY => update_binary::handle(&mut self.state, store, cmd),
+            write_data::INS_WRITE_DATA => write_data::handle(&mut self.state, store, cmd),
+            // Crypto operations that now load keys from flash on-demand.
+            sign::INS_SIGN => sign::handle(&mut self.state, store, cmd),
+            general_auth::INS_GENERAL_AUTH => general_auth::handle(&mut self.state, store, cmd),
+            pso::INS_PSO => pso::handle(&mut self.state, store, cmd),
+            cipher_sym::INS_CIPHER_SYM => cipher_sym::handle(&mut self.state, store, cmd),
+            bip_slip::INS_BIP_SLIP => bip_slip::handle(&mut self.state, store, cmd),
+            // INS 0x62: shared between DECIPHER (P1 = key_reference) and
+            // DERIVE_ASYM (P1 = 0x01). Route by P1.
+            decrypt::INS_DECRYPT => {
+                if cmd.p1 == derive_asym::P1_DERIVE {
+                    derive_asym::handle(&mut self.state, store, cmd)
+                } else {
+                    decrypt::handle(&mut self.state, store, cmd)
+                }
+            }
             // All other commands fall through to the stateless dispatch.
             _ => self.dispatch(cmd),
         }
@@ -466,78 +590,45 @@ impl ScHsm {
 
     /// Dispatch an already-parsed APDU to the appropriate command handler.
     fn dispatch(&mut self, cmd: &ApduCommand<'_>) -> ApduResponse {
-        // GET RESPONSE (INS=0xC0) is handled before clearing the pending buffer.
-        // All other commands clear the pending buffer first.
-        if cmd.ins != INS_GET_RESPONSE {
-            self.state.pending_response.clear();
-            self.state.pending_response_offset = 0;
-        }
         match cmd.ins {
-            // GET RESPONSE (ISO 7816-4 §7.6.1): return next chunk of pending response.
-            INS_GET_RESPONSE => {
-                let offset = self.state.pending_response_offset;
-                let remaining = self.state.pending_response.len().saturating_sub(offset);
-                if remaining == 0 {
-                    // Nothing pending — return empty 9000 per ISO spec.
-                    return ApduResponse::ok(&[]);
-                }
-                // Le=0 means 256 for short APDU; None means send all.
-                let chunk_len = match cmd.le {
-                    None => remaining,
-                    Some(0) => remaining.min(256),
-                    Some(n) => remaining.min(n as usize),
-                };
-                let chunk = &self.state.pending_response[offset..offset + chunk_len];
-                let mut resp = ApduResponse::ok(chunk);
-                self.state.pending_response_offset += chunk_len;
-                let new_remaining = self.state.pending_response.len().saturating_sub(self.state.pending_response_offset);
-                if new_remaining > 0 {
-                    // More data still pending — SW=0x61xx.
-                    let xx = new_remaining.min(0xFF) as u8;
-                    resp.sw = 0x6100 | (xx as u16);
-                }
-                resp
-            }
+            // Commands that need flash access — use LocalNullStore in the
+            // stateless dispatch path (host-side tests).  On firmware the
+            // dispatch_with_store() route is taken instead.
             initialize::INS_INITIALIZE => initialize::handle(&mut self.state, &mut LocalNullStore, cmd),
+            generate_keypair::INS_GENERATE_KEYPAIR => generate_keypair::handle(&mut self.state, &mut LocalNullStore, cmd),
+            generate_key::INS_GENERATE_KEY => generate_key::handle(&mut self.state, &mut LocalNullStore, cmd),
+            export_key::INS_EXPORT_KEY | 0x34 => export_key::handle(&mut self.state, &mut LocalNullStore, cmd),
+            import_key::INS_IMPORT_KEY => import_key::handle(&mut self.state, &mut LocalNullStore, cmd),
+            delete_file::INS_DELETE_FILE => delete_file::handle(&mut self.state, &mut LocalNullStore, cmd),
+            extras::INS_EXTRAS => extras::handle(&mut self.state, &mut LocalNullStore, cmd),
+            read_binary::INS_READ_BINARY => read_binary::handle(&mut self.state, &mut LocalNullStore, cmd),
+            read_binary::INS_READ_BINARY_ODD => read_binary::handle_odd(&mut self.state, &mut LocalNullStore, cmd),
+            update_binary::INS_UPDATE_BINARY => update_binary::handle(&mut self.state, &mut LocalNullStore, cmd),
+            write_data::INS_WRITE_DATA => write_data::handle(&mut self.state, &mut LocalNullStore, cmd),
+            sign::INS_SIGN => sign::handle(&mut self.state, &mut LocalNullStore, cmd),
+            general_auth::INS_GENERAL_AUTH => general_auth::handle(&mut self.state, &mut LocalNullStore, cmd),
+            pso::INS_PSO => pso::handle(&mut self.state, &mut LocalNullStore, cmd),
+            cipher_sym::INS_CIPHER_SYM => cipher_sym::handle(&mut self.state, &mut LocalNullStore, cmd),
+            bip_slip::INS_BIP_SLIP => bip_slip::handle(&mut self.state, &mut LocalNullStore, cmd),
+            decrypt::INS_DECRYPT => {
+                if cmd.p1 == derive_asym::P1_DERIVE {
+                    derive_asym::handle(&mut self.state, &mut LocalNullStore, cmd)
+                } else {
+                    decrypt::handle(&mut self.state, &mut LocalNullStore, cmd)
+                }
+            }
+            change_pin::INS_CHANGE_PIN => change_pin::handle_with_store(&mut self.state, &mut LocalNullStore, cmd),
+            reset_retry::INS_RESET_RETRY => reset_retry::handle_with_store(&mut self.state, &mut LocalNullStore, cmd),
+            // Commands that don't need flash access (stateless dispatch).
             verify::INS_VERIFY => verify::handle(&mut self.state, cmd),
-            change_pin::INS_CHANGE_PIN => change_pin::handle(&mut self.state, cmd),
-            reset_retry::INS_RESET_RETRY => reset_retry::handle(&mut self.state, cmd),
             mse::INS_MSE => mse::handle(&mut self.state, cmd),
             challenge::INS_CHALLENGE => challenge::handle(&mut self.state, cmd),
             external_auth::INS_EXTERNAL_AUTH => external_auth::handle(&mut self.state, cmd),
-            general_auth::INS_GENERAL_AUTH => general_auth::handle(&mut self.state, cmd),
-            generate_keypair::INS_GENERATE_KEYPAIR => generate_keypair::handle(&mut self.state, &mut LocalNullStore, cmd),
-            generate_key::INS_GENERATE_KEY => generate_key::handle(&mut self.state, &mut LocalNullStore, cmd),
-            sign::INS_SIGN => sign::handle(&mut self.state, cmd),
-            // INS 0x62: shared between DECIPHER (P1 = key_reference) and
-            // DERIVE_ASYM (P1 = 0x01). Route by P1.
-            decrypt::INS_DECRYPT => {
-                if cmd.p1 == derive_asym::P1_DERIVE {
-                    derive_asym::handle(&mut self.state, cmd)
-                } else {
-                    decrypt::handle(&mut self.state, cmd)
-                }
-            }
             list_keys::INS_LIST_KEYS => list_keys::handle(&mut self.state, cmd),
-            // INS=0x72: pico2hsm proprietary EXPORT KEY (kept for custom tooling).
-            // INS=0x34: standard SC-HSM WRAP KEY alias — same handler.
-            export_key::INS_EXPORT_KEY | 0x34 => export_key::handle(&mut self.state, &mut LocalNullStore, cmd),
-            // INS=0x74: pico2hsm IMPORT KEY. INS=0x58 conflicts with LIST KEYS; see
-            // dispatch_with_store for full explanation.
-            import_key::INS_IMPORT_KEY => import_key::handle(&mut self.state, &mut LocalNullStore, cmd),
-            read_binary::INS_READ_BINARY => read_binary::handle(&mut self.state, cmd),
-            read_binary::INS_READ_BINARY_ODD => read_binary::handle_odd(&mut self.state, cmd),
-            update_binary::INS_UPDATE_BINARY => update_binary::handle(&mut self.state, cmd),
-            write_data::INS_WRITE_DATA => write_data::handle(&mut self.state, cmd),
             create_file::INS_CREATE_FILE => create_file::handle(&mut self.state, cmd),
-            delete_file::INS_DELETE_FILE => delete_file::handle(&mut self.state, &mut LocalNullStore, cmd),
-            pso::INS_PSO => pso::handle(&mut self.state, cmd),
-            cipher_sym::INS_CIPHER_SYM => cipher_sym::handle(&mut self.state, cmd),
             key_domain::INS_KEY_DOMAIN => key_domain::handle(&mut self.state, cmd),
             session_pin::INS_SESSION_PIN => session_pin::handle(&mut self.state, cmd),
             puk_auth::INS_PUK_AUTH => puk_auth::handle(&mut self.state, cmd),
-            bip_slip::INS_BIP_SLIP => bip_slip::handle(&mut self.state, cmd),
-            extras::INS_EXTRAS => extras::handle(&mut self.state, &mut LocalNullStore, cmd),
             select::INS_SELECT => select::handle(&mut self.state, cmd),
             provisioning::INS_PROV_GET_STATUS => provisioning::handle_get_status(&mut self.state, cmd),
             provisioning::INS_PROV_SET_PRODUCTION => provisioning::handle_set_production_mode(&mut self.state, cmd),
@@ -687,43 +778,15 @@ impl ScHsm {
     /// will persist/erase via `store`. Non-mutating commands fall through to
     /// the stateless dispatch path.
     ///
-    /// Implements ISO 7816-4 GET RESPONSE chaining: if the response data
-    /// exceeds the Le byte, the first `Le` bytes are returned with SW=0x61xx
-    /// and the remainder is buffered in `state.pending_response` for subsequent
-    /// GET RESPONSE (INS=0xC0) calls.
+    /// GET RESPONSE chaining and Le-truncation are handled by the Dispatcher,
+    /// not here. This method returns the full serialized response.
     pub fn process_apdu_with_store(
         &mut self,
         apdu: &[u8],
         store: &mut dyn crate::storage::KeyStore,
     ) -> Vec<u8, 4096> {
         let resp = match ApduCommand::parse(apdu) {
-            Ok(cmd) => {
-                let le = cmd.le;
-                let is_get_response = cmd.ins == INS_GET_RESPONSE;
-                let mut r = self.dispatch_with_store(&cmd, store);
-                // Apply Le truncation with GET RESPONSE chaining for successful
-                // responses that have not already been chunked by the GET RESPONSE
-                // handler itself.
-                if !is_get_response && r.sw == SW_OK {
-                    if let Some(le_val) = le {
-                        // Short APDUs: parser already converts Le=0x00 → 256.
-                        // Extended APDUs: Le=0x0000 stored as 0, meaning 65536
-                        // ("return all data") — don't truncate.
-                        let le_usize = if le_val == 0 { r.data.len() } else { le_val as usize };
-                        if r.data.len() > le_usize {
-                            // Store overflow bytes in pending buffer for GET RESPONSE.
-                            self.state.pending_response.clear();
-                            let _ = self.state.pending_response.extend_from_slice(&r.data[le_usize..]);
-                            self.state.pending_response_offset = 0;
-                            r.data.truncate(le_usize);
-                            let remaining = self.state.pending_response.len();
-                            let xx = remaining.min(0xFF) as u8;
-                            r.sw = 0x6100 | (xx as u16);
-                        }
-                    }
-                }
-                r
-            }
+            Ok(cmd) => self.dispatch_with_store(&cmd, store),
             Err(_) => ApduResponse::err(SW_INS_NOT_SUPPORTED),
         };
         let serialized = resp.serialize();
@@ -735,38 +798,15 @@ impl ScHsm {
 
 impl HsmProtocol for ScHsm {
     fn process_apdu(&mut self, apdu: &[u8]) -> Vec<u8, 4096> {
-        // Used by the stateless dispatch path (host-side tests and non-ScHsm protocols).
+        // Used by the stateless dispatch path (host-side tests).
         // Key-mutating commands here use NullKeyStore (no-op flash writes).
+        // GET RESPONSE chaining and Le-truncation are handled by the Dispatcher.
         let resp = match ApduCommand::parse(apdu) {
-            Ok(cmd) => {
-                let le = cmd.le;
-                let is_get_response = cmd.ins == INS_GET_RESPONSE;
-                let mut r = self.dispatch(&cmd);
-                // Apply Le truncation with GET RESPONSE chaining for successful
-                // responses that have not already been chunked by the GET RESPONSE
-                // handler itself.
-                if !is_get_response && r.sw == SW_OK {
-                    if let Some(le_val) = le {
-                        let le_usize = if le_val == 0 { r.data.len() } else { le_val as usize };
-                        if r.data.len() > le_usize {
-                            self.state.pending_response.clear();
-                            self.state.pending_response_offset = 0;
-                            let _ = self.state.pending_response.extend_from_slice(&r.data[le_usize..]);
-                            r.data.truncate(le_usize);
-                            let remaining = self.state.pending_response.len();
-                            let xx = remaining.min(0xFF) as u8;
-                            r.sw = 0x6100 | (xx as u16);
-                        }
-                    }
-                }
-                r
-            }
+            Ok(cmd) => self.dispatch(&cmd),
             Err(_) => ApduResponse::err(SW_INS_NOT_SUPPORTED),
         };
         let serialized = resp.serialize();
         let mut out: Vec<u8, 4096> = Vec::new();
-        // Serialize returns up to 4098 bytes; truncate the data portion to fit 4096.
-        // In practice response data is ≤ 4094 bytes (4096 - 2 SW bytes).
         let _ = out.extend_from_slice(&serialized[..serialized.len().min(4096)]);
         out
     }

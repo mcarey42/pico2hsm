@@ -85,6 +85,20 @@ impl KeyId {
     pub fn openpgp(slot: u8) -> Self {
         KeyId((AppletId::OpenPgp as u32) << 16 | (slot as u32))
     }
+    /// SC-HSM EF file entry on the given partition.
+    ///
+    /// Encodes the full 16-bit file ID so that different EF prefixes
+    /// (e.g. C4 01 vs CE 01) map to distinct KeyIds.  `file_id_hi` is the
+    /// high byte (0xC4, 0xCE, etc.) and `file_id_lo` is the low byte.
+    /// The high byte occupies the "reserved" bits 15–8; the low nibble
+    /// of `file_id_lo` sits in bits 3–0 with 0xE0 in bits 7–4.
+    pub fn sc_hsm_ef(partition: u8, file_id_hi: u8, file_id_lo: u8) -> Self {
+        KeyId(
+            ((partition as u32) << 24)
+                | ((file_id_hi as u32) << 8)
+                | (0xE0u32 | (file_id_lo as u32 & 0x0F)),
+        )
+    }
     /// Extract the protocol key reference (low byte).
     pub fn proto_ref(self) -> u8 {
         (self.0 & 0xFF) as u8
@@ -137,6 +151,12 @@ pub enum KeyType {
     /// Placed at the end of the enum (discriminant 15) to preserve flash
     /// serialization compatibility — existing stored keys use discriminants 0–14.
     RsaPrivate3072,
+    /// Elementary File (EF) entry stored in flash.
+    ///
+    /// Used by the operational buffer architecture to represent EF file entries
+    /// (e.g. EF.C.DevAut) alongside crypto keys in the unified key_index.
+    /// Discriminant 16.
+    EfFile,
 }
 
 impl KeyType {
@@ -144,6 +164,7 @@ impl KeyType {
     pub fn raw_key_len(&self) -> usize {
         match self {
             KeyType::RsaPrivate2048 => 1192, // PKCS#1 DER, ~1192 bytes
+            KeyType::EfFile => 0, // Variable-length; not a fixed-size key
             KeyType::RsaPrivate3072 => 1770, // PKCS#1 DER, ~1770 bytes
             KeyType::RsaPrivate4096 => 2350, // PKCS#1 DER, ~2350 bytes (capped at MAX_KEY_BYTES)
             KeyType::EcPrivateP256 => 32,

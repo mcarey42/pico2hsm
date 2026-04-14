@@ -394,7 +394,7 @@ impl<Chip: FlashChip> KeyFilesystem<Chip> {
     /// Read a key object's encrypted blob from flash.
     ///
     /// Returns the ciphertext bytes (the caller decrypts and verifies BLAKE2s).
-    pub fn read_key(&mut self, key_id: KeyId) -> Result<heapless::Vec<u8, 2400>, StorageError> {
+    pub fn read_key(&mut self, key_id: KeyId) -> Result<heapless::Vec<u8, { crate::security::key_management::MAX_BLOB_SIZE }>, StorageError> {
         let entry = self
             .directory
             .find(key_id)
@@ -408,7 +408,11 @@ impl<Chip: FlashChip> KeyFilesystem<Chip> {
             return Err(StorageError::ReadError);
         }
 
-        let mut out: heapless::Vec<u8, 2400> = heapless::Vec::new();
+        let mut out: heapless::Vec<u8, { crate::security::key_management::MAX_BLOB_SIZE }> = heapless::Vec::new();
+        // The total plaintext length is stored in the header; read it from the
+        // first sector and use it to truncate the output (sector data is padded
+        // to 256-byte alignment for CRC, but the caller needs the exact blob).
+        let mut total_plaintext_len: usize = 0;
 
         for s in 0..sector_count {
             let addr = (sector_index + s) * SECTOR_SIZE as u32;
@@ -423,10 +427,17 @@ impl<Chip: FlashChip> KeyFilesystem<Chip> {
 
             // Parse header to know ciphertext length.
             let hdr = IntegrityChecker::read_header(&sector_buf)?;
-            let ciphertext_len = ((hdr.plaintext_len as usize + 255) & !255)
-                .min(SECTOR_SIZE - HEADER_SIZE);
+            if s == 0 {
+                total_plaintext_len = hdr.plaintext_len as usize;
+            }
+            // Read the padded extent (CRC covers padded data) but only push
+            // up to the remaining plaintext bytes to avoid including padding.
+            let max_ciphertext = SECTOR_SIZE - HEADER_SIZE;
+            let already_read = out.len();
+            let remaining = total_plaintext_len.saturating_sub(already_read);
+            let chunk_len = remaining.min(max_ciphertext);
 
-            let ciphertext = &sector_buf[HEADER_SIZE..HEADER_SIZE + ciphertext_len];
+            let ciphertext = &sector_buf[HEADER_SIZE..HEADER_SIZE + chunk_len];
             for &b in ciphertext {
                 out.push(b).map_err(|_| StorageError::ReadError)?;
             }

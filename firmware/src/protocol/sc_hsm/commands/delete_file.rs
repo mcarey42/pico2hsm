@@ -45,36 +45,31 @@ pub fn handle(state: &mut ScHsmState, store: &mut dyn crate::storage::KeyStore, 
     let key_id_proto = (file_id & 0xFF) as u8;
     let full_key_id = pico2hsm_core::key::KeyId::sc_hsm(0, key_id_proto).0; // u32 internal ID
 
-    let before = state.ef_files.len();
-    state.ef_files.retain(|e| e.file_id != file_id);
-    let deleted_ef = state.ef_files.len() < before;
+    // Remove from key_index: check for both crypto keys and EfFile entries.
+    let before_idx = state.key_index.len();
 
-    // C4 xx: also remove the key entry itself
-    let mut deleted_key = if hi == 0xC4 {
-        let before_keys = state.keys.len();
-        state.keys.retain(|k| k.key_id != full_key_id);
-        state.keys.len() < before_keys
+    if hi == 0xCE {
+        // CE xx EF files: look up by EfFile KeyId encoding.
+        let ef_key_id = pico2hsm_core::key::KeyId::sc_hsm_ef(0, hi as u8, key_id_proto).0;
+        state.key_index.retain(|m| !(m.key_type == 16 && m.key_id == ef_key_id));
+        // Erase from flash and clear cache.
+        if state.key_index.len() < before_idx {
+            let _ = store.erase_key(pico2hsm_core::key::KeyId(ef_key_id));
+            state.ef_cache_remove(ef_key_id);
+        }
     } else {
-        false
-    };
-
-    // Also remove from RSA key store (fixes RSA deletion bug).
-    #[cfg(feature = "rsa")]
-    if hi == 0xC4 {
-        let before_rsa = state.rsa_keys.len();
-        state.rsa_keys.retain(|k| k.key_id != full_key_id);
-        if state.rsa_keys.len() < before_rsa {
-            deleted_key = true;
+        // C4/CC xx crypto key entries.
+        state.key_index.retain(|m| m.key_id != full_key_id);
+        // Erase from flash.
+        if state.key_index.len() < before_idx {
+            let _ = store.erase_key(pico2hsm_core::key::KeyId(full_key_id));
+            state.generation = state.generation.wrapping_add(1);
         }
     }
 
-    // Erase from flash (best-effort; do not fail APDU on flash error).
-    if deleted_key {
-        let _ = store.erase_key(pico2hsm_core::key::KeyId(full_key_id));
-        state.generation = state.generation.wrapping_add(1);
-    }
+    let deleted = state.key_index.len() < before_idx;
 
-    if deleted_ef || deleted_key {
+    if deleted {
         ApduResponse::ok(&[])
     } else {
         ApduResponse::err(SW_FILE_NOT_FOUND)

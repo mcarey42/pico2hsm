@@ -62,16 +62,12 @@ use static_cell::StaticCell;
 
 // ─── Core1 stack and executor (ARM only) ─────────────────────────────────────
 
-/// Stack for the core1 Embassy executor.  Debug-mode peak usage ~125 KB:
-/// ScHsmState holds ~38 KB inline, plus the INITIALIZE handler in debug
-/// builds accumulates PBKDF2 intermediates, P-256 keygen temporaries,
-/// multiple KeyObject / EcKeyPair / EfEntry copies, and 4 KB response
-/// buffers without reusing stack slots (opt-level=1 no NRVO).
-/// 160 KB gives ~1.3× headroom; release builds use far less.
-/// NOTE: Increasing beyond 160 KB squeezes Core0's stack below 64 KB,
-/// which is needed for init_in_place (ScHsm::new ~40 KB temporary).
+/// Stack for the core1 Embassy executor.  Measured peak usage ~65 KB
+/// (38 KB ScHsmState inline storage + 16 KB dispatch-chain temporaries).
+/// 192 KB gives ~3× headroom; release builds use far less.
+/// Do not reduce below 128 KB (~2× measured peak).
 #[cfg(target_arch = "arm")]
-static mut CORE1_STACK: Stack<163840> = Stack::new();
+static mut CORE1_STACK: Stack<196608> = Stack::new();
 #[cfg(target_arch = "arm")]
 static CORE1_EXECUTOR: StaticCell<embassy_executor::Executor> = StaticCell::new();
 
@@ -121,13 +117,23 @@ enum FlashOp {
 #[cfg(target_arch = "arm")]
 struct FlashQueueKeyStore {
     ops: heapless::Vec<FlashOp, 8>,
+    /// Raw pointer to the BoardKeyStore for direct flash reads (fetch_key).
+    /// Flash reads go through XIP memory mapping and are safe from any core.
+    /// Flash *writes* are queued as FlashOps and sent to Core0 via FLASH_REQ.
+    store_ptr: *mut pico2hsm_firmware::storage::BoardKeyStore,
 }
+
+// SAFETY: FlashQueueKeyStore is only used by Core1's single dispatcher task.
+// The store_ptr is only used for reads; writes go through the FLASH_REQ channel.
+#[cfg(target_arch = "arm")]
+unsafe impl Send for FlashQueueKeyStore {}
 
 #[cfg(target_arch = "arm")]
 impl FlashQueueKeyStore {
-    fn new() -> Self {
+    fn new(store_ptr: *mut pico2hsm_firmware::storage::BoardKeyStore) -> Self {
         FlashQueueKeyStore {
             ops: heapless::Vec::new(),
+            store_ptr,
         }
     }
 
@@ -166,11 +172,17 @@ impl pico2hsm_firmware::storage::KeyStore for FlashQueueKeyStore {
 
     fn fetch_key(
         &mut self,
-        _key_id: pico2hsm_core::key::KeyId,
+        key_id: pico2hsm_core::key::KeyId,
     ) -> Result<Option<pico2hsm_firmware::security::key_management::KeyObject>, pico2hsm_core::error::HsmError>
     {
-        // Keys are already in the Dispatcher's in-memory state.
-        Ok(None)
+        // Direct flash read — XIP memory-mapped reads are safe from any core.
+        // Only flash writes require Core0 (the `in_ram()` XIP-halt path).
+        // SAFETY: Core0 never writes to flash while Core1 is dispatching —
+        // flash writes only happen during the drain loop, when Core1 is
+        // blocked on FLASH_RESP.
+        use pico2hsm_firmware::storage::KeyStore;
+        let store = unsafe { &mut *self.store_ptr };
+        store.fetch_key(key_id)
     }
 
     fn erase_key(
@@ -234,7 +246,10 @@ static DISPATCHER_CELL: StaticCell<pico2hsm_firmware::apdu::dispatcher::Dispatch
 /// while core1 is blocked awaiting FLASH_RESP). This exclusive access pattern
 /// makes cross-core transfer safe.
 #[cfg(target_arch = "arm")]
-struct DispatcherPtr(*mut pico2hsm_firmware::apdu::dispatcher::Dispatcher);
+struct DispatcherPtr(
+    *mut pico2hsm_firmware::apdu::dispatcher::Dispatcher,
+    *mut pico2hsm_firmware::storage::BoardKeyStore,
+);
 #[cfg(target_arch = "arm")]
 unsafe impl Send for DispatcherPtr {}
 
@@ -253,6 +268,7 @@ async fn dispatcher_task(
     ptr_wrapper: DispatcherPtr,
 ) {
     let dispatcher_ptr = ptr_wrapper.0;
+    let store_ptr = ptr_wrapper.1;
     // Core1 must not call defmt: embassy-rp's critical_section uses Spinlock31; if Core1
     // holds it while spinning for RTT buffer space, Core0 blocks with interrupts disabled
     // and USB processing stalls entirely.
@@ -284,7 +300,7 @@ async fn dispatcher_task(
             let _ = RESP_CHANNEL.send(heapless::Vec::new()).await;
         } else {
             CORE1_PROGRESS.store(10, core::sync::atomic::Ordering::Relaxed);
-            let mut q = FlashQueueKeyStore::new();
+            let mut q = FlashQueueKeyStore::new(store_ptr);
             let response = dispatcher.dispatch_with_store(&apdu_bytes, &mut q);
             CORE1_PROGRESS.store(40, core::sync::atomic::Ordering::Relaxed);
             // Drain queued flash ops BEFORE sending the response back to core0.
@@ -372,17 +388,18 @@ async fn main(_spawner: Spawner) {
     }
 
     // ── MSPLIM — hardware stack overflow detection for Core0 ──────────────────
-    // Core0 stack grows downward from 0x20082000; BSS ends at _ebss.  Set the
-    // limit 16 KB above _ebss so any overflow is caught well before it corrupts
-    // BSS.  Also enable UsageFault so STKOF surfaces cleanly in probe-rs.
+    // Core0 stack grows downward from 0x20082000; BSS ends at __ebss.
+    // MSPLIM set to __ebss — hardware UsageFault fires at the exact BSS
+    // boundary, preventing stack-into-BSS corruption with zero wasted stack
+    // space.  Also enable UsageFault so STKOF surfaces cleanly in probe-rs.
     #[cfg(target_arch = "arm")]
     unsafe {
         let ebss = core::ptr::addr_of!(__ebss) as u32;
-        // Core0 stack occupies the gap between __ebss and 0x20082000 (520 KB SRAM end).
-        // Guard zone: 4 KB above BSS — any stack overflow past this fires UsageFault.
-        // With 160 KB Core1 stack: __ebss ≈ 0x2006CA00, giving ~84 KB Core0 stack
-        // minus 4 KB guard = 80 KB usable.  Embassy USB + CCID + init_in_place need ~60 KB.
-        cortex_m::register::msplim::write(ebss + 4096);
+        // Core0 stack occupies the full gap between __ebss and 0x20082000 (520 KB SRAM end).
+        // MSPLIM at __ebss — hardware UsageFault fires at exact boundary, no guard waste.
+        // With 192 KB Core1 stack the gap is smaller but still sufficient for
+        // Embassy USB + CCID + init_in_place (~60 KB needed).
+        cortex_m::register::msplim::write(ebss);
 
         // Enable UsageFault handler so STKOF fires as UsageFault, not HardFault.
         // SHCSR bit 18 = USGFAULTENA.
@@ -391,7 +408,7 @@ async fn main(_spawner: Spawner) {
             .modify(|v| v | (1 << 18));
 
         defmt::info!("core0: MSPLIM set to 0x{:08X} (__ebss=0x{:08X})",
-            ebss + 4096, ebss);
+            ebss, ebss);
     }
 
     defmt::info!("pico2hsm: peripherals initialised");
@@ -632,17 +649,16 @@ async fn run_one_board(p: embassy_rp::Peripherals) {
         dispatcher_ref.load_keys_from_store(store);
     }
     let dispatcher_ptr = dispatcher_ref as *mut pico2hsm_firmware::apdu::dispatcher::Dispatcher;
-    let dispatcher_send = DispatcherPtr(dispatcher_ptr);
+    let dispatcher_send = DispatcherPtr(dispatcher_ptr, store as *mut _);
 
     spawn_core1(p.CORE1, unsafe { &mut *addr_of_mut!(CORE1_STACK) }, move || {
         // MSPLIM — hardware stack overflow detection for Core1.
-        // CORE1_STACK is 192 KB; set limit 8 KB above bottom for early warning.
-        // Also enable UsageFault so STKOF surfaces as UsageFault, not HardFault.
+        // MSPLIM at stack base — hardware UsageFault fires at exact boundary.
         // No defmt here — Core1 defmt contends on Spinlock31 with Core0 USB.
         #[cfg(target_arch = "arm")]
         unsafe {
             let stack_bottom = core::ptr::addr_of!(CORE1_STACK) as u32;
-            cortex_m::register::msplim::write(stack_bottom + 8192);
+            cortex_m::register::msplim::write(stack_bottom);
             // SHCSR bit 18 = USGFAULTENA
             (*cortex_m::peripheral::SCB::PTR)
                 .shcsr
@@ -915,17 +931,16 @@ async fn run_geek_board(p: embassy_rp::Peripherals) {
         dispatcher_ref.load_keys_from_store(store);
     }
     let dispatcher_ptr = dispatcher_ref as *mut pico2hsm_firmware::apdu::dispatcher::Dispatcher;
-    let dispatcher_send = DispatcherPtr(dispatcher_ptr);
+    let dispatcher_send = DispatcherPtr(dispatcher_ptr, store as *mut _);
 
     spawn_core1(p.CORE1, unsafe { &mut *addr_of_mut!(CORE1_STACK) }, move || {
         // MSPLIM — hardware stack overflow detection for Core1.
-        // CORE1_STACK is 192 KB; set limit 8 KB above bottom for early warning.
-        // Also enable UsageFault so STKOF surfaces as UsageFault, not HardFault.
+        // MSPLIM at stack base — hardware UsageFault fires at exact boundary.
         // No defmt here — Core1 defmt contends on Spinlock31 with Core0 USB.
         #[cfg(target_arch = "arm")]
         unsafe {
             let stack_bottom = core::ptr::addr_of!(CORE1_STACK) as u32;
-            cortex_m::register::msplim::write(stack_bottom + 8192);
+            cortex_m::register::msplim::write(stack_bottom);
             // SHCSR bit 18 = USGFAULTENA
             (*cortex_m::peripheral::SCB::PTR)
                 .shcsr
@@ -1206,18 +1221,17 @@ async fn run_pico2_board(p: embassy_rp::Peripherals) {
         dispatcher_ref.load_keys_from_store(store);
     }
     let dispatcher_ptr = dispatcher_ref as *mut pico2hsm_firmware::apdu::dispatcher::Dispatcher;
-    let dispatcher_send = DispatcherPtr(dispatcher_ptr);
+    let dispatcher_send = DispatcherPtr(dispatcher_ptr, store as *mut _);
 
     defmt::info!("core0: spawning core1");
     spawn_core1(p.CORE1, unsafe { &mut *addr_of_mut!(CORE1_STACK) }, move || {
         // MSPLIM — hardware stack overflow detection for Core1.
-        // CORE1_STACK is 192 KB; set limit 8 KB above bottom for early warning.
-        // Also enable UsageFault so STKOF surfaces as UsageFault, not HardFault.
+        // MSPLIM at stack base — hardware UsageFault fires at exact boundary.
         // No defmt here — Core1 defmt contends on Spinlock31 with Core0 USB.
         #[cfg(target_arch = "arm")]
         unsafe {
             let stack_bottom = core::ptr::addr_of!(CORE1_STACK) as u32;
-            cortex_m::register::msplim::write(stack_bottom + 8192);
+            cortex_m::register::msplim::write(stack_bottom);
             // SHCSR bit 18 = USGFAULTENA
             (*cortex_m::peripheral::SCB::PTR)
                 .shcsr
@@ -1520,17 +1534,16 @@ async fn run_waveshare_lcd_board(p: embassy_rp::Peripherals) {
         dispatcher_ref.load_keys_from_store(store);
     }
     let dispatcher_ptr = dispatcher_ref as *mut pico2hsm_firmware::apdu::dispatcher::Dispatcher;
-    let dispatcher_send = DispatcherPtr(dispatcher_ptr);
+    let dispatcher_send = DispatcherPtr(dispatcher_ptr, store as *mut _);
 
     spawn_core1(p.CORE1, unsafe { &mut *addr_of_mut!(CORE1_STACK) }, move || {
         // MSPLIM — hardware stack overflow detection for Core1.
-        // CORE1_STACK is 192 KB; set limit 8 KB above bottom for early warning.
-        // Also enable UsageFault so STKOF surfaces as UsageFault, not HardFault.
+        // MSPLIM at stack base — hardware UsageFault fires at exact boundary.
         // No defmt here — Core1 defmt contends on Spinlock31 with Core0 USB.
         #[cfg(target_arch = "arm")]
         unsafe {
             let stack_bottom = core::ptr::addr_of!(CORE1_STACK) as u32;
-            cortex_m::register::msplim::write(stack_bottom + 8192);
+            cortex_m::register::msplim::write(stack_bottom);
             // SHCSR bit 18 = USGFAULTENA
             (*cortex_m::peripheral::SCB::PTR)
                 .shcsr

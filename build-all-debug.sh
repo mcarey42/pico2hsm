@@ -121,4 +121,11 @@ info "Flashing with probe-rs run --chip $CHIP ..."
 info "RTT output will appear below.  Press Ctrl+C to stop monitoring."
 echo ""
 
-probe-rs run --chip "$CHIP" "$FLASH_ELF"
+# if the environment defines a PROBE_SERIAL value we add the --probe argument to target a specific probe. This is useful when multiple probes are connected.
+if [[ -n "${PROBE_SERIAL:-}" ]]; then
+    info "PROBE_SERIAL is set to '$PROBE_SERIAL', adding --probe $PROBE_SERIAL to probe-rs arguments"
+    PROBE_ARG="--probe 2e8a:000c:$PROBE_SERIAL"
+else
+    PROBE_ARG=""
+fi
+probe-rs run ${PROBE_ARG} --chip "$CHIP" "$FLASH_ELF"

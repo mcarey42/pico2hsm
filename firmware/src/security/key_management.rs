@@ -91,6 +91,26 @@ const TAG_SIZE: usize = 16;
 /// HKDF info prefix for per-key KEK derivation.
 const KEK_INFO_PREFIX: &[u8] = b"pico2hsm-keyobj-v1";
 
+/// P2K4 header size.
+const P2K4_HEADER_SIZE: usize = 21;
+
+/// Maximum plaintext payload inside a P2K4 encrypted blob.
+///
+/// Layout: `[opt 2-byte priv_len] || priv_key || pub_len(2) || pub_key`.
+/// The 2-byte priv_len prefix is added when `priv_key.len() > 255` (RSA).
+pub const MAX_PLAINTEXT_SIZE: usize = 2 + MAX_PRIVATE_KEY_SIZE + 2 + MAX_PUBLIC_KEY_SIZE;
+
+/// Maximum encrypted blob size (P2K4 format).
+///
+/// header(21) + MAX_PLAINTEXT_SIZE + tag(16) + nonce(12).
+pub const MAX_BLOB_SIZE: usize = P2K4_HEADER_SIZE + MAX_PLAINTEXT_SIZE + TAG_SIZE + NONCE_SIZE;
+
+/// Maximum DKEK-wrapped payload: key_type(1) + key_size(2) + priv_key + padding(≤7).
+const DKEK_MAX_PAYLOAD: usize = 1 + 2 + MAX_PRIVATE_KEY_SIZE + 7;
+
+/// Maximum DKEK-wrapped blob: nonce(12) + payload + tag(16).
+const DKEK_MAX_BLOB: usize = NONCE_SIZE + DKEK_MAX_PAYLOAD + TAG_SIZE;
+
 /// Maximum private key size.
 ///
 /// RSA-2048 PKCS#1 DER private keys are ~1192 bytes; RSA-4096 are ~2350 bytes.
@@ -324,7 +344,10 @@ impl KeyObject {
         buf[4] = self.key_type as u8;
         buf[5..9].copy_from_slice(&self.key_id.to_le_bytes());
         buf[9] = self.algorithm as u8;
-        buf[10] = self.private_key.len() as u8;
+        // For EC keys (≤255 bytes) store the exact length.
+        // For RSA keys (>255 bytes) store 0 as a sentinel; the actual
+        // length is prepended as a 2-byte LE value in the plaintext.
+        buf[10] = if self.private_key.len() > 255 { 0 } else { self.private_key.len() as u8 };
         buf[11] = self.key_domain;
         buf[12..16].copy_from_slice(&self.use_count.to_be_bytes());
         buf[16..20].copy_from_slice(&self.generation.to_be_bytes());
@@ -346,40 +369,46 @@ impl KeyObject {
         &self,
         smk: &[u8; 32],
         nonce: &[u8; NONCE_SIZE],
-    ) -> Result<heapless::Vec<u8, 1200>, KeyError> {
+    ) -> Result<heapless::Vec<u8, MAX_BLOB_SIZE>, KeyError> {
         // Derive per-key encryption key using the low-byte proto_ref.
         let kek = derive_key_encryption_key(smk, (self.key_id & 0xFF) as u8)?;
 
         // Build AAD = header bytes.
-        let mut header = [0u8; 21];
+        let mut header = [0u8; P2K4_HEADER_SIZE];
         self.write_header(&mut header);
 
-        // Build plaintext = priv_key || pub_len(2) || pub_key
-        // Max size: 512 priv + 2 + 512 pub = 1026 bytes
+        // Build plaintext:
+        //   EC  keys (priv ≤ 255): priv_key || pub_len(2) || pub_key
+        //   RSA keys (priv > 255): priv_len_le16(2) || priv_key || pub_len(2) || pub_key
         let priv_len = self.private_key.len();
         let pub_len  = self.public_key.len();
-        let pt_len   = priv_len + 2 + pub_len;
-        if pt_len > 1026 {
+        let inline_len = priv_len > 255;
+        let prefix_len = if inline_len { 2 } else { 0 };
+        let pt_len = prefix_len + priv_len + 2 + pub_len;
+        if pt_len > MAX_PLAINTEXT_SIZE {
             return Err(KeyError::KeyTooLarge);
         }
 
         // GCM payload buffer (plaintext -> ciphertext in-place)
-        let mut ct_buf: heapless::Vec<u8, 1200> = heapless::Vec::new();
-        // Start with the 21-byte header (included in blob, used as GCM AAD)
+        let mut ct_buf: heapless::Vec<u8, MAX_BLOB_SIZE> = heapless::Vec::new();
+        // Start with the header (included in blob, used as GCM AAD)
         ct_buf.extend_from_slice(&header).map_err(|_| KeyError::BufferTooSmall)?;
+        // For RSA: prepend 2-byte LE private key length
+        if inline_len {
+            ct_buf.extend_from_slice(&(priv_len as u16).to_le_bytes()).map_err(|_| KeyError::BufferTooSmall)?;
+        }
         ct_buf.extend_from_slice(&self.private_key).map_err(|_| KeyError::BufferTooSmall)?;
         let pub_len_bytes = (pub_len as u16).to_be_bytes();
         ct_buf.extend_from_slice(&pub_len_bytes).map_err(|_| KeyError::BufferTooSmall)?;
         ct_buf.extend_from_slice(&self.public_key).map_err(|_| KeyError::BufferTooSmall)?;
 
-        // Encrypt the payload portion (everything after the 21-byte header) in-place.
+        // Encrypt the payload portion (everything after the header) in-place.
         let cipher = Aes256Gcm::new_from_slice(&*kek)
             .map_err(|_| KeyError::EncryptFailure)?;
         let nonce_arr = GcmNonce::from_slice(nonce);
 
-        const HEADER_SIZE: usize = 21;
         let tag = cipher
-            .encrypt_in_place_detached(nonce_arr, &header, &mut ct_buf.as_mut_slice()[HEADER_SIZE..])
+            .encrypt_in_place_detached(nonce_arr, &header, &mut ct_buf.as_mut_slice()[P2K4_HEADER_SIZE..])
             .map_err(|_| KeyError::EncryptFailure)?;
 
         // Append tag then nonce.
@@ -462,13 +491,10 @@ impl KeyObject {
 
         // Decrypt the payload portion (between header and tag).
         let ct_payload = &blob[header_size..tag_start];
-        if ct_payload.len() < priv_size + 2 {
-            return Err(KeyError::InvalidFormat);
-        }
 
         // Copy into a mutable buffer for in-place decryption.
-        let mut pt_buf = Zeroizing::new([0u8; 1200]);
-        if ct_payload.len() > 1200 {
+        let mut pt_buf = Zeroizing::new([0u8; MAX_PLAINTEXT_SIZE]);
+        if ct_payload.len() > MAX_PLAINTEXT_SIZE {
             return Err(KeyError::KeyTooLarge);
         }
         pt_buf[..ct_payload.len()].copy_from_slice(ct_payload);
@@ -487,14 +513,27 @@ impl KeyObject {
             )
             .map_err(|_| KeyError::DecryptFailure)?;
 
-        // Parse plaintext: priv_key || pub_len(2) || pub_key
-        if ct_payload.len() < priv_size + 2 {
+        // Parse plaintext.  Two layouts depending on priv_size sentinel:
+        //   priv_size > 0 (EC):  priv_key(priv_size) || pub_len(2) || pub_key
+        //   priv_size == 0 (RSA): priv_len_le16(2) || priv_key || pub_len(2) || pub_key
+        let (priv_offset, priv_size) = if priv_size == 0 {
+            // RSA: read actual private key length from first 2 bytes.
+            if ct_payload.len() < 4 {
+                return Err(KeyError::InvalidFormat);
+            }
+            let len = u16::from_le_bytes(pt_buf[0..2].try_into().unwrap()) as usize;
+            (2usize, len)
+        } else {
+            (0usize, priv_size)
+        };
+
+        if ct_payload.len() < priv_offset + priv_size + 2 {
             return Err(KeyError::InvalidFormat);
         }
         let pub_len = u16::from_be_bytes(
-            pt_buf[priv_size..priv_size + 2].try_into().unwrap()
+            pt_buf[priv_offset + priv_size..priv_offset + priv_size + 2].try_into().unwrap()
         ) as usize;
-        let total_needed = priv_size + 2 + pub_len;
+        let total_needed = priv_offset + priv_size + 2 + pub_len;
         if ct_payload.len() < total_needed {
             return Err(KeyError::InvalidFormat);
         }
@@ -521,10 +560,10 @@ impl KeyObject {
         };
 
         obj.private_key
-            .extend_from_slice(&pt_buf[..priv_size])
+            .extend_from_slice(&pt_buf[priv_offset..priv_offset + priv_size])
             .map_err(|_| KeyError::KeyTooLarge)?;
         obj.public_key
-            .extend_from_slice(&pt_buf[priv_size + 2..priv_size + 2 + pub_len])
+            .extend_from_slice(&pt_buf[priv_offset + priv_size + 2..priv_offset + priv_size + 2 + pub_len])
             .map_err(|_| KeyError::KeyTooLarge)?;
 
         Ok(obj)
@@ -543,7 +582,7 @@ impl KeyObject {
         dkek:      &[u8; 32],
         device_id: &[u8],
         nonce:     &[u8; NONCE_SIZE],
-    ) -> Result<heapless::Vec<u8, 1200>, KeyError> {
+    ) -> Result<heapless::Vec<u8, DKEK_MAX_BLOB>, KeyError> {
         // Compute AAD = SHA-256(device_id)
         let aad: [u8; 32] = Sha256::digest(device_id).into();
 
@@ -557,12 +596,12 @@ impl KeyObject {
         };
         let payload_len = payload_len_before_pad + pad;
 
-        if payload_len > 1024 {
+        if payload_len > DKEK_MAX_PAYLOAD {
             return Err(KeyError::KeyTooLarge);
         }
 
         // Build plaintext into a Zeroizing buffer.
-        let mut pt = Zeroizing::new([0u8; 1024]);
+        let mut pt = Zeroizing::new([0u8; DKEK_MAX_PAYLOAD]);
         pt[0] = self.key_type as u8;
         let ks = (priv_len as u16).to_be_bytes();
         pt[1..3].copy_from_slice(&ks);
@@ -574,7 +613,7 @@ impl KeyObject {
         let nonce_arr = GcmNonce::from_slice(nonce);
 
         // Copy plaintext into output buffer (nonce first)
-        let mut out: heapless::Vec<u8, 1200> = heapless::Vec::new();
+        let mut out: heapless::Vec<u8, DKEK_MAX_BLOB> = heapless::Vec::new();
         out.extend_from_slice(nonce).map_err(|_| KeyError::BufferTooSmall)?;
         out.extend_from_slice(&pt[..payload_len]).map_err(|_| KeyError::BufferTooSmall)?;
 
@@ -620,13 +659,13 @@ impl KeyObject {
             .map_err(|_| KeyError::InvalidFormat)?;
         let ct = &blob[NONCE_SIZE..ct_end];
 
-        if ct.len() > 1024 {
+        if ct.len() > DKEK_MAX_PAYLOAD {
             return Err(KeyError::KeyTooLarge);
         }
 
         let aad: [u8; 32] = Sha256::digest(device_id).into();
 
-        let mut pt = Zeroizing::new([0u8; 1024]);
+        let mut pt = Zeroizing::new([0u8; DKEK_MAX_PAYLOAD]);
         pt[..ct.len()].copy_from_slice(ct);
 
         let cipher = Aes256Gcm::new_from_slice(dkek)

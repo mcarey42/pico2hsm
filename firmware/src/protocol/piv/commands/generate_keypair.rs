@@ -19,7 +19,7 @@ use pico2hsm_core::{
     key::{KeyId, KeyType as CoreKeyType},
 };
 
-use crate::protocol::piv::{PivState, InMemoryPivKey};
+use crate::protocol::piv::PivState;
 use crate::protocol::sc_hsm::FwRng;
 
 /// INS byte for GENERATE KEY PAIR.
@@ -46,8 +46,18 @@ fn key_ref_to_slot(key_ref: u8) -> Option<usize> {
     }
 }
 
-/// Handle a GENERATE KEY PAIR APDU command.
+/// Handle a GENERATE KEY PAIR APDU command (non-store path, used by legacy dispatch).
 pub fn handle(state: &mut PivState, cmd: &ApduCommand<'_>) -> ApduResponse {
+    let mut null_store = crate::storage::NullKeyStore;
+    handle_with_store(state, &mut null_store, cmd)
+}
+
+/// Handle GENERATE KEY PAIR and persist the result to flash.
+pub fn handle_with_store(
+    state: &mut PivState,
+    store: &mut dyn crate::storage::KeyStore,
+    cmd: &ApduCommand<'_>,
+) -> ApduResponse {
     crate::cdc_log!("PIV GENERATE KEY PAIR start slot=0x{:02x}", cmd.p2);
     let key_ref = cmd.p2;
 
@@ -86,27 +96,35 @@ pub fn handle(state: &mut PivState, cmd: &ApduCommand<'_>) -> ApduResponse {
         Err(_) => return ApduResponse::err(0x6985), // conditions not satisfied
     };
 
-    // Store in the in-memory key table, replacing any existing key in this slot
     let _slot_idx = key_ref_to_slot(key_ref).unwrap();
     let key_id = KeyId::piv(key_ref);
 
-    // Remove existing key for this slot if any
-    state.keys.retain(|k| k.key_id != key_id.0);
+    // Persist to flash.
+    {
+        use crate::security::key_management::{AlgorithmId, KeyObject, KeyType as KmKeyType};
+        use pico2hsm_core::key::AppletId;
 
-    // Push new key
-    let mut entry = InMemoryPivKey {
-        key_id: key_id.0,
-        key_type,
-        alg_id,
-        private_key: heapless::Vec::new(),
-        public_key: heapless::Vec::new(),
-    };
-    let _ = entry.private_key.extend_from_slice(&keypair.private_key);
-    let _ = entry.public_key.extend_from_slice(&keypair.public_key);
+        let algorithm = match key_type {
+            CoreKeyType::EcPrivateP256 => AlgorithmId::EcdsaP256,
+            CoreKeyType::EcPrivateP384 => AlgorithmId::EcdsaP384,
+            _ => return ApduResponse::err(0x6985),
+        };
 
-    if state.keys.push(entry).is_err() {
-        return ApduResponse::err(0x6A84); // not enough memory
+        let mut obj = KeyObject::new(KmKeyType::Ec, key_id.0, AppletId::Piv, algorithm);
+        let _ = obj.private_key.extend_from_slice(&keypair.private_key);
+        let _ = obj.public_key.extend_from_slice(&keypair.public_key);
+        let _ = store.save_key(&obj);
     }
+
+    // Update key_index metadata (replace any existing entry for this slot).
+    state.key_index.retain(|m| m.key_id != key_id.0);
+    let meta = crate::protocol::sc_hsm::KeyMeta {
+        key_id: key_id.0,
+        key_type: key_type as u8,
+        algo: alg_id,
+        key_flags: 0,
+    };
+    let _ = state.key_index.push(meta);
 
     // Build response per NIST SP 800-73-4 Part 2 Table 3.3-1:
     //   7C [len]  Dynamic Authentication Template
@@ -150,51 +168,6 @@ pub fn handle(state: &mut PivState, cmd: &ApduCommand<'_>) -> ApduResponse {
 
     crate::cdc_log!("PIV GENERATE KEY PAIR done key=0x{:08x} algo=0x{:02x}", key_id.0, alg_id);
     ApduResponse::ok(&resp)
-}
-
-/// Handle GENERATE KEY PAIR and persist the result to flash.
-pub fn handle_with_store(
-    state: &mut PivState,
-    store: &mut dyn crate::storage::KeyStore,
-    cmd: &ApduCommand<'_>,
-) -> ApduResponse {
-    let resp = handle(state, cmd);
-
-    // Only persist on success (SW=9000).
-    if resp.sw == 0x9000 {
-        let key_ref = cmd.p2;
-        let key_id = KeyId::piv(key_ref);
-
-        if let Some(entry) = state.keys.iter().find(|k| k.key_id == key_id.0) {
-            use crate::security::key_management::{AlgorithmId, KeyObject, KeyType as KmKeyType};
-            use pico2hsm_core::key::AppletId;
-
-            let algorithm = match entry.key_type {
-                CoreKeyType::EcPrivateP256 => AlgorithmId::EcdsaP256,
-                CoreKeyType::EcPrivateP384 => AlgorithmId::EcdsaP384,
-                _ => return resp,
-            };
-
-            let mut obj = KeyObject {
-                key_type: KmKeyType::Ec,
-                key_id: key_id.0,
-                owner: AppletId::Piv,
-                algorithm,
-                key_domain: 0,
-                use_count: 0,
-                generation: 0,
-                key_flags: 0,
-                timestamp_ms: 0,
-                private_key: heapless::Vec::new(),
-                public_key: heapless::Vec::new(),
-            };
-            let _ = obj.private_key.extend_from_slice(&entry.private_key);
-            let _ = obj.public_key.extend_from_slice(&entry.public_key);
-            let _ = store.save_key(&obj);
-        }
-    }
-
-    resp
 }
 
 /// Parse the AC template to extract the algorithm ID.

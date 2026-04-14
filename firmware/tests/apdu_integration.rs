@@ -595,7 +595,7 @@ fn test_list_keys_after_init_shows_dev_auth_sentinel() {
     let vr = d.dispatch(&ver);
     assert_eq!(sw(&vr), 0x9000, "VERIFY must succeed before LIST KEYS");
 
-    // LIST KEYS — should contain CC 00 (device-auth sentinel only)
+    // LIST KEYS — should contain CC 00 (device-auth sentinel) + C4 00 (its PRKD)
     let cmd = apdu_bare(0x00, INS_LIST_KEYS, 0x00, 0x00);
     let r = d.dispatch(&cmd);
 
@@ -603,8 +603,8 @@ fn test_list_keys_after_init_shows_dev_auth_sentinel() {
     let d_bytes = data_of(&r);
     assert_eq!(
         d_bytes,
-        &[0xCC, 0x00],
-        "LIST KEYS after init must contain only the device-auth sentinel CC 00"
+        &[0xCC, 0x00, 0xC4, 0x00],
+        "LIST KEYS after init must contain device-auth sentinel CC 00 + its PRKD C4 00"
     );
 }
 

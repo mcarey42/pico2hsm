@@ -26,12 +26,28 @@ use pico2hsm_core::apdu::{
 };
 
 use crate::protocol::sc_hsm::{FwRng, ScHsmState};
+use crate::storage::KeyStore;
 
 /// INS byte for COMPUTE DIGITAL SIGNATURE.
 pub const INS_SIGN: u8 = 0x68;
 
+/// Map the stored keygen algorithm byte to the core `KeyType` for EC keys.
+///
+/// `meta.algo` is set at keygen time and encodes the curve:
+/// 0x13/0x23 → P-256, 0x15/0x25 → P-384, 0x17/0x27 → P-521, 0x19/0x29 → K-256.
+fn meta_algo_to_ec_key_type(algo: u8) -> Option<pico2hsm_core::key::KeyType> {
+    use pico2hsm_core::key::KeyType;
+    match algo {
+        0x13 | 0x23 => Some(KeyType::EcPrivateP256),
+        0x15 | 0x25 => Some(KeyType::EcPrivateP384),
+        0x17 | 0x27 => Some(KeyType::EcPrivateP521),
+        0x19 | 0x29 => Some(KeyType::EcPrivateK256),
+        _ => None,
+    }
+}
+
 /// Handle a COMPUTE DIGITAL SIGNATURE APDU command.
-pub fn handle(state: &mut ScHsmState, cmd: &ApduCommand<'_>) -> ApduResponse {
+pub fn handle(state: &mut ScHsmState, store: &mut dyn KeyStore, cmd: &ApduCommand<'_>) -> ApduResponse {
     // Require PIN authentication
     if !state.pin_verified {
         return ApduResponse::err(SW_SECURITY_STATUS);
@@ -59,18 +75,35 @@ pub fn handle(state: &mut ScHsmState, cmd: &ApduCommand<'_>) -> ApduResponse {
         0x20 | 0x31 | 0x32 | 0x33 | 0x34 | 0x40 => {
             use crate::crypto::asymmetric::{HashAlgorithm, rsa_private_raw, rsa_sign_pkcs1v15, rsa_sign_pss};
 
-            // Look up the RSA key
-            let rsa_key = match state.rsa_keys.iter().find(|k| k.key_id == full_key_id) {
-                Some(k) => k,
+            // Check metadata index for the key
+            let _meta = match state.key_index.iter().find(|m| m.key_id == full_key_id) {
+                Some(m) => *m,
                 None => return ApduResponse::err(SW_FILE_NOT_FOUND),
             };
 
-            // Copy private key DER to a local stack buffer to release the borrow on state.
-            // RSA-2048 PKCS#1 DER is ≤1200 bytes; RSA-4096 is ≤2400 bytes.
+            // Load key material from flash
+            let key_obj = match store.fetch_key(pico2hsm_core::key::KeyId(full_key_id)) {
+                Ok(Some(obj)) => obj,
+                _ => return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
+            };
+
+            // Infer the core KeyType from the stored keygen algo byte
+            let key_type = match _meta.algo {
+                0x05 => pico2hsm_core::key::KeyType::RsaPrivate2048,
+                0x06 => pico2hsm_core::key::KeyType::RsaPrivate3072,
+                0x07 => pico2hsm_core::key::KeyType::RsaPrivate4096,
+                _ => {
+                    // Fallback: infer from DER length
+                    match key_obj.private_key.len() {
+                        n if n <= 1200 => pico2hsm_core::key::KeyType::RsaPrivate2048,
+                        n if n <= 1800 => pico2hsm_core::key::KeyType::RsaPrivate3072,
+                        _ => pico2hsm_core::key::KeyType::RsaPrivate4096,
+                    }
+                }
+            };
+            let der_len = key_obj.private_key.len();
             let mut der_buf = [0u8; 2400];
-            let der_len = rsa_key.private_key_der.len();
-            let key_type = rsa_key.key_type;
-            der_buf[..der_len].copy_from_slice(&rsa_key.private_key_der);
+            der_buf[..der_len].copy_from_slice(&key_obj.private_key);
 
             let sig = match algo {
                 0x20 => {
@@ -129,17 +162,29 @@ pub fn handle(state: &mut ScHsmState, cmd: &ApduCommand<'_>) -> ApduResponse {
         _ => return ApduResponse::err(SW_INS_NOT_SUPPORTED),
     }
 
-    // Look up the key in the in-memory store
-    let key = match state.keys.iter().find(|k| k.key_id == full_key_id) {
-        Some(k) => k,
+    // Check metadata index for the key
+    let meta = match state.key_index.iter().find(|m| m.key_id == full_key_id) {
+        Some(m) => *m,
         None => return ApduResponse::err(SW_FILE_NOT_FOUND),
     };
 
-    let key_type = key.key_type;
-    // Copy private key bytes to a local buffer to avoid holding reference into `state`
+    // Resolve the core KeyType from the stored keygen algorithm byte.
+    // The sign-time algo (0x70-0x75) doesn't encode the curve; use meta.algo.
+    let key_type = match meta_algo_to_ec_key_type(meta.algo) {
+        Some(kt) => kt,
+        None => return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
+    };
+
+    // Load key material from flash
+    let key_obj = match store.fetch_key(pico2hsm_core::key::KeyId(full_key_id)) {
+        Ok(Some(obj)) => obj,
+        _ => return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
+    };
+
+    // Copy private key bytes to a local buffer
     let mut priv_buf = [0u8; 66];
-    let priv_len = key.private_key.len();
-    priv_buf[..priv_len].copy_from_slice(&key.private_key);
+    let priv_len = key_obj.private_key.len();
+    priv_buf[..priv_len].copy_from_slice(&key_obj.private_key);
 
     // For card-hash algorithms (0x71–0x75) the host sends the raw message;
     // we must hash it here before passing to the sign_prehash primitive.

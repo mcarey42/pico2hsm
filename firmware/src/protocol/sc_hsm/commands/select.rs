@@ -59,7 +59,7 @@ fn select_fid(fid: u16, want_fci: bool) -> Option<ApduResponse> {
             // Dynamic EF ranges: key descriptors (C4xx), key blobs (CCxx), certs (CExx)
             let hi = fid >> 8;
             if hi == 0xC4 || hi == 0xCC || hi == 0xCE {
-                0x0200 // placeholder
+                0x0400 // 1024 — must cover largest EC CVC (~700 B for P-521)
             } else {
                 return None;
             }
@@ -118,39 +118,32 @@ pub fn handle(state: &mut ScHsmState, cmd: &ApduCommand<'_>) -> ApduResponse {
     let hi = fid >> 8;
     if hi == 0xCE {
         // EE certificate files exist only if written via WRITE DATA.
-        if !state.ef_files.iter().any(|e| e.file_id == fid) {
+        let file_id_lo = (fid & 0xFF) as u8;
+        let ef_key_id = pico2hsm_core::key::KeyId::sc_hsm_ef(0, hi as u8, file_id_lo).0;
+        if !state.key_index.iter().any(|m| m.key_type == 16 && m.key_id == ef_key_id) {
             return ApduResponse::err(SW_FILE_NOT_FOUND);
         }
     }
     if hi == 0xCC {
-        // Key blob files exist when the corresponding key is in the keystore
-        // (EC or RSA).
+        // Key blob files exist when the corresponding key is in the keystore.
         let key_id_proto = (fid & 0xFF) as u8;
         let full_key_id = pico2hsm_core::key::KeyId::sc_hsm(0, key_id_proto).0;
-        let in_ec = state.keys.iter().any(|k| k.key_id == full_key_id);
-        #[cfg(feature = "rsa")]
-        let exists = in_ec || state.rsa_keys.iter().any(|k| k.key_id == full_key_id);
-        #[cfg(not(feature = "rsa"))]
-        let exists = in_ec;
+        let exists = state.key_index.iter().any(|m| m.key_id == full_key_id && m.key_type != 16);
         if !exists {
             return ApduResponse::err(SW_FILE_NOT_FOUND);
         }
     }
     if hi == 0xC4 {
         // PRKD files exist if:
-        // - an EC key with this key_id is in the keystore (dynamically built), OR
-        // - the file was written via WRITE DATA and is in ef_files (e.g. RSA PRKD
-        //   written by OpenSC after keygen), OR
-        // - an RSA key with this key_id is in the keystore.
+        // - a key with this key_id is in key_index (dynamically built), OR
+        // - the file was written via WRITE DATA and is in key_index as EfFile.
         let key_id_proto = (fid & 0xFF) as u8;
         let full_key_id = pico2hsm_core::key::KeyId::sc_hsm(0, key_id_proto).0;
-        let in_ec = state.keys.iter().any(|k| k.key_id == full_key_id);
-        let in_ef = state.ef_files.iter().any(|e| e.file_id == fid);
-        #[cfg(feature = "rsa")]
-        let in_rsa = state.rsa_keys.iter().any(|k| k.key_id == full_key_id);
-        #[cfg(not(feature = "rsa"))]
-        let in_rsa = false;
-        if !in_ec && !in_ef && !in_rsa {
+        let in_keys = state.key_index.iter().any(|m| m.key_id == full_key_id && m.key_type != 16);
+        let file_id_lo = (fid & 0xFF) as u8;
+        let ef_key_id = pico2hsm_core::key::KeyId::sc_hsm_ef(0, hi as u8, file_id_lo).0;
+        let in_ef = state.key_index.iter().any(|m| m.key_type == 16 && m.key_id == ef_key_id);
+        if !in_keys && !in_ef {
             return ApduResponse::err(SW_FILE_NOT_FOUND);
         }
     }

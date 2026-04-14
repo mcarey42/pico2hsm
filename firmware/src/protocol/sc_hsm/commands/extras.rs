@@ -90,24 +90,26 @@ pub fn handle(state: &mut ScHsmState, store: &mut dyn KeyStore, cmd: &ApduComman
 fn handle_get_device_public_key(state: &mut ScHsmState, store: &mut dyn KeyStore, _cmd: &ApduCommand<'_>) -> ApduResponse {
     let dev_key_id = KeyId::sc_hsm(0, 0xFE);
 
-    // Try in-memory key store first.
-    if let Some(key) = state.keys.iter().find(|k| k.key_id == dev_key_id.0) {
-        if !key.public_key.is_empty() {
-            return ApduResponse::ok(&key.public_key);
-        }
-    }
-
-    // Try EF 0x2F02 (public key stored during INITIALIZE).
-    if let Some(ef) = state.ef_files.iter().find(|ef| ef.file_id == 0x2F02) {
-        if !ef.data.is_empty() {
-            return ApduResponse::ok(&ef.data);
-        }
-    }
-
-    // Try persistent store.
+    // Try persistent store (key object has public_key field).
     if let Ok(Some(key_obj)) = store.fetch_key(dev_key_id) {
         if !key_obj.public_key.is_empty() {
             return ApduResponse::ok(&key_obj.public_key);
+        }
+    }
+
+    // Try EF 0x2F02 (public key stored during INITIALIZE) from ef_cache,
+    // then fall back to flash via cross-core fetch_key RPC.
+    let ef_key_id = KeyId::sc_hsm_ef(0, 0x2F, 0x02);
+    if let Some(data) = state.ef_cache_get(ef_key_id.0) {
+        if !data.is_empty() {
+            return ApduResponse::ok(data);
+        }
+    }
+    if let Ok(Some(obj)) = store.fetch_key(ef_key_id) {
+        let data = &obj.private_key;
+        if !data.is_empty() {
+            state.ef_cache_put(ef_key_id.0, data);
+            return ApduResponse::ok(data);
         }
     }
 
@@ -578,23 +580,33 @@ fn handle_get_key_manifest(state: &mut ScHsmState, store: &mut dyn KeyStore, _cm
     // Use a heapless Vec with reasonable max.
     let mut manifest: heapless::Vec<u8, 1408> = heapless::Vec::new(); // 32 entries * 44
 
-    // Iterate in-memory EC keys.
-    for key in state.keys.iter() {
-        let key_ref = (key.key_id & 0xFF) as u8;
+    // Iterate key_index for crypto keys (not EfFile entries).
+    for meta in state.key_index.iter() {
+        // Skip EfFile entries.
+        if meta.key_type == 16 {
+            continue;
+        }
+        let key_ref = (meta.key_id & 0xFF) as u8;
         // Exclude device-internal keys: 0x00 (device cluster signing key) and
         // 0xFE (device auth cert key).  Only user keys 0x01–0xFD are synced.
         if key_ref == 0x00 || key_ref >= 0xFE {
             continue;
         }
-        let algo = key.algo;
-        let key_flags = 0u8; // No flags defined yet.
+        let algo = meta.algo;
+        let key_flags = meta.key_flags;
         let deleted = 0u8;
-        let timestamp_ms = 0u64; // In-memory keys don't have timestamps.
-        let pubkey_hash = if !key.public_key.is_empty() {
-            let h: [u8; 32] = Sha256::digest(&key.public_key).into();
-            h
+
+        // Fetch from flash to get timestamp and pubkey hash.
+        let kid = KeyId(meta.key_id);
+        let (timestamp_ms, pubkey_hash) = if let Ok(Some(key_obj)) = store.fetch_key(kid) {
+            let h = if !key_obj.public_key.is_empty() {
+                Sha256::digest(&key_obj.public_key).into()
+            } else {
+                [0u8; 32]
+            };
+            (key_obj.timestamp_ms, h)
         } else {
-            [0u8; 32]
+            (0u64, [0u8; 32])
         };
 
         let _ = manifest.push(key_ref);
@@ -603,39 +615,6 @@ fn handle_get_key_manifest(state: &mut ScHsmState, store: &mut dyn KeyStore, _cm
         let _ = manifest.push(deleted);
         let _ = manifest.extend_from_slice(&timestamp_ms.to_be_bytes());
         let _ = manifest.extend_from_slice(&pubkey_hash);
-    }
-
-    // Iterate flash keys via store.enumerate_keys() (capped at 64).
-    let flash_keys = store.enumerate_keys();
-    for kid in flash_keys.iter() {
-        let key_ref = (kid.0 & 0xFF) as u8;
-        // Exclude device-internal keys (same filter as in-memory above).
-        if key_ref == 0x00 || key_ref >= 0xFE {
-            continue;
-        }
-        // Skip if already seen in in-memory keys.
-        if state.keys.iter().any(|k| (k.key_id & 0xFF) as u8 == key_ref) {
-            continue;
-        }
-        if let Ok(Some(key_obj)) = store.fetch_key(*kid) {
-            let algo = key_obj.algorithm as u8;
-            let key_flags = 0u8;
-            let deleted = 0u8;
-            let timestamp_ms = key_obj.timestamp_ms;
-            let pubkey_hash = if !key_obj.public_key.is_empty() {
-                let h: [u8; 32] = Sha256::digest(&key_obj.public_key).into();
-                h
-            } else {
-                [0u8; 32]
-            };
-
-            let _ = manifest.push(key_ref);
-            let _ = manifest.push(algo);
-            let _ = manifest.push(key_flags);
-            let _ = manifest.push(deleted);
-            let _ = manifest.extend_from_slice(&timestamp_ms.to_be_bytes());
-            let _ = manifest.extend_from_slice(&pubkey_hash);
-        }
     }
 
     ApduResponse::ok(&manifest)
@@ -784,16 +763,8 @@ fn sign_with_device_key(state: &ScHsmState, store: &mut dyn KeyStore, msg_hash: 
 
     let dev_key_id = KeyId::sc_hsm(0, 0xFE);
 
-    // Try to find device private key: in-memory first, then flash.
-    let priv_bytes: Zeroizing<[u8; 32]> = if let Some(key) = state.keys.iter().find(|k| k.key_id == dev_key_id.0) {
-        if key.private_key.len() == 32 {
-            let mut b = Zeroizing::new([0u8; 32]);
-            b.copy_from_slice(&key.private_key);
-            b
-        } else {
-            return Err(());
-        }
-    } else if let Ok(Some(key_obj)) = store.fetch_key(dev_key_id) {
+    // Try flash first, then deprecated in-memory fallback.
+    let priv_bytes: Zeroizing<[u8; 32]> = if let Ok(Some(key_obj)) = store.fetch_key(dev_key_id) {
         if key_obj.private_key.len() == 32 {
             let mut b = Zeroizing::new([0u8; 32]);
             b.copy_from_slice(&key_obj.private_key);
@@ -824,26 +795,21 @@ fn sign_with_device_key(state: &ScHsmState, store: &mut dyn KeyStore, msg_hash: 
 fn get_device_static_pub(state: &ScHsmState, store: &mut dyn KeyStore) -> Option<[u8; 65]> {
     let dev_key_id = KeyId::sc_hsm(0, 0xFE);
 
-    if let Some(key) = state.keys.iter().find(|k| k.key_id == dev_key_id.0) {
-        if key.public_key.len() == 65 {
-            let mut out = [0u8; 65];
-            out.copy_from_slice(&key.public_key);
-            return Some(out);
-        }
-    }
-
-    if let Some(ef) = state.ef_files.iter().find(|ef| ef.file_id == 0x2F02) {
-        if ef.data.len() == 65 {
-            let mut out = [0u8; 65];
-            out.copy_from_slice(&ef.data);
-            return Some(out);
-        }
-    }
-
+    // Try flash key object first.
     if let Ok(Some(key_obj)) = store.fetch_key(dev_key_id) {
         if key_obj.public_key.len() == 65 {
             let mut out = [0u8; 65];
             out.copy_from_slice(&key_obj.public_key);
+            return Some(out);
+        }
+    }
+
+    // Try EF 0x2F02 from ef_cache.
+    let ef_key_id = KeyId::sc_hsm_ef(0, 0x2F, 0x02);
+    if let Some(data) = state.ef_cache_get(ef_key_id.0) {
+        if data.len() == 65 {
+            let mut out = [0u8; 65];
+            out.copy_from_slice(data);
             return Some(out);
         }
     }
@@ -889,29 +855,29 @@ fn find_key_info_for_slot(
 
     let key_id = KeyId::sc_hsm(0, slot);
 
-    // Check in-memory keys.
-    if let Some(key) = state.keys.iter().find(|k| k.key_id == key_id.0) {
-        let pubkey_hash = if !key.public_key.is_empty() {
-            Sha256::digest(&key.public_key).into()
-        } else {
-            [0u8; 32]
-        };
-        return Some((key.algo, 0, 0, pubkey_hash));
+    // Check key_index for metadata.
+    if let Some(meta) = state.key_index.iter().find(|m| m.key_id == key_id.0 && m.key_type != 16) {
+        // Fetch from flash for pubkey hash and timestamp.
+        if let Ok(Some(key_obj)) = store.fetch_key(key_id) {
+            let pubkey_hash = if !key_obj.public_key.is_empty() {
+                Sha256::digest(&key_obj.public_key).into()
+            } else {
+                [0u8; 32]
+            };
+            return Some((meta.algo, meta.key_flags, key_obj.timestamp_ms, pubkey_hash));
+        }
+        // Key is in index but not in flash (e.g. volatile sentinel); use metadata only.
+        return Some((meta.algo, meta.key_flags, 0, [0u8; 32]));
     }
 
-    // Check in-memory sym keys.
-    if state.sym_keys.iter().any(|k| k.key_id == key_id.0) {
-        return Some((0, 0, 0, [0u8; 32]));
-    }
-
-    // Check flash.
+    // Fallback: check flash directly (for keys not yet in key_index).
     if let Ok(Some(key_obj)) = store.fetch_key(key_id) {
         let pubkey_hash = if !key_obj.public_key.is_empty() {
             Sha256::digest(&key_obj.public_key).into()
         } else {
             [0u8; 32]
         };
-        return Some((key_obj.algorithm as u8, 0, key_obj.timestamp_ms, pubkey_hash));
+        return Some((key_obj.algorithm as u8, key_obj.key_flags, key_obj.timestamp_ms, pubkey_hash));
     }
 
     None
@@ -1280,15 +1246,53 @@ mod tests {
     // V2 DKEK Exchange Tests
     // -----------------------------------------------------------------------
 
-    use crate::protocol::sc_hsm::{ScHsmState, InMemoryKey};
+    use crate::protocol::sc_hsm::{ScHsmState, KeyMeta};
     use crate::storage::KeyStore;
     use pico2hsm_core::key::{AppletId, KeyId, KeyType as CoreKeyType};
 
-    /// Null key store for tests.
-    struct NullStore;
-    impl KeyStore for NullStore {
-        fn save_key(&mut self, _: &crate::security::key_management::KeyObject) -> Result<(), pico2hsm_core::error::HsmError> { Ok(()) }
-        fn fetch_key(&mut self, _: KeyId) -> Result<Option<crate::security::key_management::KeyObject>, pico2hsm_core::error::HsmError> { Ok(None) }
+    use crate::security::key_management::{KeyObject, AlgorithmId, KeyType as KmType};
+
+    /// Copy a KeyObject (KeyObject doesn't impl Clone).
+    fn copy_key_object(obj: &KeyObject) -> KeyObject {
+        let mut copy = KeyObject::new(obj.key_type, obj.key_id, obj.owner, obj.algorithm);
+        copy.key_flags = obj.key_flags;
+        let _ = copy.private_key.extend_from_slice(&obj.private_key);
+        let _ = copy.public_key.extend_from_slice(&obj.public_key);
+        copy
+    }
+
+    /// Test key store that holds a device identity key and optionally an EF 0x2F02.
+    struct DevKeyStore {
+        dev_key: Option<KeyObject>,
+        ef_key: Option<KeyObject>,
+    }
+    impl DevKeyStore {
+        fn new() -> Self {
+            DevKeyStore { dev_key: None, ef_key: None }
+        }
+    }
+    impl KeyStore for DevKeyStore {
+        fn save_key(&mut self, obj: &KeyObject) -> Result<(), pico2hsm_core::error::HsmError> {
+            let dev_key_id = KeyId::sc_hsm(0, 0xFE).0;
+            let ef_key_id = KeyId::sc_hsm_ef(0, 0x2F, 0x02).0;
+            if obj.key_id == dev_key_id {
+                self.dev_key = Some(copy_key_object(obj));
+            } else if obj.key_id == ef_key_id {
+                self.ef_key = Some(copy_key_object(obj));
+            }
+            Ok(())
+        }
+        fn fetch_key(&mut self, kid: KeyId) -> Result<Option<KeyObject>, pico2hsm_core::error::HsmError> {
+            let dev_key_id = KeyId::sc_hsm(0, 0xFE).0;
+            let ef_key_id = KeyId::sc_hsm_ef(0, 0x2F, 0x02).0;
+            if kid.0 == dev_key_id {
+                return Ok(self.dev_key.as_ref().map(copy_key_object));
+            }
+            if kid.0 == ef_key_id {
+                return Ok(self.ef_key.as_ref().map(copy_key_object));
+            }
+            Ok(None)
+        }
         fn erase_key(&mut self, _: KeyId) -> Result<(), pico2hsm_core::error::HsmError> { Ok(()) }
         fn wipe_all(&mut self) -> Result<(), pico2hsm_core::error::HsmError> { Ok(()) }
         fn wipe_by_owner(&mut self, _: AppletId) -> Result<(), pico2hsm_core::error::HsmError> { Ok(()) }
@@ -1296,10 +1300,10 @@ mod tests {
         fn for_each_key(&self, _f: &mut dyn FnMut(KeyId)) {}
     }
 
-    /// Create a ScHsmState with a device static key (key_ref=0xFE) and PIN verified.
-    fn state_with_device_key() -> ScHsmState {
+    /// Create a ScHsmState with a device static key (key_ref=0xFE) and PIN verified,
+    /// along with a DevKeyStore that holds the key material.
+    fn state_with_device_key() -> (ScHsmState, DevKeyStore) {
         use crate::crypto::asymmetric::generate_ec_keypair;
-        use rand_core::RngCore;
 
         let mut state = ScHsmState::new();
         state.pin_verified = true;
@@ -1311,25 +1315,52 @@ mod tests {
         let pair = generate_ec_keypair(CoreKeyType::EcPrivateP256, &mut rng).unwrap();
 
         let dev_key_id = KeyId::sc_hsm(0, 0xFE).0;
-        let mut entry = InMemoryKey {
+        let meta = KeyMeta {
             key_id: dev_key_id,
-            key_type: CoreKeyType::EcPrivateP256,
+            key_type: CoreKeyType::EcPrivateP256 as u8,
             algo: 0x13,
             key_flags: 0,
-            private_key: heapless::Vec::new(),
-            public_key: heapless::Vec::new(),
         };
-        entry.private_key.extend_from_slice(&pair.private_key).unwrap();
-        entry.public_key.extend_from_slice(&pair.public_key).unwrap();
-        state.keys.push(entry).unwrap();
+        state.key_index.push(meta).unwrap();
 
-        state
+        // Store key material in the test store.
+        let mut store = DevKeyStore::new();
+        let mut key_obj = crate::security::key_management::KeyObject::new(
+            crate::security::key_management::KeyType::Ec,
+            dev_key_id,
+            AppletId::ScHsm,
+            crate::security::key_management::AlgorithmId::EcdsaP256,
+        );
+        let _ = key_obj.private_key.extend_from_slice(&pair.private_key);
+        let _ = key_obj.public_key.extend_from_slice(&pair.public_key);
+        store.dev_key = Some(key_obj);
+
+        // Also store public key as EF 0x2F02.
+        let ef_key_id = KeyId::sc_hsm_ef(0, 0x2F, 0x02);
+        let mut ef_obj = crate::security::key_management::KeyObject::new(
+            crate::security::key_management::KeyType::Generic,
+            ef_key_id.0,
+            AppletId::ScHsm,
+            crate::security::key_management::AlgorithmId::EcdsaP256,
+        );
+        let _ = ef_obj.private_key.extend_from_slice(&pair.public_key);
+        store.ef_key = Some(ef_obj);
+
+        // Add EF metadata to key_index.
+        let ef_meta = KeyMeta {
+            key_id: ef_key_id.0,
+            key_type: 16, // EfFile
+            algo: 0x2F, // high byte of file_id 0x2F02
+            key_flags: 0,
+        };
+        state.key_index.push(ef_meta).unwrap();
+
+        (state, store)
     }
 
     #[test]
     fn test_noise_target_init_returns_correct_length() {
-        let mut state = state_with_device_key();
-        let mut store = NullStore;
+        let (mut state, mut store) = state_with_device_key();
 
         // Source static pubkey (dummy 65 bytes, starts with 0x04).
         let mut source_pub = [0u8; 65];
@@ -1359,8 +1390,7 @@ mod tests {
     fn test_noise_source_respond_returns_correct_length() {
         use crate::crypto::asymmetric::generate_ec_keypair;
 
-        let mut state = state_with_device_key();
-        let mut store = NullStore;
+        let (mut state, mut store) = state_with_device_key();
 
         // Source needs an existing ephemeral keypair (from NOISE_INITIATE).
         let mut rng = crate::protocol::sc_hsm::FwRng;
@@ -1486,8 +1516,7 @@ mod tests {
 
     #[test]
     fn test_get_state_hash_returns_104_bytes() {
-        let mut state = state_with_device_key();
-        let mut store = NullStore;
+        let (mut state, mut store) = state_with_device_key();
 
         let cmd = ApduCommand {
             cla: 0x80,
@@ -1505,8 +1534,7 @@ mod tests {
 
     #[test]
     fn test_get_state_hash_changes_after_key_add() {
-        let mut state = state_with_device_key();
-        let mut store = NullStore;
+        let (mut state, mut store) = state_with_device_key();
 
         let cmd = ApduCommand {
             cla: 0x80,
@@ -1522,21 +1550,15 @@ mod tests {
         assert_eq!(resp1.sw, 0x9000);
         let hash1 = resp1.data.clone();
 
-        // Add a fake key to a new slot.
+        // Add a fake key to a new slot (both key_index and deprecated keys).
         let key_id2 = KeyId::sc_hsm(0, 0x01).0;
-        let mut entry = InMemoryKey {
+        let meta = crate::protocol::sc_hsm::KeyMeta {
             key_id: key_id2,
-            key_type: CoreKeyType::EcPrivateP256,
+            key_type: CoreKeyType::EcPrivateP256 as u8,
             algo: 0x13,
             key_flags: 0,
-            private_key: heapless::Vec::new(),
-            public_key: heapless::Vec::new(),
         };
-        entry.private_key.extend_from_slice(&[0x42u8; 32]).unwrap();
-        let mut pub_key = [0u8; 65];
-        pub_key[0] = 0x04;
-        entry.public_key.extend_from_slice(&pub_key).unwrap();
-        state.keys.push(entry).unwrap();
+        state.key_index.push(meta).unwrap();
 
         // Get state hash after adding a key.
         let resp2 = handle(&mut state, &mut store, &cmd);
@@ -1549,7 +1571,7 @@ mod tests {
     #[test]
     fn test_get_generation_v2_returns_8_bytes() {
         let mut state = ScHsmState::new();
-        let mut store = NullStore;
+        let mut store = DevKeyStore::new();
 
         let cmd = ApduCommand {
             cla: 0x80,
@@ -1574,8 +1596,7 @@ mod tests {
 
     #[test]
     fn test_sign_enrollment_returns_64_bytes() {
-        let mut state = state_with_device_key();
-        let mut store = NullStore;
+        let (mut state, mut store) = state_with_device_key();
 
         // Input: tls_cert_fingerprint(32) || cluster_id(16) = 48 bytes
         let input = [0x55u8; 48];
@@ -1596,9 +1617,8 @@ mod tests {
 
     #[test]
     fn test_sign_enrollment_requires_so_pin() {
-        let mut state = state_with_device_key();
+        let (mut state, mut store) = state_with_device_key();
         state.so_pin_verified = false; // Override
-        let mut store = NullStore;
 
         let input = [0x55u8; 48];
         let cmd = ApduCommand {
@@ -1616,8 +1636,7 @@ mod tests {
 
     #[test]
     fn test_get_key_manifest_empty_state() {
-        let mut state = state_with_device_key();
-        let mut store = NullStore;
+        let (mut state, mut store) = state_with_device_key();
 
         let cmd = ApduCommand {
             cla: 0x80,
@@ -1682,9 +1701,8 @@ mod tests {
 
     #[test]
     fn test_enroll_peer_pubkey_requires_sopin() {
-        let mut state = state_with_device_key();
+        let (mut state, mut store) = state_with_device_key();
         state.so_pin_verified = false;
-        let mut store = NullStore;
 
         let pubkey = generate_test_p256_pubkey();
         let cmd = ApduCommand {
@@ -1702,8 +1720,7 @@ mod tests {
 
     #[test]
     fn test_enroll_peer_pubkey_validates_key_wrong_length() {
-        let mut state = state_with_device_key();
-        let mut store = NullStore;
+        let (mut state, mut store) = state_with_device_key();
 
         // Too short (32 bytes instead of 65).
         let short_data = [0x04u8; 32];
@@ -1722,8 +1739,7 @@ mod tests {
 
     #[test]
     fn test_enroll_peer_pubkey_validates_key_not_on_curve() {
-        let mut state = state_with_device_key();
-        let mut store = NullStore;
+        let (mut state, mut store) = state_with_device_key();
 
         // 65 bytes starting with 0x04 but invalid point.
         let mut bad_key = [0u8; 65];
@@ -1744,8 +1760,7 @@ mod tests {
 
     #[test]
     fn test_enroll_peer_pubkey_stores_key() {
-        let mut state = state_with_device_key();
-        let mut store = NullStore;
+        let (mut state, mut store) = state_with_device_key();
 
         let pubkey = generate_test_p256_pubkey();
         let cmd = ApduCommand {
@@ -1765,8 +1780,7 @@ mod tests {
 
     #[test]
     fn test_enroll_peer_pubkey_re_enrollment() {
-        let mut state = state_with_device_key();
-        let mut store = NullStore;
+        let (mut state, mut store) = state_with_device_key();
 
         let pubkey1 = generate_test_p256_pubkey();
         let pubkey2 = generate_test_p256_pubkey();
@@ -1792,8 +1806,7 @@ mod tests {
 
     #[test]
     fn test_enroll_peer_locks_unauthenticated() {
-        let mut state = state_with_device_key();
-        let mut store = NullStore;
+        let (mut state, mut store) = state_with_device_key();
 
         assert!(state.dkek_unauthenticated_allowed, "should start as allowed");
 

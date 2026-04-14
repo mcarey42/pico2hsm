@@ -4,7 +4,6 @@ members = [
     "firmware",
     "tools/hsm-tool",
     "tests/integration",
-    "daemon",
 ]
 resolver = "2"
 
@@ -27,3 +26,4 @@ opt-level = 3
 
 [profile.dev.package.rsa]
 opt-level = 3
+

@@ -53,10 +53,18 @@ pub static CORE1_PROGRESS: core::sync::atomic::AtomicU8 = core::sync::atomic::At
 /// we only need eventual visibility, not ordering with other memory operations.
 pub static WATCHDOG_HEARTBEAT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
-/// Maximum consecutive time-extension intervals (1.5 s each) where the watchdog
-/// heartbeat has not changed before Core0 declares Core1 stuck and aborts the
-/// APDU.  3 intervals = 4.5 seconds of no RNG activity.
-pub const WATCHDOG_STALL_LIMIT: u32 = 3;
+/// Consecutive time-extension intervals (1.5 s each) without a heartbeat change
+/// before Core0 declares Core1 stuck and aborts the APDU.  20 intervals = 30 s.
+/// The watchdog is a true deadlock detector — legitimate long operations (DKEK
+/// derivation, ECDSA scalar multiply) bump the heartbeat via `FwRng::fill_bytes`.
+/// RSA keygen suppresses the watchdog via [`WATCHDOG_SUPPRESS`] because modular
+/// exponentiation runs for minutes without RNG calls.
+pub const WATCHDOG_STALL_LIMIT: u32 = 20;
+
+/// When `true`, Core0 skips stall detection and never aborts — it just sends
+/// time-extensions.  Core1 sets this before RSA keygen and clears it after.
+/// `Relaxed` ordering is fine (same rationale as `WATCHDOG_HEARTBEAT`).
+pub static WATCHDOG_SUPPRESS: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 #[cfg(not(target_arch = "arm"))]
 #[macro_export]

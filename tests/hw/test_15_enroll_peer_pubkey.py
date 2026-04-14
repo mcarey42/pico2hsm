@@ -13,7 +13,10 @@ The APDU format is:
 from __future__ import annotations
 
 import logging
+import os
 import re
+import subprocess
+import time
 
 import pytest
 
@@ -67,6 +70,61 @@ def _build_enroll_apdu(pubkey_hex: str) -> str:
     # But for 65 bytes, short APDU is fine: 80 54 3D 00 <lc> <data> 00
     apdu = f"80543D00{lc:02X}{pubkey_hex}00"
     return apdu
+
+
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
+
+def _wait_for_device(timeout: float = 25.0) -> bool:
+    """Poll until pcscd reports a card present."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            r = subprocess.run(
+                ["opensc-tool", "--list-readers"],
+                capture_output=True, timeout=5,
+            )
+            if r.returncode == 0 and b"Yes" in r.stdout:
+                return True
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            pass
+        time.sleep(0.5)
+    return False
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _reinitialize_device(config: dict) -> None:
+    """Re-initialize the device before test_15 runs.
+
+    test_14 performs a probe-rs reset which reboots the device and
+    invalidates the session-scoped ``initialized_device`` fixture state.
+    This module-scoped fixture ensures the device is freshly initialized
+    with known PINs before the enrollment tests run.
+    """
+    log.info("Re-initializing device for enrollment tests...")
+    if not _wait_for_device(timeout=15.0):
+        pytest.skip("Device not present — cannot re-initialize for enrollment tests")
+    result = subprocess.run(
+        [
+            "sc-hsm-tool",
+            "--initialize",
+            "--label", config.get("label", "pico2hsm"),
+            "--so-pin", config["so_pin"],
+            "--pin", config["pin"],
+        ],
+        capture_output=True, timeout=60,
+    )
+    if result.returncode != 0:
+        pytest.fail(
+            f"Re-INITIALIZE for enrollment tests failed: rc={result.returncode}\n"
+            f"{result.stderr.decode(errors='replace')}"
+        )
+    # Wait for USB re-enumeration after INITIALIZE.
+    time.sleep(5)
+    if not _wait_for_device(timeout=25.0):
+        pytest.fail("Device did not re-enumerate after re-INITIALIZE")
+    log.info("Device re-initialized for enrollment tests")
 
 
 # ---------------------------------------------------------------------------

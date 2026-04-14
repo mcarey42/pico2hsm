@@ -10,14 +10,17 @@ use pico2hsm_core::apdu::{
     ApduCommand, ApduResponse, SW_CONDITIONS_NOT_SATISFIED, SW_FILE_NOT_FOUND,
     SW_SECURITY_STATUS,
 };
+use pico2hsm_core::key::{AppletId, KeyId};
 
-use crate::protocol::sc_hsm::{EfEntry, ScHsmState};
+use crate::protocol::sc_hsm::{KeyMeta, ScHsmState};
+use crate::security::key_management::{AlgorithmId, KeyObject, KeyType as KmType};
+use crate::storage::KeyStore;
 
 /// INS byte for UPDATE BINARY.
 pub const INS_UPDATE_BINARY: u8 = 0xD6;
 
 /// Handle an UPDATE BINARY APDU command.
-pub fn handle(state: &mut ScHsmState, cmd: &ApduCommand<'_>) -> ApduResponse {
+pub fn handle(state: &mut ScHsmState, store: &mut dyn KeyStore, cmd: &ApduCommand<'_>) -> ApduResponse {
     if !state.pin_verified && !state.so_pin_verified {
         return ApduResponse::err(SW_SECURITY_STATUS);
     }
@@ -28,20 +31,36 @@ pub fn handle(state: &mut ScHsmState, cmd: &ApduCommand<'_>) -> ApduResponse {
         None => return ApduResponse::err(SW_FILE_NOT_FOUND),
     };
 
-    // If the file already exists in ef_files, overwrite it.
-    if let Some(entry) = state.ef_files.iter_mut().find(|e| e.file_id == file_id) {
-        entry.data.clear();
-        let _ = entry.data.extend_from_slice(cmd.data);
-        return ApduResponse::ok(&[]);
+    let file_id_hi = (file_id >> 8) as u8;
+    let file_id_lo = (file_id & 0xFF) as u8;
+    let key_id = KeyId::sc_hsm_ef(0, file_id_hi, file_id_lo);
+
+    // Check if the EF already exists in key_index — if so, erase and rewrite.
+    let exists = state.key_index.iter().any(|m| m.key_type == 16 && m.key_id == key_id.0);
+    if exists {
+        let _ = store.erase_key(key_id);
     }
 
-    // Create a new EF entry.
-    let mut data_buf: heapless::Vec<u8, { crate::protocol::sc_hsm::MAX_EF_DATA }> =
-        heapless::Vec::new();
-    let _ = data_buf.extend_from_slice(cmd.data);
-    let entry = EfEntry { file_id, data: data_buf };
-    match state.ef_files.push(entry) {
-        Ok(()) => ApduResponse::ok(&[]),
+    // Create a KeyObject with EF data in private_key field.
+    let mut key_obj = KeyObject::new(KmType::Generic, key_id.0, AppletId::ScHsm, AlgorithmId::AesGcm);
+    let _ = key_obj.private_key.extend_from_slice(cmd.data);
+
+    match store.save_key(&key_obj) {
+        Ok(()) => {
+            // Update ef_cache so READ BINARY can serve this data.
+            state.ef_cache_put(key_id.0, cmd.data);
+            if !exists {
+                let file_id_hi = (file_id >> 8) as u8;
+                let meta = KeyMeta {
+                    key_id: key_id.0,
+                    key_type: 16, // EfFile
+                    algo: file_id_hi, // high byte of file_id
+                    key_flags: 0,
+                };
+                let _ = state.key_index.push(meta);
+            }
+            ApduResponse::ok(&[])
+        }
         Err(_) => ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
     }
 }

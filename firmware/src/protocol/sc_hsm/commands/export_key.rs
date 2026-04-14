@@ -50,41 +50,21 @@ pub fn handle(state: &mut ScHsmState, store: &mut dyn KeyStore, cmd: &ApduComman
 
     let full_key_id = KeyId::sc_hsm(0, key_ref);
 
-    // Try to load key from persistent store first, then fall back to in-memory.
-    // Also retrieve key_flags to enforce NO_EXPORT.
-    let (private_key_bytes, algo_byte, key_flags) = match store.fetch_key(full_key_id) {
-        Ok(Some(key_obj)) => {
-            // Got a key from flash — key_flags is persisted since P2K4.
-            let algo = key_obj.algorithm as u8;
-            let mut priv_data: heapless::Vec<u8, 2400> = heapless::Vec::new();
-            let _ = priv_data.extend_from_slice(&key_obj.private_key);
-            (priv_data, algo, key_obj.key_flags)
-        }
-        _ => {
-            // Fall back to in-memory key lookup (EC keys).
-            if let Some(key) = state.keys.iter().find(|k| k.key_id == full_key_id.0) {
-                let mut priv_data: heapless::Vec<u8, 2400> = heapless::Vec::new();
-                let _ = priv_data.extend_from_slice(&key.private_key);
-                (priv_data, key.algo, key.key_flags)
-            } else {
-                // Try RSA keys.
-                #[cfg(feature = "rsa")]
-                {
-                    if let Some(rsa_key) = state.rsa_keys.iter().find(|k| k.key_id == full_key_id.0) {
-                        let mut priv_data: heapless::Vec<u8, 2400> = heapless::Vec::new();
-                        let _ = priv_data.extend_from_slice(&rsa_key.private_key_der);
-                        (priv_data, rsa_key.algo, rsa_key.key_flags)
-                    } else {
-                        return ApduResponse::err(SW_FILE_NOT_FOUND);
-                    }
-                }
-                #[cfg(not(feature = "rsa"))]
-                {
-                    return ApduResponse::err(SW_FILE_NOT_FOUND);
-                }
-            }
-        }
+    // Look up metadata from key_index, then load key material from flash.
+    let meta = match state.key_index.iter().find(|m| m.key_id == full_key_id.0) {
+        Some(m) => *m,
+        None => return ApduResponse::err(SW_FILE_NOT_FOUND),
     };
+
+    let key_obj = match store.fetch_key(full_key_id) {
+        Ok(Some(obj)) => obj,
+        _ => return ApduResponse::err(SW_FILE_NOT_FOUND),
+    };
+
+    let mut private_key_bytes: heapless::Vec<u8, 2400> = heapless::Vec::new();
+    let _ = private_key_bytes.extend_from_slice(&key_obj.private_key);
+    let algo_byte = meta.algo;
+    let key_flags = meta.key_flags;
 
     // Enforce NO_EXPORT flag: reject wrapping if the key was generated with
     // the NO_EXPORT bit set in its key access conditions (TLV tag 0xD4).
@@ -106,16 +86,48 @@ mod tests {
     use super::*;
     use pico2hsm_core::apdu::{ApduCommand, SW_OK};
     use pico2hsm_core::key::{AppletId, KeyId, KeyType as CoreKeyType};
-    use crate::protocol::sc_hsm::{InMemoryKey, ScHsmState};
+    use crate::protocol::sc_hsm::{KeyMeta, ScHsmState};
     use crate::storage::KeyStore;
+    use crate::security::key_management::{AlgorithmId, KeyObject, KeyType as KmType};
     use pico2hsm_core::error::HsmError;
 
-    struct NullStore;
-    impl KeyStore for NullStore {
-        fn save_key(&mut self, _: &crate::security::key_management::KeyObject) -> Result<(), HsmError> { Ok(()) }
-        fn fetch_key(&mut self, _: KeyId) -> Result<Option<crate::security::key_management::KeyObject>, HsmError> { Ok(None) }
-        fn erase_key(&mut self, _: KeyId) -> Result<(), HsmError> { Ok(()) }
-        fn wipe_all(&mut self) -> Result<(), HsmError> { Ok(()) }
+    struct TestStore {
+        keys: heapless::Vec<KeyObject, 4>,
+    }
+    impl TestStore {
+        fn new() -> Self { TestStore { keys: heapless::Vec::new() } }
+        fn add_key(&mut self, key_id: u32, algo: AlgorithmId, key_flags: u8, private_key: &[u8]) {
+            let mut obj = KeyObject::new(KmType::Ec, key_id, AppletId::ScHsm, algo);
+            obj.key_flags = key_flags;
+            let _ = obj.private_key.extend_from_slice(private_key);
+            let _ = self.keys.push(obj);
+        }
+    }
+    impl KeyStore for TestStore {
+        fn save_key(&mut self, obj: &KeyObject) -> Result<(), HsmError> {
+            self.keys.retain(|k| k.key_id != obj.key_id);
+            let mut copy = KeyObject::new(obj.key_type, obj.key_id, obj.owner, obj.algorithm);
+            copy.key_flags = obj.key_flags;
+            let _ = copy.private_key.extend_from_slice(&obj.private_key);
+            let _ = copy.public_key.extend_from_slice(&obj.public_key);
+            let _ = self.keys.push(copy);
+            Ok(())
+        }
+        fn fetch_key(&mut self, key_id: KeyId) -> Result<Option<KeyObject>, HsmError> {
+            if let Some(obj) = self.keys.iter().find(|k| k.key_id == key_id.0) {
+                let mut copy = KeyObject::new(obj.key_type, obj.key_id, obj.owner, obj.algorithm);
+                copy.key_flags = obj.key_flags;
+                let _ = copy.private_key.extend_from_slice(&obj.private_key);
+                let _ = copy.public_key.extend_from_slice(&obj.public_key);
+                return Ok(Some(copy));
+            }
+            Ok(None)
+        }
+        fn erase_key(&mut self, key_id: KeyId) -> Result<(), HsmError> {
+            self.keys.retain(|k| k.key_id != key_id.0);
+            Ok(())
+        }
+        fn wipe_all(&mut self) -> Result<(), HsmError> { self.keys.clear(); Ok(()) }
         fn wipe_by_owner(&mut self, _: AppletId) -> Result<(), HsmError> { Ok(()) }
         fn enumerate_keys(&self) -> heapless::Vec<KeyId, 64> { heapless::Vec::new() }
         fn for_each_key(&self, _f: &mut dyn FnMut(KeyId)) {}
@@ -140,22 +152,18 @@ mod tests {
     fn test_export_key_with_dkek_and_in_memory_key() {
         let mut state = state_with_dkek();
 
-        // Insert a P-256 EC key at key_ref=0x01.
+        // Insert a P-256 EC key at key_ref=0x01 in key_index + store.
         let key_id = KeyId::sc_hsm(0, 0x01);
-        let mut entry = InMemoryKey {
+        let _ = state.key_index.push(KeyMeta {
             key_id: key_id.0,
-            key_type: CoreKeyType::EcPrivateP256,
+            key_type: CoreKeyType::EcPrivateP256 as u8,
             algo: 0x13, // ECDSA P-256
             key_flags: 0x00, // exportable
-            private_key: heapless::Vec::new(),
-            public_key: heapless::Vec::new(),
-        };
-        // 32-byte fake private key scalar.
-        let _ = entry.private_key.extend_from_slice(&[0x42u8; 32]);
-        let _ = state.keys.push(entry);
+        });
+        let mut store = TestStore::new();
+        store.add_key(key_id.0, AlgorithmId::EcdsaP256, 0x00, &[0x42u8; 32]);
 
         let cmd = make_cmd(0x01, 0x92, &[]);
-        let mut store = NullStore;
         let resp = handle(&mut state, &mut store, &cmd);
 
         assert_eq!(resp.sw, SW_OK, "expected SW_OK for valid export");
@@ -171,19 +179,16 @@ mod tests {
 
         // Insert a key so the key-not-found path is not hit.
         let key_id = KeyId::sc_hsm(0, 0x01);
-        let mut entry = InMemoryKey {
+        let _ = state.key_index.push(KeyMeta {
             key_id: key_id.0,
-            key_type: CoreKeyType::EcPrivateP256,
+            key_type: CoreKeyType::EcPrivateP256 as u8,
             algo: 0x13,
             key_flags: 0x00,
-            private_key: heapless::Vec::new(),
-            public_key: heapless::Vec::new(),
-        };
-        let _ = entry.private_key.extend_from_slice(&[0x42u8; 32]);
-        let _ = state.keys.push(entry);
+        });
 
         let cmd = make_cmd(0x01, 0x92, &[]);
-        let mut store = NullStore;
+        let mut store = TestStore::new();
+        store.add_key(key_id.0, AlgorithmId::EcdsaP256, 0x00, &[0x42u8; 32]);
         let resp = handle(&mut state, &mut store, &cmd);
 
         assert_eq!(resp.sw, SW_CONDITIONS_NOT_SATISFIED);
@@ -195,7 +200,7 @@ mod tests {
         // No keys in state — key_ref 0x01 does not exist.
 
         let cmd = make_cmd(0x01, 0x92, &[]);
-        let mut store = NullStore;
+        let mut store = TestStore::new();
         let resp = handle(&mut state, &mut store, &cmd);
 
         assert_eq!(resp.sw, SW_FILE_NOT_FOUND);
@@ -207,19 +212,16 @@ mod tests {
 
         // Insert a P-256 EC key at key_ref=0x02 with NO_EXPORT flag set.
         let key_id = KeyId::sc_hsm(0, 0x02);
-        let mut entry = InMemoryKey {
+        let _ = state.key_index.push(KeyMeta {
             key_id: key_id.0,
-            key_type: CoreKeyType::EcPrivateP256,
+            key_type: CoreKeyType::EcPrivateP256 as u8,
             algo: 0x13, // ECDSA P-256
             key_flags: NO_EXPORT_BIT, // 0x08 = NO_EXPORT
-            private_key: heapless::Vec::new(),
-            public_key: heapless::Vec::new(),
-        };
-        let _ = entry.private_key.extend_from_slice(&[0x42u8; 32]);
-        let _ = state.keys.push(entry);
+        });
+        let mut store = TestStore::new();
+        store.add_key(key_id.0, AlgorithmId::EcdsaP256, NO_EXPORT_BIT, &[0x42u8; 32]);
 
         let cmd = make_cmd(0x02, 0x92, &[]);
-        let mut store = NullStore;
         let resp = handle(&mut state, &mut store, &cmd);
 
         assert_eq!(resp.sw, SW_CONDITIONS_NOT_SATISFIED,
@@ -232,19 +234,16 @@ mod tests {
 
         // Insert a key with ALLOW_SIGN + ALLOW_DECRYPT set but NOT NO_EXPORT.
         let key_id = KeyId::sc_hsm(0, 0x03);
-        let mut entry = InMemoryKey {
+        let _ = state.key_index.push(KeyMeta {
             key_id: key_id.0,
-            key_type: CoreKeyType::EcPrivateP256,
+            key_type: CoreKeyType::EcPrivateP256 as u8,
             algo: 0x13,
             key_flags: 0x03, // ALLOW_SIGN | ALLOW_DECRYPT, no NO_EXPORT
-            private_key: heapless::Vec::new(),
-            public_key: heapless::Vec::new(),
-        };
-        let _ = entry.private_key.extend_from_slice(&[0x42u8; 32]);
-        let _ = state.keys.push(entry);
+        });
+        let mut store = TestStore::new();
+        store.add_key(key_id.0, AlgorithmId::EcdsaP256, 0x03, &[0x42u8; 32]);
 
         let cmd = make_cmd(0x03, 0x92, &[]);
-        let mut store = NullStore;
         let resp = handle(&mut state, &mut store, &cmd);
 
         assert_eq!(resp.sw, SW_OK,

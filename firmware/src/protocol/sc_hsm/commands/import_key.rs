@@ -14,7 +14,7 @@ use pico2hsm_core::apdu::{
 };
 use pico2hsm_core::key::{AppletId, KeyId};
 
-use crate::protocol::sc_hsm::{InMemoryKey, ScHsmState};
+use crate::protocol::sc_hsm::{KeyMeta, ScHsmState};
 use crate::security::key_management::{AlgorithmId, KeyObject, KeyType as KmType};
 use crate::storage::KeyStore;
 
@@ -52,7 +52,7 @@ pub fn handle(state: &mut ScHsmState, store: &mut dyn KeyStore, cmd: &ApduComman
     // uses path B: it calls sc_hsm_write_ef(card, 0x2F10, …) then sends IMPORT KEY
     // as a Case-1 APDU with no inline data.  We must support both paths.
 
-    // Copy blob into a local buffer so we can later mutate state (retain EF 0x2F10).
+    // Copy blob into a local buffer so we can later mutate state.
     let blob_data: heapless::Vec<u8, 2400> = if !cmd.data.is_empty() {
         let mut v: heapless::Vec<u8, 2400> = heapless::Vec::new();
         if v.extend_from_slice(cmd.data).is_err() {
@@ -62,15 +62,32 @@ pub fn handle(state: &mut ScHsmState, store: &mut dyn KeyStore, cmd: &ApduComman
     } else {
         // Standard sc-hsm-tool protocol: host wrote the blob to EF 0x2F10 first,
         // then sends IMPORT KEY as Case-1 APDU (no inline data).
-        match state.ef_files.iter().find(|e| e.file_id == 0x2F10) {
-            Some(ef) if !ef.data.is_empty() => {
+        // EF 0x2F10 is stored via write_data; read from ef_cache first,
+        // then fall back to flash via cross-core fetch_key RPC.
+        let ef_key_id = KeyId::sc_hsm_ef(0, 0x2F, 0x10);
+        if let Some(data) = state.ef_cache_get(ef_key_id.0) {
+            if !data.is_empty() {
                 let mut v: heapless::Vec<u8, 2400> = heapless::Vec::new();
-                if v.extend_from_slice(&ef.data).is_err() {
+                if v.extend_from_slice(data).is_err() {
                     return ApduResponse::err(SW_WRONG_DATA);
                 }
                 v
+            } else {
+                return ApduResponse::err(SW_WRONG_DATA);
             }
-            _ => return ApduResponse::err(SW_WRONG_DATA),
+        } else if let Ok(Some(obj)) = store.fetch_key(ef_key_id) {
+            if !obj.private_key.is_empty() {
+                state.ef_cache_put(ef_key_id.0, &obj.private_key);
+                let mut v: heapless::Vec<u8, 2400> = heapless::Vec::new();
+                if v.extend_from_slice(&obj.private_key).is_err() {
+                    return ApduResponse::err(SW_WRONG_DATA);
+                }
+                v
+            } else {
+                return ApduResponse::err(SW_WRONG_DATA);
+            }
+        } else {
+            return ApduResponse::err(SW_WRONG_DATA);
         }
     };
 
@@ -81,7 +98,10 @@ pub fn handle(state: &mut ScHsmState, store: &mut dyn KeyStore, cmd: &ApduComman
     };
 
     // Clear EF 0x2F10 now that we have consumed the blob.
-    state.ef_files.retain(|e| e.file_id != 0x2F10);
+    let ef_key_id_2f10 = KeyId::sc_hsm_ef(0, 0x2F, 0x10);
+    let _ = store.erase_key(ef_key_id_2f10);
+    state.key_index.retain(|m| m.key_id != ef_key_id_2f10.0);
+    state.ef_cache_remove(ef_key_id_2f10.0);
 
     let full_key_id = KeyId::sc_hsm(0, key_ref);
 
@@ -110,8 +130,7 @@ pub fn handle(state: &mut ScHsmState, store: &mut dyn KeyStore, cmd: &ApduComman
     let _ = store.save_key(&key_obj);
     state.generation = state.generation.wrapping_add(1);
 
-    // Also store in in-memory EC key store for immediate use.
-    // Map algo byte to CoreKeyType for InMemoryKey.
+    // Map algo byte to CoreKeyType for metadata.
     let core_key_type = match algo_id {
         0x13 | 0x23 => pico2hsm_core::key::KeyType::EcPrivateP256,
         0x15 | 0x25 => pico2hsm_core::key::KeyType::EcPrivateP384,
@@ -122,28 +141,22 @@ pub fn handle(state: &mut ScHsmState, store: &mut dyn KeyStore, cmd: &ApduComman
         0x55 => pico2hsm_core::key::KeyType::EcPrivateBrainpoolP512,
         0x20 => pico2hsm_core::key::KeyType::Ed25519,
         0x21 => pico2hsm_core::key::KeyType::X25519,
+        0x05 | 0x07 | 0x31 | 0x32 | 0x33 | 0x34 | 0x41 => pico2hsm_core::key::KeyType::RsaPrivate2048, // RSA family placeholder
+        0x60 | 0x61 | 0x62 | 0x63 => pico2hsm_core::key::KeyType::Aes256,
         _ => {
-            // RSA and symmetric keys are handled differently; for now just persist to flash.
-            // The in-memory store doesn't apply to RSA/AES imports (they'd be re-loaded from flash).
             crate::cdc_log!("SC-HSM IMPORT KEY done key=0x{:08x} algo=0x{:02x}", full_key_id.0, algo_id);
             return ApduResponse::ok(&[]);
         }
     };
 
-    // Remove any existing key with the same ID.
-    state.keys.retain(|k| k.key_id != full_key_id.0);
-
-    let mut entry = InMemoryKey {
+    // Store metadata in key_index (replacing any existing entry with the same ID).
+    state.key_index.retain(|m| m.key_id != full_key_id.0);
+    let _ = state.key_index.push(KeyMeta {
         key_id: full_key_id.0,
-        key_type: core_key_type,
+        key_type: core_key_type as u8,
         algo: algo_id,
         key_flags,
-        private_key: heapless::Vec::new(),
-        public_key: heapless::Vec::new(),
-    };
-    let _ = entry.private_key.extend_from_slice(&key_material);
-    // Public key is not available from the wrapped blob; it will be derived on demand.
-    let _ = state.keys.push(entry);
+    });
 
     crate::cdc_log!("SC-HSM IMPORT KEY done key=0x{:08x} algo=0x{:02x}", full_key_id.0, algo_id);
     ApduResponse::ok(&[])
@@ -155,7 +168,7 @@ mod tests {
     use pico2hsm_core::apdu::{ApduCommand, SW_OK};
     use pico2hsm_core::key::{KeyId, KeyType as CoreKeyType};
     use pico2hsm_core::error::HsmError;
-    use crate::protocol::sc_hsm::{FwRng, InMemoryKey, ScHsmState};
+    use crate::protocol::sc_hsm::{FwRng, ScHsmState};
     use crate::storage::KeyStore;
 
     struct NullStore;
@@ -201,12 +214,11 @@ mod tests {
         let resp = handle(&mut state, &mut store, &cmd);
 
         assert_eq!(resp.sw, SW_OK, "expected SW_OK for valid import");
-        // Verify the key was added to in-memory store.
-        let found = state.keys.iter().find(|k| k.key_id == KeyId::sc_hsm(0, 0x01).0);
-        assert!(found.is_some(), "imported key should be in memory");
-        let key = found.unwrap();
-        assert_eq!(key.algo, 0x13);
-        assert_eq!(&key.private_key[..], &private_key[..]);
+        // Verify the key metadata was added to key_index.
+        let found = state.key_index.iter().find(|m| m.key_id == KeyId::sc_hsm(0, 0x01).0);
+        assert!(found.is_some(), "imported key should be in key_index");
+        let meta = found.unwrap();
+        assert_eq!(meta.algo, 0x13);
     }
 
     #[test]
@@ -252,6 +264,50 @@ mod tests {
         assert_eq!(resp.sw, SW_WRONG_DATA, "empty data with no EF 0x2F10 should fail");
     }
 
+    /// A store that holds one EF 0x2F10 blob for testing the standard import path.
+    struct EfStore {
+        ef_data: Option<heapless::Vec<u8, 2400>>,
+    }
+    impl KeyStore for EfStore {
+        fn save_key(&mut self, obj: &crate::security::key_management::KeyObject) -> Result<(), HsmError> {
+            // Store EF 0x2F10 data
+            let ef_key_id = KeyId::sc_hsm_ef(0, 0x2F, 0x10).0;
+            if obj.key_id == ef_key_id {
+                let mut v = heapless::Vec::new();
+                let _ = v.extend_from_slice(&obj.private_key);
+                self.ef_data = Some(v);
+            }
+            Ok(())
+        }
+        fn fetch_key(&mut self, kid: KeyId) -> Result<Option<crate::security::key_management::KeyObject>, HsmError> {
+            let ef_key_id = KeyId::sc_hsm_ef(0, 0x2F, 0x10);
+            if kid == ef_key_id {
+                if let Some(ref data) = self.ef_data {
+                    let mut obj = crate::security::key_management::KeyObject::new(
+                        crate::security::key_management::KeyType::Generic,
+                        ef_key_id.0,
+                        AppletId::ScHsm,
+                        crate::security::key_management::AlgorithmId::EcdsaP256,
+                    );
+                    let _ = obj.private_key.extend_from_slice(data);
+                    return Ok(Some(obj));
+                }
+            }
+            Ok(None)
+        }
+        fn erase_key(&mut self, kid: KeyId) -> Result<(), HsmError> {
+            let ef_key_id = KeyId::sc_hsm_ef(0, 0x2F, 0x10);
+            if kid == ef_key_id {
+                self.ef_data = None;
+            }
+            Ok(())
+        }
+        fn wipe_all(&mut self) -> Result<(), HsmError> { Ok(()) }
+        fn wipe_by_owner(&mut self, _: AppletId) -> Result<(), HsmError> { Ok(()) }
+        fn enumerate_keys(&self) -> heapless::Vec<KeyId, 64> { heapless::Vec::new() }
+        fn for_each_key(&self, _f: &mut dyn FnMut(KeyId)) {}
+    }
+
     #[test]
     fn test_import_via_ef_0x2f10_succeeds() {
         // Standard sc-hsm-tool path: blob written to EF 0x2F10 first, then Case-1 IMPORT KEY.
@@ -259,30 +315,34 @@ mod tests {
         let private_key = [0x42u8; 32];
         let wrapped = wrap_test_key(&state, &private_key, 0x13); // ECDSA P-256
 
-        // Populate EF 0x2F10 with the wrapped blob.
-        let mut ef_data: heapless::Vec<u8, { crate::protocol::sc_hsm::MAX_EF_DATA }> =
-            heapless::Vec::new();
-        let _ = ef_data.extend_from_slice(&wrapped);
-        let _ = state.ef_files.push(crate::protocol::sc_hsm::EfEntry {
-            file_id: 0x2F10,
-            data: ef_data,
-        });
+        // Populate EF 0x2F10 via ef_cache (import handler reads from cache,
+        // not store.fetch_key, since FlashQueueKeyStore returns None).
+        let ef_key_id = KeyId::sc_hsm_ef(0, 0x2F, 0x10);
+        state.ef_cache_put(ef_key_id.0, &wrapped);
+        let mut store = EfStore { ef_data: None };
+
+        // Also add the EF metadata to key_index so import can find it.
+        let ef_meta = crate::protocol::sc_hsm::KeyMeta {
+            key_id: ef_key_id.0,
+            key_type: 16, // EfFile
+            algo: 0,
+            key_flags: 0,
+        };
+        let _ = state.key_index.push(ef_meta);
 
         // Case-1 IMPORT KEY (no inline data) — standard sc-hsm-tool protocol.
         let cmd = make_cmd(0x01, P2_IMPORT, &[]);
-        let mut store = NullStore;
         let resp = handle(&mut state, &mut store, &cmd);
 
         assert_eq!(resp.sw, SW_OK, "EF 0x2F10 path should succeed");
-        // EF 0x2F10 must be cleared after import.
+        // EF 0x2F10 must be cleared from ef_cache after import.
         assert!(
-            state.ef_files.iter().find(|e| e.file_id == 0x2F10).is_none(),
-            "EF 0x2F10 should be cleared after import"
+            state.ef_cache_get(ef_key_id.0).is_none(),
+            "EF 0x2F10 should be cleared from ef_cache after import"
         );
-        // Key must be in the in-memory store.
-        let found = state.keys.iter().find(|k| k.key_id == KeyId::sc_hsm(0, 0x01).0);
-        assert!(found.is_some(), "imported key should be in memory");
+        // Key metadata must be in the key_index.
+        let found = state.key_index.iter().find(|m| m.key_id == KeyId::sc_hsm(0, 0x01).0);
+        assert!(found.is_some(), "imported key should be in key_index");
         assert_eq!(found.unwrap().algo, 0x13);
-        assert_eq!(&found.unwrap().private_key[..], &private_key[..]);
     }
 }

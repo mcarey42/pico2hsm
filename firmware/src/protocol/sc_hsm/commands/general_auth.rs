@@ -18,6 +18,7 @@ use pico2hsm_core::apdu::{
 };
 
 use crate::protocol::sc_hsm::{FwRng, ScHsmState};
+use crate::storage::KeyStore;
 
 /// INS byte for GENERAL AUTHENTICATE.
 pub const INS_GENERAL_AUTH: u8 = 0x86;
@@ -60,8 +61,20 @@ fn encode_tlv(
     Some(())
 }
 
+/// Map the stored keygen algorithm byte to the core `KeyType` for EC keys.
+fn meta_algo_to_ec_key_type(algo: u8) -> Option<pico2hsm_core::key::KeyType> {
+    use pico2hsm_core::key::KeyType;
+    match algo {
+        0x13 | 0x23 => Some(KeyType::EcPrivateP256),
+        0x15 | 0x25 => Some(KeyType::EcPrivateP384),
+        0x17 | 0x27 => Some(KeyType::EcPrivateP521),
+        0x19 | 0x29 => Some(KeyType::EcPrivateK256),
+        _ => None,
+    }
+}
+
 /// Handle a GENERAL AUTHENTICATE APDU command.
-pub fn handle(state: &mut ScHsmState, cmd: &ApduCommand<'_>) -> ApduResponse {
+pub fn handle(state: &mut ScHsmState, store: &mut dyn KeyStore, cmd: &ApduCommand<'_>) -> ApduResponse {
     // Require PIN authentication.
     if !state.pin_verified && !state.so_pin_verified {
         return ApduResponse::err(SW_SECURITY_STATUS);
@@ -85,18 +98,29 @@ pub fn handle(state: &mut ScHsmState, cmd: &ApduCommand<'_>) -> ApduResponse {
         None => return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
     };
 
-    // Look up the EC key in the in-memory store.
+    // Check metadata index for the key.
     let full_key_id = pico2hsm_core::key::KeyId::sc_hsm(0, key_id_proto).0;
-    let key = match state.keys.iter().find(|k| k.key_id == full_key_id) {
-        Some(k) => k,
+    let meta = match state.key_index.iter().find(|m| m.key_id == full_key_id) {
+        Some(m) => *m,
         None => return ApduResponse::err(SW_FILE_NOT_FOUND),
     };
 
-    // Copy key data to local stack buffers to release the borrow on `state`.
-    let key_type = key.key_type;
-    let priv_len = key.private_key.len();
+    // Resolve the core KeyType from the stored keygen algorithm byte.
+    let key_type = match meta_algo_to_ec_key_type(meta.algo) {
+        Some(kt) => kt,
+        None => return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
+    };
+
+    // Load key material from flash.
+    let key_obj = match store.fetch_key(pico2hsm_core::key::KeyId(full_key_id)) {
+        Ok(Some(obj)) => obj,
+        _ => return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
+    };
+
+    // Copy key data to local stack buffers.
+    let priv_len = key_obj.private_key.len();
     let mut priv_buf = [0u8; 66];
-    priv_buf[..priv_len].copy_from_slice(&key.private_key);
+    priv_buf[..priv_len].copy_from_slice(&key_obj.private_key);
 
     // Hash the challenge with SHA-256 before signing.
     let hash = sha2::Sha256::digest(challenge);
@@ -130,12 +154,48 @@ mod tests {
     use super::*;
     use pico2hsm_core::{
         apdu::{SW_CONDITIONS_NOT_SATISFIED, SW_FILE_NOT_FOUND, SW_OK, SW_SECURITY_STATUS, SW_WRONG_DATA},
-        key::KeyType,
+        key::{AppletId, KeyId, KeyType},
     };
     use rand_core::RngCore;
 
     use crate::crypto::asymmetric::generate_ec_keypair;
-    use crate::protocol::sc_hsm::{InMemoryKey, ScHsmState};
+    use crate::protocol::sc_hsm::{KeyMeta, ScHsmState};
+    use crate::security::key_management::{AlgorithmId, KeyObject, KeyType as KmType};
+
+    /// Test key store that holds a single KeyObject and returns it on fetch_key.
+    struct TestStore {
+        obj: Option<KeyObject>,
+    }
+
+    impl TestStore {
+        fn new(obj: KeyObject) -> Self {
+            Self { obj: Some(obj) }
+        }
+        fn empty() -> Self {
+            Self { obj: None }
+        }
+    }
+
+    impl crate::storage::KeyStore for TestStore {
+        fn save_key(&mut self, _: &KeyObject) -> Result<(), pico2hsm_core::error::HsmError> { Ok(()) }
+        fn fetch_key(&mut self, key_id: KeyId) -> Result<Option<KeyObject>, pico2hsm_core::error::HsmError> {
+            if let Some(ref obj) = self.obj {
+                if obj.key_id == key_id.0 {
+                    let mut clone = KeyObject::new(obj.key_type, obj.key_id, obj.owner, obj.algorithm);
+                    clone.key_flags = obj.key_flags;
+                    let _ = clone.private_key.extend_from_slice(&obj.private_key);
+                    let _ = clone.public_key.extend_from_slice(&obj.public_key);
+                    return Ok(Some(clone));
+                }
+            }
+            Ok(None)
+        }
+        fn erase_key(&mut self, _: KeyId) -> Result<(), pico2hsm_core::error::HsmError> { Ok(()) }
+        fn wipe_all(&mut self) -> Result<(), pico2hsm_core::error::HsmError> { Ok(()) }
+        fn wipe_by_owner(&mut self, _: AppletId) -> Result<(), pico2hsm_core::error::HsmError> { Ok(()) }
+        fn enumerate_keys(&self) -> heapless::Vec<KeyId, 64> { heapless::Vec::new() }
+        fn for_each_key(&self, _f: &mut dyn FnMut(KeyId)) {}
+    }
 
     /// Simple counter-hash PRNG adequate for tests (no hardware TRNG needed).
     struct CounterRng(u64);
@@ -198,10 +258,11 @@ mod tests {
     fn test_general_auth_requires_auth() {
         // No pin_verified and no so_pin_verified → SW_SECURITY_STATUS.
         let mut state = ScHsmState::new();
+        let mut store = TestStore::empty();
         let dat = make_7c_challenge(&[0xAA; 16]);
         let raw = make_apdu(&dat);
         let cmd = ApduCommand::parse(&raw).unwrap();
-        let resp = handle(&mut state, &cmd);
+        let resp = handle(&mut state, &mut store, &cmd);
         assert_eq!(resp.sw, SW_SECURITY_STATUS);
     }
 
@@ -209,12 +270,13 @@ mod tests {
     fn test_general_auth_no_7c_tag() {
         // Data that does not contain a 0x7C outer tag → SW_WRONG_DATA.
         let mut state = ScHsmState::new();
+        let mut store = TestStore::empty();
         state.pin_verified = true;
         // Send garbage data with no 0x7C tag.
         let garbage = [0xDE, 0x04, 0xBE, 0xEF, 0xCA, 0xFE];
         let raw = make_apdu(&garbage);
         let cmd = ApduCommand::parse(&raw).unwrap();
-        let resp = handle(&mut state, &cmd);
+        let resp = handle(&mut state, &mut store, &cmd);
         assert_eq!(resp.sw, SW_WRONG_DATA);
     }
 
@@ -222,6 +284,7 @@ mod tests {
     fn test_general_auth_no_81_tag() {
         // 7C tag present but inner 0x81 tag is missing → SW_WRONG_DATA.
         let mut state = ScHsmState::new();
+        let mut store = TestStore::empty();
         state.pin_verified = true;
         // 7C wrapping tag 0x82 (wrong inner tag).
         let inner = [0x82u8, 0x04, 0x01, 0x02, 0x03, 0x04];
@@ -231,7 +294,7 @@ mod tests {
         let _ = dat.extend_from_slice(&inner);
         let raw = make_apdu(&dat);
         let cmd = ApduCommand::parse(&raw).unwrap();
-        let resp = handle(&mut state, &cmd);
+        let resp = handle(&mut state, &mut store, &cmd);
         assert_eq!(resp.sw, SW_WRONG_DATA);
     }
 
@@ -239,32 +302,34 @@ mod tests {
     fn test_general_auth_no_mse_key() {
         // Valid 7C(81(challenge)) but no MSE-selected key → SW_CONDITIONS_NOT_SATISFIED.
         let mut state = ScHsmState::new();
+        let mut store = TestStore::empty();
         state.pin_verified = true;
         // current_key_id is None by default.
         let dat = make_7c_challenge(&[0xBB; 32]);
         let raw = make_apdu(&dat);
         let cmd = ApduCommand::parse(&raw).unwrap();
-        let resp = handle(&mut state, &cmd);
+        let resp = handle(&mut state, &mut store, &cmd);
         assert_eq!(resp.sw, SW_CONDITIONS_NOT_SATISFIED);
     }
 
     #[test]
     fn test_general_auth_key_not_found() {
-        // current_key_id set but no matching key in state.keys → SW_FILE_NOT_FOUND.
+        // current_key_id set but no matching key in key_index → SW_FILE_NOT_FOUND.
         let mut state = ScHsmState::new();
+        let mut store = TestStore::empty();
         state.pin_verified = true;
         state.current_key_id = Some(0x01);
         // No keys added.
         let dat = make_7c_challenge(&[0xCC; 32]);
         let raw = make_apdu(&dat);
         let cmd = ApduCommand::parse(&raw).unwrap();
-        let resp = handle(&mut state, &cmd);
+        let resp = handle(&mut state, &mut store, &cmd);
         assert_eq!(resp.sw, SW_FILE_NOT_FOUND);
     }
 
     #[test]
     fn test_general_auth_success() {
-        // Full happy-path: P-256 key in state, valid 7C(81) challenge → SW_OK,
+        // Full happy-path: P-256 key, valid 7C(81) challenge → SW_OK,
         // response starts with 0x7C.
         let mut rng = CounterRng(42);
         let kp = generate_ec_keypair(KeyType::EcPrivateP256, &mut rng)
@@ -275,21 +340,23 @@ mod tests {
         state.current_key_id = Some(0x01);
         state.current_algo = Some(0x13); // ECDSA-P256
 
-        let key = InMemoryKey {
-            key_id: pico2hsm_core::key::KeyId::sc_hsm(0, 0x01).0,
-            key_type: KeyType::EcPrivateP256,
-            algo: 0x13,
-            key_flags: 0,
-            private_key: kp.private_key.clone(),
-            public_key: kp.public_key.clone(),
-        };
-        assert!(state.keys.push(key).is_ok());
+        let full_key_id = pico2hsm_core::key::KeyId::sc_hsm(0, 0x01).0;
+
+        // Push metadata into key_index
+        let meta = KeyMeta { key_id: full_key_id, key_type: 0, algo: 0x13, key_flags: 0 };
+        state.key_index.push(meta).unwrap();
+
+        // Create KeyObject with the generated key
+        let mut key_obj = KeyObject::new(KmType::Ec, full_key_id, AppletId::ScHsm, AlgorithmId::EcdsaP256);
+        let _ = key_obj.private_key.extend_from_slice(&kp.private_key);
+        let _ = key_obj.public_key.extend_from_slice(&kp.public_key);
+        let mut store = TestStore::new(key_obj);
 
         let challenge = [0x42u8; 32];
         let dat = make_7c_challenge(&challenge);
         let raw = make_apdu(&dat);
         let cmd = ApduCommand::parse(&raw).unwrap();
-        let resp = handle(&mut state, &cmd);
+        let resp = handle(&mut state, &mut store, &cmd);
 
         assert_eq!(resp.sw, SW_OK);
         assert!(!resp.data.is_empty());

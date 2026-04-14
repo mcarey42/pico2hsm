@@ -25,9 +25,21 @@ use pico2hsm_core::{
 };
 
 use crate::protocol::sc_hsm::ScHsmState;
+use crate::storage::KeyStore;
 
 /// INS byte for DECIPHER.
 pub const INS_DECRYPT: u8 = 0x62;
+
+/// Map the stored keygen algorithm byte to the core `KeyType` for EC keys.
+fn meta_algo_to_ec_key_type(algo: u8) -> Option<KeyType> {
+    match algo {
+        0x13 | 0x23 => Some(KeyType::EcPrivateP256),
+        0x15 | 0x25 => Some(KeyType::EcPrivateP384),
+        0x17 | 0x27 => Some(KeyType::EcPrivateP521),
+        0x19 | 0x29 => Some(KeyType::EcPrivateK256),
+        _ => None,
+    }
+}
 
 /// Map an explicit ECDH AlgorithmId byte to the expected `KeyType`.
 ///
@@ -56,7 +68,7 @@ fn is_ec_private(kt: KeyType) -> bool {
 }
 
 /// Handle a DECIPHER APDU command.
-pub fn handle(state: &mut ScHsmState, cmd: &ApduCommand<'_>) -> ApduResponse {
+pub fn handle(state: &mut ScHsmState, store: &mut dyn KeyStore, cmd: &ApduCommand<'_>) -> ApduResponse {
     // Require PIN authentication
     if !state.pin_verified {
         return ApduResponse::err(SW_SECURITY_STATUS);
@@ -82,15 +94,22 @@ pub fn handle(state: &mut ScHsmState, cmd: &ApduCommand<'_>) -> ApduResponse {
         0x21 | 0x22 => {
             use crate::crypto::asymmetric::rsa_private_raw;
 
-            let rsa_key = match state.rsa_keys.iter().find(|k| k.key_id == full_key_id) {
-                Some(k) => k,
+            // Check metadata index for the key
+            let _meta = match state.key_index.iter().find(|m| m.key_id == full_key_id) {
+                Some(m) => *m,
                 None => return ApduResponse::err(SW_FILE_NOT_FOUND),
+            };
+
+            // Load key material from flash
+            let key_obj = match store.fetch_key(pico2hsm_core::key::KeyId(full_key_id)) {
+                Ok(Some(obj)) => obj,
+                _ => return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
             };
 
             // RSA-2048 PKCS#1 DER is ≤1200 bytes; RSA-4096 is ≤2400 bytes.
             let mut der_buf = [0u8; 2400];
-            let der_len = rsa_key.private_key_der.len();
-            der_buf[..der_len].copy_from_slice(&rsa_key.private_key_der);
+            let der_len = key_obj.private_key.len();
+            der_buf[..der_len].copy_from_slice(&key_obj.private_key);
 
             // Raw RSA: result = ciphertext^d mod n. OpenSC handles all unpadding.
             return match rsa_private_raw(&der_buf[..der_len], cmd.data) {
@@ -102,10 +121,16 @@ pub fn handle(state: &mut ScHsmState, cmd: &ApduCommand<'_>) -> ApduResponse {
     }
 
     // ---- ECDH path — EC key lookup ------------------------------------------
-    // Look up the EC key. RSA keys (handled above) never reach here.
-    let key = match state.keys.iter().find(|k| k.key_id == full_key_id) {
-        Some(k) => k,
+    // Check metadata index for the EC key. RSA keys (handled above) never reach here.
+    let meta = match state.key_index.iter().find(|m| m.key_id == full_key_id) {
+        Some(m) => *m,
         None => return ApduResponse::err(SW_FILE_NOT_FOUND),
+    };
+
+    // Resolve the core KeyType from meta.algo (set at keygen time).
+    let stored_key_type = match meta_algo_to_ec_key_type(meta.algo) {
+        Some(kt) => kt,
+        None => return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
     };
 
     // ---- ECDH path ----------------------------------------------------------
@@ -113,15 +138,15 @@ pub fn handle(state: &mut ScHsmState, cmd: &ApduCommand<'_>) -> ApduResponse {
     // - If the algo byte maps to an explicit ECDH algorithm (0x23/0x25/0x27/0x29),
     //   validate it matches the stored key.
     // - If the algo byte is 0x80 (OpenSC's ALGO_EC_DH), infer the key type from
-    //   the stored key record directly.
+    //   the stored key metadata directly.
     // - Anything else is unsupported.
     let key_type = if let Some(expected) = algo_to_key_type(algo) {
-        if key.key_type != expected {
+        if stored_key_type != expected {
             return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED);
         }
         expected
-    } else if algo == 0x80 && is_ec_private(key.key_type) {
-        key.key_type
+    } else if algo == 0x80 && is_ec_private(stored_key_type) {
+        stored_key_type
     } else {
         return ApduResponse::err(SW_INS_NOT_SUPPORTED);
     };
@@ -132,9 +157,15 @@ pub fn handle(state: &mut ScHsmState, cmd: &ApduCommand<'_>) -> ApduResponse {
     // Explicit ECDH algo codes (0x23/0x25/0x27/0x29) are returned as raw bytes.
     let needs_04_prefix = algo == 0x80;
 
+    // Load key material from flash
+    let key_obj = match store.fetch_key(pico2hsm_core::key::KeyId(full_key_id)) {
+        Ok(Some(obj)) => obj,
+        _ => return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
+    };
+
     let mut priv_buf = [0u8; 66];
-    let priv_len = key.private_key.len();
-    priv_buf[..priv_len].copy_from_slice(&key.private_key);
+    let priv_len = key_obj.private_key.len();
+    priv_buf[..priv_len].copy_from_slice(&key_obj.private_key);
 
     let shared = match crate::crypto::asymmetric::ecdh_agree(
         key_type,

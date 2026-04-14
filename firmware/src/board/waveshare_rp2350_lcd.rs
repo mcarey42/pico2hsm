@@ -51,7 +51,7 @@
 //! ```text
 //! SWRESET  (01h)  software reset — 150 ms delay
 //! SLPOUT   (11h)  sleep out     — 255 ms delay
-//! COLMOD   (3Ah)  colour format — 0x05 = 16-bit RGB565
+//! COLMOD   (3Ah)  colour format — 0x03 = 12-bit RGB444
 //! MADCTL   (36h)  memory access — 0xA0 (MY+MV, landscape 180°-corrected)
 //! INVON    (21h)  inversion on  (required for correct colours on V3 panel)
 //! NORON    (13h)  normal display mode on
@@ -73,13 +73,13 @@
 //! 180°.  MADCTL=0xA0 (MY+MV) is 180° opposite and produces the correct image.
 //!
 //! ## Colour encoding
-//! RGB565: 5 bits red (bits 15–11), 6 bits green (bits 10–5), 5 bits blue (bits 4–0).
-//! The display expects big-endian byte order (MSB first) over SPI.
+//! RGB444: 4 bits per channel, packed 2 pixels into 3 bytes (ST7789 Interface II).
+//! The `DrawTarget` impl converts from Rgb565 internally.
 //!
 //! ## Flood-fill pixel write
 //! After `CASET`/`RASET` the host enters write mode with `RAMWR (2Ch)`.
-//! Each pixel is two bytes (big-endian u16). A full fill is 172 × 320 = 55 040 pixels
-//! = 110 080 bytes.  Sent in 128-byte chunks to avoid large stack allocations.
+//! Each pixel pair is 3 bytes (RGB444).  A full fill is 172 × 320 = 55 040 pixels
+//! = 82 560 bytes.  Sent in chunks to avoid large stack allocations.
 //!
 //! # WS2812B LED
 //!
@@ -239,7 +239,7 @@ pub const CMD_RAMWR: u8 = 0x2C;
 pub const CMD_DISPON: u8 = 0x29;
 /// Memory data access control — controls scan direction and colour order.
 pub const CMD_MADCTL: u8 = 0x36;
-/// Interface pixel format — 0x05 = 16-bit/pixel (RGB565).
+/// Interface pixel format — 0x03 = 12-bit/pixel (RGB444).
 pub const CMD_COLMOD: u8 = 0x3A;
 
 // ─── RGB565 status colours ────────────────────────────────────────────────────
@@ -352,14 +352,23 @@ impl LedController for St7789V3StatusDisplay {
 const FB_W: usize = 320;
 const FB_H: usize = 172;
 
-/// 320×172 RGB565 framebuffer — 2 bytes per pixel, row-major, big-endian.
+/// 320×172 RGB444 framebuffer — 3 bytes per 2 pixels (packed), row-major.
+///
+/// Two pixels are packed into 3 bytes (ST7789 "Interface II" RGB444):
+///   Byte 0: [R1₃R1₂R1₁R1₀ | G1₃G1₂G1₁G1₀]
+///   Byte 1: [B1₃B1₂B1₁B1₀ | R2₃R2₂R2₁R2₀]
+///   Byte 2: [G2₃G2₂G2₁G2₀ | B2₃B2₂B2₁B2₀]
+///
+/// 320×172 = 55 040 pixels → 82 560 bytes (saves ~28 KB vs RGB565's 110 080).
+/// Both dimensions are even, so rows always end on a pixel-pair boundary.
+///
 /// Owned exclusively by `flush_display()` and the `DrawTarget` impl.
 ///
 /// # Safety
 /// `FRAMEBUF` is only ever accessed from core0 display code.  No other task
 /// or core touches this buffer, so there is no concurrent mutation.
 #[cfg(target_arch = "arm")]
-static mut FRAMEBUF: [u8; FB_W * FB_H * 2] = [0u8; FB_W * FB_H * 2];
+static mut FRAMEBUF: [u8; FB_W * FB_H * 3 / 2] = [0u8; FB_W * FB_H * 3 / 2];
 
 #[cfg(target_arch = "arm")]
 use embedded_graphics::{
@@ -369,6 +378,37 @@ use embedded_graphics::{
     primitives::Rectangle,
     Pixel,
 };
+
+// ─── RGB444 packing helpers ─────────────────────────────────────────────────
+
+/// Extract 4-bit R, G, B components from an RGB565 raw u16.
+#[cfg(target_arch = "arm")]
+#[inline(always)]
+fn rgb565_to_rgb444(color: Rgb565) -> (u8, u8, u8) {
+    let raw: u16 = RawU16::from(color).into_inner();
+    let r = ((raw >> 12) & 0x0F) as u8;
+    let g = ((raw >> 7) & 0x0F) as u8;
+    let b = ((raw >> 1) & 0x0F) as u8;
+    (r, g, b)
+}
+
+/// Pack one pixel's RGB444 components into the framebuffer at `linear_idx`.
+///
+/// Two pixels share 3 bytes (ST7789 Interface II):
+///   Even pixel (i%2==0): byte[base]   = R1G1, byte[base+1] upper nibble = B1
+///   Odd pixel  (i%2==1): byte[base+1] lower nibble = R2, byte[base+2] = G2B2
+#[cfg(target_arch = "arm")]
+#[inline(always)]
+fn pack_pixel_444(fb: &mut [u8], linear_idx: usize, r: u8, g: u8, b: u8) {
+    let base = linear_idx / 2 * 3;
+    if linear_idx % 2 == 0 {
+        fb[base] = (r << 4) | g;
+        fb[base + 1] = (fb[base + 1] & 0x0F) | (b << 4);
+    } else {
+        fb[base + 1] = (fb[base + 1] & 0xF0) | r;
+        fb[base + 2] = (g << 4) | b;
+    }
+}
 
 #[cfg(target_arch = "arm")]
 impl OriginDimensions for St7789V3StatusDisplay {
@@ -396,10 +436,9 @@ impl DrawTarget for St7789V3StatusDisplay {
             {
                 continue;
             }
-            let raw: u16 = RawU16::from(color).into_inner();
-            let idx = (coord.y as usize * FB_W + coord.x as usize) * 2;
-            fb[idx]     = (raw >> 8) as u8;
-            fb[idx + 1] = (raw & 0xFF) as u8;
+            let (r, g, b) = rgb565_to_rgb444(color);
+            let linear = coord.y as usize * FB_W + coord.x as usize;
+            pack_pixel_444(fb, linear, r, g, b);
         }
         Ok(())
     }
@@ -422,10 +461,9 @@ impl DrawTarget for St7789V3StatusDisplay {
         let mut row = 0usize;
         for color in colors {
             if row >= area.size.height as usize { break; }
-            let raw: u16 = RawU16::from(color).into_inner();
-            let idx = ((y0 + row) * FB_W + (x0 + col)) * 2;
-            fb[idx]     = (raw >> 8) as u8;
-            fb[idx + 1] = (raw & 0xFF) as u8;
+            let (r, g, b) = rgb565_to_rgb444(color);
+            let linear = (y0 + row) * FB_W + (x0 + col);
+            pack_pixel_444(fb, linear, r, g, b);
             col += 1;
             if col >= w { col = 0; row += 1; }
         }
@@ -439,19 +477,16 @@ impl DrawTarget for St7789V3StatusDisplay {
         if area.size.width == 0 || area.size.height == 0 {
             return Ok(());
         }
-        let raw: u16 = RawU16::from(color).into_inner();
-        let hi = (raw >> 8) as u8;
-        let lo = (raw & 0xFF) as u8;
+        let (r, g, b) = rgb565_to_rgb444(color);
         let fb = unsafe { &mut *(&raw mut FRAMEBUF) };
         let x0 = area.top_left.x as usize;
         let y0 = area.top_left.y as usize;
         let w  = area.size.width as usize;
         let h  = area.size.height as usize;
         for row in y0..(y0 + h) {
-            let base = (row * FB_W + x0) * 2;
             for col in 0..w {
-                fb[base + col * 2]     = hi;
-                fb[base + col * 2 + 1] = lo;
+                let linear = row * FB_W + (x0 + col);
+                pack_pixel_444(fb, linear, r, g, b);
             }
         }
         Ok(())
@@ -463,7 +498,7 @@ impl DrawTarget for St7789V3StatusDisplay {
 /// Blocking SPI0 type for the Waveshare RP2350-LCD-1.47-B (LCD bus).
 /// `'static` lifetime: peripherals come from `embassy_rp::init()`.
 /// SPI0 bus for the LCD — Async mode so `flush_display` / `fill_screen` use
-/// DMA and yield to the embassy executor during the 110 KB framebuffer transfer,
+/// DMA and yield to the embassy executor during the 83 KB framebuffer transfer,
 /// preventing USB starvation.  Small command writes use `spi.blocking_write()`.
 pub type WaveshareRp2350LcdSpi0 =
     embassy_rp::spi::Spi<'static, embassy_rp::peripherals::SPI0, embassy_rp::spi::Async>;
@@ -639,17 +674,17 @@ fn lcd_set_window(
     ]);
 }
 
-/// Flood-fill the entire LCD with a single RGB565 colour.
+/// Flood-fill the entire LCD with a single RGB565 colour (converted to RGB444).
 ///
 /// Sets the drawing window to the full 172×320 display, then streams
-/// `LCD_PIXEL_COUNT` × 2 bytes of pixel data in 128-byte chunks to avoid
+/// `LCD_PIXEL_COUNT * 3 / 2` bytes of pixel data in chunks to avoid
 /// large stack allocations.
 ///
 /// # Parameters
-/// - `spi`   — SPI0 bus handle (blocking, 40 MHz, mode 0).
+/// - `spi`   — SPI0 bus handle (async, 40 MHz, mode 0).
 /// - `dc`    — GPIO16 Data/Command select output.
 /// - `cs`    — GPIO17 chip-select output.
-/// - `color` — RGB565 colour value (big-endian u16: high byte first).
+/// - `color` — RGB565 colour value (converted to RGB444 internally).
 #[cfg(target_arch = "arm")]
 pub async fn fill_screen(
     spi: &mut WaveshareRp2350LcdSpi0,
@@ -666,26 +701,36 @@ pub async fn fill_screen(
     let _ = spi.blocking_write(&[CMD_RAMWR]);
     dc.set_high();
 
-    // Stream pixel data in 64-pixel (128-byte) chunks via async DMA.
-    // Each chunk yields to the executor, keeping USB serviced.
-    let hi = (color >> 8) as u8;
-    let lo = (color & 0xFF) as u8;
+    // Convert RGB565 to RGB444: extract top 4 bits of each channel.
+    let r = ((color >> 12) & 0x0F) as u8;
+    let g = ((color >> 7)  & 0x0F) as u8;
+    let b = ((color >> 1)  & 0x0F) as u8;
 
-    let mut chunk = [0u8; 128];
+    // Pack two identical pixels into 3 bytes (RGB444 Interface II):
+    //   Byte 0: R1G1, Byte 1: B1R2, Byte 2: G2B2
+    let byte0 = (r << 4) | g;
+    let byte1 = (b << 4) | r;
+    let byte2 = (g << 4) | b;
+
+    // Stream pixel data in 64-pixel-pair (192-byte) chunks via async DMA.
+    // Each chunk yields to the executor, keeping USB serviced.
+    let mut chunk = [0u8; 192]; // 64 pixel pairs × 3 bytes = 192 bytes
     for i in 0..64 {
-        chunk[i * 2] = hi;
-        chunk[i * 2 + 1] = lo;
+        chunk[i * 3]     = byte0;
+        chunk[i * 3 + 1] = byte1;
+        chunk[i * 3 + 2] = byte2;
     }
 
-    let total_pixels = LCD_PIXEL_COUNT;
-    let full_chunks = total_pixels / 64;
-    let remainder = (total_pixels % 64) as usize;
+    // Total pixel pairs = LCD_PIXEL_COUNT / 2 = 27 520
+    let total_pairs = LCD_PIXEL_COUNT / 2;
+    let full_chunks = total_pairs / 64;
+    let remainder = (total_pairs % 64) as usize;
 
     for _ in 0..full_chunks {
         let _ = spi.write(&chunk).await;
     }
     if remainder > 0 {
-        let _ = spi.write(&chunk[..remainder * 2]).await;
+        let _ = spi.write(&chunk[..remainder * 3]).await;
     }
 
     cs.set_high();
@@ -737,8 +782,8 @@ pub async fn init_lcd(
     lcd_write_cmd(spi, dc, cs, CMD_SLPOUT);
     Timer::after_millis(255).await;
 
-    // Colour format: 16-bit/pixel RGB565 (0x05).
-    lcd_cmd_data(spi, dc, cs, CMD_COLMOD, &[0x05]);
+    // Colour format: 12-bit/pixel RGB444 (0x03) — saves ~25% framebuffer SRAM.
+    lcd_cmd_data(spi, dc, cs, CMD_COLMOD, &[0x03]);
 
     // Memory access control: landscape (MY=1, MV=1 = 0xA0).
     // 180° opposite of the broken 0x60 (MX+MV), correcting the inverted image.
@@ -752,7 +797,7 @@ pub async fn init_lcd(
 
     // Clear the full controller GRAM to black to eliminate border artefacts.
     // In landscape (MV=1): CASET = physical GRAM rows 0–319, RASET = physical
-    // GRAM columns 0–239.  Total: 320 × 240 = 76 800 pixels.
+    // GRAM columns 0–239.  Total: 320 × 240 = 76 800 pixels = 115 200 bytes (RGB444).
     {
         lcd_cmd_data(spi, dc, cs, CMD_CASET, &[0x00, 0x00, 0x01, 0x3F]); // 0–319
         lcd_cmd_data(spi, dc, cs, CMD_RASET, &[0x00, 0x00, 0x00, 0xEF]); // 0–239
@@ -760,12 +805,12 @@ pub async fn init_lcd(
         dc.set_low();
         let _ = spi.blocking_write(&[CMD_RAMWR]);
         dc.set_high();
-        let chunk = [0u8; 128];
-        let total_pixels = LCD_WIDTH as u32 * CTRL_HEIGHT as u32; // 76 800
-        let full_chunks = total_pixels / 64;
-        let remainder = (total_pixels % 64) as usize;
+        let chunk = [0u8; 192]; // 64 pixel pairs × 3 bytes
+        let total_bytes: u32 = LCD_WIDTH as u32 * CTRL_HEIGHT as u32 * 3 / 2; // 115 200
+        let full_chunks = total_bytes / 192;
+        let remainder = (total_bytes % 192) as usize;
         for _ in 0..full_chunks { let _ = spi.write(&chunk).await; }
-        if remainder > 0 { let _ = spi.write(&chunk[..remainder * 2]).await; }
+        if remainder > 0 { let _ = spi.write(&chunk[..remainder]).await; }
         cs.set_high();
     }
 
@@ -788,7 +833,7 @@ pub async fn init_lcd(
 /// window), then writes the full 320×172 FRAMEBUF.
 #[cfg(target_arch = "arm")]
 /// Send the FRAMEBUF to the LCD via DMA.  The async DMA write yields to the
-/// embassy executor while the 110 KB transfer is in flight, so `usb_fut` keeps
+/// embassy executor while the 83 KB transfer is in flight, so `usb_fut` keeps
 /// running and USB does not stall.
 pub async fn flush_display(
     spi: &mut WaveshareRp2350LcdSpi0,
@@ -805,7 +850,7 @@ pub async fn flush_display(
     dc.set_high();
 
     // SAFETY: FRAMEBUF is only accessed from core0; no concurrent mutation.
-    // DMA write: yields to executor during the ~22 ms transfer.
+    // DMA write: yields to executor during the ~17 ms transfer.
     let _ = spi.write(unsafe { &*(&raw const FRAMEBUF) }).await;
 
     cs.set_high();

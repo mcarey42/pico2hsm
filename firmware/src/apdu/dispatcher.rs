@@ -26,6 +26,11 @@ use pico2hsm_core::{
     protocol::HsmProtocol,
 };
 
+use super::shared_buffer::SharedResponseBuffer;
+
+/// INS byte for GET RESPONSE (ISO 7816-4 §7.6.1).
+const INS_GET_RESPONSE: u8 = 0xC0;
+
 use crate::protocol::{
     openpgp::{OpenPgp, OPENPGP_AID_PREFIX},
     piv::{Piv, PIV_AID},
@@ -60,6 +65,8 @@ pub struct Dispatcher {
     sc_hsm: ScHsm,
     piv: Piv,
     openpgp: OpenPgp,
+    /// Shared GET RESPONSE chaining buffer — replaces per-protocol buffers.
+    shared_buf: SharedResponseBuffer,
 }
 
 impl Dispatcher {
@@ -70,6 +77,7 @@ impl Dispatcher {
             sc_hsm: ScHsm::new(),
             piv: Piv::new(),
             openpgp: OpenPgp::new(),
+            shared_buf: SharedResponseBuffer::new(),
         }
     }
 
@@ -88,24 +96,20 @@ impl Dispatcher {
         let ptr = dest.as_mut_ptr();
         unsafe {
             core::ptr::addr_of_mut!((*ptr).active).write(ActiveProtocol::None);
-            core::ptr::addr_of_mut!((*ptr).sc_hsm).write(ScHsm::new());
-            core::ptr::addr_of_mut!((*ptr).piv).write(Piv::new());
+            ScHsm::init_in_place(core::ptr::addr_of_mut!((*ptr).sc_hsm));
+            Piv::init_in_place(core::ptr::addr_of_mut!((*ptr).piv));
             core::ptr::addr_of_mut!((*ptr).openpgp).write(OpenPgp::new());
+            core::ptr::addr_of_mut!((*ptr).shared_buf).write(SharedResponseBuffer::new());
             &mut *ptr
         }
     }
 
-    /// Return the total number of in-memory keys across all applets, clamped to u8.
+    /// Return the total number of keys in the key_index, clamped to u8.
     ///
     /// Used by core1 to update the `KEY_COUNT` atomic without needing access
     /// to the flash keystore (which lives on core0).
     pub fn in_memory_key_count(&self) -> u8 {
-        let mut count = self.sc_hsm.state.keys.len();
-        #[cfg(feature = "rsa")]
-        {
-            count += self.sc_hsm.state.rsa_keys.len();
-        }
-        count.min(255) as u8
+        self.sc_hsm.state.key_index.len().min(255) as u8
     }
 
     /// Load all persisted keys from flash into the in-memory key cache.
@@ -125,7 +129,15 @@ impl Dispatcher {
         for kid in sc_hsm_ids.iter() {
             match store.fetch_key(*kid) {
                 Ok(Some(obj)) => {
-                    push_key_object_to_state(&mut self.sc_hsm.state, obj);
+                    // EF files (Generic/AesGcm stored via WRITE DATA) are
+                    // identified by having file_id_hi in bits 15-8 of the
+                    // key_id — normal SC-HSM keys have bits 15-8 = 0.
+                    let is_ef = (kid.0 >> 8) & 0xFF != 0;
+                    if is_ef {
+                        push_ef_to_state(&mut self.sc_hsm.state, &obj);
+                    } else {
+                        push_key_object_to_state(&mut self.sc_hsm.state, obj);
+                    }
                     loaded += 1;
                 }
                 Ok(None) => {}
@@ -150,9 +162,8 @@ impl Dispatcher {
 
     /// Dispatch a raw APDU byte slice with access to persistent storage.
     ///
-    /// For key-mutating commands (INITIALIZE, GENERATE KEY PAIR, DELETE FILE)
-    /// routes through the storage-aware path.  All other commands (and all
-    /// non-ScHsm APDUs) fall through to the stateless `dispatch()`.
+    /// Centralizes GET RESPONSE (INS=0xC0) interception and Le-truncation
+    /// chaining in the Dispatcher, so protocols just return full responses.
     pub fn dispatch_with_store(
         &mut self,
         raw_apdu: &[u8],
@@ -171,35 +182,44 @@ impl Dispatcher {
 
         // Intercept SELECT by AID before forwarding.
         if cmd.ins == INS_SELECT && cmd.p1 == P1_SELECT_BY_AID {
+            self.shared_buf.invalidate();
             let resp = self.select_aid(cmd.data);
             return resp.serialize();
         }
 
+        // Intercept GET RESPONSE — serve from shared_buf, not protocols.
+        if cmd.ins == INS_GET_RESPONSE {
+            let resp = self.handle_get_response(cmd.le);
+            return resp.serialize();
+        }
+
+        // Clear stale chaining data before routing to protocol.
+        self.shared_buf.clear_if_not_get_response();
+
         // Route all active protocols through the storage-aware path.
         crate::CORE1_PROGRESS.store(20, core::sync::atomic::Ordering::Relaxed);
-        let mut out: Vec<u8, 4098> = Vec::new();
-        {
-            let raw_resp: Vec<u8, 4096> = match self.active {
-                ActiveProtocol::ScHsm => self.sc_hsm.process_apdu_with_store(raw_apdu, store),
-                ActiveProtocol::Piv => self.piv.process_apdu_with_store(raw_apdu, store),
-                ActiveProtocol::OpenPgp => self.openpgp.process_apdu_with_store(raw_apdu, store),
-                ActiveProtocol::None => {
-                    return pico2hsm_core::apdu::ApduResponse::err(
-                        pico2hsm_core::apdu::SW_INS_NOT_SUPPORTED,
-                    )
-                    .serialize()
-                }
-            };
-            let _ = out.extend_from_slice(&raw_resp);
-            // raw_resp (4096 bytes on stack) is dropped here, before `out` is returned.
-        }
-        out
+        let resp = match self.active {
+            ActiveProtocol::ScHsm => self.sc_hsm.process_apdu_with_store(raw_apdu, store),
+            ActiveProtocol::Piv => self.piv.process_apdu_with_store(raw_apdu, store),
+            ActiveProtocol::OpenPgp => self.openpgp.process_apdu_with_store(raw_apdu, store),
+            ActiveProtocol::None => {
+                return pico2hsm_core::apdu::ApduResponse::err(
+                    pico2hsm_core::apdu::SW_INS_NOT_SUPPORTED,
+                )
+                .serialize()
+            }
+        };
+
+        // Apply Le-truncation with GET RESPONSE chaining.
+        self.apply_le_truncation(resp, cmd.le)
     }
 
     /// Dispatch a raw APDU byte slice.
     ///
     /// Handles SELECT AID (INS=0xA4, P1=0x04) by switching the active
-    /// protocol. All other commands are forwarded to the active protocol.
+    /// protocol. GET RESPONSE (INS=0xC0) is intercepted and served from
+    /// the shared buffer. All other commands are forwarded to the active
+    /// protocol with Le-truncation applied afterward.
     ///
     /// Returns the serialized response bytes (data + SW1 + SW2).
     pub fn dispatch(&mut self, raw_apdu: &[u8]) -> Vec<u8, 4098> {
@@ -211,27 +231,117 @@ impl Dispatcher {
 
         // Intercept SELECT by AID before forwarding to the active protocol.
         if cmd.ins == INS_SELECT && cmd.p1 == P1_SELECT_BY_AID {
+            self.shared_buf.invalidate();
             let resp = self.select_aid(cmd.data);
             return resp.serialize();
         }
 
-        // Forward to the active protocol, then widen into the 4098-byte output.
-        // The intermediate Vec<u8, 4096> is scoped so it is dropped before return,
-        // allowing the compiler to reclaim its stack slot.
-        let mut out: Vec<u8, 4098> = Vec::new();
-        {
-            let raw_resp: Vec<u8, 4096> = match self.active {
-                ActiveProtocol::ScHsm => self.sc_hsm.process_apdu(raw_apdu),
-                ActiveProtocol::Piv => self.piv.process_apdu(raw_apdu),
-                ActiveProtocol::OpenPgp => self.openpgp.process_apdu(raw_apdu),
-                ActiveProtocol::None => {
-                    // No AID selected yet — return INS not supported
-                    return ApduResponse::err(SW_INS_NOT_SUPPORTED).serialize();
-                }
-            };
-            let _ = out.extend_from_slice(&raw_resp);
-            // raw_resp (4096 bytes on stack) is dropped here, before `out` is returned.
+        // Intercept GET RESPONSE — serve from shared_buf.
+        if cmd.ins == INS_GET_RESPONSE {
+            let resp = self.handle_get_response(cmd.le);
+            return resp.serialize();
         }
+
+        // Clear stale chaining data before routing to protocol.
+        self.shared_buf.clear_if_not_get_response();
+
+        // Forward to the active protocol.
+        let raw_resp: Vec<u8, 4096> = match self.active {
+            ActiveProtocol::ScHsm => self.sc_hsm.process_apdu(raw_apdu),
+            ActiveProtocol::Piv => self.piv.process_apdu(raw_apdu),
+            ActiveProtocol::OpenPgp => self.openpgp.process_apdu(raw_apdu),
+            ActiveProtocol::None => {
+                // No AID selected yet — return INS not supported
+                return ApduResponse::err(SW_INS_NOT_SUPPORTED).serialize();
+            }
+        };
+
+        // Apply Le-truncation with GET RESPONSE chaining.
+        self.apply_le_truncation(raw_resp, cmd.le)
+    }
+
+    /// Handle GET RESPONSE (INS=0xC0): serve the next chunk from `shared_buf`.
+    fn handle_get_response(&mut self, le: Option<u16>) -> ApduResponse {
+        let max_len = match le {
+            None => 4096, // no Le — return all remaining
+            Some(0) => 256, // short APDU Le=0x00 → 256
+            Some(n) => n as usize,
+        };
+        match self.shared_buf.get_response_chunk(max_len) {
+            Some((chunk, more)) => {
+                let mut resp = ApduResponse::ok(chunk);
+                if more {
+                    let remaining = self.shared_buf.len.saturating_sub(self.shared_buf.offset);
+                    let xx = remaining.min(0xFF) as u8;
+                    resp.sw = 0x6100 | (xx as u16);
+                }
+                resp
+            }
+            None => {
+                // Nothing pending — return empty 9000 per ISO spec.
+                ApduResponse::ok(&[])
+            }
+        }
+    }
+
+    /// Apply Le-truncation to a serialized protocol response.
+    ///
+    /// If the response data exceeds Le, the overflow is stored in `shared_buf`
+    /// and the truncated response is returned with SW=0x61xx.
+    ///
+    /// `raw_resp` is the serialized response from the protocol (data + SW1 + SW2).
+    fn apply_le_truncation(&mut self, raw_resp: Vec<u8, 4096>, le: Option<u16>) -> Vec<u8, 4098> {
+        // Deserialize: last 2 bytes are SW, rest is data.
+        if raw_resp.len() < 2 {
+            let mut out: Vec<u8, 4098> = Vec::new();
+            let _ = out.extend_from_slice(&raw_resp);
+            return out;
+        }
+        let data_len = raw_resp.len() - 2;
+        let sw = ((raw_resp[data_len] as u16) << 8) | (raw_resp[data_len + 1] as u16);
+
+        // Only truncate successful responses (SW=9000).
+        if sw != SW_OK {
+            let mut out: Vec<u8, 4098> = Vec::new();
+            let _ = out.extend_from_slice(&raw_resp);
+            return out;
+        }
+
+        let le_val = match le {
+            None => {
+                // No Le — no truncation.
+                let mut out: Vec<u8, 4098> = Vec::new();
+                let _ = out.extend_from_slice(&raw_resp);
+                return out;
+            }
+            Some(0) => {
+                // Extended APDUs: Le=0x0000 stored as 0, meaning 65536 — don't truncate.
+                // Short APDUs: Le=0x00 is pre-resolved to 256 by parser.
+                // If we get 0 here it's from extended APDU → return all.
+                let mut out: Vec<u8, 4098> = Vec::new();
+                let _ = out.extend_from_slice(&raw_resp);
+                return out;
+            }
+            Some(n) => n as usize,
+        };
+
+        if data_len <= le_val {
+            // Response fits — no truncation needed.
+            let mut out: Vec<u8, 4098> = Vec::new();
+            let _ = out.extend_from_slice(&raw_resp);
+            return out;
+        }
+
+        // Store overflow in shared_buf, return first le_val bytes + SW=0x61xx.
+        self.shared_buf.store_response(&raw_resp[le_val..data_len]);
+        let remaining = data_len - le_val;
+        let xx = remaining.min(0xFF) as u8;
+        let sw_chained = 0x6100 | (xx as u16);
+
+        let mut out: Vec<u8, 4098> = Vec::new();
+        let _ = out.extend_from_slice(&raw_resp[..le_val]);
+        let _ = out.push((sw_chained >> 8) as u8);
+        let _ = out.push((sw_chained & 0xFF) as u8);
         out
     }
 
@@ -306,105 +416,56 @@ fn km_algo_to_core_key_type(
     }
 }
 
-/// Convert a `KeyObject` (security layer) to an `InMemoryKey` (protocol layer)
-/// and push it into `ScHsmState`, honouring the slot limits.
-///
-/// RSA keys are partially reconstructed: the PKCS#1 DER is placed back in
-/// `RsaInMemoryKey.private_key_der`, and the modulus / exponent are extracted
-/// from the stored `public_key` blob (layout: `[2 BE mod_len] || modulus || exponent`).
+/// Convert a `KeyObject` (security layer) to a `KeyMeta` entry and push it
+/// into `ScHsmState.key_index`. Key material stays in flash; only lightweight
+/// metadata is kept in RAM.
 fn push_key_object_to_state(
     state: &mut crate::protocol::sc_hsm::ScHsmState,
     obj: crate::security::key_management::KeyObject,
 ) {
-    use crate::security::key_management::KeyType as KmKeyType;
-    use crate::protocol::sc_hsm::{InMemoryKey, MAX_IN_MEMORY_KEYS};
-
-    let is_rsa = matches!(obj.key_type, KmKeyType::Rsa);
-
-    #[cfg(feature = "rsa")]
-    if is_rsa {
-        use pico2hsm_core::key::KeyType as CoreKeyType;
-        use crate::protocol::sc_hsm::{RsaInMemoryKey, MAX_RSA_IN_MEMORY_KEYS};
-        if state.rsa_keys.len() >= MAX_RSA_IN_MEMORY_KEYS {
-            #[cfg(target_arch = "arm")]
-            defmt::warn!("MAX_RSA_IN_MEMORY_KEYS reached, key {} not loaded", obj.key_id);
-            return;
-        }
-
-        // Reconstruct modulus and exponent from the stored public_key blob.
-        // Layout written by generate_keypair: [2-byte mod_len BE] || modulus || exponent
-        let (modulus_bytes, exponent_bytes) = if obj.public_key.len() >= 2 {
-            let mod_len = ((obj.public_key[0] as usize) << 8) | (obj.public_key[1] as usize);
-            let rest = &obj.public_key[2..];
-            if rest.len() >= mod_len {
-                (&rest[..mod_len], &rest[mod_len..])
-            } else {
-                #[cfg(target_arch = "arm")]
-                defmt::warn!("RSA key {} public_key blob malformed, skipping", obj.key_id);
-                return;
-            }
-        } else {
-            #[cfg(target_arch = "arm")]
-            defmt::warn!("RSA key {} missing public_key blob, skipping", obj.key_id);
-            return;
-        };
-
-        // Infer RSA key size from modulus length rather than algorithm ID.
-        // AlgorithmId represents operations (e.g. RsaPkcs1Sha256), not key sizes,
-        // so km_algo_to_core_key_type cannot distinguish RSA-2048/3072/4096.
-        let core_key_type = match modulus_bytes.len() {
-            256 => CoreKeyType::RsaPrivate2048,
-            384 => CoreKeyType::RsaPrivate3072,
-            512 => CoreKeyType::RsaPrivate4096,
-            _ => {
-                #[cfg(target_arch = "arm")]
-                defmt::warn!("RSA key {} unknown modulus size {}, skipping", obj.key_id, modulus_bytes.len());
-                return;
-            }
-        };
-        let algo = obj.algorithm as u8;
-
-        let mut entry = RsaInMemoryKey {
-            key_id: obj.key_id,
-            key_type: core_key_type,
-            algo,
-            key_flags: obj.key_flags,
-            private_key_der: heapless::Vec::new(),
-            modulus: heapless::Vec::new(),
-            exponent: heapless::Vec::new(),
-        };
-        let _ = entry.private_key_der.extend_from_slice(&obj.private_key);
-        let _ = entry.modulus.extend_from_slice(modulus_bytes);
-        let _ = entry.exponent.extend_from_slice(exponent_bytes);
-        let _ = state.rsa_keys.push(entry);
-        return;
-    }
-
-    // For non-rsa feature flag builds, suppress the unused variable warning.
-    #[cfg(not(feature = "rsa"))]
-    let _ = is_rsa;
-
-    // EC / symmetric key
-    if state.keys.len() >= MAX_IN_MEMORY_KEYS {
-        #[cfg(target_arch = "arm")]
-        defmt::warn!("MAX_IN_MEMORY_KEYS reached, key {} not loaded", obj.key_id);
-        return;
-    }
+    use crate::protocol::sc_hsm::KeyMeta;
 
     let algo = obj.algorithm as u8;
     let core_key_type = km_algo_to_core_key_type(obj.algorithm);
 
-    let mut entry = InMemoryKey {
+    // Avoid duplicate entries — replace any existing entry with the same key_id.
+    state.key_index.retain(|m| m.key_id != obj.key_id);
+
+    let meta = KeyMeta {
         key_id: obj.key_id,
-        key_type: core_key_type,
+        key_type: core_key_type as u8,
         algo,
         key_flags: obj.key_flags,
-        private_key: heapless::Vec::new(),
-        public_key: heapless::Vec::new(),
     };
-    let _ = entry.private_key.extend_from_slice(&obj.private_key);
-    let _ = entry.public_key.extend_from_slice(&obj.public_key);
-    let _ = state.keys.push(entry);
+    let _ = state.key_index.push(meta);
+}
+
+/// Convert a `KeyObject` representing an EF file (written via WRITE DATA) to
+/// a `KeyMeta` entry + ef_cache data.  EF files are stored in flash with
+/// `KmType::Generic` / `AlgorithmId::AesGcm`, but their key_index metadata
+/// uses `key_type=16` (EfFile) and `algo=file_id_hi`.
+fn push_ef_to_state(
+    state: &mut crate::protocol::sc_hsm::ScHsmState,
+    obj: &crate::security::key_management::KeyObject,
+) {
+    use crate::protocol::sc_hsm::KeyMeta;
+
+    // Extract file_id_hi from key_id bits 15-8.
+    let file_id_hi = ((obj.key_id >> 8) & 0xFF) as u8;
+
+    // Avoid duplicate entries.
+    state.key_index.retain(|m| m.key_id != obj.key_id);
+
+    let meta = KeyMeta {
+        key_id: obj.key_id,
+        key_type: 16, // EfFile
+        algo: file_id_hi,
+        key_flags: 0,
+    };
+    let _ = state.key_index.push(meta);
+
+    // Populate ef_cache so read_binary can serve the data.
+    state.ef_cache_put(obj.key_id, &obj.private_key);
 }
 
 /// Build the FCI (File Control Information) template returned on SELECT SC-HSM AID.

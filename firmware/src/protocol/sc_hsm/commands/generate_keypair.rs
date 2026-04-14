@@ -29,7 +29,7 @@ use pico2hsm_core::{
     key::KeyType as CoreKeyType,
 };
 
-use crate::protocol::sc_hsm::{FwRng, InMemoryKey, ScHsmState};
+use crate::protocol::sc_hsm::{FwRng, KeyMeta, ScHsmState};
 
 /// INS byte for GENERATE KEY PAIR.
 pub const INS_GENERATE_KEYPAIR: u8 = 0x46;
@@ -738,15 +738,7 @@ pub fn handle(state: &mut ScHsmState, store: &mut dyn crate::storage::KeyStore, 
         cmd.p1
     } else {
         let mut id = 0u8;
-        while id < 0xFF && (
-            state.keys.iter().any(|k| k.key_id == pico2hsm_core::key::KeyId::sc_hsm(0, id).0)
-            || {
-                #[cfg(feature = "rsa")]
-                { state.rsa_keys.iter().any(|k| k.key_id == pico2hsm_core::key::KeyId::sc_hsm(0, id).0) }
-                #[cfg(not(feature = "rsa"))]
-                { false }
-            }
-        ) {
+        while id < 0xFF && state.key_index.iter().any(|m| m.key_id == pico2hsm_core::key::KeyId::sc_hsm(0, id).0) {
             id = id.wrapping_add(1);
         }
         if id == 0xFF {
@@ -791,8 +783,6 @@ pub fn handle(state: &mut ScHsmState, store: &mut dyn crate::storage::KeyStore, 
     // ---- RSA key generation (feature-gated) ---------------------------------
     #[cfg(feature = "rsa")]
     if is_rsa_key_type(key_type) {
-        use crate::protocol::sc_hsm::RsaInMemoryKey;
-
         // Extract the RSA algorithm OID from the incoming 7F49 block so we can
         // echo it back in the response CVC.  OpenSC's sc_pkcs15emu_sc_hsm_decode_cvc
         // requires a tag-0x06 OID inside 7F49 to recognise the key type.
@@ -802,9 +792,19 @@ pub fn handle(state: &mut ScHsmState, store: &mut dyn crate::storage::KeyStore, 
             .and_then(|pk49| find_tlv(pk49, 0x06))
             .unwrap_or(RSA_V15_SHA256_OID);
 
+        // Suppress the watchdog during RSA keygen — modular exponentiation
+        // runs for minutes without RNG calls, which would trip the heartbeat
+        // stall detector and crash the device.
+        crate::WATCHDOG_SUPPRESS.store(true, core::sync::atomic::Ordering::Relaxed);
         let pair = match crate::crypto::asymmetric::generate_rsa_keypair(key_type, &mut FwRng) {
-            Ok(p) => p,
-            Err(_) => return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
+            Ok(p) => {
+                crate::WATCHDOG_SUPPRESS.store(false, core::sync::atomic::Ordering::Relaxed);
+                p
+            }
+            Err(_) => {
+                crate::WATCHDOG_SUPPRESS.store(false, core::sync::atomic::Ordering::Relaxed);
+                return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED);
+            }
         };
 
         // Dummy RSA signature length = modulus length
@@ -841,23 +841,15 @@ pub fn handle(state: &mut ScHsmState, store: &mut dyn crate::storage::KeyStore, 
         }
         state.generation = state.generation.wrapping_add(1);
 
-        // Store RSA key (replacing any existing entry with the same key_id)
-        state.rsa_keys.retain(|k| k.key_id != key_id);
+        // Store metadata in key_index (replacing any existing entry with the same key_id)
+        state.key_index.retain(|m| m.key_id != key_id);
 
-        let mut entry = RsaInMemoryKey {
+        if state.key_index.push(KeyMeta {
             key_id,
-            key_type,
+            key_type: key_type as u8,
             algo,
             key_flags,
-            private_key_der: heapless::Vec::new(),
-            modulus: heapless::Vec::new(),
-            exponent: heapless::Vec::new(),
-        };
-        let _ = entry.private_key_der.extend_from_slice(&pair.private_key_der);
-        let _ = entry.modulus.extend_from_slice(&pair.modulus);
-        let _ = entry.exponent.extend_from_slice(&pair.exponent);
-
-        if state.rsa_keys.push(entry).is_err() {
+        }).is_err() {
             return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED);
         }
 
@@ -890,21 +882,15 @@ pub fn handle(state: &mut ScHsmState, store: &mut dyn crate::storage::KeyStore, 
     }
     state.generation = state.generation.wrapping_add(1);
 
-    // Store (replacing any existing key with the same key_id)
-    state.keys.retain(|k| k.key_id != key_id);
+    // Store metadata in key_index (replacing any existing entry with the same key_id)
+    state.key_index.retain(|m| m.key_id != key_id);
 
-    let mut entry = InMemoryKey {
+    if state.key_index.push(KeyMeta {
         key_id,
-        key_type,
+        key_type: key_type as u8,
         algo,
         key_flags,
-        private_key: heapless::Vec::new(),
-        public_key: heapless::Vec::new(),
-    };
-    let _ = entry.private_key.extend_from_slice(&pair.private_key);
-    let _ = entry.public_key.extend_from_slice(&pair.public_key);
-
-    if state.keys.push(entry).is_err() {
+    }).is_err() {
         return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED);
     }
 

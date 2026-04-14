@@ -20,6 +20,7 @@ use pico2hsm_core::{
 
 use crate::crypto::symmetric;
 use crate::protocol::sc_hsm::ScHsmState;
+use crate::storage::KeyStore;
 
 /// INS byte for SYMMETRIC CIPHER.
 pub const INS_CIPHER_SYM: u8 = 0x78;
@@ -62,7 +63,7 @@ fn make_key_material(key_id: u32, raw: &[u8]) -> Option<KeyMaterial> {
 ///
 /// P1 = direction (0x01 = encrypt, 0x02 = decrypt)
 /// P2 = mode (0x02=CBC, 0x03=CTR, 0x05=GCM, 0x06=CMAC)
-pub fn handle(state: &mut ScHsmState, cmd: &ApduCommand<'_>) -> ApduResponse {
+pub fn handle(state: &mut ScHsmState, store: &mut dyn KeyStore, cmd: &ApduCommand<'_>) -> ApduResponse {
     // Require PIN authentication
     if !state.pin_verified {
         return ApduResponse::err(SW_SECURITY_STATUS);
@@ -79,11 +80,20 @@ pub fn handle(state: &mut ScHsmState, cmd: &ApduCommand<'_>) -> ApduResponse {
         return ApduResponse::err(SW_WRONG_DATA);
     }
 
-    // Look up the symmetric key by full u32 key_id
-    let raw_key: heapless::Vec<u8, 32> = match state.sym_keys.iter().find(|k| k.key_id == full_key_id) {
-        Some(sk) => sk.raw_key.clone(),
+    // Check metadata index for the key
+    let _meta = match state.key_index.iter().find(|m| m.key_id == full_key_id) {
+        Some(m) => *m,
         None => return ApduResponse::err(SW_FILE_NOT_FOUND),
     };
+
+    // Load key material from flash
+    let key_obj = match store.fetch_key(pico2hsm_core::key::KeyId(full_key_id)) {
+        Ok(Some(obj)) => obj,
+        _ => return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
+    };
+
+    let mut raw_key: heapless::Vec<u8, 32> = heapless::Vec::new();
+    let _ = raw_key.extend_from_slice(&key_obj.private_key);
 
     let km = match make_key_material(full_key_id, &raw_key) {
         Some(k) => k,
@@ -248,21 +258,59 @@ fn handle_cmac(km: &KeyMaterial, data: &[u8]) -> ApduResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::sc_hsm::{InMemorySymKey, ScHsmState};
+    use crate::protocol::sc_hsm::{KeyMeta, ScHsmState};
+    use crate::security::key_management::{AlgorithmId, KeyObject, KeyType as KmType};
     use pico2hsm_core::apdu::{ApduCommand, SW_OK};
+    use pico2hsm_core::key::AppletId;
 
-    /// Build a minimal ScHsmState with a single AES-256 key at slot 0x01.
-    fn make_state_with_key(key_id: u8, key_bytes: &[u8]) -> ScHsmState {
+    /// Test key store that holds a single KeyObject and returns it on fetch_key.
+    struct TestStore {
+        obj: Option<KeyObject>,
+    }
+
+    impl TestStore {
+        fn new(obj: KeyObject) -> Self {
+            Self { obj: Some(obj) }
+        }
+    }
+
+    impl crate::storage::KeyStore for TestStore {
+        fn save_key(&mut self, _: &KeyObject) -> Result<(), pico2hsm_core::error::HsmError> { Ok(()) }
+        fn fetch_key(&mut self, key_id: KeyId) -> Result<Option<KeyObject>, pico2hsm_core::error::HsmError> {
+            if let Some(ref obj) = self.obj {
+                if obj.key_id == key_id.0 {
+                    let mut clone = KeyObject::new(obj.key_type, obj.key_id, obj.owner, obj.algorithm);
+                    clone.key_flags = obj.key_flags;
+                    let _ = clone.private_key.extend_from_slice(&obj.private_key);
+                    let _ = clone.public_key.extend_from_slice(&obj.public_key);
+                    return Ok(Some(clone));
+                }
+            }
+            Ok(None)
+        }
+        fn erase_key(&mut self, _: KeyId) -> Result<(), pico2hsm_core::error::HsmError> { Ok(()) }
+        fn wipe_all(&mut self) -> Result<(), pico2hsm_core::error::HsmError> { Ok(()) }
+        fn wipe_by_owner(&mut self, _: AppletId) -> Result<(), pico2hsm_core::error::HsmError> { Ok(()) }
+        fn enumerate_keys(&self) -> heapless::Vec<KeyId, 64> { heapless::Vec::new() }
+        fn for_each_key(&self, _f: &mut dyn FnMut(KeyId)) {}
+    }
+
+    /// Build a minimal ScHsmState + TestStore with a single AES-256 key at slot `key_id`.
+    fn make_state_and_store(key_id: u8, key_bytes: &[u8]) -> (ScHsmState, TestStore) {
         let mut state = ScHsmState::new();
         state.pin_verified = true;
         state.current_key_id = Some(key_id);
         state.current_algo = None;
 
-        let mut raw_key: heapless::Vec<u8, 32> = heapless::Vec::new();
-        raw_key.extend_from_slice(key_bytes).unwrap();
         let full_key_id = pico2hsm_core::key::KeyId::sc_hsm(0, key_id).0;
-        let _ = state.sym_keys.push(InMemorySymKey { key_id: full_key_id, raw_key });
-        state
+
+        let meta = KeyMeta { key_id: full_key_id, key_type: 0, algo: 0x61, key_flags: 0 };
+        state.key_index.push(meta).unwrap();
+
+        let mut key_obj = KeyObject::new(KmType::Aes, full_key_id, AppletId::ScHsm, AlgorithmId::AesCbc);
+        let _ = key_obj.private_key.extend_from_slice(key_bytes);
+
+        (state, TestStore::new(key_obj))
     }
 
     fn parse_sw(resp: &[u8]) -> u16 {
@@ -280,7 +328,7 @@ mod tests {
     // Helper: build a raw APDU and dispatch through handle()
     // -----------------------------------------------------------------------
 
-    fn run_cmd(state: &mut ScHsmState, p1: u8, p2: u8, data: &[u8]) -> heapless::Vec<u8, 4200> {
+    fn run_cmd(state: &mut ScHsmState, store: &mut dyn KeyStore, p1: u8, p2: u8, data: &[u8]) -> heapless::Vec<u8, 4200> {
         // Build: CLA=0x00 INS=0x78 P1 P2 Lc data
         let mut apdu: heapless::Vec<u8, 4200> = heapless::Vec::new();
         apdu.push(0x00).unwrap();
@@ -292,7 +340,7 @@ mod tests {
         apdu.push(0x00).unwrap(); // Le
 
         let cmd = ApduCommand::parse(&apdu).unwrap();
-        let resp = handle(state, &cmd);
+        let resp = handle(state, store, &cmd);
         let serialized = resp.serialize();
         let mut out: heapless::Vec<u8, 4200> = heapless::Vec::new();
         out.extend_from_slice(&serialized).unwrap();
@@ -306,7 +354,7 @@ mod tests {
     #[test]
     fn test_aes_cbc_roundtrip() {
         let key = [0x42u8; 32]; // AES-256
-        let mut state = make_state_with_key(0x01, &key);
+        let (mut state, mut store) = make_state_and_store(0x01, &key);
 
         let iv = [0xABu8; 16];
         let plaintext = b"Hello, World! AES-CBC test data!"; // 32 bytes, block-aligned
@@ -316,7 +364,7 @@ mod tests {
         enc_data.extend_from_slice(&iv).unwrap();
         enc_data.extend_from_slice(plaintext).unwrap();
 
-        let enc_resp = run_cmd(&mut state, P1_ENCRYPT, P2_AES_CBC, &enc_data);
+        let enc_resp = run_cmd(&mut state, &mut store, P1_ENCRYPT, P2_AES_CBC, &enc_data);
         assert_eq!(parse_sw(&enc_resp), SW_OK, "CBC encrypt should succeed");
         let mut ciphertext: heapless::Vec<u8, 64> = heapless::Vec::new();
         ciphertext.extend_from_slice(resp_data(&enc_resp)).unwrap();
@@ -326,7 +374,7 @@ mod tests {
         dec_data.extend_from_slice(&iv).unwrap();
         dec_data.extend_from_slice(&ciphertext).unwrap();
 
-        let dec_resp = run_cmd(&mut state, P1_DECRYPT, P2_AES_CBC, &dec_data);
+        let dec_resp = run_cmd(&mut state, &mut store, P1_DECRYPT, P2_AES_CBC, &dec_data);
         assert_eq!(parse_sw(&dec_resp), SW_OK, "CBC decrypt should succeed");
         let recovered = resp_data(&dec_resp);
 
@@ -340,7 +388,7 @@ mod tests {
     #[test]
     fn test_aes_gcm_roundtrip() {
         let key = [0x11u8; 32]; // AES-256
-        let mut state = make_state_with_key(0x01, &key);
+        let (mut state, mut store) = make_state_and_store(0x01, &key);
 
         let nonce = [0x01u8; 12];
         let aad = b"assoc data";
@@ -354,7 +402,7 @@ mod tests {
         enc_data.extend_from_slice(aad).unwrap();
         enc_data.extend_from_slice(plaintext).unwrap();
 
-        let enc_resp = run_cmd(&mut state, P1_ENCRYPT, P2_AES_GCM, &enc_data);
+        let enc_resp = run_cmd(&mut state, &mut store, P1_ENCRYPT, P2_AES_GCM, &enc_data);
         assert_eq!(parse_sw(&enc_resp), SW_OK, "GCM encrypt should succeed");
         let ct_and_tag = resp_data(&enc_resp);
         // ciphertext + 16-byte tag
@@ -367,7 +415,7 @@ mod tests {
         dec_data.extend_from_slice(aad).unwrap();
         dec_data.extend_from_slice(ct_and_tag).unwrap();
 
-        let dec_resp = run_cmd(&mut state, P1_DECRYPT, P2_AES_GCM, &dec_data);
+        let dec_resp = run_cmd(&mut state, &mut store, P1_DECRYPT, P2_AES_GCM, &dec_data);
         assert_eq!(parse_sw(&dec_resp), SW_OK, "GCM decrypt should succeed");
         let recovered = resp_data(&dec_resp);
 
@@ -381,11 +429,11 @@ mod tests {
     #[test]
     fn test_aes_cmac_tag_length() {
         let key = [0x55u8; 32];
-        let mut state = make_state_with_key(0x01, &key);
+        let (mut state, mut store) = make_state_and_store(0x01, &key);
         let message = b"test message for CMAC";
 
         // P1 is ignored for CMAC
-        let resp = run_cmd(&mut state, P1_ENCRYPT, P2_AES_CMAC, message);
+        let resp = run_cmd(&mut state, &mut store, P1_ENCRYPT, P2_AES_CMAC, message);
         assert_eq!(parse_sw(&resp), SW_OK, "CMAC should succeed");
         let tag = resp_data(&resp);
         assert_eq!(tag.len(), 16, "CMAC tag must be 16 bytes");
@@ -398,13 +446,13 @@ mod tests {
     #[test]
     fn test_missing_pin_returns_security_status() {
         let key = [0x42u8; 32];
-        let mut state = make_state_with_key(0x01, &key);
+        let (mut state, mut store) = make_state_and_store(0x01, &key);
         state.pin_verified = false; // override
 
         let mut data: heapless::Vec<u8, 48> = heapless::Vec::new();
         data.extend_from_slice(&[0u8; 32]).unwrap(); // IV + some data
 
-        let resp = run_cmd(&mut state, P1_ENCRYPT, P2_AES_CBC, &data);
+        let resp = run_cmd(&mut state, &mut store, P1_ENCRYPT, P2_AES_CBC, &data);
         assert_eq!(parse_sw(&resp), SW_SECURITY_STATUS);
     }
 
@@ -415,14 +463,14 @@ mod tests {
     #[test]
     fn test_missing_sym_key_returns_file_not_found() {
         let key = [0x42u8; 32];
-        let mut state = make_state_with_key(0x01, &key);
-        // Point MSE to a key_id that isn't in sym_keys
+        let (mut state, mut store) = make_state_and_store(0x01, &key);
+        // Point MSE to a key_id that isn't in key_index
         state.current_key_id = Some(0x02);
 
         let mut data: heapless::Vec<u8, 48> = heapless::Vec::new();
         data.extend_from_slice(&[0u8; 32]).unwrap();
 
-        let resp = run_cmd(&mut state, P1_ENCRYPT, P2_AES_CBC, &data);
+        let resp = run_cmd(&mut state, &mut store, P1_ENCRYPT, P2_AES_CBC, &data);
         assert_eq!(parse_sw(&resp), SW_FILE_NOT_FOUND);
     }
 
@@ -433,13 +481,14 @@ mod tests {
     #[test]
     fn test_no_key_selected_returns_conditions_not_satisfied() {
         let mut state = ScHsmState::new();
+        let (_, mut store) = make_state_and_store(0x01, &[0u8; 32]);
         state.pin_verified = true;
         state.current_key_id = None; // no MSE
 
         let mut data: heapless::Vec<u8, 48> = heapless::Vec::new();
         data.extend_from_slice(&[0u8; 32]).unwrap();
 
-        let resp = run_cmd(&mut state, P1_ENCRYPT, P2_AES_CBC, &data);
+        let resp = run_cmd(&mut state, &mut store, P1_ENCRYPT, P2_AES_CBC, &data);
         assert_eq!(parse_sw(&resp), SW_CONDITIONS_NOT_SATISFIED);
     }
 }

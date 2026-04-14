@@ -54,7 +54,9 @@ const DEFAULT_MGMT_KEY: [u8; 24] = [
 ];
 
 /// An in-memory (volatile) PIV asymmetric key slot.
+/// DEPRECATED: retained for type definition only; no longer used by command handlers.
 #[cfg(feature = "applet-piv")]
+#[allow(dead_code)]
 pub struct InMemoryPivKey {
     /// Full u32 internal key ID (from `KeyId::piv(key_ref)`).
     pub key_id: u32,
@@ -92,14 +94,10 @@ pub struct PivState {
     pub mgmt_challenge: Option<[u8; 8]>,
     /// Device ID (16 bytes, used as CHUID GUID and PBKDF2 salt).
     pub device_id: [u8; 16],
-    /// In-memory asymmetric key slots.
-    pub keys: heapless::Vec<InMemoryPivKey, MAX_PIV_KEYS>,
+    /// Lightweight metadata index for PIV key slots (mirrors SC-HSM key_index).
+    pub key_index: heapless::Vec<crate::protocol::sc_hsm::KeyMeta, MAX_PIV_KEYS>,
     /// Stored data objects (certificates, etc.).
     pub data_objects: heapless::Vec<PivDataObject, MAX_PIV_DATA_OBJECTS>,
-    /// Buffer for chained GET RESPONSE (INS=0xC0) — stores the full pending response.
-    pub last_response: heapless::Vec<u8, 4096>,
-    /// Byte offset into `last_response` for the next GET RESPONSE chunk.
-    pub last_response_offset: usize,
 }
 
 #[cfg(feature = "applet-piv")]
@@ -132,10 +130,8 @@ impl PivState {
             mgmt_key_authenticated: false,
             mgmt_challenge: None,
             device_id,
-            keys: heapless::Vec::new(),
+            key_index: heapless::Vec::new(),
             data_objects: heapless::Vec::new(),
-            last_response: heapless::Vec::new(),
-            last_response_offset: 0,
         }
     }
 }
@@ -155,21 +151,31 @@ impl Piv {
         }
     }
 
+    /// Initialise a `Piv` directly into a destination pointer, avoiding
+    /// a ~8 KB stack temporary from `PivState::data_objects`.
+    #[cfg(feature = "applet-piv")]
+    pub fn init_in_place(dest: *mut Self) {
+        unsafe {
+            // PivState::new() does PBKDF2 so we can't split it further,
+            // but we write it directly to the destination to avoid a copy.
+            core::ptr::addr_of_mut!((*dest).state).write(PivState::new());
+        }
+    }
+
+    /// Initialise a `Piv` directly into a destination pointer (no-op without applet-piv).
+    #[cfg(not(feature = "applet-piv"))]
+    pub fn init_in_place(dest: *mut Self) {
+        let _ = dest;
+    }
+
     /// Dispatch a parsed APDU to the appropriate PIV command handler.
+    ///
+    /// GET RESPONSE and Le-truncation are handled by the Dispatcher.
     #[cfg(feature = "applet-piv")]
     fn dispatch(&mut self, cmd: &ApduCommand<'_>) -> ApduResponse {
         use commands::*;
 
-        // GET RESPONSE (INS=0xC0) — return next chunk of a previously buffered response.
-        if cmd.ins == 0xC0 {
-            return self.handle_get_response(cmd.le);
-        }
-
-        // Any non-GET-RESPONSE command clears the pending response buffer.
-        self.state.last_response.clear();
-        self.state.last_response_offset = 0;
-
-        let raw = match cmd.ins {
+        match cmd.ins {
             select::INS_SELECT => select::handle(cmd),
             get_data::INS_GET_DATA => get_data::handle(&self.state, cmd),
             verify::INS_VERIFY => verify::handle(&mut self.state, cmd),
@@ -186,71 +192,8 @@ impl Piv {
             reset_retry_counter::INS_RESET_RETRY_COUNTER => {
                 reset_retry_counter::handle(&mut self.state, cmd)
             }
-            _ => return ApduResponse::err(SW_INS_NOT_SUPPORTED),
-        };
-
-        self.maybe_chain_response(raw, cmd.le)
-    }
-
-    /// Handle GET RESPONSE (INS=0xC0): return next chunk from `last_response`.
-    ///
-    /// `le` is the Le field from the GET RESPONSE APDU: `None` = no Le,
-    /// `Some(0)` = 256 bytes (short APDU convention), `Some(n)` = n bytes.
-    #[cfg(feature = "applet-piv")]
-    fn handle_get_response(&mut self, le: Option<u16>) -> ApduResponse {
-        let offset = self.state.last_response_offset;
-        let remaining = self.state.last_response.len().saturating_sub(offset);
-        if remaining == 0 {
-            // Nothing pending — return empty 9000 per ISO spec.
-            return ApduResponse::ok(&[]);
+            _ => ApduResponse::err(SW_INS_NOT_SUPPORTED),
         }
-        let chunk_len = match le {
-            None => remaining,
-            Some(0) => remaining.min(256),
-            Some(n) => remaining.min(n as usize),
-        };
-        let chunk = &self.state.last_response[offset..offset + chunk_len];
-        let mut resp = ApduResponse::ok(chunk);
-        self.state.last_response_offset += chunk_len;
-        let new_remaining = self.state.last_response.len()
-            .saturating_sub(self.state.last_response_offset);
-        if new_remaining > 0 {
-            let xx = new_remaining.min(0xFF) as u8;
-            resp.sw = 0x6100 | (xx as u16);
-        } else {
-            self.state.last_response.clear();
-            self.state.last_response_offset = 0;
-        }
-        resp
-    }
-
-    /// If the response data exceeds `le`, buffer the remainder and return SW=61xx.
-    ///
-    /// `le` is the Le field from the command APDU: `None` = no Le (no truncation),
-    /// `Some(0)` = 256 bytes (short APDU convention), `Some(n)` = n bytes.
-    #[cfg(feature = "applet-piv")]
-    fn maybe_chain_response(&mut self, resp: ApduResponse, le: Option<u16>) -> ApduResponse {
-        // Only chain successful responses with data.
-        if resp.sw != 0x9000 {
-            return resp;
-        }
-        let le_val = match le {
-            None => return resp, // no Le field — no truncation
-            Some(0) => 256usize,
-            Some(n) => n as usize,
-        };
-        if resp.data.len() <= le_val {
-            return resp;
-        }
-        // Store overflow in pending buffer; return first le_val bytes with SW=0x61xx.
-        self.state.last_response.clear();
-        self.state.last_response_offset = 0;
-        let _ = self.state.last_response.extend_from_slice(&resp.data[le_val..]);
-        let mut out = ApduResponse::ok(&resp.data[..le_val]);
-        let remaining = self.state.last_response.len();
-        let xx = remaining.min(0xFF) as u8;
-        out.sw = 0x6100 | (xx as u16);
-        out
     }
 
     /// KeyId for the PIV PIN/PUK record sentinel.
@@ -327,6 +270,8 @@ impl Piv {
     }
 
     /// Dispatch a parsed APDU using the store-aware path for mutations.
+    ///
+    /// GET RESPONSE and Le-truncation are handled by the Dispatcher.
     #[cfg(feature = "applet-piv")]
     fn dispatch_with_store(
         &mut self,
@@ -335,18 +280,12 @@ impl Piv {
     ) -> ApduResponse {
         use commands::*;
 
-        // GET RESPONSE is handled inside dispatch(); delegate unconditionally.
-        if cmd.ins == 0xC0 {
-            return self.dispatch(cmd);
-        }
-
-        // Any non-GET-RESPONSE command clears the pending response buffer.
-        self.state.last_response.clear();
-        self.state.last_response_offset = 0;
-
-        let raw = match cmd.ins {
+        match cmd.ins {
             generate_keypair::INS_GENERATE_KEYPAIR => {
                 generate_keypair::handle_with_store(&mut self.state, store, cmd)
+            }
+            general_authenticate::INS_GENERAL_AUTHENTICATE => {
+                general_authenticate::handle_with_store(&mut self.state, store, cmd)
             }
             verify::INS_VERIFY => {
                 verify::handle_with_store(&mut self.state, store, cmd)
@@ -358,40 +297,10 @@ impl Piv {
                 reset_retry_counter::handle_with_store(&mut self.state, store, cmd)
             }
             _ => {
-                // Re-use the non-store dispatch path but skip the buffer clear
-                // (already done above) and the GET RESPONSE branch (already handled).
-                return self.dispatch_inner(cmd);
+                // Fall through to the non-store dispatch path.
+                self.dispatch(cmd)
             }
-        };
-
-        self.maybe_chain_response(raw, cmd.le)
-    }
-
-    /// Inner dispatch for commands that don't need store access (skips GET RESPONSE
-    /// and buffer-clear preamble — callers must handle those before calling this).
-    #[cfg(feature = "applet-piv")]
-    fn dispatch_inner(&mut self, cmd: &ApduCommand<'_>) -> ApduResponse {
-        use commands::*;
-        let raw = match cmd.ins {
-            select::INS_SELECT => select::handle(cmd),
-            get_data::INS_GET_DATA => get_data::handle(&self.state, cmd),
-            verify::INS_VERIFY => verify::handle(&mut self.state, cmd),
-            generate_keypair::INS_GENERATE_KEYPAIR => {
-                generate_keypair::handle(&mut self.state, cmd)
-            }
-            put_data::INS_PUT_DATA => put_data::handle(&mut self.state, cmd),
-            general_authenticate::INS_GENERAL_AUTHENTICATE => {
-                general_authenticate::handle(&mut self.state, cmd)
-            }
-            change_reference_data::INS_CHANGE_REFERENCE_DATA => {
-                change_reference_data::handle(&mut self.state, cmd)
-            }
-            reset_retry_counter::INS_RESET_RETRY_COUNTER => {
-                reset_retry_counter::handle(&mut self.state, cmd)
-            }
-            _ => return ApduResponse::err(SW_INS_NOT_SUPPORTED),
-        };
-        self.maybe_chain_response(raw, cmd.le)
+        }
     }
 
     /// Process a raw APDU with access to persistent storage.
@@ -455,18 +364,15 @@ impl Piv {
                         _ => continue,
                     };
 
-                    let mut entry = InMemoryPivKey {
+                    // Store lightweight metadata in key_index.
+                    self.state.key_index.retain(|m| m.key_id != kid.0);
+                    let meta = crate::protocol::sc_hsm::KeyMeta {
                         key_id: kid.0,
-                        key_type,
-                        alg_id,
-                        private_key: heapless::Vec::new(),
-                        public_key: heapless::Vec::new(),
+                        key_type: key_type as u8,
+                        algo: alg_id,
+                        key_flags: 0,
                     };
-                    let _ = entry.private_key.extend_from_slice(&obj.private_key);
-                    let _ = entry.public_key.extend_from_slice(&obj.public_key);
-                    // Replace any existing key in this slot.
-                    self.state.keys.retain(|k| k.key_id != kid.0);
-                    let _ = self.state.keys.push(entry);
+                    let _ = self.state.key_index.push(meta);
                 }
             }
         }

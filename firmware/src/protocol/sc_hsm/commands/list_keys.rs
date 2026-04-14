@@ -20,35 +20,59 @@ pub fn handle(state: &mut ScHsmState, cmd: &ApduCommand<'_>) -> ApduResponse {
     // sc_hsm_determine_free_id uses KEY_PREFIX=0xCC to find occupied slots.
     // sc_pkcs15emu_sc_hsm_init also scans for 0xCC to call add_prkd per key.
     let mut resp: heapless::Vec<u8, 256> = heapless::Vec::new();
-    for key in &state.keys {
-        let proto_ref = (key.key_id & 0xFF) as u8;
-        // Skip internal reserved slots (>= 0xF0): device identity key (0xFE),
-        // device auth sentinel at 0xFF, etc. These must not appear in the
-        // user-facing key enumeration or OpenSC will try to load PRKD for them.
+
+
+    // Iterate key_index: emit CC xx for non-EfFile entries (crypto keys).
+    for meta in &state.key_index {
+        // Skip EfFile entries (key_type == 16).
+        if meta.key_type == 16 {
+            continue;
+        }
+        let proto_ref = (meta.key_id & 0xFF) as u8;
+        // Skip internal reserved slots: device identity key (0xFE) and other
+        // internal keys above 0xF0. These must not appear in the user-facing
+        // key enumeration or OpenSC will try to load PRKD for them.
+        //
+        // Slot 0 (device auth sentinel) IS included: OpenSC's
+        // sc_hsm_determine_free_id() scans LIST KEYS to find the first free
+        // key reference. If slot 0 is hidden, OpenSC assigns keygen P1=0x00,
+        // which overwrites the sentinel and then gets filtered — making the
+        // generated key invisible.
         if proto_ref >= 0xF0 {
             continue;
         }
         let _ = resp.push(0xCC);
         let _ = resp.push(proto_ref);
     }
-    #[cfg(feature = "rsa")]
-    for key in &state.rsa_keys {
-        let rsa_proto_ref = (key.key_id & 0xFF) as u8;
-        if rsa_proto_ref >= 0xF0 {
+
+    // Emit C4 xx (PRKD) for every key — read_binary generates these
+    // dynamically, so they always exist for any key in the keystore.
+    // OpenSC's sc_pkcs15emu_sc_hsm_add_prkd needs them in the file list.
+    // Include slot 0 so OpenSC can read PRKD for the sentinel too
+    // (read_binary returns a valid descriptor for any key in key_index).
+    for meta in &state.key_index {
+        if meta.key_type == 16 {
             continue;
         }
-        let _ = resp.push(0xCC);
-        let _ = resp.push(rsa_proto_ref);
+        let proto_ref = (meta.key_id & 0xFF) as u8;
+        if proto_ref >= 0xF0 {
+            continue;
+        }
+        let _ = resp.push(0xC4);
+        let _ = resp.push(proto_ref);
     }
-    // Also expose PRKD (C4 xx) and EE-cert (CE xx) EF entries so that
-    // SELECT by those file IDs succeeds and sc_pkcs15emu_sc_hsm_add_prkd
-    // can read them via read_file().
-    for ef in &state.ef_files {
-        let hi = (ef.file_id >> 8) as u8;
-        if hi == 0xC4 || hi == 0xCE {
-            let _ = resp.push(hi);
-            let _ = resp.push((ef.file_id & 0xFF) as u8);
+
+    // Expose EE-cert (CE xx) EF entries from key_index.
+    // EfFile entries store the file_id high byte in the `algo` field.
+    // Only emit entries where algo == 0xCE (EE certificate files).
+    for meta in &state.key_index {
+        if meta.key_type == 16 && meta.algo == 0xCE {
+            let proto_ref = (meta.key_id & 0xFF) as u8;
+            let file_id_lo = proto_ref & 0x0F;
+            let _ = resp.push(0xCE);
+            let _ = resp.push(file_id_lo);
         }
     }
+
     ApduResponse::ok(&resp)
 }
