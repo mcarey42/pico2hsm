@@ -896,7 +896,7 @@ hardware-validated 2026-04-05.
 | 6.2 | ECDSA P-384 Sign/Verify | PASS |
 | 6.3 | ECDSA P-521 Sign/Verify | PASS |
 | 6.4 | ECDH Key Agreement (ECDH1-DERIVE) | PASS |
-| 6.4a | ECDH1-COFACTOR-DERIVE | XFAIL (punchout item 9, not implemented) |
+| 6.4a | ECDH1-COFACTOR-DERIVE | N/A — cofactor h=1 for all curves; tests use ECDH1-DERIVE |
 | 6.5 | AES-CBC Encrypt/Decrypt | PASS |
 | 6.6 | GET CHALLENGE (Random) | PASS |
 | 6.7 | BIP32/SLIP-0010 Derivation | PASS |

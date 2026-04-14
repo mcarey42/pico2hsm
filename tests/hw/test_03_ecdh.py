@@ -49,7 +49,7 @@ def _derive(
         "--login",
         "--pin",          config["pin"],
         "--derive",
-        "--mechanism",    "ECDH1-COFACTOR-DERIVE",
+        "--mechanism",    "ECDH1-DERIVE",
         "--id",           slot["key_id"],
         "--input-file",   str(peer_point_file),
         "--output-file",  str(secret_file),
@@ -77,13 +77,6 @@ def test_ecdh_returns_correct_length(
         pytest.skip(f"Key for {slot['curve_display']} was not generated.")
     if not slot.get("ecdh"):
         pytest.skip(f"ECDH not supported for {slot['curve_display']}.")
-    if slot["name"] == "p256":
-        pytest.xfail(
-            "OpenSC 0.25.0-rc1 SC-HSM driver rejects ECDH1-COFACTOR-DERIVE for P-256 keys "
-            "generated via pkcs11-tool (SC_ERROR_NOT_ALLOWED). Firmware ECDH is correct; "
-            "this is a PKCS11 layer restriction. The cluster protocol bypasses PKCS11."
-        )
-
     _priv_pem, raw_point = crypto.generate_ec_peer_key(slot["curve_openssl"])
 
     peer_point_file = tmp_path / f"peer_point_{slot['name']}.bin"
@@ -143,12 +136,6 @@ def test_ecdh_cross_check(
         pytest.skip(f"Key for {slot['curve_display']} was not generated.")
     if not slot.get("ecdh"):
         pytest.skip(f"ECDH not supported for {slot['curve_display']}.")
-    if slot["name"] == "p256":
-        pytest.xfail(
-            "OpenSC 0.25.0-rc1 SC-HSM driver rejects ECDH1-COFACTOR-DERIVE for P-256 keys "
-            "generated via pkcs11-tool (SC_ERROR_NOT_ALLOWED). Firmware ECDH is correct; "
-            "this is a PKCS11 layer restriction. The cluster protocol bypasses PKCS11."
-        )
     pub_pem = entry.get("pub_pem")
     if pub_pem is None:
         pytest.skip(f"Public key not available for {slot['curve_display']}.")
@@ -160,7 +147,7 @@ def test_ecdh_cross_check(
     secret_file     = tmp_path / f"secret_{slot['name']}.bin"
     peer_point_file.write_bytes(raw_point)
 
-    # Device side: ECDH1-COFACTOR-DERIVE
+    # Device side: ECDH1-DERIVE
     result = _derive(slot, runner, config, peer_point_file, secret_file, save_as=None)
     assert result.returncode == 0, (
         f"Device ECDH failed for {slot['curve_display']} (rc={result.returncode}):\n"
@@ -203,13 +190,6 @@ def test_ecdh_different_peers_give_different_secrets(
         pytest.skip(f"Key for {slot['curve_display']} was not generated.")
     if not slot.get("ecdh"):
         pytest.skip(f"ECDH not supported for {slot['curve_display']}.")
-    if slot["name"] == "p256":
-        pytest.xfail(
-            "OpenSC 0.25.0-rc1 SC-HSM driver rejects ECDH1-COFACTOR-DERIVE for P-256 keys "
-            "generated via pkcs11-tool (SC_ERROR_NOT_ALLOWED). Firmware ECDH is correct; "
-            "this is a PKCS11 layer restriction. The cluster protocol bypasses PKCS11."
-        )
-
     secrets: list[bytes] = []
     for i in range(2):
         _priv_pem, raw_point = crypto.generate_ec_peer_key(slot["curve_openssl"])

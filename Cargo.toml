@@ -2,7 +2,7 @@
 members = [
     "pico2hsm-core",
     "firmware",
-    "tools/hsm-tool",
+
     "tests/integration",
 ]
 resolver = "2"

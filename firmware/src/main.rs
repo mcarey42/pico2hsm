@@ -568,10 +568,6 @@ async fn run_one_board(p: embassy_rp::Peripherals) {
     board.led().set_status(LedStatus::Busy);
 
     // ── Storage initialization (rp2350_one: internal QMI flash) ───────────────
-    // TODO (board-storage wiring): SPI0/SPI1 external flash (RAID-1) requires
-    // board struct refactor to separate LED from SPI ownership.  For now, use
-    // the RP2350 internal QMI flash (upper 2 MB partition) via the AnyChip::SdCard
-    // slot (third type parameter is QmiFlash).
     let smk_bytes = pico2hsm_firmware::security::otp::derive_smk()
         .unwrap_or([0u8; 32]);
     let smk = zeroize::Zeroizing::new(smk_bytes);
@@ -894,10 +890,6 @@ async fn run_geek_board(p: embassy_rp::Peripherals) {
     defmt::info!("pico2hsm (RP2350-Geek): USB CCID ready, entering main loop");
 
     // ── Storage initialization (rp2350_geek: internal QMI flash) ──────────────
-    // TODO (board-storage wiring): SPI0/SPI1 external flash (RAID-1) requires
-    // board struct refactor to separate LED from SPI ownership.  For now, use
-    // the RP2350 internal QMI flash (upper 2 MB partition) via the AnyChip::SdCard
-    // slot (third type parameter is QmiFlash).
     serial_println!("KeyStore init (QMI internal flash)...");
     let smk_bytes = pico2hsm_firmware::security::otp::derive_smk()
         .unwrap_or([0u8; 32]);

@@ -1,9 +1,0 @@
-[package]
-name = "hsm-tool"
-version = "0.1.0"
-edition = "2021"
-description = "Command-line tool for managing pico2hsm devices"
-license = "MIT"
-
-[dependencies]
-pico2hsm-core = { path = "../../pico2hsm-core" }

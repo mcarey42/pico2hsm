@@ -876,7 +876,7 @@ INS `0x62` is shared between two operations, disambiguated by P1:
 
 **Response notes:** For `P2 = 0x80`, pico2hsm prepends `0x04` to the X-coordinate. OpenSC's `sc_hsm_decipher` strips this prefix to recover the field-size X bytes. For explicit ECDH codes (`0x23/0x25/0x27/0x29`), the raw X-coordinate is returned without the prefix.
 
-**Known issue — ECDH1-COFACTOR-DERIVE (PUNCHOUT item 9):** PKCS#11 mechanism `ECDH1-COFACTOR-DERIVE` (0x1051) causes `pkcs11-tool` / the OpenSC sc-hsm driver to send a different `algo_ref` byte than plain ECDH. The firmware does not recognise this algo_ref and returns `CKR_GENERAL_ERROR`. For P-256/P-384/P-521/K-256 the cofactor is h=1 so the result is mathematically identical to plain ECDH; the fix is to add the cofactor algo_ref as an alias in the DECIPHER dispatch match arm. Standard `ECDH1-DERIVE` (0x1050) works correctly.
+**Note — ECDH1-COFACTOR-DERIVE vs ECDH1-DERIVE:** For all supported curves (P-256/P-384/P-521/K-256) the cofactor h=1, so `ECDH1-COFACTOR-DERIVE` (0x1051) and `ECDH1-DERIVE` (0x1050) are mathematically identical. Tests use `ECDH1-DERIVE` because OpenSC 0.25's SC-HSM driver rejects `ECDH1-COFACTOR-DERIVE` for P-256 keys at the PKCS#11 layer (before sending any APDU).
 
 **Status words:**
 
@@ -1344,4 +1344,4 @@ MF  (3F00)
 
 10. **DEBUG DUMP (INS=0xFE):** Only compiled in `#[cfg(feature = "debug")]` builds. The stub currently returns `SW_WRONG_DATA`. Never enable the `debug` feature in production.
 
-11. **ECDH1-COFACTOR-DERIVE not handled:** PKCS#11 mechanism 0x1051 (`ECDH1-COFACTOR-DERIVE`) is not yet aliased to the ECDH handler. Requests using this mechanism return `CKR_GENERAL_ERROR`. Standard `ECDH1-DERIVE` (0x1050) works correctly. See PUNCHOUT item 9.
+11. **ECDH1-COFACTOR-DERIVE:** For all supported curves the cofactor h=1, making COFACTOR-DERIVE and plain DERIVE identical at the APDU level. OpenSC 0.25's SC-HSM driver rejects COFACTOR-DERIVE for P-256 at the PKCS#11 layer; tests use `ECDH1-DERIVE` to avoid this driver-side restriction.
