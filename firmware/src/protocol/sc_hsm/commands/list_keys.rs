@@ -3,7 +3,7 @@
 //! Returns a list of all key objects stored in the keystore. The response
 //! contains a sequence of key descriptor TLV structures.
 
-use pico2hsm_core::apdu::{ApduCommand, ApduResponse, SW_CONDITIONS_NOT_SATISFIED, SW_OK};
+use pico2hsm_core::apdu::{ApduCommand, ApduResponse, SW_CONDITIONS_NOT_SATISFIED, SW_INCORRECT_P1P2, SW_OK};
 
 use crate::protocol::sc_hsm::ScHsmState;
 
@@ -15,6 +15,11 @@ pub fn handle(state: &mut ScHsmState, cmd: &ApduCommand<'_>) -> ApduResponse {
     // LIST KEYS does not require PIN — OpenSC's sc_pkcs15emu_sc_hsm_init calls
     // sc_list_files() before any VERIFY, so rejecting here prevents the PKCS#15
     // tree from being built and makes all key objects invisible to pkcs11-tool.
+
+    // P1 and P2 must both be 0x00.
+    if cmd.p1 != 0x00 || cmd.p2 != 0x00 {
+        return ApduResponse::err(SW_INCORRECT_P1P2);
+    }
 
     // Return 2-byte file ID pairs per key slot: {0xCC, key_id}.
     // sc_hsm_determine_free_id uses KEY_PREFIX=0xCC to find occupied slots.

@@ -231,6 +231,10 @@ impl Dispatcher {
 
         // Intercept SELECT by AID before forwarding to the active protocol.
         if cmd.ins == INS_SELECT && cmd.p1 == P1_SELECT_BY_AID {
+            // SELECT is an interindustry command — CLA must be 0x00.
+            if cmd.cla != 0x00 {
+                return ApduResponse::err(SW_CLASS_NOT_SUPPORTED).serialize();
+            }
             self.shared_buf.invalidate();
             let resp = self.select_aid(cmd.data);
             return resp.serialize();

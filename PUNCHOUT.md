@@ -3,7 +3,7 @@
 Items identified during development, mechanism audits, and pre-release security review.
 Each item carries a severity and a target milestone.
 
-Last updated: 2026-04-11 (audit pass — closed resolved items, updated descriptions)
+Last updated: 2026-04-13 (v1.0.0-rc2: M3 fuzz test written, Brainpool status corrected, provisioning design complete)
 
 ---
 
@@ -35,6 +35,7 @@ Last updated: 2026-04-11 (audit pass — closed resolved items, updated descript
 | L3 | Python version standardized to 3.10+ across all docs | v0.9.9-rc2 |
 | L4 | Config file name standardized to daemon.yaml | v0.9.9-rc2 |
 | L6 | macOS opensc-pkcs11 path shows both Intel and Apple Silicon | v0.9.9-rc2 |
+| M3 | Malformed/hostile APDU fuzz test (81 cases) | v1.0.0-rc2 |
 
 ---
 
@@ -195,14 +196,14 @@ Moved to Closed items table. V1 handlers (P1=0x31/0x32/0x33) now return `SW_INS_
 
 ---
 
-### M3. No hardware test for malformed/hostile APDUs — POST-RC2
+### ~~M3. No hardware test for malformed/hostile APDUs~~ — RESOLVED
 
-A security device must not hang, panic, or return unexpected SW codes when receiving truncated
-data, wrong CLA bytes, or oversized payloads. Deferred to post-RC2 work.
-
-**Fix:** Add a parametrized `test_malformed_apdu_rejected_gracefully` test (full pseudocode
-in 2026-04-08 review board report). Minimum cases: truncated GENERATE KEYPAIR TLV, wrong CLA,
-oversized SIGN data, empty VERIFY PIN, oversized EXTRAS payload.
+**Fixed (v1.0.0-rc2):** `tests/hw/test_16_fuzz_malformed.py` — 81 parametrized test cases
+covering structural malformation, truncated TLV, wrong CLA/INS, oversized payloads, empty
+data, protocol violations (commands before SELECT/PIN), boundary lengths, and rapid-fire
+burst stress tests. Each case sends a malformed APDU sandwiched between SELECT commands
+and asserts the device stays alive. Designed for use with a debug probe attached for
+Cortex-M33 fault register analysis (CFSR/MMFAR/BFAR) if a hang is detected.
 
 ---
 
@@ -271,9 +272,29 @@ and Apple Silicon (`/opt/homebrew/lib/`) paths, plus the auto-detect form
 
 ### 3. Brainpool curves — Blocked on upstream crate
 
-`EcPrivateBrainpoolP256/P384/P512` return `CryptoError::UnsupportedAlgorithm`. Blocked on
-RustCrypto/elliptic-curves#1114 (`bp-curves` no_std + `elliptic-curve 0.13` compatibility).
-No firmware work possible until upstream ships. Monitor the tracking issue.
+`EcPrivateBrainpoolP256/P384/P512` return `CryptoError::UnsupportedAlgorithm`.
+
+**Status (2026-04-13 feasibility study):**
+
+The PUNCHOUT reference to RustCrypto/elliptic-curves#1114 was stale (that was a LICENSE PR).
+The actual blockers are:
+
+1. **`bp256`/`bp384` crates** exist on RustCrypto master with full arithmetic (`CurveArithmetic`,
+   ECDSA, ECDH) but target `elliptic-curve 0.14.0-rc` — incompatible with our 0.13.8 stack.
+   No stable 0.14 release yet; maintainer says EC crates "will be some of the last to get releases."
+2. **`bp512` does not exist** — not upstream, not in any crate anywhere. Would need to be
+   written from scratch using fiat-crypto generated field arithmetic (~3-4 weeks).
+3. Brainpool random primes are 1.6-2.7x slower than equivalent NIST curves on Cortex-M33
+   (no Montgomery reduction shortcuts). BP512r1 sign: ~5-8 seconds.
+4. Flash impact: +55-75 KB for all three curves (not a concern on 4 MB flash).
+
+**Plan:**
+- **Wait for `elliptic-curve 0.14` stable.** Migrate the full ECC stack (p256, p384, p521,
+  k256, ecdsa, elliptic-curve) from 0.13→0.14. Add bp256+bp384 as dependencies (zero local
+  crypto code). Then write bp512 locally (~2 weeks with the other two as reference).
+- **If urgent before 0.14:** BearSSL FFI is the fastest path (~2-3 weeks for all three curves)
+  but adds C toolchain dependency and audit surface. Only pursue if there's a concrete
+  customer/compliance requirement (German/EU BSI TR-03110 PKI).
 
 ---
 

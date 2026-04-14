@@ -37,6 +37,9 @@ pub const SW_WRONG_DATA: u16 = 0x6A80;
 pub const SW_FILE_NOT_FOUND: u16 = 0x6A82;
 
 /// INS not supported.
+/// Incorrect P1/P2 parameters.
+pub const SW_INCORRECT_P1P2: u16 = 0x6A86;
+
 pub const SW_INS_NOT_SUPPORTED: u16 = 0x6D00;
 
 /// CLA not supported.

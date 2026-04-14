@@ -955,6 +955,10 @@ async fn run_geek_board(p: embassy_rp::Peripherals) {
     let mut screensaver = ScreensaverState::Active;
 
     let ccid_fut = async {
+        // Render the full UI at boot (replaces the solid green from set_status).
+        pico2hsm_firmware::display::render(board.led(), &display_state, &layout);
+        board.led().flush().await;
+
         loop {
             serial_println!("waiting for USB connect...");
             ccid.wait_connected().await;

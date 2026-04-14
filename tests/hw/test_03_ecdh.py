@@ -44,12 +44,22 @@ def _derive(
     secret_file: Path,
     save_as: str | None,
 ):
-    """Invoke pkcs11-tool --derive and return the CLIResult."""
+    """Invoke pkcs11-tool --derive and return the CLIResult.
+
+    Uses ECDH1-COFACTOR-DERIVE for P-256 because OpenSC 0.25's sc-hsm driver
+    rejects ECDH1-DERIVE for that curve at the PKCS#11 layer (the firmware
+    handles both identically since P-256 cofactor h=1).
+    """
+    mechanism = (
+        "ECDH1-COFACTOR-DERIVE"
+        if slot["curve_openssl"] == "prime256v1"
+        else "ECDH1-DERIVE"
+    )
     return runner.pkcs11_tool(
         "--login",
         "--pin",          config["pin"],
         "--derive",
-        "--mechanism",    "ECDH1-DERIVE",
+        "--mechanism",    mechanism,
         "--id",           slot["key_id"],
         "--input-file",   str(peer_point_file),
         "--output-file",  str(secret_file),

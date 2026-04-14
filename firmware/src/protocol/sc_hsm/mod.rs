@@ -21,7 +21,10 @@ pub mod pkcs15_objects;
 
 use heapless::{String, Vec};
 use pico2hsm_core::{
-    apdu::{ApduCommand, ApduResponse, SW_INS_NOT_SUPPORTED, SW_OK},
+    apdu::{
+        ApduCommand, ApduResponse, SW_CLASS_NOT_SUPPORTED, SW_INS_NOT_SUPPORTED,
+        SW_OK,
+    },
     error::HsmError,
     key::{AppletId, KeyId, KeyType as CoreKeyType},
     protocol::HsmProtocol,
@@ -535,6 +538,23 @@ impl ScHsm {
         }
     }
 
+    /// Validate the CLA byte against the command's INS.
+    ///
+    /// ISO 7816-4 interindustry commands (VERIFY, SELECT, READ BINARY, etc.)
+    /// require CLA=0x00. SC-HSM proprietary commands (INITIALIZE, EXTRAS,
+    /// LIST KEYS, etc.) require CLA=0x80.
+    fn validate_cla(cmd: &ApduCommand<'_>) -> Result<(), ApduResponse> {
+        // The real SmartCard-HSM accepts CLA=0x00 for all commands, and OpenSC's
+        // SC-HSM driver always sends CLA=0x00.  We accept both CLA=0x00 and
+        // CLA=0x80 (the ISO 7816-4 proprietary range) for all known INS bytes,
+        // rejecting only truly invalid class bytes (0x01–0x7F excluding 0x00,
+        // and 0x81–0xFF excluding 0x80).
+        if cmd.cla != 0x00 && cmd.cla != 0x80 {
+            return Err(ApduResponse::err(SW_CLASS_NOT_SUPPORTED));
+        }
+        Ok(())
+    }
+
     /// Dispatch an already-parsed APDU to the appropriate command handler,
     /// with access to persistent storage for key-mutating commands.
     fn dispatch_with_store(
@@ -542,6 +562,9 @@ impl ScHsm {
         cmd: &ApduCommand<'_>,
         store: &mut dyn crate::storage::KeyStore,
     ) -> ApduResponse {
+        if let Err(resp) = Self::validate_cla(cmd) {
+            return resp;
+        }
         match cmd.ins {
             initialize::INS_INITIALIZE => initialize::handle(&mut self.state, store, cmd),
             generate_keypair::INS_GENERATE_KEYPAIR => {
@@ -590,6 +613,9 @@ impl ScHsm {
 
     /// Dispatch an already-parsed APDU to the appropriate command handler.
     fn dispatch(&mut self, cmd: &ApduCommand<'_>) -> ApduResponse {
+        if let Err(resp) = Self::validate_cla(cmd) {
+            return resp;
+        }
         match cmd.ins {
             // Commands that need flash access — use LocalNullStore in the
             // stateless dispatch path (host-side tests).  On firmware the
