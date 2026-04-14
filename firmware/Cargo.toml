@@ -18,7 +18,6 @@ test = false
 [features]
 default = ["rp2350_one_4m", "rsa", "applet-piv", "applet-openpgp-curve25519"]
 rp2350_one_4m = ["uart-debug"]
-rp2350_one_16m = ["uart-debug"]
 rp2350_geek_16m = ["uart-debug"]
 rp2350_geek_sdcard = ["uart-debug"]
 pico2_4m = []

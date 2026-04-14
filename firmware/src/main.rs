@@ -20,7 +20,7 @@
 //!
 //! # Board selection
 //! The correct board impl is selected at compile time:
-//! - `rp2350_one_4m` / `rp2350_one_16m` → `Rp2350OneBoard`
+//! - `rp2350_one_4m`                     → `Rp2350OneBoard`
 //! - `rp2350_geek_*`                     → `Rp2350GeekBoard`
 //!
 //! # Host (x86_64) note
@@ -430,7 +430,7 @@ async fn main(_spawner: Spawner) {
     }
 
     // ── RP2350-One: security + OTP + board loop ──────────────────────────────
-    #[cfg(any(feature = "rp2350_one_4m", feature = "rp2350_one_16m"))]
+    #[cfg(feature = "rp2350_one_4m")]
     {
         pico2hsm_firmware::security::boot::security_checks();
         pico2hsm_firmware::allocator::init();
@@ -476,7 +476,6 @@ async fn main(_spawner: Spawner) {
     // ── Fallback ─────────────────────────────────────────────────────────────
     #[cfg(not(any(
         feature = "rp2350_one_4m",
-        feature = "rp2350_one_16m",
         feature = "rp2350_geek_16m",
         feature = "rp2350_geek_sdcard",
         feature = "pico2_4m",
@@ -537,7 +536,7 @@ fn handle_flash_op(
 
 // ─── RP2350-One main function ─────────────────────────────────────────────────
 
-#[cfg(all(target_arch = "arm", any(feature = "rp2350_one_4m", feature = "rp2350_one_16m")))]
+#[cfg(all(target_arch = "arm", feature = "rp2350_one_4m"))]
 async fn run_one_board(p: embassy_rp::Peripherals) {
     use embassy_futures::join::join;
     use embassy_rp::spi::{Config as SpiConfig, Phase, Polarity, Spi};

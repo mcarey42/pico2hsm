@@ -42,7 +42,6 @@ Two flash size variants are supported:
 | Variant           | Feature flag      | Flash size | Flash size (hex) |
 |-------------------|-------------------|------------|------------------|
 | RP2350-One 4 MB   | `rp2350_one_4m`   | 4 MB       | 0x00400000       |
-| RP2350-One 16 MB  | `rp2350_one_16m`  | 16 MB      | 0x01000000       |
 
 `rp2350_one_4m` is the **default** Cargo feature.
 
@@ -329,7 +328,6 @@ final wiring.  See the TODO comment in `firmware/src/main.rs` →
 | Feature flag              | Flash  | RAID-1 SPI1 | Notes                    |
 |---------------------------|--------|-------------|--------------------------|
 | `rp2350_one_4m`           | 4 MB   | yes         | **Default** in Cargo.toml |
-| `rp2350_one_16m`          | 16 MB  | yes         |                          |
 
 Always pass `--no-default-features` when selecting a non-default board flag to
 prevent conflicting features from being simultaneously active (see `CLAUDE.md`
@@ -372,9 +370,6 @@ cargo build --release
 # SC-HSM only, 4 MB flash (explicit)
 cargo build --release --no-default-features --features rp2350_one_4m
 
-# SC-HSM only, 16 MB flash
-cargo build --release --no-default-features --features rp2350_one_16m
-
 # SC-HSM + PIV, 4 MB
 cargo build --release --no-default-features --features rp2350_one_4m,applet-piv
 
@@ -389,10 +384,6 @@ cargo build --release --no-default-features \
 # All three applets + Ed25519/X25519, 4 MB
 cargo build --release --no-default-features \
     --features rp2350_one_4m,applet-piv,applet-openpgp,applet-openpgp-curve25519
-
-# SC-HSM + PIV + OpenPGP + Ed25519, 16 MB flash
-cargo build --release --no-default-features \
-    --features rp2350_one_16m,applet-piv,applet-openpgp,applet-openpgp-curve25519
 
 # With RSA support (RSA-2048 + RSA-4096)
 cargo build --release --no-default-features --features rp2350_one_4m,rsa

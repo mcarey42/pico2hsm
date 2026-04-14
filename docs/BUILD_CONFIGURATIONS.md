@@ -47,10 +47,6 @@ cargo build --release --no-default-features \
 cargo build --release --no-default-features \
     --features rp2350_one_4m,rsa,applet-piv,applet-openpgp-curve25519
 
-# Waveshare RP2350-One 16MB
-cargo build --release --no-default-features \
-    --features rp2350_one_16m,rsa,applet-piv,applet-openpgp-curve25519
-
 # Waveshare RP2350-Geek 16MB
 cargo build --release --no-default-features \
     --features rp2350_geek_16m,rsa,applet-piv,applet-openpgp-curve25519
@@ -77,9 +73,6 @@ cargo build --release --no-default-features --features pico2_4m
 ```sh
 # 4 MB flash variant
 cargo build --release --no-default-features --features rp2350_one_4m
-
-# 16 MB flash variant (no SD card)
-cargo build --release --no-default-features --features rp2350_one_16m
 
 ```
 
@@ -140,9 +133,6 @@ cargo build --release --no-default-features --features waveshare_rp2350_lcd_16m,
 ### SC-HSM + OpenPGP (NIST ECC curves only)
 
 ```sh
-# OpenPGP on RP2350-One 16 MB
-cargo build --release --no-default-features --features rp2350_one_16m,applet-openpgp
-
 # OpenPGP on Waveshare LCD
 cargo build --release --no-default-features --features waveshare_rp2350_lcd_16m,applet-openpgp
 ```
@@ -165,10 +155,6 @@ cargo build --release --no-default-features \
 ### SC-HSM + PIV + OpenPGP (all three applets)
 
 ```sh
-# All three applets, NIST curves only — RP2350-One 16 MB
-cargo build --release --no-default-features \
-  --features rp2350_one_16m,applet-piv,applet-openpgp
-
 # All three applets + Ed25519/X25519 — Waveshare LCD
 cargo build --release --no-default-features \
   --features waveshare_rp2350_lcd_16m,applet-piv,applet-openpgp,applet-openpgp-curve25519
@@ -218,7 +204,7 @@ dominate; applet state structs are small by comparison. Current worst-case
 
 **RSA note**: The `rsa` feature pulls in `num-bigint-dig` which generates very
 large code. It is only recommended for boards with 16 MB flash
-(`rp2350_one_16m`, `rp2350_geek_16m`, `rp2350_geek_sdcard`, etc.).
+(`rp2350_geek_16m`, `rp2350_geek_sdcard`, `waveshare_rp2350_lcd_16m`, etc.).
 
 **RSA debug build speed**: Without optimization, RSA-4096 keygen takes >30
 minutes on Cortex-M33 in debug builds. The workspace `Cargo.toml` adds
@@ -238,9 +224,6 @@ code paths), and streams RTT output via probe-rs.
 ```sh
 # Pico 2 (default development target)
 ./build-all-debug.sh pico2_4m
-
-# RP2350-One 16 MB
-./build-all-debug.sh rp2350_one_16m
 
 # RP2350-Geek with built-in SD card
 ./build-all-debug.sh rp2350_geek_sdcard

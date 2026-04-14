@@ -11,7 +11,6 @@
 //!
 //! # Feature flags
 //! - `rp2350_one_4m`             → RP2350-One with 4 MB flash
-//! - `rp2350_one_16m`            → RP2350-One with 16 MB flash
 //! - `rp2350_geek_16m`           → RP2350-Geek with 16 MB flash, no SDCard
 //! - `rp2350_geek_sdcard`        → RP2350-Geek with SDCard slot
 //! - `pico2_4m`                  → Stock Pico 2 with 4 MB flash, GPIO25 LED

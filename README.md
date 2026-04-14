@@ -31,9 +31,8 @@ The firmware provides hardware-backed key storage with:
 |-------|-------|-------------------|---------|
 | Raspberry Pi Pico 2 | 4MB | 2MB internal | GPIO LED |
 | Waveshare RP2350-One 4MB | 4MB | 2MB internal | WS2812B LED |
-| Waveshare RP2350-One 16MB | 16MB | 14MB internal | WS2812B LED |
-| Waveshare RP2350-Geek 16MB | 16MB | 14MB internal | SPI LCD |
-| Waveshare RP2350-Geek + SDCard | 16MB | 14MB + SDCard | SPI LCD, SDCard |
+| Waveshare RP2350-Geek 16MB | 16MB | 14MB internal | ST7789 LCD |
+| Waveshare RP2350-Geek + SDCard | 16MB | 14MB + SDCard | ST7789 LCD, SDCard |
 | Waveshare RP2350-LCD-1.47-B | 16MB | 14MB internal | ST7789V3 LCD, WS2812B LED |
 | Waveshare RP2350-LCD-1.47-B + SDCard | 16MB | SDCard | ST7789V3 LCD, SDCard |
 
@@ -82,7 +81,6 @@ See [BUILDING.md](BUILDING.md) for the full reference.
 
 ### Board selection (mutually exclusive — always use `--no-default-features`)
 - `rp2350_one_4m` — Waveshare RP2350-One 4MB (default)
-- `rp2350_one_16m` — Waveshare RP2350-One 16MB
 - `rp2350_geek_16m` — Waveshare RP2350-Geek 16MB
 - `rp2350_geek_sdcard` — Waveshare RP2350-Geek with SDCard
 - `waveshare_rp2350_lcd_16m` — Waveshare RP2350-LCD-1.47-B 16MB
@@ -124,7 +122,6 @@ pico2hsm/
 │       ├── storage/            # RAID, WAL, filesystem, integrity
 │       ├── security/           # OTP, secure boot, PIN management
 │       └── dkek/               # DKEK exchange via Noise_XX
-├── tools/hsm-tool/             # Host-side CLI tool (std)
 ├── tests/hw/                   # Hardware integration tests (Python/pytest)
 └── tests/integration/          # Unit/integration tests (std)
 ```

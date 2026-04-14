@@ -105,7 +105,6 @@ COMMON_FEATURES="rsa,applet-piv,applet-openpgp-curve25519"
 declare -a VARIANTS=(
     "pico2_4m                 | Raspberry Pi Pico 2 4MB                | RP2350"
     "rp2350_one_4m            | Waveshare RP2350-One  4MB              | RP2350"
-    "rp2350_one_16m           | Waveshare RP2350-One 16MB              | RP2350"
     "rp2350_geek_16m          | Waveshare RP2350-Geek 16MB             | RP2350"
     "rp2350_geek_sdcard               | Waveshare RP2350-Geek SDCard           | RP2350"
     "waveshare_rp2350_lcd_16m         | Waveshare RP2350-LCD-1.47-B 16MB       | RP2350"

@@ -52,7 +52,6 @@ brew install arm-none-eabi-binutils
 | Feature flag | Hardware | Flash | Storage |
 |---|---|---|---|
 | `rp2350_one_4m` (default) | Waveshare RP2350-One | 4 MB | 2 MB keystore |
-| `rp2350_one_16m` | Waveshare RP2350-One | 16 MB | 14 MB keystore |
 | `rp2350_geek_16m` | Waveshare RP2350-Geek | 16 MB | 6 MB keystore |
 | `rp2350_geek_sdcard` | Waveshare RP2350-Geek + SDCard | 16 MB + SD | 14 MB keystore |
 | `waveshare_rp2350_lcd_16m` | Waveshare RP2350-LCD-1.47-B | 16 MB | 14 MB keystore |
@@ -100,11 +99,11 @@ cargo build --release \
     --no-default-features \
     --features pico2_4m,rsa,applet-piv,applet-openpgp-curve25519
 
-# RP2350-One 16MB — all features
+# RP2350-Geek 16MB — all features
 cargo build --release \
     --manifest-path firmware/Cargo.toml \
     --no-default-features \
-    --features rp2350_one_16m,rsa,applet-piv,applet-openpgp-curve25519
+    --features rp2350_geek_16m,rsa,applet-piv,applet-openpgp-curve25519
 ```
 
 `applet-openpgp-curve25519` implies `applet-openpgp`; you do not need to list
@@ -250,7 +249,6 @@ probe-rs run \
 ```
 dist/pico2hsm-pico2_4m.uf2
 dist/pico2hsm-rp2350_one_4m.uf2
-dist/pico2hsm-rp2350_one_16m.uf2
 dist/pico2hsm-rp2350_geek_16m.uf2
 dist/pico2hsm-rp2350_geek_sdcard.uf2
 dist/pico2hsm-waveshare_rp2350_lcd_16m.uf2

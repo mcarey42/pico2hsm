@@ -14,7 +14,7 @@ This document describes all significant design decisions for the pico2hsm projec
 0x10200000  KEYSTORE (2MB) — pico2hsm keystore sectors
 ```
 
-### RP2350-One 16MB / RP2350-Geek 16MB / RP2350-Geek + SDCard
+### RP2350-Geek 16MB / Waveshare LCD 16MB / SDCard variants
 
 ```
 0x10000000  BOOT2    (256 bytes)
@@ -214,9 +214,7 @@ Noise_XX provides:
 
 ### Transport options
 
-**USB (local):** Noise frames are carried in SC-HSM EXTRAS APDUs (INS=0x54, P1=0x10). Both HSM devices must be connected to the same host machine running hsm-tool.
-
-**TCP (network):** For geographically separated devices, hsm-tool establishes a TCP connection to port 4443 on the remote device. The Noise frames are carried directly over TCP. The HSM firmware embeds a minimal TCP stack (to be determined — possibly via a host proxy).
+**USB (local):** Noise frames are carried in SC-HSM EXTRAS APDUs (INS=0x54, P1=0x10). Both HSM devices must be connected to the same host machine. A host-side tool sends APDUs to both devices to relay Noise frames between them.
 
 ### DKEK share accumulation
 
@@ -404,3 +402,69 @@ All types that hold secret material implement `zeroize::ZeroizeOnDrop`:
 ### Watchdog
 
 The hardware watchdog is armed at boot with a 5-second timeout. The watchdog is serviced by the main Embassy task every 500ms. A firmware hang (e.g. infinite loop in a command handler) results in a hardware reset within 5 seconds.
+
+---
+
+## 14. Dual-Core Async Runtime
+
+The RP2350 has two Cortex-M33 cores. pico2hsm uses both with separate
+Embassy async executors.
+
+### Core 0 — USB + Transport
+
+Core 0 runs the main Embassy executor with these tasks:
+
+- **USB device driver** (`usb.run()`) — handles USB enumeration, endpoints
+- **CCID transport loop** — receives APDUs via USB bulk-out, sends responses
+  via bulk-in. Sends CCID time-extension messages (BWT) every 1.5 s while
+  waiting for Core 1 to finish processing
+- **CDC-ACM serial logger** (`drain_one()`) — forwards defmt log lines to
+  `/dev/ttyACMx`; checks DTR before writing to avoid CCID stalls
+- **Display rendering** (LCD boards) — async DMA SPI flush of framebuffer
+- **Flash service** — handles `FLASH_REQ` channel for Core 1 flash writes
+  (embassy-rp `in_ram()` asserts Core 0)
+
+Core 0 uses `embassy_futures::join` to run USB and CCID concurrently.
+
+### Core 1 — APDU Dispatch
+
+Core 1 runs a dedicated Embassy executor with a single task:
+
+- **`dispatcher_task()`** — receives APDUs from `APDU_CHANNEL`, calls the
+  synchronous `Dispatcher::dispatch()` chain, sends responses back via
+  `RESP_CHANNEL`
+
+The dispatch chain is fully synchronous on Core 1:
+```
+dispatcher_task()
+  └─ Dispatcher::dispatch()
+       ├─ SELECT AID → activates applet (ScHsm / Piv / OpenPgp)
+       └─ all other INS → active protocol's process_apdu()
+            └─ ScHsm::dispatch() → <command>::handle()
+```
+
+### Cross-Core Communication
+
+| Channel | Direction | Purpose | Sync mechanism |
+|---------|-----------|---------|----------------|
+| `APDU_CHANNEL` | Core 0 → 1 | APDU bytes from USB | RP2350 spinlock 29 |
+| `RESP_CHANNEL` | Core 1 → 0 | Response bytes | RP2350 spinlock 30 |
+| `FLASH_REQ` | Core 1 → 0 | Flash write requests | Embassy channel |
+| `WATCHDOG_HEARTBEAT` | Core 1 → 0 | Liveness counter | AtomicU32 |
+| `CORE1_PROGRESS` | Core 1 → 0 | Operation progress | AtomicU32 |
+
+### Core 1 Stack
+
+Core 1 uses a 192 KB static stack (`CORE1_STACK`). Measured peak usage is
+~65 KB (38 KB `ScHsmState` inline storage + 16 KB dispatch-chain
+temporaries), giving ~3x headroom. The `Dispatcher` is initialized via
+`init_in_place()` on Core 0 to avoid stack overflow during construction.
+
+### defmt Constraint
+
+Core 1 **must not** call `defmt` logging functions. The defmt RTT channel
+uses RP2350 spinlock 31 with `BLOCK_IF_FULL` mode. If Core 0 is servicing
+USB while Core 1 calls defmt, a deadlock occurs: Core 1 spins on spinlock
+31 waiting for Core 0 to drain the RTT buffer, but Core 0 is blocked
+waiting for Core 1's APDU response. All Core 1 logging uses
+`serial_println!` (direct UART writes) instead.

@@ -8,7 +8,7 @@ Always use the debug script to build and flash firmware. Do not run `cargo build
 ./build-all-debug.sh pico2_4m
 ```
 
-Valid board arguments: `pico2_4m`, `rp2350_one_4m`, `rp2350_one_16m`, `rp2350_geek_16m`, `rp2350_geek_sdcard`, `waveshare_rp2350_lcd_16m`, `waveshare_rp2350_lcd_sdcard`.
+Valid board arguments: `pico2_4m`, `rp2350_one_4m`, `rp2350_geek_16m`, `rp2350_geek_sdcard`, `waveshare_rp2350_lcd_16m`, `waveshare_rp2350_lcd_sdcard`.
 
 This script:
 - Builds with `DEFMT_LOG=trace` (required for defmt log output to survive optimisation)
@@ -92,7 +92,7 @@ cargo build --release --no-default-features \
 | Board | Flash | RAM | SRAM % |
 |---|---|---|---|
 | Pico 2 4MB | 522 KB | 398 KB | 77% |
-| RP2350-One 4MB/16MB | 529 KB | 398 KB | 77% |
+| RP2350-One 4MB | 529 KB | 398 KB | 77% |
 | RP2350-Geek 16MB/SDCard | 539 KB | 450 KB | 87% |
 | Waveshare LCD 16MB | 539 KB | 449 KB | 87% |
 | Waveshare LCD SDCard | 542 KB | 442 KB | 85% |

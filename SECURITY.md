@@ -4,8 +4,8 @@
 
 | Version | Status |
 |---------|--------|
-| 0.9.x | Current development series -- receives security fixes |
-| < 0.9 | No longer maintained |
+| 1.0.x | Current stable release -- receives security fixes |
+| 0.9.x | Legacy development series -- no longer maintained |
 
 ## Threat model summary
 
@@ -40,6 +40,6 @@ These are documented design limitations within the current threat model, not bug
 
 - **V1 Noise exchange provides no mutual authentication.** The V1 DKEK exchange (P1=0x30..0x34) uses unauthenticated ephemeral ECDH. It is deprecated; use V2 (P1=0x35..0x38) for new deployments. Note that V2 mutual authentication signature verification is not yet implemented (see PUNCHOUT C1) and must be completed before v1.0.
 
-- **Self-signed TLS in anonymous mode.** The Python daemon's standalone DKEK exchange mode uses TLS with `CERT_NONE` verification, which encrypts but does not authenticate peers. For network deployments, configure mutual TLS with a CA-signed certificate (see PUNCHOUT C2).
+- **DKEK V2 exchange requires pre-shared device identity.** The V2 Noise_XX DKEK exchange authenticates peers using static device identity keys stored in OTP. These keys must be exchanged out-of-band before the first DKEK transfer. See `docs/SECURE_PROVISIONING_PLAN.md` for the provisioning workflow.
 
 - **No side-channel hardening.** Cryptographic operations (ECDSA sign, ECDH, RSA) use unmasked software implementations. Timing and power analysis attacks are feasible for an attacker with physical access to the device.

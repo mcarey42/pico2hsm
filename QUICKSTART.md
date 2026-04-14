@@ -23,10 +23,10 @@ One of the following supported boards:
 
 | Board | Where to get it | Notes |
 |-------|----------------|-------|
-| Waveshare RP2350-One 4MB | waveshare.com | Smallest, USB-A dongle form factor |
-| Waveshare RP2350-One 16MB | waveshare.com | Same board, more storage for keys |
 | Raspberry Pi Pico 2 | raspberrypi.com | Cheapest option; needs a USB cable |
-| Waveshare RP2350-Geek | waveshare.com | Has a small LCD screen |
+| Waveshare RP2350-One 4MB | waveshare.com | Smallest, USB-A dongle form factor |
+| Waveshare RP2350-Geek | waveshare.com | ST7789 LCD screen, SD card slot |
+| Waveshare RP2350-LCD-1.47-B | waveshare.com | ST7789V3 LCD + WS2812B LED, SD card slot |
 
 You do **not** need a debug probe to follow this guide. You will flash the
 firmware by holding a button and plugging in USB (called BOOTSEL mode).
@@ -198,7 +198,7 @@ After the build, `dist/` contains one set of files per board:
 dist/
   pico2hsm-pico2_4m.uf2              ← Flash this file to a Pico 2
   pico2hsm-rp2350_one_4m.uf2         ← Flash this file to an RP2350-One 4MB
-  pico2hsm-rp2350_one_16m.uf2        ← Flash this file to an RP2350-One 16MB
+  pico2hsm-rp2350_geek_16m.uf2       ← Flash this file to an RP2350-Geek
   ...
   pico2hsm-pico2_4m-signed.elf       ← Signed firmware binary (for probe-rs)
   pico2hsm-pico2_4m-otp.json         ← OTP settings for locking the device
@@ -232,8 +232,8 @@ cp dist/pico2hsm-pico2_4m.uf2 /media/$USER/RPI-RP2/
 # For Waveshare RP2350-One 4MB:
 cp dist/pico2hsm-rp2350_one_4m.uf2 /media/$USER/RPI-RP2/
 
-# For Waveshare RP2350-One 16MB:
-cp dist/pico2hsm-rp2350_one_16m.uf2 /media/$USER/RPI-RP2/
+# For Waveshare RP2350-Geek 16MB:
+cp dist/pico2hsm-rp2350_geek_16m.uf2 /media/$USER/RPI-RP2/
 ```
 
 On macOS, the drive appears in Finder as `RPI-RP2`. You can drag and drop the file.

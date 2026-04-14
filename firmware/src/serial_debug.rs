@@ -22,7 +22,7 @@
 //! Each message is prefixed with a short board identifier:
 //! - `[GEEK]` — rp2350_geek_16m / rp2350_geek_sdcard
 //! - `[LCD]`  — waveshare_rp2350_lcd_16m / waveshare_rp2350_lcd_sdcard
-//! - `[ONE]`  — rp2350_one_4m / rp2350_one_16m
+//! - `[ONE]`  — rp2350_one_4m
 //! - `[PICO]` — pico2_4m (only if uart-debug were manually enabled)
 
 /// Write raw bytes to UART1 via PAC registers (spin-wait on TX FIFO).
@@ -49,7 +49,7 @@ pub const BOARD_TAG: &[u8] = {
     { b"[GEEK] " }
     #[cfg(any(feature = "waveshare_rp2350_lcd_16m", feature = "waveshare_rp2350_lcd_sdcard"))]
     { b"[LCD] " }
-    #[cfg(any(feature = "rp2350_one_4m", feature = "rp2350_one_16m"))]
+    #[cfg(feature = "rp2350_one_4m")]
     { b"[ONE] " }
     #[cfg(feature = "pico2_4m")]
     { b"[PICO] " }

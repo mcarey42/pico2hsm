@@ -28,8 +28,6 @@ fn main() {
     // Select board linker script based on active feature flag.
     let board = if cfg!(feature = "rp2350_one_4m") {
         "rp2350_one_4m"
-    } else if cfg!(feature = "rp2350_one_16m") {
-        "rp2350_one_16m"
     } else if cfg!(feature = "rp2350_geek_16m") {
         "rp2350_geek_16m"
     } else if cfg!(feature = "rp2350_geek_sdcard") {

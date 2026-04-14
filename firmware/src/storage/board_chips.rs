@@ -42,7 +42,7 @@ pub type BoardChip = QmiFlash;
 
 /// RAID-1 pair: SPI0 primary (W25Qxx) + SPI1 mirror (W25Qxx).
 /// The third type parameter (`QmiFlash`) is the unused SD-slot placeholder.
-#[cfg(all(target_arch = "arm", any(feature = "rp2350_one_4m", feature = "rp2350_one_16m")))]
+#[cfg(all(target_arch = "arm", feature = "rp2350_one_4m"))]
 pub type BoardChip = AnyChip<
     SpiFlash<
         embassy_rp::spi::Spi<'static, embassy_rp::peripherals::SPI0, embassy_rp::spi::Blocking>,

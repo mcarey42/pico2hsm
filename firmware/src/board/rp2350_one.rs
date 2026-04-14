@@ -2,7 +2,6 @@
 //!
 //! Board variants covered by this module:
 //! - RP2350-One 4MB  (`rp2350_one_4m` feature)
-//! - RP2350-One 16MB (`rp2350_one_16m` feature)
 //!
 //! # Hardware specifics
 //! - Status LED: single WS2812B RGB LED on GPIO 16
@@ -58,7 +57,7 @@
 // Always import shared types — Ws2812Led implements LedController unconditionally.
 use super::{LedController, LedStatus};
 // Board is only needed inside the feature-gated impl block.
-#[cfg(any(feature = "rp2350_one_4m", feature = "rp2350_one_16m"))]
+#[cfg(feature = "rp2350_one_4m")]
 use super::Board;
 
 // ─── GPIO pin assignments ─────────────────────────────────────────────────────
@@ -487,7 +486,7 @@ impl Rp2350OneBoard {
     }
 }
 
-#[cfg(any(feature = "rp2350_one_4m", feature = "rp2350_one_16m"))]
+#[cfg(feature = "rp2350_one_4m")]
 impl Board for Rp2350OneBoard {
     type Led  = Ws2812Led;
     type Spi0 = Rp2350OneSpi0;
