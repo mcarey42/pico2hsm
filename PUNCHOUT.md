@@ -36,6 +36,7 @@ Last updated: 2026-04-13 (v1.0.0-rc2: M3 fuzz test written, Brainpool status cor
 | L4 | Config file name standardized to daemon.yaml | v0.9.9-rc2 |
 | L6 | macOS opensc-pkcs11 path shows both Intel and Apple Silicon | v0.9.9-rc2 |
 | M3 | Malformed/hostile APDU fuzz test (81 cases) | v1.0.0-rc2 |
+| 4b | CRIT1/JTAG disable OTP rows fixed, RBIT-8 via picotool | v1.0.0-rc4 |
 
 ---
 
@@ -304,24 +305,26 @@ The actual blockers are:
 program `OTP.sw_lock(page)` to `INACCESSIBLE` / write-protect via real PAC registers.
 Moved to Closed items table.
 
-**4b. CRIT0 / JTAG disable — WRONG ROW AND WRONG REGISTER (upgraded to HIGH)**
+**~~4b. CRIT0 / JTAG disable — WRONG ROW AND WRONG REGISTER~~** — RESOLVED
 
-**Severity:** HIGH (pre-production)
+**Fixed (v1.0.0-rc4):** Triple-checked against pico-sdk `otp_data.h`, rp-pac 7.0.0
+SVD-derived definitions, and the Raspberry Pi `rp2350_hacking_challenge/lock_chip.sh`
+known-working reference.
 
-Two bugs confirmed by SVD/PAC analysis (2026-04-11):
-
-1. **Wrong row:** `CRIT0_ROW = 0x18` writes to `randid2` (private random number), not CRIT0.
-2. **Wrong register:** The target bits (DEBUG_DISABLE, GLITCH_DETECTOR_ENABLE,
-   GLITCH_DETECTOR_SENS) are in **CRIT1** (row 0x40), not CRIT0 (row 0x38).
-
-Value `0x74` is correct for CRIT1 bit layout. Affected files:
-- `provisioning.rs:294` — `CRIT0_ROW = 0x18` → should be `CRIT1_ROW = 0x40`
-- `boot.rs:269` — `RP2350_CRIT0_ROW = 0x18` → should be `RP2350_CRIT1_ROW = 0x40`
-- `docs/SECURE_PROVISIONING_PLAN.md` — references "CRIT0 row 0x18"
-
-**Additional concern:** CRIT1 uses RBIT-8 redundancy (rows 0x40-0x47). Must verify
-whether `embassy_rp::otp::write_raw_word` handles 8-way redundancy or if all 8 copies
-need explicit writes. Do NOT fix until RBIT-8 handling is confirmed on hardware.
+Bugs found and fixed:
+1. `boot.rs:269` `RP2350_CRIT0_ROW = 0x18` → row 0x18 is NUM_GPIOS, not CRIT0.
+   Removed: firmware no longer writes CRIT1 at runtime.
+2. `boot.rs:176` `RP2350_OTP_BOOT_FLAGS0_ROW = 0x30` → BOOT_FLAGS0 is row 0x48,
+   and SECURE_BOOT_ENABLE is in CRIT1 (row 0x40) bit 0, not BOOT_FLAGS0.
+   Fixed: `is_secure_boot_enabled()` now reads CRIT1 row 0x40.
+3. RBIT-8 confirmed: `embassy_rp::otp::write_raw_word()` writes exactly 1 row;
+   CRIT1 needs all 8 copies (rows 0x40–0x47). Solution: firmware does NOT write
+   CRIT1; provisioning uses `picotool otp set OTP_DATA_CRIT1.*` which handles
+   all 8 copies automatically.
+4. `docs/PROVISIONING.md` corrected: all row numbers, picotool commands, and
+   the provisioning checklist now reference the verified OTP layout.
+5. CRIT0 (rows 0x38–0x3F) only contains ARM_DISABLE and RISCV_DISABLE — it has
+   nothing to do with secure boot, JTAG, or glitch detection.
 
 **~~4c. Periodic CSPRNG reseed not wired~~** — RESOLVED. `fill_random()` now reseeds
 every `RESEED_INTERVAL` (1,000) calls via an atomic counter. Moved to Closed items table.

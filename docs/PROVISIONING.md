@@ -223,14 +223,22 @@ Rows 0x120–0x12F : Device identity key (32 bytes, 16 ECC words)
                    Static key for Noise_XX device authentication
 ```
 
-The RP2350 ROM uses these additional rows (programmed via `picotool otp load`):
+The RP2350 ROM uses these additional rows (programmed via `picotool otp set`
+or `picotool otp load`).  Row numbers verified against pico-sdk `otp_data.h`
+and rp-pac 7.0.0:
 
 ```
-Row  0x18        : CRIT0 — secure boot enable, glitch detector, JTAG disable
-Row  0x19        : CRIT1 — redundant copy of CRIT0
-Rows 0x20–0x2F  : Boot signing key hash (SHA-256 of secp256k1 public key)
-Row  0x30        : BOOT_FLAGS0 — secure boot enable flag (bit 0)
+Rows 0x38–0x3F  : CRIT0 (RBIT-8) — ARM_DISABLE, RISCV_DISABLE only
+Rows 0x40–0x47  : CRIT1 (RBIT-8) — SECURE_BOOT_ENABLE, DEBUG_DISABLE,
+                   SECURE_DEBUG_DISABLE, GLITCH_DETECTOR_ENABLE/SENS
+Rows 0x48–0x4A  : BOOT_FLAGS0 (RBIT-3) — boot path control
+Rows 0x4B–0x4D  : BOOT_FLAGS1 (RBIT-3) — KEY_INVALID flags
+Rows 0x80–0x8F  : BOOTKEY0 (ECC) — SHA-256 hash of secp256k1 signing public key
 ```
+
+**RBIT-8**: CRIT0 and CRIT1 each store 8 identical copies.  The ROM does a
+majority vote across all copies.  Always use `picotool otp set OTP_DATA_CRIT1.*`
+(which writes all 8 copies) — do NOT write individual rows manually.
 
 ### Step 1: Generate per-device key material
 
@@ -283,7 +291,7 @@ picotool otp load dist/pico2hsm-otp.json
 ```
 
 This burns:
-- **Boot key hash** (rows 0x20–0x2F): SHA-256 of your secp256k1 public key
+- **Boot key hash** (BOOTKEY0, rows 0x80–0x8F): SHA-256 of your secp256k1 public key
 - **Boot flags**: key-valid flag
 
 ---
@@ -302,16 +310,19 @@ before proceeding.
 
 ### Enable secure boot
 
-The SECURE_BOOT_ENABLE bit is in BOOT_FLAGS0 (OTP row 0x30, bit 0) and
-CRIT0 (OTP row 0x18, bit 0). These are typically set via the OTP JSON
-from `picotool seal`:
+SECURE_BOOT_ENABLE is bit 0 of **CRIT1** (OTP rows 0x40–0x47, RBIT-8).
+It is NOT in BOOT_FLAGS0 (row 0x48) or CRIT0 (row 0x38).
+
+Use picotool's field-name syntax — this automatically writes all 8
+RBIT-8 copies:
 
 ```bash
-# If not already set by picotool otp load:
-picotool otp set 0x30 0x01    # BOOT_FLAGS0: secure boot enable
-picotool otp set 0x18 0x01    # CRIT0: secure boot enable
-picotool otp set 0x19 0x01    # CRIT1: redundant copy
+# Enable secure boot (CRIT1 bit 0, all 8 copies):
+picotool otp set OTP_DATA_CRIT1.SECURE_BOOT_ENABLE 1
 ```
+
+Do NOT write raw row numbers for CRIT1 — `picotool otp set 0x40 0x01`
+would only write 1 of 8 copies, which is unreliable.
 
 ### Set production mode flag
 
@@ -354,18 +365,29 @@ Before disabling JTAG, verify **all** of the following:
 
 ### Disable JTAG
 
-The JTAG disable fuse is in two locations:
-
-1. **CRIT0 bit 4** (OTP row 0x18): Hardware JTAG disable, enforced by ROM
-2. **pico2hsm boot flags bit 0** (OTP row 0x110): User-land record
+The hardware JTAG disable fuse is **CRIT1.DEBUG_DISABLE** (bit 2, OTP
+rows 0x40–0x47, RBIT-8).  The pico2hsm firmware also records a user-land
+bookkeeping flag in OTP row 0x110 bit 0.
 
 ```bash
-# Hardware JTAG disable (ROM-enforced):
-picotool otp set 0x18 0x11    # CRIT0: SECURE_BOOT + JTAG_DISABLE
+# Hardware JTAG disable (ROM-enforced, all 8 RBIT-8 copies):
+picotool otp set OTP_DATA_CRIT1.DEBUG_DISABLE 1
 
-# pico2hsm user-land flag:
-# Set via firmware Otp::disable_jtag_permanent() (requires production mode)
+# Also disable secure debug access:
+picotool otp set OTP_DATA_CRIT1.SECURE_DEBUG_DISABLE 1
+
+# Enable glitch detector at maximum sensitivity:
+picotool otp set OTP_DATA_CRIT1.GLITCH_DETECTOR_ENABLE 1
+picotool otp set OTP_DATA_CRIT1.GLITCH_DETECTOR_SENS 3
+
+# pico2hsm user-land flag (set automatically by firmware at next boot
+# when production mode is active):
+# Row 0x110 bit 0 = JTAG_DISABLED (bookkeeping only)
 ```
+
+**Important**: CRIT1 fields (DEBUG_DISABLE, SECURE_BOOT_ENABLE, etc.)
+use RBIT-8 redundancy — always use `picotool otp set OTP_DATA_CRIT1.*`
+field-name syntax, never raw row writes.
 
 ### Verify SWD is disabled
 
@@ -492,7 +514,7 @@ PHASE 5 — OTP PROVISIONING
   [ ] Verify boot key hash in OTP
 
 PHASE 6 — SECURE BOOT (irreversible)
-  [ ] Enable SECURE_BOOT_ENABLE in BOOT_FLAGS0 + CRIT0
+  [ ] picotool otp set OTP_DATA_CRIT1.SECURE_BOOT_ENABLE 1
   [ ] Reboot and verify device still boots
   [ ] Run full integration test suite
 
@@ -503,9 +525,12 @@ PHASE 7 — PRODUCTION MODE
 PHASE 8 — JTAG DISABLE (irreversible)
   [ ] Final verification: all tests pass
   [ ] Final verification: multiple power cycles succeed
-  [ ] Program JTAG_DISABLE in CRIT0 (bit 4)
-  [ ] Set JTAG_DISABLED in pico2hsm boot flags (row 0x110 bit 0)
+  [ ] picotool otp set OTP_DATA_CRIT1.DEBUG_DISABLE 1
+  [ ] picotool otp set OTP_DATA_CRIT1.SECURE_DEBUG_DISABLE 1
+  [ ] picotool otp set OTP_DATA_CRIT1.GLITCH_DETECTOR_ENABLE 1
+  [ ] picotool otp set OTP_DATA_CRIT1.GLITCH_DETECTOR_SENS 3
   [ ] Verify probe-rs cannot connect
+  [ ] Reboot — firmware sets pico2hsm bookkeeping flag (row 0x110 bit 0)
 
 PHASE 9 — RECORDS
   [ ] Record device serial, IKM, dates in production database
@@ -516,8 +541,10 @@ PHASE 9 — RECORDS
 
 ## References
 
-- [RP2350 Datasheet](https://datasheets.raspberrypi.com/rp2350/rp2350-datasheet.pdf) — OTP layout (§5.4), secure boot (§5.6), CRIT0 (§5.6.4)
-- [picotool](https://github.com/raspberrypi/picotool) — firmware signing, OTP programming
+- [RP2350 Datasheet](https://datasheets.raspberrypi.com/rp2350/rp2350-datasheet.pdf) — OTP layout (§5.4), secure boot (§5.6), CRIT1 (§5.6.4)
+- [pico-sdk otp_data.h](https://github.com/raspberrypi/pico-sdk/blob/develop/src/rp2350/hardware_regs/include/hardware/regs/otp_data.h) — authoritative OTP row definitions
+- [rp2350_hacking_challenge lock_chip.sh](https://github.com/raspberrypi/rp2350_hacking_challenge) — known-working picotool provisioning commands
+- [picotool](https://github.com/raspberrypi/picotool) — firmware signing, OTP programming (handles RBIT-8 automatically)
 - `firmware/src/security/otp.rs` — pico2hsm OTP row constants and access functions
 - `firmware/src/security/boot.rs` — secure boot status checks
 - `generate_firmware_signing_keys.sh` — key generation script

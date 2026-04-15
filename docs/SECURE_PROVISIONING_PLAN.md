@@ -31,12 +31,13 @@ for flag registers.
 
 | Row address | Name | Content | When programmed | Lock after? | Confidence |
 |---|---|---|---|---|---|
-| `0x00–0x17` | Silicon/ROM reserved | RP2350 silicon identifiers | Factory | N/A — already locked | CONFIRMED (RP2350 TRM §5.6.1) |
-| `0x18` | CRIT0 | Critical boot flags: bit 0 = SECURE_BOOT_ENABLE, bit 1 = GLITCH_DETECTOR_ENABLE, bits 2–3 = GLITCH_DETECTOR_SENS, bit 4 = JTAG_DISABLE | Provisioning step | Yes — write-lock | CONFIRMED (RP2350 datasheet §5.6.4 "Critical Boot Flags") |
-| `0x19` | CRIT1 | Mirror/redundancy of CRIT0 (RP2350 reads both for agreement) | Provisioning step | Yes — write-lock | CONFIRMED (RP2350 datasheet §5.6.4) |
-| `0x20–0x2F` | Boot signing public key hash (rows 0–15) | SHA-256 hash of the Ed25519 boot signing public key (32 bytes = 16 ECC rows) | Key provisioning | Yes — write-lock | ESTIMATED — exact row range from RP2350 TRM §5.6.6 "BOOT_FLAGS / Boot Key Hash"; TBD by TRM cross-reference |
-| `0x30` | BOOT_FLAGS0 | Hardware boot flags: bit 0 = SECURE_BOOT_ENABLE (ROM reads this); other bits: rollback counter, key revocation | Provisioning step | Yes — write-lock | CONFIRMED (RP2350 datasheet §5.6.6; referenced in `security/boot.rs` comment and `is_secure_boot_enabled()`) |
-| `0x31` | BOOT_FLAGS1 | Extended boot flags / rollback counter high bits | Provisioning step | Yes — write-lock | ESTIMATED — TBD by TRM |
+| `0x00–0x17` | Silicon/ROM reserved | RP2350 silicon identifiers, RANDID, calibration | Factory | N/A — already locked | CONFIRMED (pico-sdk otp_data.h) |
+| `0x18` | NUM_GPIOS | Number of main user GPIOs (48 QFN80, 30 QFN60) | Factory | N/A | CONFIRMED (pico-sdk otp_data.h) — **NOT CRIT0** |
+| `0x38–0x3F` | CRIT0 (RBIT-8) | ARM_DISABLE (bit 0), RISCV_DISABLE (bit 1). **Not** secure boot or JTAG. | Provisioning | Yes — write-lock | CONFIRMED (pico-sdk, rp-pac 7.0.0) |
+| `0x40–0x47` | CRIT1 (RBIT-8) | SECURE_BOOT_ENABLE (bit 0), SECURE_DEBUG_DISABLE (bit 1), DEBUG_DISABLE (bit 2), GLITCH_DETECTOR_ENABLE (bit 4), GLITCH_DETECTOR_SENS (bits 5-6) | Provisioning | Yes — write-lock | CONFIRMED (pico-sdk, rp-pac 7.0.0, rp2350_hacking_challenge) |
+| `0x48–0x4A` | BOOT_FLAGS0 (RBIT-3) | Boot path control flags (NOT secure boot enable) | Provisioning | Yes — write-lock | CONFIRMED (pico-sdk, rp-pac 7.0.0) |
+| `0x4B–0x4D` | BOOT_FLAGS1 (RBIT-3) | KEY_INVALID flags for boot key slots | Provisioning | Yes — write-lock | CONFIRMED (pico-sdk, rp-pac 7.0.0) |
+| `0x80–0x8F` | BOOTKEY0 (ECC) | SHA-256 hash of secp256k1 boot signing public key (32 bytes = 16 ECC rows) | Key provisioning | Yes — write-lock | CONFIRMED (pico-sdk, rp-pac 7.0.0) |
 | `0x100–0x11F` | pico2hsm storage key material (32 ECC rows = 64 bytes) | IKM for HKDF-SHA256 that derives the Storage Master Key (SMK). Per-device random bytes written once at provisioning. | Factory provisioning | Yes — read-lock + write-lock | CONFIRMED (defined in `security/otp.rs` `OTP_STORAGE_KEY_ROW_START = 0x100`) |
 | `0x110` | pico2hsm boot flags | bit 0 = JTAG_DISABLED (user-land record); bit 1 = PRODUCTION_MODE; bit 2 = PROVISIONED | After production mode set | Yes — write-lock after setting | CONFIRMED (defined in `security/otp.rs` `OTP_BOOT_FLAGS_ROW = 0x110`) |
 | `0x120–0x12F` | Device identity key (16 ECC rows = 32 bytes) | Static Ed25519 device identity key for Noise_XX authentication (pico2hsm DKEK exchange protocol) | Factory provisioning | Yes — read-lock + write-lock | CONFIRMED (defined in `security/otp.rs` `OTP_DEVICE_ID_KEY_ROW_START = 0x120`) |
@@ -47,11 +48,12 @@ for flag registers.
 
 The RP2350 uses a two-level addressing scheme in its ROM API: the `otp_access`
 ROM function takes a row number (0–4095) and an operation code. The
-`embassy_rp::otp` module wraps this for ECC and raw access. The CRIT0/CRIT1 rows
-(0x18/0x19) and BOOT_FLAGS0 (0x30) are read by the ROM during the second-stage boot
-sequence — they must be programmed before the device is sealed, and ideally should
-be programmed last (after firmware signing key and device key are stored) to make
-the provisioning sequence atomic.
+`embassy_rp::otp` module wraps this for ECC and raw access. The CRIT1 rows
+(0x40–0x47, RBIT-8) and BOOT_FLAGS0 (0x48–0x4A, RBIT-3) are read by the ROM
+during the boot sequence — they must be programmed before the device is
+sealed.  CRIT1 and CRIT0 use RBIT-8 redundancy (8 identical copies); always
+use `picotool otp set OTP_DATA_CRIT1.*` which writes all 8 copies
+automatically.  Do NOT write individual rows with `write_raw_word()`.
 
 ---
 
@@ -60,28 +62,28 @@ the provisioning sequence atomic.
 ### 3.1 How RP2350 Secure Boot Works
 
 The RP2350 ROM implements a two-stage boot process. In the second stage, if
-`SECURE_BOOT_ENABLE` is set in `BOOT_FLAGS0` (OTP row `0x30`, bit 0), the ROM
-reads a boot manifest at the start of the firmware image in flash. The manifest
-contains an Ed25519 signature over a SHA-256 hash of the firmware binary. The ROM
-verifies this signature against a hash of the public signing key that was burned
-into OTP rows `0x20–0x2F` during provisioning. If verification fails, the ROM
-halts — it does not attempt to execute any firmware code.
+`SECURE_BOOT_ENABLE` is set in **CRIT1** (OTP rows `0x40–0x47`, RBIT-8, bit 0),
+the ROM reads a boot manifest at the start of the firmware image in flash. The
+manifest contains a **secp256k1** signature (not Ed25519) over a SHA-256 hash of
+the firmware binary. The ROM verifies this signature against a hash of the public
+signing key that was burned into OTP BOOTKEY0 (rows `0x80–0x8F`) during
+provisioning. If verification fails, the ROM halts — it does not attempt to
+execute any firmware code.
 
 This means secure boot protection is entirely hardware-enforced by the ROM, before
 any firmware code runs. The `security/boot.rs` `is_secure_boot_enabled()` function
-reads row `0x30` to confirm this bit is set at runtime, but that is a software
-check layered on top of the hardware guarantee.
+reads CRIT1 row `0x40` bit 0 to confirm this bit is set at runtime, but that is a
+software check layered on top of the hardware guarantee.
 
 ### 3.2 Step-by-Step Implementation Plan
 
 **Step 1 — Key generation (offline, one-time per operator)**
 
-Generate an Ed25519 signing key pair on an air-gapped machine. The private key
+Generate a **secp256k1** signing key pair on an air-gapped machine. The private key
 must never leave that machine and should be stored in an HSM or on encrypted
-offline media. Only the public key (32 bytes) needs to be available during
-provisioning.
+offline media. Only the public key needs to be available during provisioning.
 
-Tool: `openssl genpkey -algorithm ed25519` or the `rp2350-sign` tool from the
+Tool: `openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:secp256k1` or the
 Raspberry Pi SDK (if available). The public key must be exported as a raw 32-byte
 file (no PEM wrapper) for the OTP programming step.
 
@@ -112,7 +114,11 @@ Probe-rs can flash it normally. The ROM's manifest parser expects a specific lay
 at the image header — using the official SDK signing tool is mandatory; hand-crafting
 the manifest is error-prone.
 
-**Step 4 — Set SECURE_BOOT_ENABLE in BOOT_FLAGS0 (OTP row 0x30)**
+**Step 4 — Set SECURE_BOOT_ENABLE in CRIT1 (OTP rows 0x40–0x47)**
+
+```bash
+picotool otp set OTP_DATA_CRIT1.SECURE_BOOT_ENABLE 1
+```
 
 This is the point of no return for secure boot. After this bit is set:
 - Unsigned firmware will not run
@@ -120,12 +126,13 @@ This is the point of no return for secure boot. After this bit is set:
 - The device can only be recovered by flashing a correctly signed image
 
 This step must happen after the signed firmware has been successfully flashed and
-verified to boot.
+verified to boot. Use `picotool otp set` (not raw row writes) — CRIT1 uses RBIT-8
+redundancy and all 8 copies must be written.
 
 **Step 5 — Verify at runtime**
 
-The existing `is_secure_boot_enabled()` function in `security/boot.rs` reads OTP
-row `0x30` bit 0 and can be used as a runtime assertion:
+The existing `is_secure_boot_enabled()` function in `security/boot.rs` reads CRIT1
+row `0x40` bit 0 and can be used as a runtime assertion:
 
 ```
 assert!(security::boot::is_secure_boot_enabled(), "Secure boot not active — refuse to operate")
@@ -150,17 +157,20 @@ The missing piece is a hard assertion in `security_checks()` that calls
 
 ### 4.1 Hardware Fuse Location
 
-The RP2350 hardware JTAG disable fuse is in the CRIT0 register (OTP row `0x18`).
-The RP2350 datasheet §5.6.4 describes CRIT0 as the "Critical Boot Flags" register.
-Based on the datasheet, the relevant bit is: **CRIT0 bit 4 = JTAG_DISABLE** (the
-exact bit position must be verified against the TRM; the code comments in
-`security/boot.rs` and `security/otp.rs` note this ambiguity explicitly as
-PUNCHOUT item 5d).
+The RP2350 hardware JTAG disable fuse is **CRIT1.DEBUG_DISABLE** (bit 2 of CRIT1,
+OTP rows `0x40–0x47`, RBIT-8 redundancy). Verified against pico-sdk `otp_data.h`,
+rp-pac 7.0.0, and the Raspberry Pi `rp2350_hacking_challenge/lock_chip.sh`.
 
-The existing `disable_jtag_permanent()` function in `security/otp.rs` (line 226)
-sets bit 0 of OTP row `0x110` — this is the **pico2hsm user-land bookkeeping flag**,
-not the hardware JTAG fuse. The actual hardware JTAG lockdown requires writing CRIT0
-row `0x18` via the `otp_access` ROM function with programming voltage enabled.
+**Important corrections from previous versions of this document:**
+- CRIT0 (rows 0x38–0x3F) only contains ARM_DISABLE and RISCV_DISABLE — it has
+  nothing to do with JTAG or secure boot.
+- Row 0x18 is NUM_GPIOS, not CRIT0.
+- SECURE_BOOT_ENABLE, DEBUG_DISABLE, GLITCH_DETECTOR, and SECURE_DEBUG_DISABLE
+  are all in CRIT1 (rows 0x40–0x47).
+
+The firmware's `disable_jtag_permanent()` function in `security/boot.rs` sets
+bit 0 of OTP row `0x110` — this is the **pico2hsm user-land bookkeeping flag**,
+not the hardware JTAG fuse.
 
 ### 4.2 Timing in Provisioning Sequence
 
@@ -173,33 +183,32 @@ complete. Once the hardware JTAG fuse is blown:
 The recommended sequence is:
 1. Flash signed firmware
 2. Program all OTP key rows
-3. Set SECURE_BOOT_ENABLE (BOOT_FLAGS0)
-4. Set PRODUCTION_MODE (pico2hsm OTP row 0x110)
-5. **Set JTAG_DISABLE (CRIT0 row 0x18)** — point of no return for debugging
-6. Set pico2hsm JTAG_DISABLED bookkeeping flag (row 0x110 bit 0)
+3. `picotool otp set OTP_DATA_CRIT1.SECURE_BOOT_ENABLE 1`
+4. Set PRODUCTION_MODE (pico2hsm OTP row 0x110 via firmware APDU)
+5. **`picotool otp set OTP_DATA_CRIT1.DEBUG_DISABLE 1`** — point of no return
+6. `picotool otp set OTP_DATA_CRIT1.SECURE_DEBUG_DISABLE 1`
+7. `picotool otp set OTP_DATA_CRIT1.GLITCH_DETECTOR_ENABLE 1`
+8. `picotool otp set OTP_DATA_CRIT1.GLITCH_DETECTOR_SENS 3`
+9. Firmware sets bookkeeping flag (row 0x110 bit 0) at next boot
 
 ### 4.3 Point of No Return
 
-**Once OTP row 0x18 (CRIT0) has JTAG_DISABLE set, there is no recovery path.**
-The RP2350 will ignore all SWD/JTAG connections on all subsequent boots. This
+**Once CRIT1.DEBUG_DISABLE is set, there is no recovery path.**
+The RP2350 ROM will reject all SWD/JTAG connections on all subsequent boots. This
 cannot be undone by any software operation. If the device has a bug at this point,
 the only option is to discard the unit.
 
-### 4.4 Current Implementation Gap (PUNCHOUT 5d)
+### 4.4 CRIT1 RBIT-8 Redundancy
 
-The current `disable_jtag_permanent()` in `security/otp.rs` only sets the user-land
-flag (row `0x110` bit 0). The hardware CRIT0 write is missing because:
-1. The exact CRIT0 bit for JTAG disable needs TRM confirmation
-2. Writing CRIT0 requires programming voltage on the RP2350 OTP — the ROM
-   `otp_access` function handles this, but embassy-rp does not expose a convenient
-   wrapper for CRIT0 writes specifically
-3. This operation is so irreversible that it should only ever be done by a dedicated
-   provisioning tool, not by runtime firmware
+CRIT1 uses RBIT-8: the value is stored in 8 identical copies (rows 0x40–0x47).
+The ROM does a majority vote across all copies. **Always use `picotool otp set
+OTP_DATA_CRIT1.*` for CRIT1 writes** — picotool writes all 8 copies automatically.
+`embassy_rp::otp::write_raw_word()` writes exactly one row, which is insufficient
+for reliable RBIT-8 programming.
 
-**Recommendation:** The hardware CRIT0 write should be performed exclusively by the
-factory provisioning tool (a script using `picotool` or direct `otp_access` via a
-probe), not by the firmware itself. The firmware's `disable_jtag_permanent()` should
-only set the bookkeeping flag and serve as a detection/assertion mechanism.
+The firmware does NOT write CRIT1 at runtime. The INS=0xF3 provisioning APDU is
+disabled (returns SW 6D00) because single-row writes cannot reliably program
+RBIT-8 fields. The firmware only sets the bookkeeping flag in row 0x110.
 
 ---
 
@@ -270,16 +279,17 @@ to the device via SWD probe) must:
 
 1. Connect to the device via probe-rs / picotool
 2. Generate 64 bytes of random IKM
-3. Write IKM to OTP rows `0x100–0x11F` via `otp::write_ecc_word()` (16 calls)
-   and rows `0x101–0x11F` for the upper 32 bytes
+3. Write IKM to OTP rows `0x100–0x11F` via `otp::write_ecc_word()`
 4. Generate a device serial (16 bytes)
 5. Write serial to OTP rows `0x130–0x137`
-6. Write the boot signing public key hash to rows `0x20–0x2F`
+6. Write the boot signing public key hash to BOOTKEY0 (rows `0x80–0x8F`)
 7. Write PRODUCTION_MODE + PROVISIONED flags to row `0x110`
-8. Write BOOT_FLAGS0 SECURE_BOOT_ENABLE to row `0x30`
-9. Write CRIT0 JTAG_DISABLE to row `0x18` (point of no return)
-10. Read back all programmed rows to verify (critical — OTP write errors are silent)
-11. Record device serial and provisioning timestamp in production database
+8. `picotool otp set OTP_DATA_CRIT1.SECURE_BOOT_ENABLE 1`
+9. `picotool otp set OTP_DATA_CRIT1.DEBUG_DISABLE 1` (point of no return)
+10. `picotool otp set OTP_DATA_CRIT1.GLITCH_DETECTOR_ENABLE 1`
+11. `picotool otp set OTP_DATA_CRIT1.GLITCH_DETECTOR_SENS 3`
+12. Read back all programmed rows to verify (critical — OTP write errors are silent)
+13. Record device serial and provisioning timestamp in production database
 
 ---
 
@@ -305,10 +315,10 @@ When a voltage glitch is detected (voltage drops below the threshold set by SENS
 POWMAN triggers an immediate system reset. The firmware does not get a chance to
 react — the hardware reset happens autonomously.
 
-There is also an OTP-level glitch detector enable: CRIT0 bits 1–3 (GLITCH_DETECTOR_ENABLE
-and GLITCH_DETECTOR_SENS). These configure the detector to be active from the moment
-the ROM runs, before firmware starts. The POWMAN VREG software configuration is an
-additional control that the firmware can apply at runtime.
+There is also an OTP-level glitch detector enable: **CRIT1** bit 4 (GLITCH_DETECTOR_ENABLE)
+and bits 5–6 (GLITCH_DETECTOR_SENS). These configure the detector to be active from
+the moment the ROM runs, before firmware starts. The POWMAN VREG software configuration
+is an additional control that the firmware can apply at runtime.
 
 ### 6.2 Sensitivity Levels and False-Positive Risk
 
@@ -354,7 +364,7 @@ on the `VREG` register as of embassy-rp 0.10 (PUNCHOUT item 5b).
 3. Once `rp_pac` exposes the field accessors, replace the raw pointer write with
    the idiomatic PAC call
 
-For OTP-level glitch detector (CRIT0 bits 1–3), the provisioning tool should set
+For OTP-level glitch detector (CRIT1 bits 4–6), the provisioning tool should set
 these during factory programming so the detector is active from first ROM execution,
 before firmware even starts. This provides protection during the boot sequence
 itself.
@@ -416,9 +426,9 @@ steps marked **[IRREVERSIBLE]** cannot be undone.
    - Read back and verify
    - Point of no return: same as step 4
 
-6. **Write boot signing public key hash to OTP rows 0x20–0x2F** [IRREVERSIBLE for those rows]
-   - Compute `SHA-256(ed25519_public_key_bytes)`
-   - Write as 16 ECC words
+6. **Write boot signing public key hash to BOOTKEY0 (OTP rows 0x80–0x8F)** [IRREVERSIBLE]
+   - Compute `SHA-256(secp256k1_public_key_bytes)`
+   - Write as 16 ECC words (or use `picotool otp load` with OTP JSON from `picotool seal`)
    - Read back and verify
    - Point of no return: signing key is now bound to this device
 
@@ -429,26 +439,26 @@ steps marked **[IRREVERSIBLE]** cannot be undone.
    - Tool: provisioning firmware APDU or direct OTP write
    - Point of no return: production mode cannot be unset
 
-8. **Enable secure boot in BOOT_FLAGS0 (OTP row 0x30, bit 0)** [IRREVERSIBLE]
-   - Write `SECURE_BOOT_ENABLE = 1` to OTP row `0x30`
-   - Read back and verify
+8. **Enable secure boot in CRIT1 (OTP rows 0x40–0x47, bit 0)** [IRREVERSIBLE]
+   - `picotool otp set OTP_DATA_CRIT1.SECURE_BOOT_ENABLE 1`
+   - picotool writes all 8 RBIT-8 copies automatically
    - Reboot the device and confirm it still boots correctly (firmware is signed)
-   - Tool: provisioning tool with direct OTP write
    - **Critical point of no return: unsigned firmware will never run again on this device**
    - If the device fails to boot after this step (e.g. bad signature), the device is bricked
 
-9. **Lock key material OTP rows (0x100–0x12F) against further reads and writes** (PUNCHOUT 5c)
+9. **Lock key material OTP rows (0x100–0x12F) against further reads and writes**
    - Set read-lock and write-lock permission bits on rows 0x100–0x12F
    - This prevents an attacker who compromises the firmware from reading the raw IKM
-   - Current status: stub — `lock_read()` and `lock_write()` in `security/otp.rs` are no-ops
-   - Must be implemented via PAC write to OTP permission registers before this step is viable
-   - Once implemented: [IRREVERSIBLE]
+   - Implemented via PAC write to OTP SW_LOCK registers in `security/otp.rs`
+   - [IRREVERSIBLE per boot session; permanent locks require OTP lock page writes]
 
-10. **Disable JTAG via CRIT0 (OTP row 0x18, bit 4 TBD)** [IRREVERSIBLE — POINT OF NO RETURN]
-    - Write JTAG_DISABLE bit in CRIT0
-    - Also write CRIT1 (row 0x19) identically for redundancy
+10. **Disable JTAG via CRIT1 (OTP rows 0x40–0x47, bit 2)** [IRREVERSIBLE — POINT OF NO RETURN]
+    - `picotool otp set OTP_DATA_CRIT1.DEBUG_DISABLE 1`
+    - `picotool otp set OTP_DATA_CRIT1.SECURE_DEBUG_DISABLE 1`
+    - `picotool otp set OTP_DATA_CRIT1.GLITCH_DETECTOR_ENABLE 1`
+    - `picotool otp set OTP_DATA_CRIT1.GLITCH_DETECTOR_SENS 3`
     - Reboot and confirm SWD connection is refused (probe-rs should fail to connect)
-    - Tool: provisioning tool only — this must NEVER be done by runtime firmware
+    - Tool: picotool only — firmware does NOT write CRIT1 (RBIT-8 requires all 8 copies)
     - **This is the final, absolute point of no return. After this step, no debugger
       can ever connect to this device again.**
 
@@ -489,49 +499,31 @@ requires versus what embassy-rp 0.10 currently exposes.
 
 ## 9. Open Questions
 
-The following items need clarification from the RP2350 TRM (or empirical testing)
-before the provisioning implementation can be finalized:
+Items resolved during v1.0.0-rc4 OTP audit (triple-checked against pico-sdk
+`otp_data.h`, rp-pac 7.0.0, and rp2350_hacking_challenge `lock_chip.sh`):
 
-- **JTAG disable bit in CRIT0 (PUNCHOUT 5d):** The exact bit position of the
-  JTAG_DISABLE fuse in OTP row `0x18` (CRIT0) is not confirmed. The RP2350 datasheet
-  §5.6.4 lists several CRIT0 bits but the pico2hsm code comments note ambiguity.
-  Must verify: is it bit 4, or a different bit? Does it affect both SWD and JTAG, or
-  only JTAG? Does CRIT1 need to be programmed identically for the lockdown to take effect?
+- ~~**JTAG disable bit position:**~~ **RESOLVED.** JTAG disable is CRIT1 bit 2
+  (DEBUG_DISABLE) at rows 0x40–0x47 (RBIT-8). CRIT0 (rows 0x38–0x3F) only
+  contains ARM_DISABLE and RISCV_DISABLE. Row 0x18 is NUM_GPIOS.
 
-- **Boot signing public key hash row range:** The exact OTP row range for the Ed25519
-  public key hash that the ROM uses for secure boot verification is listed as ESTIMATED
-  (`0x20–0x2F`). The TRM §5.6.6 must be consulted to confirm this range before
-  any provisioning tool is written.
+- ~~**Boot signing key hash row range:**~~ **RESOLVED.** BOOTKEY0 is at rows
+  0x80–0x8F (ECC). Contains SHA-256 of secp256k1 signing public key (not Ed25519).
 
-- **SECURE_BOOT_ENABLE effect on unsigned binary:** Confirm whether setting
-  `BOOT_FLAGS0` bit 0 causes the ROM to refuse execution of an unsigned image
-  (expected), or merely warn. The pico2hsm design assumes hard refusal (ROM halts);
-  this must be verified empirically or confirmed in the TRM.
+- ~~**SECURE_BOOT_ENABLE location:**~~ **RESOLVED.** CRIT1 bit 0 at rows
+  0x40–0x47 (RBIT-8). NOT in BOOT_FLAGS0.
 
-- **POWMAN VREG register address:** The memory-mapped address of the POWMAN VREG
-  register needs to be extracted from the TRM or PAC generated sources for the raw
-  `write_volatile` workaround to arm the glitch detector. The PAC file at
-  `embassy-rp` source tree path `src/pac/POWMAN.rs` or equivalent should contain
-  the base address.
+Still open:
 
-- **OTP lock permission register layout:** The OTP_DATA_RAW region has per-row
-  permission bits, but the exact register layout (address, bits per row, whether
-  lock is per-row or per-page) must be confirmed from the TRM §5.4 "OTP Access
-  Control" before `lock_read()` / `lock_write()` can be implemented with PAC
-  writes.
+- **POWMAN VREG register address:** The memory-mapped address for the glitch
+  detector arming register. Currently using PAC-derived address.
 
-- **`derive_smk()` vs `read_storage_key_material()` inconsistency:** The current
-  `derive_smk()` calls `read_root_secret()` (legacy layout, rows `0x20–0x3F`)
-  rather than `read_storage_key_material()` (rows `0x100–0x11F`). The legacy rows
-  `0x20–0x3F` overlap with the boot signing public key hash rows (ESTIMATED). This
-  must be resolved: either update `derive_smk()` to use `read_storage_key_material()`
-  and the new `0x100–0x11F` layout, or confirm that the legacy layout is intended.
-  Current assessment: the new layout (`0x100–0x11F`) is correct and `derive_smk()`
-  should be updated.
+- **OTP lock permission register layout:** Per-row permission bits for
+  `lock_read()` / `lock_write()` — requires PAC OTP_DATA_RAW access not yet
+  exposed by embassy-rp.
 
-- **Glitch detector sensitivity for USB-powered board:** SENS=2 is recommended but
-  not empirically tested. False-positive resets during USB enumeration or high-load
-  crypto operations need to be ruled out on actual hardware before shipping.
+- **Glitch detector sensitivity for USB-powered board:** SENS=3 is configured
+  but not empirically tested for false-positive resets during USB enumeration
+  or high-load crypto operations.
 
 - **OTP write-verify requirement:** The RP2350 OTP programming circuit can
   occasionally fail to blow a fuse. The TRM §5.6.1 may specify a recommended

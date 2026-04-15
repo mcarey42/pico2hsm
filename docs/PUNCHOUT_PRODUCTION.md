@@ -12,7 +12,7 @@ Status key: `[ ]` open · `[~]` in-progress · `[x]` done · `[>]` deferred · `
 | ID | Status | Title | Branch | Notes |
 |----|--------|-------|--------|-------|
 | P0-1 | [-] | Firmware signing key in repo | — | Non-issue: build-tree artifact, not checked in |
-| P0-2 | [x] | JTAG/CRIT0 hardware fuse never written | worktree-agent-a185ced7 | CRIT0 row 0x18 bit 2 now burned via `write_raw_word`; double-burn guard |
+| P0-2 | [x] | JTAG/CRIT1 hardware fuse never written | worktree-agent-a185ced7 | CRIT1 DEBUG_DISABLE (rows 0x40–0x47, RBIT-8) programmed via `picotool otp set`; firmware reads only |
 | P0-3 | [x] | OTP read-lock is a stub | worktree-agent-a185ced7 | `lock_read()` programs `OTP.sw_lock(page)` to INACCESSIBLE |
 | P0-4 | [x] | SMK zero-fallback on unprovisioned devices | worktree-agent-aabccc16 | Production+provisioned → panic; dev → warn + zero fallback |
 | P0-5 | [x] | Silent flash-op queue overflow | worktree-agent-aabccc16 | Queue full → `StorageError::WriteError` propagated to APDU handler |

@@ -1,11 +1,12 @@
 //! Secure boot configuration and verification.
 //!
 //! The RP2350 supports hardware-enforced secure boot via a boot manifest
-//! signed with an Ed25519 key. The public key hash is stored in OTP.
+//! signed with a **secp256k1** key (not Ed25519 or P-256).  The SHA-256
+//! hash of the public key is stored in OTP (BOOTKEY0, rows 0x80–0x8F).
 //!
 //! # Secure boot flow (production)
-//! 1. RP2350 ROM reads boot manifest from flash offset 0x10000000
-//! 2. ROM verifies Ed25519 signature using OTP-stored public key hash
+//! 1. RP2350 ROM reads boot manifest from flash
+//! 2. ROM verifies secp256k1 signature using OTP-stored public key hash
 //! 3. If signature is invalid, ROM halts (does not boot)
 //! 4. Firmware is loaded and executed
 //!
@@ -17,20 +18,36 @@
 //! # Boot-time security checks performed by firmware
 //! After boot, the firmware performs additional checks:
 //! 1. Verify OTP provisioning status flag is set
-//! 2. Verify JTAG disable flag is set (or set it if not)
+//! 2. Verify JTAG disable flag is set (record in pico2hsm boot flags)
 //! 3. Check for debugger attachment (SWD active) — halt if found in production
 //! 4. Arm the hardware watchdog
 //!
-//! # RP2350 OTP references
-//! - BOOT_FLAGS0 is OTP row 0x30 (RP2350 datasheet §5.6.6 "OTP Registers")
-//! - CRIT0 (row 0x18) bit layout (per rp-pac):
-//!   - bit 0: secure_boot_enable
-//!   - bit 1: secure_debug_disable
-//!   - bit 2: debug_disable (JTAG disable)
-//!   - bit 3: default_archsel
-//!   - bit 4: glitch_detector_enable
-//!   - bits 5-6: glitch_detector_sens
-//! - The pico2hsm boot flags are stored in OTP row 0x110 (see otp.rs)
+//! # RP2350 OTP references (verified against pico-sdk otp_data.h + rp-pac 7.0.0)
+//!
+//! - **CRIT0** (rows 0x38–0x3F, RBIT-8): ARM_DISABLE (bit 0), RISCV_DISABLE (bit 1)
+//! - **CRIT1** (rows 0x40–0x47, RBIT-8): the security-critical register
+//!   - bit 0: SECURE_BOOT_ENABLE
+//!   - bit 1: SECURE_DEBUG_DISABLE
+//!   - bit 2: DEBUG_DISABLE (JTAG/SWD kill switch)
+//!   - bit 3: BOOT_ARCH
+//!   - bit 4: GLITCH_DETECTOR_ENABLE
+//!   - bits 5-6: GLITCH_DETECTOR_SENS
+//! - **BOOT_FLAGS0** (rows 0x48–0x4A, RBIT-3): boot path control (NOT secure boot enable)
+//! - **BOOT_FLAGS1** (rows 0x4B–0x4D, RBIT-3): KEY_INVALID flags
+//! - **BOOTKEY0** (rows 0x80–0x8F, ECC): SHA-256 hash of secp256k1 signing public key
+//! - The pico2hsm application boot flags are in OTP row 0x110 (see otp.rs)
+//!
+//! # Hardware JTAG disable (CRIT1.DEBUG_DISABLE)
+//!
+//! The firmware does NOT write CRIT1 at runtime.  CRIT1 uses RBIT-8
+//! redundancy (8 identical copies at rows 0x40–0x47); the ROM does a
+//! majority vote across all 8 copies.  `embassy_rp::otp::write_raw_word()`
+//! writes exactly one row, which is insufficient for reliable RBIT-8.
+//! Use `picotool otp set OTP_DATA_CRIT1.DEBUG_DISABLE 1` during
+//! provisioning — picotool handles all 8 copies automatically.
+//!
+//! Row 0x18 is NUM_GPIOS, NOT CRIT0.  Previous code incorrectly wrote
+//! to row 0x18 believing it was CRIT0 — that was a no-op at best.
 
 use embassy_rp::watchdog::Watchdog;
 use embassy_time::Duration;
@@ -99,10 +116,9 @@ pub fn security_checks() {
                 cortex_m::peripheral::SCB::sys_reset();
             }
 
-            // Disable JTAG permanently if not already disabled.
-            // OTP row 0x110 bit 0 = JTAG_DISABLED (pico2hsm user-land flag).
-            // The hardware JTAG CRIT0 fuse write is also handled in
-            // disable_jtag_permanent().
+            // Record JTAG-disabled bookkeeping flag in OTP row 0x110 bit 0.
+            // Hardware JTAG disable (CRIT1.DEBUG_DISABLE) must be set via
+            // picotool during provisioning — see docs/PROVISIONING.md Phase 8.
             disable_jtag_permanent();
         }
     }
@@ -159,9 +175,14 @@ fn is_production_mode_otp() -> Result<bool, ()> {
 
 /// Check if the RP2350 is running in secure boot mode.
 ///
-/// Reads OTP BOOT_FLAGS0 register (row 0x30 in the RP2350 hardware OTP
-/// address space; RP2350 datasheet §5.6.6).
-/// Bit 0 of BOOT_FLAGS0 = SECURE_BOOT_ENABLE.
+/// SECURE_BOOT_ENABLE is bit 0 of **CRIT1** (OTP row 0x40), NOT in
+/// BOOT_FLAGS0 (row 0x48, which controls boot paths, not secure boot).
+///
+/// CRIT1 uses RBIT-8 redundancy (rows 0x40–0x47).  The ROM resolves
+/// the 8 copies via majority vote, but a simple raw read of row 0x40
+/// is sufficient for a runtime check — if the fuse was programmed
+/// correctly via `picotool otp set OTP_DATA_CRIT1.SECURE_BOOT_ENABLE 1`,
+/// all 8 copies are identical.
 ///
 /// # Safety
 /// Uses `embassy_rp::otp::read_raw_word` which performs a memory-mapped
@@ -171,37 +192,39 @@ fn is_production_mode_otp() -> Result<bool, ()> {
 /// Returns `true` if the SECURE_BOOT_ENABLE fuse is set.
 pub fn is_secure_boot_enabled() -> bool {
     use embassy_rp::otp;
-    // RP2350 datasheet §5.6.6: BOOT_FLAGS0 is at OTP row 0x30.
-    // Bit 0 = SECURE_BOOT_ENABLE (set by blowing the fuse during provisioning).
-    const RP2350_OTP_BOOT_FLAGS0_ROW: usize = 0x30;
-    const SECURE_BOOT_ENABLE_BIT: u32 = 1 << 0;
+    // CRIT1 is at OTP row 0x40 (pico-sdk OTP_DATA_CRIT1_ROW, rp-pac
+    // otp_data_raw byte offset 0x100 / 4 = row 0x40).
+    // Bit 0 = SECURE_BOOT_ENABLE.
+    const RP2350_OTP_CRIT1_ROW: usize = 0x40;
+    const CRIT1_SECURE_BOOT_ENABLE_BIT: u32 = 1 << 0;
 
-    otp::read_raw_word(RP2350_OTP_BOOT_FLAGS0_ROW)
-        .map(|bits| bits & SECURE_BOOT_ENABLE_BIT != 0)
+    otp::read_raw_word(RP2350_OTP_CRIT1_ROW)
+        .map(|bits| bits & CRIT1_SECURE_BOOT_ENABLE_BIT != 0)
         .unwrap_or(false)
 }
 
-/// Disable JTAG permanently via OTP fuse.
+/// Record JTAG-disabled status in the pico2hsm application boot flags.
 ///
-/// Sets the pico2hsm user-land JTAG_DISABLED flag in OTP row 0x110 bit 0.
+/// Sets bit 0 of OTP row 0x110 as a user-land bookkeeping marker that
+/// JTAG has been disabled.  This does NOT disable JTAG at the hardware
+/// level — that requires writing CRIT1.DEBUG_DISABLE (OTP rows 0x40–0x47,
+/// RBIT-8), which must be done via `picotool otp set OTP_DATA_CRIT1.DEBUG_DISABLE 1`
+/// during provisioning.
+///
+/// # Why firmware does not write CRIT1
+///
+/// CRIT1 uses RBIT-8 redundancy: 8 identical copies at rows 0x40–0x47.
+/// The ROM does a majority vote across all 8 copies.
+/// `embassy_rp::otp::write_raw_word()` writes exactly one row, which is
+/// insufficient — a single copy does not reliably flip the majority vote,
+/// and a power loss during sequential writes could leave the device in an
+/// inconsistent state.  `picotool otp set` handles all 8 copies atomically.
 ///
 /// # Irreversibility
 /// OTP bits can only transition 0→1 (fuse burning). This operation is
 /// permanent and cannot be undone.
 ///
-/// # RP2350 hardware JTAG fuse
-/// The RP2350 hardware JTAG disable fuse is in OTP page 0 (CRIT0/CRIT1,
-/// rows 0x18–0x19; RP2350 datasheet §5.6.4 "Critical Boot Flags").
-/// Full hardware JTAG lockdown requires writing those rows via the ROM
-/// `otp_access` function with the correct programming voltage applied.
-/// That step is performed by the provisioning tool, not by runtime firmware
-/// (to avoid accidental lockout during development).
-///
-/// This function records that the lockdown has been performed by setting
-/// the pico2hsm book-keeping bit in our user-land boot flags row.
-///
-/// Only callable when production mode is active (checked inside `otp.rs`
-/// `Otp::disable_jtag_permanent()`).
+/// Only callable when production mode is active.
 pub fn disable_jtag_permanent() {
     use embassy_rp::otp;
     const OTP_BOOT_FLAGS_ROW: usize = 0x110;
@@ -241,54 +264,11 @@ pub fn disable_jtag_permanent() {
     let new_flags = current | BOOT_FLAG_JTAG_DISABLED;
     match otp::write_raw_word(OTP_BOOT_FLAGS_ROW, new_flags) {
         Ok(()) => {
-            defmt::warn!("boot: JTAG disable OTP flag set — IRREVERSIBLE");
+            defmt::warn!("boot: JTAG disable bookkeeping flag set in OTP row 0x110 — IRREVERSIBLE");
+            defmt::warn!("boot: hardware JTAG disable (CRIT1.DEBUG_DISABLE) must be set via picotool");
         }
         Err(_) => {
             defmt::error!("boot: failed to set JTAG disable OTP flag");
-        }
-    }
-
-    // P0-2 fix: Also write the RP2350 hardware CRIT0 register (OTP row 0x18)
-    // bit 2 (debug_disable) to actually disable JTAG/SWD at the hardware level.
-    //
-    // The pico2hsm bookkeeping flag in row 0x110 bit 0 is a user-land marker;
-    // it does NOT prevent probe-rs from connecting. The RP2350 hardware JTAG
-    // lockdown is controlled by OTP CRIT0 (row 0x18):
-    //   bit 0: secure_boot_enable
-    //   bit 1: secure_debug_disable
-    //   bit 2: debug_disable  ← this disables JTAG/SWD entirely
-    //   bit 4: glitch_detector_enable
-    //
-    // RP2350 datasheet §5.6.4 "Critical Boot Flags": row 0x18 controls CRIT0.
-    // Writing bit 2 (debug_disable = 0x04) via otp_access permanently disables
-    // the debug interface. This is irreversible.
-    //
-    // SAFETY: CRIT0 row 0x18 is in OTP page 0. The RP2350 ROM otp_access
-    // function (called by write_raw_word) handles the programming voltage.
-    // We read-modify-write to preserve any bits already set (e.g. secure boot).
-    const RP2350_CRIT0_ROW: usize = 0x18;
-    const CRIT0_DEBUG_DISABLE_BIT: u32 = 1 << 2; // bit 2 = debug_disable
-
-    let crit0_current = match otp::read_raw_word(RP2350_CRIT0_ROW) {
-        Ok(v) => v,
-        Err(_) => {
-            defmt::error!("boot: failed to read CRIT0 row — skipping hardware JTAG disable");
-            return;
-        }
-    };
-
-    if crit0_current & CRIT0_DEBUG_DISABLE_BIT != 0 {
-        // CRIT0 debug_disable already set — no-op.
-        return;
-    }
-
-    let crit0_new = crit0_current | CRIT0_DEBUG_DISABLE_BIT;
-    match otp::write_raw_word(RP2350_CRIT0_ROW, crit0_new) {
-        Ok(()) => {
-            defmt::warn!("boot: RP2350 CRIT0 debug_disable fuse burned — JTAG/SWD PERMANENTLY DISABLED");
-        }
-        Err(_) => {
-            defmt::error!("boot: failed to burn CRIT0 debug_disable fuse");
         }
     }
 }

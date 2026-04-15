@@ -117,7 +117,7 @@ items.
 | ~~LOW~~ | ~~L3~~ | ~~Python version inconsistency (3.9+ vs 3.10+)~~ | Resolved v0.9.9-rc2 |
 | ~~LOW~~ | ~~L4~~ | ~~`install.sh` uses `daemon.yaml`, docs use `config.yaml`~~ | Resolved v0.9.9-rc2 |
 | ~~LOW~~ | ~~L6~~ | ~~macOS opensc-pkcs11 path may be wrong for Apple Silicon~~ | Resolved v0.9.9-rc2 |
-| INFO | 4b | CRIT0/JTAG disable bit positions unverified on production boards | Verify with `picotool otp get` on sacrificial board |
+| INFO | 4b | ~~CRIT1/JTAG disable bit positions verified~~ | Resolved — triple-checked against pico-sdk `otp_data.h`, rp-pac 7.0.0, rp2350_hacking_challenge; CRIT1 rows 0x40–0x47 (RBIT-8) |
 | BLOCKED | 3 | Brainpool curves blocked on upstream `bp-curves` crate | Monitor RustCrypto/elliptic-curves#1114 |
 
 ---

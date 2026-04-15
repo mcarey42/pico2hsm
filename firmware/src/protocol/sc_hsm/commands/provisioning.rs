@@ -4,12 +4,18 @@
 //! - GET STATUS (0xF0): Read provisioning/security flags (no auth required)
 //! - SET PRODUCTION MODE (0xF1): Permanently set production mode flag (SO-PIN)
 //! - LOCK OTP ROWS (0xF2): Lock OTP rows (not yet implemented)
-//! - WRITE CRIT0 (0xF3): Permanently program RP2350 CRIT0 OTP row (SO-PIN)
+//! - WRITE CRIT1 (0xF3): Disabled — use `picotool otp set OTP_DATA_CRIT1.*`
 //!
 //! # Security model
 //! All mutating operations (0xF1–0xF3) require SO-PIN authentication.
-//! Operations 0xF1 and 0xF3 are IRREVERSIBLE — they burn OTP fuses that
-//! cannot be cleared once set.
+//! Operation 0xF1 is IRREVERSIBLE — it burns OTP fuses that cannot be cleared.
+//!
+//! # CRIT1 (hardware JTAG disable, secure boot, glitch detector)
+//! CRIT1 uses RBIT-8 redundancy (8 identical copies at OTP rows 0x40–0x47).
+//! The ROM does a majority vote across all copies.  `embassy_rp::otp::write_raw_word()`
+//! writes exactly one row — insufficient for reliable RBIT-8 programming.
+//! Use `picotool otp set OTP_DATA_CRIT1.DEBUG_DISABLE 1` which writes all
+//! 8 copies automatically.  INS=0xF3 is reserved but returns SW 6D00.
 //!
 //! # Core1 constraint
 //! These handlers run on core1 via the dispatcher. They MUST NOT call defmt
@@ -32,8 +38,8 @@ pub const INS_PROV_SET_PRODUCTION: u8 = 0xF1;
 /// INS byte for LOCK OTP ROWS (not yet implemented).
 pub const INS_PROV_LOCK_OTP_ROWS: u8 = 0xF2;
 
-/// INS byte for WRITE CRIT0 (irreversible).
-pub const INS_PROV_WRITE_CRIT0: u8 = 0xF3;
+/// INS byte for WRITE CRIT1 (disabled — use picotool instead).
+pub const INS_PROV_WRITE_CRIT1: u8 = 0xF3;
 
 // SW constants not defined in pico2hsm_core::apdu:
 /// Incorrect parameters P1-P2 (ISO 7816-4).
@@ -58,7 +64,7 @@ const BOOT_FLAG_PRODUCTION_MODE: u32 = 1 << 1;
 ///   80 01 [production_mode: 0|1]
 ///   81 01 [jtag_sw_flag: 0|1]         -- OTP row 0x110 bit 0
 ///   82 01 [otp_rows_locked: 0|1]      -- STUB: always 0
-///   83 01 [secure_boot_enabled: 0|1]  -- BOOT_FLAGS0 row 0x30 bit 0
+///   83 01 [secure_boot_enabled: 0|1]  -- CRIT1 row 0x40 bit 0
 ///   84 01 [glitch_detector_armed: 0|1]
 /// ```
 pub fn handle_get_status(_state: &mut ScHsmState, _cmd: &ApduCommand<'_>) -> ApduResponse {
@@ -89,7 +95,7 @@ pub fn handle_get_status(_state: &mut ScHsmState, _cmd: &ApduCommand<'_>) -> Apd
     // OTP row locking: not yet implemented, always report 0.
     let otp_rows_locked: u8 = 0;
 
-    // Secure boot enabled (BOOT_FLAGS0 row 0x30 bit 0).
+    // Secure boot enabled (CRIT1 row 0x40 bit 0).
     let secure_boot_enabled: u8 = {
         #[cfg(target_arch = "arm")]
         {
@@ -228,95 +234,43 @@ pub fn handle_lock_otp_rows(state: &mut ScHsmState, _cmd: &ApduCommand<'_>) -> A
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// WRITE CRIT0 (INS=0xF3)
+// WRITE CRIT1 (INS=0xF3) — DISABLED
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Handle WRITE CRIT0 (INS=0xF3).
+/// Handle WRITE CRIT1 (INS=0xF3) — **DISABLED**.
 ///
-/// # IRREVERSIBLE
-/// This permanently programs the RP2350 CRIT0 OTP row (row 0x18).
+/// CRIT1 (OTP rows 0x40–0x47) uses RBIT-8 redundancy: 8 identical copies.
+/// The ROM does a majority vote across all copies to determine the value.
+/// `embassy_rp::otp::write_raw_word()` writes exactly ONE row, which is
+/// insufficient for reliable RBIT-8 programming — a power loss mid-sequence
+/// could leave the device with inconsistent redundancy state.
 ///
-/// Sets:
-/// - bit 2: debug_disable (hardware JTAG disable)
-/// - bit 4: glitch_detector_enable
-/// - bits 5-6: glitch_detector_sens = 3 (maximum sensitivity)
+/// Use `picotool otp set OTP_DATA_CRIT1.*` during provisioning instead:
+/// ```text
+/// picotool otp set OTP_DATA_CRIT1.DEBUG_DISABLE 1
+/// picotool otp set OTP_DATA_CRIT1.SECURE_DEBUG_DISABLE 1
+/// picotool otp set OTP_DATA_CRIT1.GLITCH_DETECTOR_ENABLE 1
+/// picotool otp set OTP_DATA_CRIT1.GLITCH_DETECTOR_SENS 3
+/// picotool otp set OTP_DATA_CRIT1.SECURE_BOOT_ENABLE 1
+/// ```
 ///
-/// These bits CANNOT be cleared once set. The device will reject JTAG/SWD
-/// connections on all subsequent boots and will automatically arm the
-/// hardware glitch detector at maximum sensitivity from the OTP defaults.
+/// picotool writes all 8 RBIT-8 copies automatically.
 ///
-/// Does NOT set:
-/// - bit 0: secure_boot_enable (separate provisioning concern)
-/// - bit 1: secure_debug_disable (separate provisioning concern)
+/// # CRIT1 bit layout (rows 0x40–0x47, RBIT-8)
+/// Verified against pico-sdk `otp_data.h` and rp-pac 7.0.0:
+/// - bit 0: SECURE_BOOT_ENABLE
+/// - bit 1: SECURE_DEBUG_DISABLE
+/// - bit 2: DEBUG_DISABLE (JTAG/SWD kill switch)
+/// - bit 3: BOOT_ARCH
+/// - bit 4: GLITCH_DETECTOR_ENABLE
+/// - bits 5-6: GLITCH_DETECTOR_SENS
 ///
-/// # Double confirmation (MEDIUM-3 security audit finding)
-/// Both P1=0xC1 and P2=0xC2 must be set simultaneously as a double-
-/// confirmation against accidental invocation. Any other P1/P2 values
-/// return SW 6A86 (incorrect P1/P2).
-///
-/// # Prerequisites
-/// - SO-PIN must be verified (SW 6982 if not)
-/// - Production mode must be set in OTP (SW 6985 if not)
-///
-/// # CRIT0 bit layout (per rp-pac, row 0x18)
-/// - bit 0: secure_boot_enable
-/// - bit 1: secure_debug_disable
-/// - bit 2: debug_disable (JTAG disable) <-- SET
-/// - bit 3: default_archsel
-/// - bit 4: glitch_detector_enable       <-- SET
-/// - bits 5-6: glitch_detector_sens      <-- SET to 3 (max)
-///
-/// Value to OR in: (1 << 2) | (1 << 4) | (3 << 5) = 0x74
-pub fn handle_write_crit0(state: &mut ScHsmState, cmd: &ApduCommand<'_>) -> ApduResponse {
-    if !state.so_pin_verified {
-        return ApduResponse::err(SW_SECURITY_STATUS);
-    }
-
-    // Require production mode.
-    #[cfg(target_arch = "arm")]
-    {
-        let flags = embassy_rp::otp::read_raw_word(OTP_BOOT_FLAGS_ROW).unwrap_or(0);
-        if flags & BOOT_FLAG_PRODUCTION_MODE == 0 {
-            return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED);
-        }
-    }
-
-    // MEDIUM-3: Double confirmation — P1=0xC1 and P2=0xC2 required.
-    // Both P1=0xC1 and P2=0xC2 must be set simultaneously as a double-
-    // confirmation against accidental invocation.
-    if cmd.p1 != 0xC1 || cmd.p2 != 0xC2 {
-        return ApduResponse::err(SW_WRONG_P1P2);
-    }
-
-    #[cfg(target_arch = "arm")]
-    {
-        // CRIT0 OTP row address.
-        const CRIT0_ROW: usize = 0x18;
-
-        // Bits to set:
-        //   bit 2:   debug_disable (JTAG disable)
-        //   bit 4:   glitch_detector_enable
-        //   bits 5-6: glitch_detector_sens = 3 (max)
-        // Value: (1 << 2) | (1 << 4) | (3 << 5) = 0x04 | 0x10 | 0x60 = 0x74
-        const CRIT0_BITS: u32 = 0x74;
-
-        // Read current CRIT0 value (OTP bits are additive — can only set, never clear).
-        let current = match embassy_rp::otp::read_raw_word(CRIT0_ROW) {
-            Ok(v) => v,
-            Err(_) => return ApduResponse::err(SW_INTERNAL_ERROR),
-        };
-
-        let new_value = current | CRIT0_BITS;
-
-        match embassy_rp::otp::write_raw_word(CRIT0_ROW, new_value) {
-            Ok(()) => ApduResponse::ok(&[]),
-            Err(_) => ApduResponse::err(SW_INTERNAL_ERROR),
-        }
-    }
-
-    #[cfg(not(target_arch = "arm"))]
-    {
-        // Host-side tests: not supported.
-        ApduResponse::err(SW_INS_NOT_SUPPORTED)
-    }
+/// # Note on CRIT0 (rows 0x38–0x3F)
+/// CRIT0 only contains ARM_DISABLE (bit 0) and RISCV_DISABLE (bit 1).
+/// It has nothing to do with secure boot, JTAG, or glitch detection.
+/// Row 0x18 is NUM_GPIOS — previous code incorrectly wrote there.
+pub fn handle_write_crit1(_state: &mut ScHsmState, _cmd: &ApduCommand<'_>) -> ApduResponse {
+    // INS=0xF3 is reserved but disabled.  CRIT1 must be programmed via
+    // picotool during provisioning (handles RBIT-8 automatically).
+    ApduResponse::err(SW_INS_NOT_SUPPORTED)
 }

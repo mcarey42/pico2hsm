@@ -219,10 +219,11 @@ impl Otp {
     /// Writes bit 0 of OTP row 0x110 and then configures the RP2350
     /// JTAG disable fuse via the SWD interface lock register.
     ///
-    /// TODO: Cross-reference the exact RP2350 OTP fuse row for JTAG
-    /// disable (documented in RP2350 TRM §5.1 "OTP Boot Flags").
-    /// The row used here (0x110, bit 0) is the pico2hsm user-land flag;
-    /// the hardware JTAG fuse may be at a different row in page 0.
+    /// Note: OTP row 0x110 bit 0 is the pico2hsm user-land bookkeeping
+    /// flag only.  The hardware JTAG fuse is CRIT1.DEBUG_DISABLE (OTP
+    /// rows 0x40–0x47, RBIT-8) and must be set via `picotool otp set
+    /// OTP_DATA_CRIT1.DEBUG_DISABLE 1` during provisioning.  See
+    /// docs/PROVISIONING.md Phase 8 for the complete procedure.
     pub fn disable_jtag_permanent(&mut self) -> Result<(), HsmError> {
         if !self.is_production_mode() {
             defmt::error!("OTP: JTAG disable attempted outside production mode");

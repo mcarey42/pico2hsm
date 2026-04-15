@@ -5,7 +5,7 @@ TLV response with the device's current security state.
 
 WARNING: Provisioning tests require deliberate opt-in: run with -m provisioning.
 The GET STATUS test itself is non-destructive, but other provisioning tests
-(production mode, CRIT0) involve IRREVERSIBLE OTP operations.
+(production mode, CRIT1) involve IRREVERSIBLE OTP operations.
 """
 
 from __future__ import annotations
@@ -24,7 +24,7 @@ pytestmark = [
     pytest.mark.skip(
         reason=(
             "Provisioning tests require deliberate opt-in: run with -m provisioning. "
-            "WARNING: production mode and CRIT0 tests are IRREVERSIBLE."
+            "WARNING: production mode and CRIT1 tests are IRREVERSIBLE."
         )
     ),
     pytest.mark.provisioning,

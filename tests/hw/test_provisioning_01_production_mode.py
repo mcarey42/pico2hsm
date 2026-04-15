@@ -26,7 +26,7 @@ pytestmark = [
     pytest.mark.skip(
         reason=(
             "Provisioning tests require deliberate opt-in: run with -m provisioning. "
-            "WARNING: production mode and CRIT0 tests are IRREVERSIBLE."
+            "WARNING: production mode and CRIT1 tests are IRREVERSIBLE."
         )
     ),
     pytest.mark.provisioning,
