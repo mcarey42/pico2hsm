@@ -18,7 +18,7 @@ This document is the **source of truth** for where the release-prep effort is. T
 | 2 — Triage | completed | 2026-04-16 | 2026-04-16 | gate #1 — user approved all 30 findings with auditor's proposed owners |
 | 3 — Parallel execution | completed | 2026-04-16 | 2026-04-17 | all 30 findings resolved + 2 supplemental CI fixes; post-v1.0.0 follow-ups tracked |
 | 4 — Firmware items | skipped | — | 2026-04-17 | gate #2 — no firmware-source findings surfaced; skipping per plan |
-| 5 — Verification sweep | pending | — | — | auditor rerun ready |
+| 5 — Verification sweep | completed | 2026-04-17 | 2026-04-17 | sweep-2 audit 30/30 + 2/2 closed; verdict READY |
 | 6 — Finalize | pending | — | — | gate #3, CHANGELOG date + PR |
 
 ---
@@ -237,6 +237,26 @@ These have been red since at least `v1.0.0-rc2`. Not in audit scope (auditor did
 - Local `cargo clippy --workspace -- -D warnings` with new `[workspace.lints]` pedantic ramp produces **36 errors in pico2hsm-core + 78 errors in firmware** (all style/doc lints — none true bugs). Examples: `clippy::doc_markdown`, `clippy::pub_underscore_fields`, `clippy::result_large_err`, `clippy::cast_possible_truncation`.
 - ci-engineer correctly applied `continue-on-error: true` with `TODO(post-v1.0.0)` comments on BOTH clippy steps. Preserves strict policy, prevents rc5 CI red.
 - **Post-v1.0.0 follow-up tracked in this doc** (see "Post-v1.0.0 follow-ups" section below).
+
+### [2026-04-17] DISPATCH → release-auditor (Phase 5 sweep-2)
+**Task:** Verify every Phase 1 finding and supplemental finding against its resolution commit; surface any regressions or new issues
+**Context provided:** worktree path, Phase 1 audit path, progress doc path, supplemental-finding expectations, read-only scope
+**Expected deliverable:** `docs/superpowers/audit/2026-04-17-release-audit-sweep2.md` with per-finding verdict + release-readiness statement
+
+### [2026-04-17] RETURN ← release-auditor (Phase 5 sweep-2)
+**Verdict:** **READY for Phase 6**
+**Commit audited:** `fa79af7`
+**Files changed:** `docs/superpowers/audit/2026-04-17-release-audit-sweep2.md` (new, 150 lines)
+**Counts:** 30/30 Phase 1 findings closed; 2/2 supplemental closed; 0 still open; 0 new findings surfaced
+**Spot-check results:**
+- `cargo fmt --all --check` clean
+- LICENSE singular (no `.txt` duplicate); all workspace members on `version.workspace = true` = 1.0.0
+- No `0.7.0`/`0.9.0`/`0.1.0` stale version strings in any `Cargo.toml`
+- `CHANGELOG.md:9` placeholder `YYYY-MM-DD` intentional (RELEASE_PROCESS.md fills at tag time)
+- `cargo clippy -p pico2hsm-core -- -D warnings` surfaces 36 pedantic warnings (style/doc only); `continue-on-error: true` guard in place with `TODO(post-v1.0.0)` comment as designed
+- `.claude/` contains only `agents/` — no settings leakage
+- No `.pem/.key/.crt/.env` files tracked; `ec_firmware_signing_key.pem` correctly gitignored
+**No blockers.** Phase 6 may proceed on admin/user signal.
 
 ---
 
