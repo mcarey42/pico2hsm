@@ -80,15 +80,50 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Security advisory audit — uses continue-on-error so new upstream
-      # advisories do not block every PR, but results are always visible in
-      # the Actions UI.  Review failures promptly and either update the dep
-      # or add an ignore entry in .cargo/audit.toml.
+      # Cache the cargo-audit binary — without caching, every CI run reinstalls
+      # it from source (~90 s). Cache key is pinned to the version below so a
+      # version bump invalidates the cache automatically.
+      - name: Cache cargo-audit install
+        id: cache-cargo-audit
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-audit
+          key: ${{ runner.os }}-cargo-audit-0.21.1
+
+      # cargo-audit 0.21.1 is the current stable as of 2026-04. Pin the
+      # version explicitly so a breaking change to its output format does not
+      # silently break CI; bump this and the cache key together.
+      - name: Install cargo-audit
+        if: steps.cache-cargo-audit.outputs.cache-hit != 'true'
+        run: cargo install cargo-audit --locked --version 0.21.1
+
+      # Security advisory audit. `continue-on-error: true` is intentional: a
+      # new upstream advisory should not block every unrelated PR. But we also
+      # do not want silent failures, so the step records its exit code and the
+      # follow-up step surfaces a visible warning in the Actions UI. Review
+      # failures promptly and either update the dep or add an ignore entry in
+      # `.cargo/audit.toml`.
       - name: Security audit (cargo audit)
-        run: |
-          cargo install cargo-audit --locked 2>/dev/null || true
-          cargo audit
+        id: cargo-audit
         continue-on-error: true
+        run: |
+          set +e
+          cargo audit
+          rc=$?
+          echo "rc=${rc}" >> "$GITHUB_OUTPUT"
+          exit $rc
+
+      - name: Report cargo-audit result
+        if: always()
+        env:
+          RC: ${{ steps.cargo-audit.outputs.rc }}
+        run: |
+          if [ "$RC" = "0" ]; then
+            echo "cargo-audit: PASS" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "cargo-audit: FAIL (rc=${RC}) — advisory or parse error; review the step log above" >> "$GITHUB_STEP_SUMMARY"
+            echo "::warning::cargo-audit reported a failure (rc=${RC}). See the step log for details."
+          fi
 
   python-tests:
     runs-on: ubuntu-latest
