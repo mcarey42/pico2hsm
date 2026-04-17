@@ -1,6 +1,6 @@
 [package]
 name = "pico2hsm-firmware"
-version = "0.9.0"
+version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -142,3 +142,6 @@ heapless = { version = "0.9" }
 rand_core = { version = "0.6" }
 
 [build-dependencies]
+
+[lints]
+workspace = true
