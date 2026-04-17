@@ -199,10 +199,30 @@ jobs:
             ${{ runner.os }}-cargo-artifact-${{ matrix.board }}-
             ${{ runner.os }}-cargo-
 
-      - name: Install picotool
+      # picotool is not in Ubuntu apt (confirmed 2026-04-17 — no such
+      # package in jammy/noble/plucky/questing/resolute). We build from the
+      # upstream 2.2.0 tag, which is the first stable release to ship the
+      # `rp2350-arm-s` UF2 family used below. Binary is cached keyed on the
+      # pinned version so subsequent runs skip the ~2 min build entirely.
+      - name: Cache picotool binary
+        id: cache-picotool
+        uses: actions/cache@v4
+        with:
+          path: /usr/local/bin/picotool
+          key: ${{ runner.os }}-picotool-2.2.0
+
+      - name: Install picotool from source
+        if: steps.cache-picotool.outputs.cache-hit != 'true'
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq picotool
+          sudo apt-get install -y -qq build-essential cmake libusb-1.0-0-dev pkg-config git
+          git clone --depth 1 --branch 2.2.0 https://github.com/raspberrypi/pico-sdk.git /tmp/pico-sdk
+          git -C /tmp/pico-sdk submodule update --init --depth 1 lib/mbedtls
+          git clone --depth 1 --branch 2.2.0 https://github.com/raspberrypi/picotool.git /tmp/picotool
+          cmake -S /tmp/picotool -B /tmp/picotool/build -DPICO_SDK_PATH=/tmp/pico-sdk
+          cmake --build /tmp/picotool/build -j
+          sudo cmake --install /tmp/picotool/build
+          picotool version
 
       - name: Build firmware (release, unsigned)
         run: |
