@@ -1,0 +1,76 @@
+name: Bug report
+description: Report a reproducible problem with pico2hsm firmware or tooling.
+title: "[bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a bug. **Security issues must not be filed here** — see
+        [SECURITY.md](../../SECURITY.md) for the private advisory flow.
+  - type: input
+    id: version
+    attributes:
+      label: pico2hsm version
+      description: Version tag or commit SHA you are running (e.g. `v1.0.0-rc4` or `a27fbfd`).
+      placeholder: "v1.0.0-rc4"
+    validations:
+      required: true
+  - type: dropdown
+    id: board
+    attributes:
+      label: Board
+      description: Which board variant is flashed?
+      options:
+        - rp2350_one_4m
+        - pico2_4m
+        - rp2350_geek_16m
+        - rp2350_geek_sdcard
+        - waveshare_rp2350_lcd_16m
+        - waveshare_rp2350_lcd_sdcard
+    validations:
+      required: true
+  - type: input
+    id: host
+    attributes:
+      label: Host OS and OpenSC version
+      description: Output of `uname -a` and `opensc-tool --version`.
+      placeholder: "Ubuntu 24.04, OpenSC 0.24.0"
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: Exact commands, in order, that produce the bug.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behaviour
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behaviour
+      description: Include error codes (SW1 SW2), panic messages, or observed symptoms.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: RTT / defmt log (optional)
+      description: If you have an RTT capture from `build-all-debug.sh`, paste it here.
+      render: shell
+    validations:
+      required: false
+  - type: checkboxes
+    id: not-security
+    attributes:
+      label: Not a security issue
+      options:
+        - label: I confirm this is not a security vulnerability. (Security issues go through GitHub Security Advisories — see SECURITY.md.)
+          required: true
