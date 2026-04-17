@@ -30,35 +30,35 @@ All 30 findings approved by user on 2026-04-16 with auditor's proposed owners.
 | ID | Sev | Category | Owner | Decision | Status | Commit |
 |---|---|---|---|---|---|---|
 | F-C-001 | C | code-hygiene | admin | approved | resolved | 34b6ce2 (verifier ACCEPT) |
-| F-C-002 | C | licensing | license-hygienist | approved | pending | — |
-| F-C-003 | C | docs | docs-engineer | approved | pending | — |
-| F-H-001 | H | ci | ci-engineer | approved | pending | — |
-| F-H-002 | H | ci | ci-engineer | approved | pending | — |
-| F-H-003 | H | examples | examples-author | approved | pending | — |
-| F-H-004 | H | metadata | license-hygienist | approved | pending | — |
-| F-H-005 | H | docs | docs-engineer | approved | pending | — |
-| F-H-006 | H | docs | docs-engineer | approved | pending | — |
-| F-H-007 | H | ci | ci-engineer | approved | pending | — |
-| F-H-008 | H | docs | docs-engineer | approved | pending | — |
-| F-H-009 | H | docs | docs-engineer | approved | pending | — |
-| F-M-001 | M | metadata | license-hygienist | approved | pending | — |
-| F-M-002 | M | ci | ci-engineer | approved | pending | — |
-| F-M-003 | M | docs | docs-engineer | approved | pending | — |
-| F-M-004 | M | docs | docs-engineer | approved | pending | — |
-| F-M-005 | M | metadata | admin→license-hygienist | approved | pending | — |
-| F-M-006 | M | docs | docs-engineer | approved | pending | — |
-| F-M-007 | M | docs | docs-engineer | approved | pending | — |
-| F-M-008 | M | docs | docs-engineer | approved | pending | — |
-| F-M-009 | M | licensing | license-hygienist | approved | pending | — |
-| F-M-010 | M | ci | ci-engineer | approved | pending | — |
-| F-M-011 | M | ci | admin | approved | pending | — |
-| F-L-001 | L | docs | docs-engineer | approved | pending | — |
-| F-L-002 | L | docs | admin | approved | pending | — |
-| F-L-003 | L | docs | admin | approved | pending | — |
-| F-L-004 | L | metadata | license-hygienist | approved | pending | — |
-| F-L-005 | L | ci | admin→ci-engineer | approved | pending | — |
-| F-L-006 | L | docs | docs-engineer | approved | pending | — |
-| F-L-007 | L | metadata | admin | approved | pending | — |
+| F-C-002 | C | licensing | license-hygienist | approved | resolved | 537b8ce |
+| F-C-003 | C | docs | docs-engineer | approved | partial | 4fcfddd (release.yml), aa78ee2 (CHANGELOG partial — date stamp deferred) |
+| F-H-001 | H | ci | ci-engineer | approved | resolved | 4fcfddd |
+| F-H-002 | H | ci | ci-engineer | approved | resolved | 78dcfc1 |
+| F-H-003 | H | examples | examples-author | approved | resolved | 7152de5, 945a192, 2ca3696, b3e8368, d796153 (needs HW validation in Phase 5) |
+| F-H-004 | H | metadata | license-hygienist | approved | resolved | 537b8ce |
+| F-H-005 | H | docs | docs-engineer | approved | pending | blocked-content-filter; re-dispatch |
+| F-H-006 | H | docs | docs-engineer | approved | pending | blocked-content-filter; re-dispatch |
+| F-H-007 | H | ci | ci-engineer | approved | resolved | 4fcfddd |
+| F-H-008 | H | docs | docs-engineer | approved | pending | blocked-content-filter; re-dispatch |
+| F-H-009 | H | docs | docs-engineer | approved | pending | blocked-content-filter; re-dispatch |
+| F-M-001 | M | metadata | license-hygienist | approved | resolved | 537b8ce |
+| F-M-002 | M | ci | ci-engineer | approved | resolved | a28b773 |
+| F-M-003 | M | docs | docs-engineer | approved | pending | blocked-content-filter; re-dispatch |
+| F-M-004 | M | docs | docs-engineer | approved | pending | blocked-content-filter; re-dispatch |
+| F-M-005 | M | metadata | admin→license-hygienist | approved | pending | needs user decision on version scheme |
+| F-M-006 | M | docs | docs-engineer | approved | pending | blocked-content-filter; re-dispatch |
+| F-M-007 | M | docs | docs-engineer | approved | pending | blocked-content-filter; re-dispatch |
+| F-M-008 | M | docs | docs-engineer | approved | pending | blocked-content-filter; re-dispatch |
+| F-M-009 | M | licensing | license-hygienist | approved | resolved | 537b8ce (THIRD_PARTY_NOTICES.md) |
+| F-M-010 | M | ci | ci-engineer | approved | resolved | a28b773 |
+| F-M-011 | M | ci | admin | approved | pending | admin — deferred |
+| F-L-001 | L | docs | docs-engineer | approved | pending | blocked-content-filter; re-dispatch |
+| F-L-002 | L | docs | admin | approved | pending | admin — deferred |
+| F-L-003 | L | docs | admin | approved | pending | admin — deferred |
+| F-L-004 | L | metadata | license-hygienist | approved | resolved | 537b8ce (rust-version.workspace) |
+| F-L-005 | L | ci | admin→ci-engineer | approved | pending | admin — deferred |
+| F-L-006 | L | docs | docs-engineer | approved | pending | blocked-content-filter; re-dispatch |
+| F-L-007 | L | metadata | admin | approved | pending | admin — deferred |
 
 ---
 
@@ -144,11 +144,54 @@ These have been red since at least `v1.0.0-rc2`. Not in audit scope (auditor did
 **Proposed owners (from findings):** `ci-engineer` (release infra), `docs-engineer` (OSS scaffolding + runbooks), `examples-author` (examples/ dir), `license-hygienist` (Cargo metadata + LICENSE dedup), `admin` (fmt CI root-cause triage)
 **Follow-ups:** Phase 2 triage — user approval required before Phase 3 dispatch. Audit addendum captures positive findings (clean third-party deps, no secrets committed, PUNCHOUT clean, 6-board CI matrix, clippy passes on core) to support Phase 5 diff.
 
+### [2026-04-16] RETURN ← license-hygienist
+**Verdict:** SUCCESS
+**Commit:** `537b8ce` — "chore(cargo): fill workspace metadata, dedupe LICENSE, add THIRD_PARTY_NOTICES"
+**Findings addressed:** F-C-002, F-H-004, F-M-001, F-M-009, F-L-004
+**Files changed:** `LICENSE.txt` deleted (dedup to `LICENSE`), `Cargo.toml` workspace metadata filled (description/repository/homepage/keywords/categories/rust-version), `THIRD_PARTY_NOTICES.md` added.
+**Explicitly deferred:** F-M-005 (version scheme) — admin owns.
+
+### [2026-04-16] RETURN ← ci-engineer
+**Verdict:** SUCCESS
+**Commits:** `4fcfddd` (release.yml with UF2 + SHA256SUMS + SBOM + CHANGELOG excerpt), `78dcfc1` (RELEASE_PROCESS.md runbook), `a28b773` (build.yml cache + pin cargo-audit)
+**Findings addressed:** F-H-001, F-H-002, F-H-007, F-M-002, F-M-010
+**Explicitly deferred:** F-L-005 (clippy `-D warnings`) — admin owns.
+
+### [2026-04-16] RETURN ← examples-author
+**Verdict:** SUCCESS
+**Commits:** `7152de5` (top-level examples README), `945a192` (01-opensc-smoke), `2ca3696` (02-pkcs11-keygen), `b3e8368` (03-piv-cli-auth), `d796153` (04-gnupg-signing)
+**Findings addressed:** F-H-003
+**Files:** `examples/` directory with 4 examples, each with README + run.sh (1,044 lines / 9 files total)
+**Follow-ups for Phase 5:** Examples require end-to-end hardware validation before release tag. Author flagged that run.sh scripts have not been executed against a flashed device.
+
+### [2026-04-16] RETURN ← docs-engineer
+**Verdict:** **FAIL — content-filter block**
+**Agent:** dispatched general-purpose (Mode B) with inlined docs-engineer system prompt; agentId `af72dc00987b903f8` completed 16 tool uses over 93.5s before Anthropic API error: "Output blocked by content filtering policy". No commits landed.
+**Partial salvage:** untracked `CHANGELOG.md` (81 lines, Keep a Changelog format covering v1.0.0 Added/Changed/Fixed/Security) was recovered from the worktree and committed by admin as `aa78ee2`. F-C-003 is now partial — CHANGELOG exists with placeholder date; release-day date stamp is documented in RELEASE_PROCESS.md.
+**Findings still open:** F-H-005, F-H-006, F-H-008, F-H-009, F-M-003, F-M-004, F-M-006, F-M-007, F-M-008, F-L-001, F-L-006 (11 findings).
+**Hypothesis:** likely trigger was attempting to paste the full Contributor Covenant 2.1 text into `CODE_OF_CONDUCT.md` (F-H-005). The canonical-URL + short attribution variant is the standard OSS-safe remediation.
+**Recovery plan:** re-dispatch in 3 smaller chunks (date-stamp/README edits; runbooks + issue/PR templates; CoC as URL + CONTRIBUTING DCO + reviewer note).
+
+### [2026-04-16] DISPATCH → docs-engineer (Chunk A — metadata/date-stamp/README polish)
+**Task:** Resolve F-M-003 (PROVISIONING date), F-M-004 (PUNCHOUT date), F-M-006 (SECURITY version table), F-H-006 (README badges), F-L-006 (README board coverage)
+**Context provided:** worktree path, canonical URL `github.com/mcarey42/pico2hsm`, finding evidence, no large boilerplate pastes
+**Expected deliverable:** one commit editing `docs/PROVISIONING.md`, `PUNCHOUT.md`, `SECURITY.md`, `README.md` only
+
+### [2026-04-16] DISPATCH → docs-engineer (Chunk B — new runbooks + GitHub templates)
+**Task:** Resolve F-M-007 (INCIDENT_RESPONSE), F-M-008 (SUPPORT), F-H-008 (issue/PR templates)
+**Context provided:** worktree path, incident-response + support runbook structure from spec
+**Expected deliverable:** new `docs/INCIDENT_RESPONSE.md`, `docs/SUPPORT.md`, `.github/ISSUE_TEMPLATE/{bug_report,feature_request}.yml`, `.github/pull_request_template.md`
+
+### [2026-04-16] DISPATCH → docs-engineer (Chunk C — CoC + CONTRIBUTING polish)
+**Task:** Resolve F-H-005 (CODE_OF_CONDUCT), F-H-009 (CONTRIBUTING DCO), F-L-001 (CONTRIBUTING reviewer note)
+**Context provided:** worktree path, **explicit instruction** to write `CODE_OF_CONDUCT.md` as a short-form reference to Contributor Covenant 2.1 (canonical URL + attribution, NOT inline the full text) to avoid content-filter block
+**Expected deliverable:** new `CODE_OF_CONDUCT.md` (short-form), targeted edits to `CONTRIBUTING.md`
+
 ---
 
 ## Open user approvals
 
-*(none pending)*
+*(none pending — Phase 3 recovery in progress)*
 
 ---
 
