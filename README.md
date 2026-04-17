@@ -1,5 +1,10 @@
 # pico2hsm
 
+[![Build](https://github.com/mcarey42/pico2hsm/actions/workflows/build.yml/badge.svg)](https://github.com/mcarey42/pico2hsm/actions/workflows/build.yml)
+[![Release](https://github.com/mcarey42/pico2hsm/actions/workflows/release.yml/badge.svg)](https://github.com/mcarey42/pico2hsm/actions/workflows/release.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Rust Edition](https://img.shields.io/badge/rust-2024-orange.svg)](https://doc.rust-lang.org/edition-guide/rust-2024/)
+
 A production-grade, open-source Hardware Security Module (HSM) firmware written in Rust for the Raspberry Pi RP2350/RP2354 microcontroller. MIT licensed.
 
 ## Overview
@@ -35,6 +40,8 @@ The firmware provides hardware-backed key storage with:
 | Waveshare RP2350-Geek + SDCard | 16MB | 14MB + SDCard | ST7789 LCD, SDCard |
 | Waveshare RP2350-LCD-1.47-B | 16MB | 14MB internal | ST7789V3 LCD, WS2812B LED |
 | Waveshare RP2350-LCD-1.47-B + SDCard | 16MB | SDCard | ST7789V3 LCD, SDCard |
+
+The default feature flag is `rp2350_one_4m` for historical reasons; the primary debug/test target is `pico2_4m` (Raspberry Pi Pico 2 stock board) as documented in `CLAUDE.md`. See `docs/BUILD_CONFIGURATIONS.md` for all flag combinations.
 
 ## Build Requirements
 

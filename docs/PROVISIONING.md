@@ -4,7 +4,7 @@ Complete step-by-step guide for provisioning a pico2hsm device from bare
 hardware to a production-locked state using **picotool** and standard CLI
 tools. No custom provisioning hardware is required.
 
-Last updated: 2026-04-14 (v1.0.0-rc2)
+Last updated: 2026-04-16 (v1.0.0-rc4)
 
 ---
 
