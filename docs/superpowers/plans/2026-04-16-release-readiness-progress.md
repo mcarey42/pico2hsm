@@ -53,8 +53,8 @@ All 30 findings approved by user on 2026-04-16 with auditor's proposed owners.
 | F-M-010 | M | ci | ci-engineer | approved | resolved | a28b773 |
 | F-M-011 | M | ci | admin | approved | pending | admin — deferred |
 | F-L-001 | L | docs | docs-engineer | approved | resolved | 0655272 (CODEOWNERS + CONTRIBUTING edits) |
-| F-L-002 | L | docs | admin | approved | pending | admin — deferred |
-| F-L-003 | L | docs | admin | approved | pending | admin — deferred |
+| F-L-002 | L | docs | admin | approved | resolved | user decision: keep; CLAUDE.md is functional AI-assistant documentation |
+| F-L-003 | L | docs | admin | approved | resolved | note added to CLAUDE.md explaining signing key is user-owned root of trust |
 | F-L-004 | L | metadata | license-hygienist | approved | resolved | 537b8ce (rust-version.workspace) |
 | F-L-005 | L | ci | admin→ci-engineer | approved | pending | admin — deferred |
 | F-L-006 | L | docs | docs-engineer | approved | resolved | 5d6988d |
