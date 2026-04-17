@@ -14,9 +14,9 @@ This document is the **source of truth** for where the release-prep effort is. T
 | Phase | Status | Started | Completed | Notes |
 |---|---|---|---|---|
 | 0 — Setup | completed | 2026-04-16 | 2026-04-16 | worktree + agents + progress doc seeded |
-| 1 — Audit | in_progress | 2026-04-16 | — | auditor dispatch pending |
-| 2 — Triage | pending | — | — | gate #1 |
-| 3 — Parallel execution | pending | — | — | depends on triage |
+| 1 — Audit | completed | 2026-04-16 | 2026-04-16 | 30 findings (3 C / 9 H / 11 M / 7 L) |
+| 2 — Triage | completed | 2026-04-16 | 2026-04-16 | gate #1 — user approved all 30 findings with auditor's proposed owners |
+| 3 — Parallel execution | in_progress | 2026-04-16 | — | F-C-001 admin diagnosis first; then 4-specialist parallel dispatch |
 | 4 — Firmware items | pending | — | — | gate #2, on demand only |
 | 5 — Verification sweep | pending | — | — | auditor rerun |
 | 6 — Finalize | pending | — | — | gate #3, CHANGELOG + PR |
@@ -25,9 +25,40 @@ This document is the **source of truth** for where the release-prep effort is. T
 
 ## Audit findings tracker
 
-Populated after Phase 1 auditor returns. Columns: ID, Severity, Category, Proposed owner, User decision (approved/deferred/rejected), Current status, Resolution commit.
+All 30 findings approved by user on 2026-04-16 with auditor's proposed owners.
 
-*(empty until Phase 1 completes)*
+| ID | Sev | Category | Owner | Decision | Status | Commit |
+|---|---|---|---|---|---|---|
+| F-C-001 | C | code-hygiene | admin | approved | pending | — |
+| F-C-002 | C | licensing | license-hygienist | approved | pending | — |
+| F-C-003 | C | docs | docs-engineer | approved | pending | — |
+| F-H-001 | H | ci | ci-engineer | approved | pending | — |
+| F-H-002 | H | ci | ci-engineer | approved | pending | — |
+| F-H-003 | H | examples | examples-author | approved | pending | — |
+| F-H-004 | H | metadata | license-hygienist | approved | pending | — |
+| F-H-005 | H | docs | docs-engineer | approved | pending | — |
+| F-H-006 | H | docs | docs-engineer | approved | pending | — |
+| F-H-007 | H | ci | ci-engineer | approved | pending | — |
+| F-H-008 | H | docs | docs-engineer | approved | pending | — |
+| F-H-009 | H | docs | docs-engineer | approved | pending | — |
+| F-M-001 | M | metadata | license-hygienist | approved | pending | — |
+| F-M-002 | M | ci | ci-engineer | approved | pending | — |
+| F-M-003 | M | docs | docs-engineer | approved | pending | — |
+| F-M-004 | M | docs | docs-engineer | approved | pending | — |
+| F-M-005 | M | metadata | admin→license-hygienist | approved | pending | — |
+| F-M-006 | M | docs | docs-engineer | approved | pending | — |
+| F-M-007 | M | docs | docs-engineer | approved | pending | — |
+| F-M-008 | M | docs | docs-engineer | approved | pending | — |
+| F-M-009 | M | licensing | license-hygienist | approved | pending | — |
+| F-M-010 | M | ci | ci-engineer | approved | pending | — |
+| F-M-011 | M | ci | admin | approved | pending | — |
+| F-L-001 | L | docs | docs-engineer | approved | pending | — |
+| F-L-002 | L | docs | admin | approved | pending | — |
+| F-L-003 | L | docs | admin | approved | pending | — |
+| F-L-004 | L | metadata | license-hygienist | approved | pending | — |
+| F-L-005 | L | ci | admin→ci-engineer | approved | pending | — |
+| F-L-006 | L | docs | docs-engineer | approved | pending | — |
+| F-L-007 | L | metadata | admin | approved | pending | — |
 
 ---
 
