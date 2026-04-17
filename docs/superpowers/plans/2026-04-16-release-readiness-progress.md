@@ -52,7 +52,21 @@ Chronological record. One entry per `Agent` invocation.
 
 ### Entries
 
-*(none yet)*
+### [2026-04-16] DISPATCH → release-auditor
+**Task:** Phase 1 initial OSS-release readiness audit
+**Context provided:** worktree path `/home/mcarey/pico2hsm-release-prep`, canonical docs (spec/plan/progress), auditor system prompt inlined (Mode B — session cwd is main repo, not worktree), full audit checklist
+**Expected deliverable:** `docs/superpowers/audit/2026-04-16-release-audit.md` with severity-tagged findings covering every checklist section
+
+### [2026-04-16] RETURN ← release-auditor
+**Files changed:** `docs/superpowers/audit/2026-04-16-release-audit.md` (new, 341 lines, 28 KB)
+**Commit audited:** `cc36a06` (release-prep/v1.0.0, after gitignore carve-out)
+**Findings:** 3 critical, 9 high, 11 medium, 7 low — 30 total
+**Top CRITICAL themes:**
+1. F-C-001 — `cargo fmt --check` fails on 887 diffs across 89 files, contradicting CI
+2. F-C-002 — LICENSE and LICENSE.txt both tracked, content differs (year, typography)
+3. F-C-003 — No `CHANGELOG.md` + no `release.yml` workflow; release machinery absent
+**Proposed owners (from findings):** `ci-engineer` (release infra), `docs-engineer` (OSS scaffolding + runbooks), `examples-author` (examples/ dir), `license-hygienist` (Cargo metadata + LICENSE dedup), `admin` (fmt CI root-cause triage)
+**Follow-ups:** Phase 2 triage — user approval required before Phase 3 dispatch. Audit addendum captures positive findings (clean third-party deps, no secrets committed, PUNCHOUT clean, 6-board CI matrix, clippy passes on core) to support Phase 5 diff.
 
 ---
 
