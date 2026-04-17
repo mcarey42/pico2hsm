@@ -91,16 +91,45 @@ impl Dispatcher {
     /// and corrupts wakers / async state.
     ///
     /// This method uses `addr_of_mut!` to write each field individually
-    /// into the destination, keeping peak stack usage under 1 KB.
+    /// into the destination, keeping peak stack usage under 512 bytes.
+    ///
+    /// Each field is written directly via `addr_of_mut!` — no intermediate
+    /// struct is constructed on the stack.  Large fields (`SharedResponseBuffer`
+    /// with a 4 KB inline array, `OpenPgp`) are initialised via separate
+    /// `#[inline(never)]` helpers to avoid return-value stack temporaries.
+    ///
+    /// `#[inline(never)]` on this function itself ensures its frame is
+    /// separate from the async state machine, preventing cumulative overflow.
+    #[inline(never)]
     pub fn init_in_place(dest: &mut core::mem::MaybeUninit<Self>) -> &mut Self {
         let ptr = dest.as_mut_ptr();
         unsafe {
             core::ptr::addr_of_mut!((*ptr).active).write(ActiveProtocol::None);
             ScHsm::init_in_place(core::ptr::addr_of_mut!((*ptr).sc_hsm));
             Piv::init_in_place(core::ptr::addr_of_mut!((*ptr).piv));
-            core::ptr::addr_of_mut!((*ptr).openpgp).write(OpenPgp::new());
-            core::ptr::addr_of_mut!((*ptr).shared_buf).write(SharedResponseBuffer::new());
+            Self::init_openpgp_in_place(core::ptr::addr_of_mut!((*ptr).openpgp));
+            // SharedResponseBuffer has a 4 KB inline [u8; 4096].
+            // Write fields individually to keep it off the stack.
+            {
+                let sb = core::ptr::addr_of_mut!((*ptr).shared_buf);
+                core::ptr::addr_of_mut!((*sb).data).write_bytes(0u8, 1);
+                core::ptr::addr_of_mut!((*sb).len).write(0);
+                core::ptr::addr_of_mut!((*sb).offset).write(0);
+                core::ptr::addr_of_mut!((*sb).state).write(
+                    crate::apdu::shared_buffer::SharedBufState::Empty,
+                );
+            }
             &mut *ptr
+        }
+    }
+
+    /// Initialise `OpenPgp` in its own stack frame to avoid inflating
+    /// `init_in_place`.  `OpenPgpState` is ~2 KB; `#[inline(never)]` keeps
+    /// that temporary out of the caller's frame.
+    #[inline(never)]
+    fn init_openpgp_in_place(dest: *mut OpenPgp) {
+        unsafe {
+            dest.write(OpenPgp::new());
         }
     }
 
@@ -115,10 +144,12 @@ impl Dispatcher {
     /// Load all persisted keys from flash into the in-memory key cache.
     ///
     /// Called at session start and on USB reconnect (new Dispatcher).
+    ///
+    /// `#[inline(never)]` keeps the ~9 KB stack frame (from `KeyObject`
+    /// temporaries in `fetch_key`) separate from the async state machine,
+    /// preventing core0 stack overflow on display boards.
+    #[inline(never)]
     pub fn load_keys_from_store(&mut self, store: &mut dyn crate::storage::KeyStore) {
-        // Collect SC-HSM key IDs to load (applet byte == 0, not PIN sentinel).
-        // Uses for_each_key to avoid a large stack Vec, then collects into a
-        // small Vec for the fetch loop (which needs &mut store).
         let mut sc_hsm_ids: heapless::Vec<pico2hsm_core::key::KeyId, 64> = heapless::Vec::new();
         store.for_each_key(&mut |kid| {
             if kid.applet_byte() == 0 && kid.proto_ref() != 0xFF {
@@ -146,17 +177,10 @@ impl Dispatcher {
         }
         let _ = loaded;
 
-        // Load PIV keys and PIN state.
         #[cfg(feature = "applet-piv")]
         self.piv.load_from_store(store);
-
-        // Load OpenPGP keys and PIN state.
         self.openpgp.load_from_store(store);
-
-        // Load SC-HSM PIN state from flash sentinel.
         ScHsm::load_pin_state_from_store(&mut self.sc_hsm.state, store);
-
-        // Load enrolled peer pubkey for V2 Noise mutual auth.
         ScHsm::load_peer_pubkey_from_store(&mut self.sc_hsm.state, store);
     }
 

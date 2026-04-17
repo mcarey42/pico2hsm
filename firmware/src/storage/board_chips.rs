@@ -29,7 +29,10 @@ use crate::storage::{
     flash_chip::{QmiFlash, SpiFlash},
 };
 
-#[cfg(all(target_arch = "arm", feature = "waveshare_rp2350_lcd_sdcard"))]
+#[cfg(all(target_arch = "arm", any(
+    feature = "waveshare_rp2350_lcd_sdcard",
+    feature = "rp2350_geek_sdcard",
+)))]
 use crate::storage::sdcard::SdCardFlash;
 
 // ── pico2_4m ─────────────────────────────────────────────────────────────────
@@ -55,24 +58,25 @@ pub type BoardChip = AnyChip<
     QmiFlash,
 >;
 
-// ── rp2350_geek_* ─────────────────────────────────────────────────────────────
+// ── rp2350_geek_16m ──────────────────────────────────────────────────────────
 
-/// RAID-1 pair: SPI0 primary + SPI1 mirror.
-/// SPI pin assignments are identical to RP2350-One.
-#[cfg(all(target_arch = "arm", any(
-    feature = "rp2350_geek_16m",
-    feature = "rp2350_geek_sdcard",
-)))]
-pub type BoardChip = AnyChip<
-    SpiFlash<
+/// QMI flash — upper 2 MB of the 16 MB on-board QSPI chip.
+/// No external SPI flash chips on this board; SPI0 is unused.
+#[cfg(all(target_arch = "arm", feature = "rp2350_geek_16m"))]
+pub type BoardChip = QmiFlash;
+
+// ── rp2350_geek_sdcard ──────────────────────────────────────────────────────
+
+/// SD card on SPI0 (SCK=GPIO18, MOSI=GPIO19, MISO=GPIO20, CS=GPIO23).
+#[cfg(all(target_arch = "arm", feature = "rp2350_geek_sdcard"))]
+pub type BoardChip = SdCardFlash<
+    embassy_embedded_hal::shared_bus::blocking::spi::SpiDevice<
+        'static,
+        embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex,
         embassy_rp::spi::Spi<'static, embassy_rp::peripherals::SPI0, embassy_rp::spi::Blocking>,
         Output<'static>,
     >,
-    SpiFlash<
-        embassy_rp::spi::Spi<'static, embassy_rp::peripherals::SPI1, embassy_rp::spi::Blocking>,
-        Output<'static>,
-    >,
-    QmiFlash,
+    embassy_time::Delay,
 >;
 
 // ── waveshare_rp2350_lcd_16m ──────────────────────────────────────────────────
@@ -88,6 +92,8 @@ pub type BoardChip = QmiFlash;
 
 /// Single SD card on SPI1 (SCK=GPIO10, MOSI=GPIO11, MISO=GPIO12, CS=GPIO15).
 /// SPI1 is consumed entirely by the SD card; the LCD uses SPI0.
+/// Uses `SimpleSpiDevice` (no mutex/critical section) since the SD card is the
+/// sole SPI1 consumer on this board.
 #[cfg(all(target_arch = "arm", feature = "waveshare_rp2350_lcd_sdcard"))]
 pub type BoardChip = SdCardFlash<
     embassy_embedded_hal::shared_bus::blocking::spi::SpiDevice<

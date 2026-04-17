@@ -43,15 +43,16 @@ pkill -9 -f "probe-rs"
 
 **Concurrency model** (RP2350 dual-core):
 - **Core0** — Embassy async executor: USB device driver + CCID transport loop. Sends APDUs to core1 via `APDU_CHANNEL` and waits for responses on `RESP_CHANNEL`.
-- **Core1** — Embassy async executor: `dispatcher_task()` receives APDUs, calls the synchronous `Dispatcher::dispatch()` chain, sends responses back.
+- **Core1** — Synchronous `dispatcher_loop()`: no Embassy executor.  Sleeps via ARM `wfe` (Wait For Event) while idle; woken by core0 via `sev` (Send Event) after each channel send.  Calls `blocking_receive()`/`blocking_send()` on the shared channels using `try_receive()`/`try_send()`.
 
 Both channels use RP2350 hardware spinlocks (29 and 30) for SMP-safe cross-core signalling.
+Core0 issues `cortex_m::asm::sev()` after every `APDU_CHANNEL.send()` and `FLASH_RESP.send()` to wake core1 from WFE.
 
 **CDC serial logger**: Core0 runs a `drain_one()` task that forwards buffered log lines to `/dev/ttyACMx`. `drain_one()` checks DTR before writing; if no terminal has `/dev/ttyACMx` open, the line is dropped silently (no CCID stall).
 
 **APDU dispatch chain** (all on core1, synchronous):
 ```
-dispatcher_task()
+dispatcher_loop()
   └─ Dispatcher::dispatch()          [apdu/dispatcher.rs]
        ├─ SELECT AID → activates one of:
        │     ScHsm  (always present)
@@ -97,7 +98,7 @@ cargo build --release --no-default-features \
 | Waveshare LCD 16MB | 539 KB | 449 KB | 87% |
 | Waveshare LCD SDCard | 542 KB | 442 KB | 85% |
 
-Flash is not a concern.  RAM is the metric to watch; the 192 KB core1 stack and the
+Flash is not a concern.  RAM is the metric to watch; the 128 KB core1 stack and the
 display framebuffers (48 KB Geek, 83 KB Waveshare LCD, RGB444) dominate on display boards.
 Non-display boards have ~90 KB free SRAM; Waveshare LCD 16MB has ~39 KB free.
 
@@ -172,15 +173,20 @@ Each board's LED/display driver is fully implemented (not stubbed):
 
 **Cause**: `ScHsmState` holds `ef_files: Vec<EfEntry, 16>` where each `EfEntry` contains `Vec<u8, 2048>` inline — 32 KB of fixed EF storage alone. Combined with multiple `Vec<u8, 4096>` response buffers allocated as stack temporaries across the `Dispatcher → ScHsm::process_apdu → ScHsm::dispatch → handle()` call chain (~12–16 KB), the total easily exceeds the core1 stack limit. On Cortex-M33 without MPU guard pages this is a **silent** overflow: no panic, no fault, core1 just runs garbage.
 
-**Fix**: Set `CORE1_STACK` in `firmware/src/main.rs` to 192 KB.  Measured peak usage
+**Fix**: Set `CORE1_STACK` in `firmware/src/main.rs` to 128 KB.  Measured peak usage
 is ~65 KB (38 KB ScHsmState inline storage + 16 KB dispatch-chain temporaries),
-giving ~3× headroom:
+giving ~2× headroom:
 ```rust
-// 192 KB — ~3× measured peak of ~65 KB.  Do not reduce below 128 KB.
-static mut CORE1_STACK: Stack<196608> = Stack::new();
+// 128 KB — ~2× measured peak of ~65 KB.  Do not reduce below 96 KB.
+static mut CORE1_STACK: Stack<131072> = Stack::new();
 ```
 
-**Rule of thumb**: Any time a new large static allocation is added to `ScHsmState` (keys, files, buffers), re-evaluate core1 stack headroom. The RP2350 has 520 KB SRAM total; current BSS is ~340 KB (waveshare_rp2350_lcd_16m with all applets), so headroom remains if needed.
+**Rule of thumb**: Any time a new large static allocation is added to `ScHsmState` (keys, files, buffers), re-evaluate core1 stack headroom. The RP2350 has 520 KB SRAM total; current BSS is ~332 KB (rp2350_geek_16m with all applets, after removing Embassy executor from core1).
+
+**Core1 synchronous loop**: Core1 no longer runs an Embassy executor — it uses a
+synchronous `dispatcher_loop()` with `wfe`/`sev` for cooperative sleep/wake.
+This eliminated ~61 KB of async state machine BSS overhead, giving core0 ~188 KB
+of stack space (ample for the ~67 KB debug-build poll frame).
 
 ### CCID timeout on long operations (P-384 / P-521 / K-256 sign)
 

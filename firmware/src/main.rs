@@ -60,16 +60,17 @@ use embassy_sync::channel::Channel;
 #[cfg(target_arch = "arm")]
 use static_cell::StaticCell;
 
-// ─── Core1 stack and executor (ARM only) ─────────────────────────────────────
+// ─── Core1 stack (ARM only) ──────────────────────────────────────────────────
 
-/// Stack for the core1 Embassy executor.  Measured peak usage ~65 KB
-/// (38 KB ScHsmState inline storage + 16 KB dispatch-chain temporaries).
-/// 192 KB gives ~3× headroom; release builds use far less.
-/// Do not reduce below 128 KB (~2× measured peak).
+/// Stack for core1.  Measured peak usage ~65 KB (38 KB ScHsmState inline
+/// storage + 16 KB dispatch-chain temporaries).  128 KB gives ~2× headroom.
+/// Do not reduce below 96 KB.
+///
+/// Core1 runs a synchronous dispatch loop (no Embassy executor) — the
+/// full 128 KB is available as call-stack, with no async state machine
+/// overhead.
 #[cfg(target_arch = "arm")]
-static mut CORE1_STACK: Stack<196608> = Stack::new();
-#[cfg(target_arch = "arm")]
-static CORE1_EXECUTOR: StaticCell<embassy_executor::Executor> = StaticCell::new();
+static mut CORE1_STACK: Stack<131072> = Stack::new();
 
 /// Core0 → Core1: raw APDU bytes.  Empty Vec = reset-dispatcher signal.
 /// Uses RP2350 hardware spinlock 29 for SMP-safe access across both cores.
@@ -111,20 +112,29 @@ enum FlashOp {
     ReloadKeys,
 }
 
-/// A `KeyStore` implementation that queues flash operations instead of
-/// executing them immediately.  Used by the core1 dispatcher to collect
-/// flash ops during APDU processing, then drain them to core0 afterwards.
+/// A `KeyStore` implementation used by the core1 dispatcher during APDU
+/// processing.
+///
+/// **SD card boards** (`rp2350_geek_sdcard`, `waveshare_rp2350_lcd_sdcard`):
+/// All operations (read and write) go directly through the `store_ptr`.
+/// SD card writes are plain SPI transactions with no core affinity — no need
+/// to round-trip through core0.  This avoids blocking core0's async executor
+/// (which must stay responsive for USB servicing and CCID time extensions).
+///
+/// **QMI flash boards** (all others):
+/// Reads go through `store_ptr` (XIP memory-mapped, safe from any core).
+/// Writes are queued as `FlashOp`s and drained to core0 after dispatch,
+/// because `embassy_rp::flash` asserts `core_id == 0` for erase/write.
 #[cfg(target_arch = "arm")]
 struct FlashQueueKeyStore {
+    /// Queued flash ops — only used by QMI flash boards.
+    /// SD card boards leave this empty (writes go direct).
     ops: heapless::Vec<FlashOp, 8>,
-    /// Raw pointer to the BoardKeyStore for direct flash reads (fetch_key).
-    /// Flash reads go through XIP memory mapping and are safe from any core.
-    /// Flash *writes* are queued as FlashOps and sent to Core0 via FLASH_REQ.
+    /// Raw pointer to the BoardKeyStore.
     store_ptr: *mut pico2hsm_firmware::storage::BoardKeyStore,
 }
 
 // SAFETY: FlashQueueKeyStore is only used by Core1's single dispatcher task.
-// The store_ptr is only used for reads; writes go through the FLASH_REQ channel.
 #[cfg(target_arch = "arm")]
 unsafe impl Send for FlashQueueKeyStore {}
 
@@ -140,6 +150,14 @@ impl FlashQueueKeyStore {
     fn drain(&mut self) -> heapless::Vec<FlashOp, 8> {
         core::mem::replace(&mut self.ops, heapless::Vec::new())
     }
+
+    /// Whether this board uses direct SD card writes (no core0 channel needed).
+    const fn is_direct_write() -> bool {
+        cfg!(any(
+            feature = "rp2350_geek_sdcard",
+            feature = "waveshare_rp2350_lcd_sdcard",
+        ))
+    }
 }
 
 #[cfg(target_arch = "arm")]
@@ -149,7 +167,15 @@ impl pico2hsm_firmware::storage::KeyStore for FlashQueueKeyStore {
         obj: &pico2hsm_firmware::security::key_management::KeyObject,
     ) -> Result<(), pico2hsm_core::error::HsmError> {
         CORE1_PROGRESS.store(70, core::sync::atomic::Ordering::Relaxed);
-        // Clone the KeyObject by reconstructing it field by field.
+        if Self::is_direct_write() {
+            // SD card: write directly from core1 — no XIP involvement.
+            use pico2hsm_firmware::storage::KeyStore;
+            let store = unsafe { &mut *self.store_ptr };
+            let result = store.save_key(obj);
+            CORE1_PROGRESS.store(73, core::sync::atomic::Ordering::Relaxed);
+            return result;
+        }
+        // QMI flash: queue for core0.
         let mut copy = pico2hsm_firmware::security::key_management::KeyObject::new(
             obj.key_type,
             obj.key_id,
@@ -175,11 +201,8 @@ impl pico2hsm_firmware::storage::KeyStore for FlashQueueKeyStore {
         key_id: pico2hsm_core::key::KeyId,
     ) -> Result<Option<pico2hsm_firmware::security::key_management::KeyObject>, pico2hsm_core::error::HsmError>
     {
-        // Direct flash read — XIP memory-mapped reads are safe from any core.
-        // Only flash writes require Core0 (the `in_ram()` XIP-halt path).
-        // SAFETY: Core0 never writes to flash while Core1 is dispatching —
-        // flash writes only happen during the drain loop, when Core1 is
-        // blocked on FLASH_RESP.
+        // Direct read — safe from any core.
+        // For QMI flash this is XIP memory-mapped; for SD card it's SPI reads.
         use pico2hsm_firmware::storage::KeyStore;
         let store = unsafe { &mut *self.store_ptr };
         store.fetch_key(key_id)
@@ -189,11 +212,21 @@ impl pico2hsm_firmware::storage::KeyStore for FlashQueueKeyStore {
         &mut self,
         key_id: pico2hsm_core::key::KeyId,
     ) -> Result<(), pico2hsm_core::error::HsmError> {
+        if Self::is_direct_write() {
+            use pico2hsm_firmware::storage::KeyStore;
+            let store = unsafe { &mut *self.store_ptr };
+            return store.erase_key(key_id);
+        }
         let _ = self.ops.push(FlashOp::EraseKey(key_id));
         Ok(())
     }
 
     fn wipe_all(&mut self) -> Result<(), pico2hsm_core::error::HsmError> {
+        if Self::is_direct_write() {
+            use pico2hsm_firmware::storage::KeyStore;
+            let store = unsafe { &mut *self.store_ptr };
+            return store.wipe_all();
+        }
         let _ = self.ops.push(FlashOp::WipeAll);
         Ok(())
     }
@@ -202,16 +235,19 @@ impl pico2hsm_firmware::storage::KeyStore for FlashQueueKeyStore {
         &mut self,
         owner: pico2hsm_core::key::AppletId,
     ) -> Result<(), pico2hsm_core::error::HsmError> {
+        if Self::is_direct_write() {
+            use pico2hsm_firmware::storage::KeyStore;
+            let store = unsafe { &mut *self.store_ptr };
+            return store.wipe_by_owner(owner);
+        }
         let _ = self.ops.push(FlashOp::WipeByOwner(owner));
         Ok(())
     }
 
     fn enumerate_keys(&self) -> heapless::Vec<pico2hsm_core::key::KeyId, 64> {
-        // In-memory state is authoritative; flash enumeration not needed.
         heapless::Vec::new()
     }
     fn for_each_key(&self, _f: &mut dyn FnMut(pico2hsm_core::key::KeyId)) {
-        // In-memory state is authoritative; flash enumeration not needed.
     }
 }
 
@@ -253,20 +289,72 @@ struct DispatcherPtr(
 #[cfg(target_arch = "arm")]
 unsafe impl Send for DispatcherPtr {}
 
-/// APDU dispatcher task — runs on core1 so that blocking ECC crypto does not
+/// Block until a message can be sent on the channel.
+///
+/// Uses `try_send` (no async runtime required) and `wfe` to sleep between
+/// attempts.  Core0 issues `sev` after each channel operation that could
+/// unblock core1, so the `wfe` wakes promptly.
+///
+/// `try_send` calls `receiver_waker.wake()` on success, which wakes core0's
+/// async receiver — no changes needed on the core0 side.
+#[cfg(target_arch = "arm")]
+fn blocking_send<M: embassy_sync::blocking_mutex::raw::RawMutex, T, const N: usize>(
+    channel: &Channel<M, T, N>,
+    mut message: T,
+) {
+    loop {
+        match channel.try_send(message) {
+            Ok(()) => {
+                // Wake core0 in case it is in WFE/WFI (embassy executor idle).
+                cortex_m::asm::sev();
+                return;
+            }
+            Err(embassy_sync::channel::TrySendError::Full(returned)) => {
+                message = returned;
+                cortex_m::asm::wfe();
+            }
+        }
+    }
+}
+
+/// Block until a message is received from the channel.
+///
+/// Uses `try_receive` (no async runtime required) and `wfe` to sleep between
+/// attempts.  Core0 issues `sev` after each `APDU_CHANNEL.send()` and
+/// `FLASH_RESP.send()` to wake core1.
+#[cfg(target_arch = "arm")]
+fn blocking_receive<M: embassy_sync::blocking_mutex::raw::RawMutex, T, const N: usize>(
+    channel: &Channel<M, T, N>,
+) -> T {
+    loop {
+        match channel.try_receive() {
+            Ok(value) => return value,
+            Err(_) => cortex_m::asm::wfe(),
+        }
+    }
+}
+
+/// APDU dispatcher loop — runs on core1 so that blocking ECC crypto does not
 /// starve the USB driver which runs cooperatively on core0.
+///
+/// This is a synchronous loop with no Embassy executor — core1 sleeps via
+/// `wfe` (Wait For Event) while idle and is woken by core0 via `sev` (Send
+/// Event) when an APDU arrives.  This eliminates ~10–20 KB of async state
+/// machine overhead that the Embassy executor would otherwise add.
 ///
 /// Takes a raw pointer to the `Dispatcher` which was initialized and loaded
 /// from the keystore by core0 before spawning core1.  Core0 never touches the
 /// Dispatcher after this point, so the mutable reference is exclusive.
 ///
-/// Flash writes are delegated to core0 via `FLASH_REQ`/`FLASH_RESP` channels
-/// because `embassy_rp::flash` asserts `core_id == 0`.
+/// **QMI flash boards**: flash writes are delegated to core0 via
+/// `FLASH_REQ`/`FLASH_RESP` channels because `embassy_rp::flash` asserts
+/// `core_id == 0`.
+///
+/// **SD card boards**: all storage I/O happens directly on core1 via SPI.
+/// No core0 round-trip needed — core0 stays free for USB servicing and
+/// CCID time extensions throughout the entire APDU dispatch.
 #[cfg(target_arch = "arm")]
-#[embassy_executor::task]
-async fn dispatcher_task(
-    ptr_wrapper: DispatcherPtr,
-) {
+fn dispatcher_loop(ptr_wrapper: DispatcherPtr) -> ! {
     let dispatcher_ptr = ptr_wrapper.0;
     let store_ptr = ptr_wrapper.1;
     // Core1 must not call defmt: embassy-rp's critical_section uses Spinlock31; if Core1
@@ -283,36 +371,39 @@ async fn dispatcher_task(
     let dispatcher = unsafe { &mut *dispatcher_ptr };
 
     loop {
-        let apdu_bytes = APDU_CHANNEL.receive().await;
+        let apdu_bytes = blocking_receive(&APDU_CHANNEL);
         // No defmt logging inside the receive loop.  All embassy_rp TRACE logs
         // from Core0 fill the RTT buffer rapidly; any defmt write from Core1
         // here would block on BLOCK_IF_FULL mode and deadlock both cores.
         if apdu_bytes.is_empty() {
             // Empty APDU = reset signal issued by core0 on USB disconnect.
-            // Reset in-memory state and ask core0 to reload keys from flash.
+            // Reset in-memory state and reload keys from store.
             *dispatcher = pico2hsm_firmware::apdu::dispatcher::Dispatcher::new();
-            // Signal core0 to reload keys from store into the fresh dispatcher.
-            // Core0 will call dispatcher.load_keys_from_store(store) via the raw
-            // pointer.  This is safe because core1 is awaiting FLASH_RESP and
-            // not touching the dispatcher.
-            FLASH_REQ.send(FlashOp::ReloadKeys).await;
-            let _ = FLASH_RESP.receive().await;
-            let _ = RESP_CHANNEL.send(heapless::Vec::new()).await;
+            if FlashQueueKeyStore::is_direct_write() {
+                // SD card: reload directly on core1.
+                use pico2hsm_firmware::storage::KeyStore;
+                let store = unsafe { &mut *store_ptr };
+                dispatcher.load_keys_from_store(store);
+            } else {
+                // QMI flash: ask core0 to reload (it holds the store).
+                blocking_send(&FLASH_REQ, FlashOp::ReloadKeys);
+                let _ = blocking_receive(&FLASH_RESP);
+            }
+            blocking_send(&RESP_CHANNEL, heapless::Vec::new());
         } else {
             CORE1_PROGRESS.store(10, core::sync::atomic::Ordering::Relaxed);
             let mut q = FlashQueueKeyStore::new(store_ptr);
             let response = dispatcher.dispatch_with_store(&apdu_bytes, &mut q);
             CORE1_PROGRESS.store(40, core::sync::atomic::Ordering::Relaxed);
-            // Drain queued flash ops BEFORE sending the response back to core0.
-            // Core0 is in its select loop awaiting RESP_CHANNEL, so it will
-            // process FLASH_REQ messages during that wait.
+            // Drain queued flash ops (QMI flash boards only).
+            // SD card boards write directly during dispatch — queue is empty.
             for op in q.drain() {
                 CORE1_PROGRESS.store(50, core::sync::atomic::Ordering::Relaxed);
-                FLASH_REQ.send(op).await;
-                let _ = FLASH_RESP.receive().await;
+                blocking_send(&FLASH_REQ, op);
+                let _ = blocking_receive(&FLASH_RESP);
             }
             CORE1_PROGRESS.store(60, core::sync::atomic::Ordering::Relaxed);
-            let _ = RESP_CHANNEL.send(response).await;
+            blocking_send(&RESP_CHANNEL, response);
             CORE1_PROGRESS.store(0, core::sync::atomic::Ordering::Relaxed);
         }
         KEY_COUNT.store(
@@ -529,6 +620,10 @@ fn handle_flash_op(
             // touch the dispatcher until we send the response.
             let dispatcher = unsafe { &mut *dispatcher_ptr };
             dispatcher.load_keys_from_store(store);
+            KEY_COUNT.store(
+                dispatcher.in_memory_key_count(),
+                core::sync::atomic::Ordering::Relaxed,
+            );
             Ok(())
         }
     }
@@ -643,6 +738,10 @@ async fn run_one_board(p: embassy_rp::Peripherals) {
         use pico2hsm_firmware::storage::KeyStore as _;
         dispatcher_ref.load_keys_from_store(store);
     }
+    KEY_COUNT.store(
+        dispatcher_ref.in_memory_key_count(),
+        core::sync::atomic::Ordering::Relaxed,
+    );
     let dispatcher_ptr = dispatcher_ref as *mut pico2hsm_firmware::apdu::dispatcher::Dispatcher;
     let dispatcher_send = DispatcherPtr(dispatcher_ptr, store as *mut _);
 
@@ -660,8 +759,7 @@ async fn run_one_board(p: embassy_rp::Peripherals) {
                 .modify(|v| v | (1 << 18));
         }
 
-        let executor = CORE1_EXECUTOR.init(embassy_executor::Executor::new());
-        executor.run(|spawner| spawner.spawn(dispatcher_task(dispatcher_send).expect("dispatcher task")));
+        dispatcher_loop(dispatcher_send);
     });
 
     // ── Concurrent USB + CCID command loop (core0) ───────────────────────────
@@ -677,6 +775,7 @@ async fn run_one_board(p: embassy_rp::Peripherals) {
                     Ok(apdu_bytes) => {
                         board.led().set_status(LedStatus::Busy);
                         let _ = APDU_CHANNEL.send(apdu_bytes).await;
+                        cortex_m::asm::sev(); // wake core1 from WFE
                         let response = {
                             use embassy_futures::select::{select3, Either3};
                             let mut stall_count: u32 = 0;
@@ -711,6 +810,7 @@ async fn run_one_board(p: embassy_rp::Peripherals) {
                                     Either3::Third(op) => {
                                         let result = handle_flash_op(op, store, dispatcher_ptr);
                                         FLASH_RESP.send(result).await;
+                                        cortex_m::asm::sev(); // wake core1 from WFE
                                     }
                                 }
                             }
@@ -723,6 +823,7 @@ async fn run_one_board(p: embassy_rp::Peripherals) {
                             }
                             Err(CcidError::UsbDisconnected) => {
                                 let _ = APDU_CHANNEL.send(heapless::Vec::new()).await;
+                                cortex_m::asm::sev(); // wake core1 from WFE
                                 let _ = RESP_CHANNEL.receive().await;
                                 break;
                             }
@@ -732,6 +833,7 @@ async fn run_one_board(p: embassy_rp::Peripherals) {
                     }
                     Err(CcidError::UsbDisconnected) => {
                         let _ = APDU_CHANNEL.send(heapless::Vec::new()).await;
+                                cortex_m::asm::sev(); // wake core1 from WFE
                         let _ = RESP_CHANNEL.receive().await;
                         board.led().set_status(LedStatus::Ready);
                         break;
@@ -753,12 +855,13 @@ async fn run_one_board(p: embassy_rp::Peripherals) {
 )))]
 async fn run_geek_board(p: embassy_rp::Peripherals) {
     use embassy_futures::join::join;
+    use embassy_rp::gpio::{Level, Output};
     use embassy_rp::spi::{Config as SpiConfig, Phase, Polarity, Spi};
     use embassy_rp::uart::{Config as UartConfig, Uart};
     use embassy_rp::usb::Driver as UsbDriver;
     use embassy_usb::{Builder as UsbBuilder, Config as UsbConfig};
 
-    use pico2hsm_firmware::board::rp2350_geek::{Rp2350GeekBoard, SPI_FREQ_HZ};
+    use pico2hsm_firmware::board::rp2350_geek::Rp2350GeekBoard;
     use pico2hsm_firmware::board::{Board, LedController, LedStatus};
     use pico2hsm_firmware::transport::ccid::CcidError;
     use pico2hsm_firmware::transport::CcidTransport;
@@ -805,36 +908,22 @@ async fn run_geek_board(p: embassy_rp::Peripherals) {
     defmt::info!("Board: RP2350-Geek initialising");
 
     // ── CHECKPOINT 1 — SPI buses ─────────────────────────────────────────────
-    serial_println!("SPI0 init (SCK=18 MOSI=19 MISO=20)...");
-    let mut spi0_cfg = SpiConfig::default();
-    spi0_cfg.frequency = SPI_FREQ_HZ;
-    spi0_cfg.phase = Phase::CaptureOnFirstTransition;
-    spi0_cfg.polarity = Polarity::IdleLow;
-    let spi0 = Spi::new_blocking(p.SPI0, p.PIN_18, p.PIN_19, p.PIN_20, spi0_cfg);
-    serial_fmt!("SPI0 ok @ {} Hz", SPI_FREQ_HZ);
 
-    // SPI1 LCD bus — Async/DMA mode so flush() yields to the executor during
+    // SPI1: LCD bus — Async/DMA mode so flush() yields to the executor during
     // the ~17 ms 63 KB framebuffer transfer, keeping USB alive.
-    // DMA_CH3=TX, DMA_CH4=RX (RX is unused — LCD is write-only).
-    serial_println!("SPI1 init (SCK=10 MOSI=11 MISO=12, async DMA)...");
+    serial_println!("SPI1 init (LCD async DMA)...");
     let mut spi1_cfg = SpiConfig::default();
     spi1_cfg.frequency = pico2hsm_firmware::board::rp2350_geek::LCD_SPI_FREQ_HZ;
     spi1_cfg.phase = Phase::CaptureOnFirstTransition;
     spi1_cfg.polarity = Polarity::IdleLow;
     let spi1 = Spi::new(p.SPI1, p.PIN_10, p.PIN_11, p.PIN_12, p.DMA_CH3, p.DMA_CH4, Irqs, spi1_cfg);
-    serial_fmt!("SPI1 ok @ {} Hz (async DMA)", pico2hsm_firmware::board::rp2350_geek::LCD_SPI_FREQ_HZ);
+    serial_println!("SPI1 ok");
 
-    // ── CHECKPOINT 2 — board struct ──────────────────────────────────────────
-    serial_println!("Board struct init...");
-    let mut board = Rp2350GeekBoard::new(spi0, spi1);
+    // ── CHECKPOINT 2 — board struct (LCD only, SPI0 not in board) ────────────
+    serial_println!("Board init...");
+    let mut board = Rp2350GeekBoard::new(spi1);
     board.led().set_status(LedStatus::Busy);
-    serial_println!("Board ok, LED=Busy");
-
-    #[cfg(feature = "rp2350_geek_sdcard")]
-    {
-        serial_fmt!("SDCard slot active CS=GPIO{}", pico2hsm_firmware::board::rp2350_geek::SDCARD0_CS);
-        defmt::info!("SDCard slot active — CS on GPIO {}", pico2hsm_firmware::board::rp2350_geek::SDCARD0_CS);
-    }
+    serial_println!("Board ok");
     // ── CHECKPOINT 3 — USB driver ────────────────────────────────────────────
     serial_println!("USB driver init...");
     let usb_driver = UsbDriver::new(p.USB, Irqs);
@@ -885,42 +974,113 @@ async fn run_geek_board(p: embassy_rp::Peripherals) {
     serial_println!("USB device ok");
 
     board.led().set_status(LedStatus::Ready);
-    serial_println!("LED=Ready — entering main loop");
-    defmt::info!("pico2hsm (RP2350-Geek): USB CCID ready, entering main loop");
 
-    // ── Storage initialization (rp2350_geek: internal QMI flash) ──────────────
-    serial_println!("KeyStore init (QMI internal flash)...");
+    // ── Storage initialization ──────────────────────────────────────────────
     let smk_bytes = pico2hsm_firmware::security::otp::derive_smk()
         .unwrap_or([0u8; 32]);
     let smk = zeroize::Zeroizing::new(smk_bytes);
 
-    let qmi_flash = embassy_rp::flash::Flash::<
-        _,
-        embassy_rp::flash::Blocking,
-        { pico2hsm_firmware::storage::flash_chip::QMI_FLASH_SIZE },
-    >::new_blocking(p.FLASH);
-    let qmi = pico2hsm_firmware::storage::flash_chip::QmiFlash::new(qmi_flash);
+    // rp2350_geek_sdcard: SD card keystore on SPI0 (GPIO18/19/20, CS=GPIO23).
+    #[cfg(feature = "rp2350_geek_sdcard")]
+    let store: &'static mut _ = {
+        use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+        use embassy_sync::blocking_mutex::Mutex;
+        use static_cell::StaticCell;
 
-    let mut fs = pico2hsm_firmware::storage::filesystem::KeyFilesystem::new();
-    let _ = fs.add_chip(pico2hsm_firmware::storage::AnyChip::SdCard(qmi));
-    let sm = pico2hsm_firmware::storage::StorageManager::new(fs);
-    let mut ks = pico2hsm_firmware::storage::FlashKeyStore::new(sm, smk);
-    match ks.init() {
-        Ok(()) => serial_println!("KeyStore ok (QMI internal flash)"),
-        Err(_) => serial_println!("KeyStore init failed — degraded mode"),
-    }
-    let store: &'static mut _ = KEYSTORE_CELL.init(ks);
+        serial_println!("SD card init (SPI0 CS=23)...");
+
+        // SPI0 at 400 kHz — SD spec requires ≤400 kHz for card identification.
+        let mut spi0_cfg = SpiConfig::default();
+        spi0_cfg.frequency = 400_000;
+        spi0_cfg.phase = Phase::CaptureOnFirstTransition;
+        spi0_cfg.polarity = Polarity::IdleLow;
+        let spi0_bus = Spi::new_blocking(p.SPI0, p.PIN_18, p.PIN_19, p.PIN_20, spi0_cfg);
+
+        // Enable internal pull-up on MISO (GPIO20).  SD cards require a pull-up
+        // on DO (MISO) — the card's output is high-impedance until SPI mode.
+        embassy_rp::pac::PADS_BANK0.gpio(20).modify(|w| w.set_pue(true));
+
+        // Wrap SPI0 in a shared-bus SpiDevice with CS=GPIO23.
+        static SPI0_BUS: StaticCell<
+            Mutex<
+                CriticalSectionRawMutex,
+                core::cell::RefCell<
+                    embassy_rp::spi::Spi<'static, embassy_rp::peripherals::SPI0, embassy_rp::spi::Blocking>,
+                >,
+            >,
+        > = StaticCell::new();
+        let spi0_bus_ref = SPI0_BUS.init(Mutex::new(core::cell::RefCell::new(spi0_bus)));
+        let sd_cs = Output::new(p.PIN_23, Level::High);
+        let spi_device = embassy_embedded_hal::shared_bus::blocking::spi::SpiDevice::new(
+            spi0_bus_ref, sd_cs,
+        );
+
+        let delay = embassy_time::Delay;
+        let sd_chip = pico2hsm_firmware::storage::sdcard::SdCardFlash::new(spi_device, delay)
+            .expect("SD card init failed — is a card inserted?");
+        serial_println!("SD card detected");
+
+        // Card identified — raise SPI clock from 400 kHz to 25 MHz for data transfers.
+        spi0_bus_ref.lock(|bus| {
+            let mut fast_cfg = SpiConfig::default();
+            fast_cfg.frequency = 25_000_000;
+            fast_cfg.phase = Phase::CaptureOnFirstTransition;
+            fast_cfg.polarity = Polarity::IdleLow;
+            bus.borrow_mut().set_config(&fast_cfg);
+        });
+        serial_println!("SPI0 clock raised to 25 MHz");
+
+        let mut fs = pico2hsm_firmware::storage::filesystem::KeyFilesystem::new();
+        fs.add_chip(sd_chip).expect("add SD chip");
+        let sm = pico2hsm_firmware::storage::StorageManager::new(fs);
+        let mut ks = pico2hsm_firmware::storage::FlashKeyStore::new(sm, smk);
+        match ks.init() {
+            Ok(()) => serial_println!("KeyStore ok (SD card)"),
+            Err(_) => serial_println!("KeyStore init failed (SD)"),
+        }
+        KEYSTORE_CELL.init(ks)
+    };
+
+    // rp2350_geek_16m: QMI flash keystore (upper 2 MB of 16 MB QSPI flash).
+    #[cfg(feature = "rp2350_geek_16m")]
+    let store: &'static mut _ = {
+        serial_println!("QMI flash init...");
+        let qmi_flash = embassy_rp::flash::Flash::<
+            _,
+            embassy_rp::flash::Blocking,
+            { pico2hsm_firmware::storage::flash_chip::QMI_FLASH_SIZE },
+        >::new_blocking(p.FLASH);
+        let qmi = pico2hsm_firmware::storage::flash_chip::QmiFlash::new(qmi_flash);
+
+        let mut fs = pico2hsm_firmware::storage::filesystem::KeyFilesystem::new();
+        let _ = fs.add_chip(qmi);
+        let sm = pico2hsm_firmware::storage::StorageManager::new(fs);
+        let mut ks = pico2hsm_firmware::storage::FlashKeyStore::new(sm, smk);
+        match ks.init() {
+            Ok(()) => serial_println!("KeyStore ok (QMI flash)"),
+            Err(_) => serial_println!("KeyStore init failed (QMI)"),
+        }
+        KEYSTORE_CELL.init(ks)
+    };
+    serial_println!("KeyStore ready");
 
     // Set provisioning status for display.
     // (qmi_ok/sd_ok left as None — geek board doesn't track individual store health yet)
 
     // ── CHECKPOINT 7 — init dispatcher on core0, spawn core1 ──────────────
+    serial_println!("Dispatcher init_in_place...");
     let dispatcher_ref: &'static mut pico2hsm_firmware::apdu::dispatcher::Dispatcher =
         pico2hsm_firmware::apdu::dispatcher::Dispatcher::init_in_place(DISPATCHER_CELL.uninit());
+    serial_println!("Loading keys...");
     {
         use pico2hsm_firmware::storage::KeyStore as _;
         dispatcher_ref.load_keys_from_store(store);
     }
+    KEY_COUNT.store(
+        dispatcher_ref.in_memory_key_count(),
+        core::sync::atomic::Ordering::Relaxed,
+    );
+    serial_println!("Keys loaded, spawning core1...");
     let dispatcher_ptr = dispatcher_ref as *mut pico2hsm_firmware::apdu::dispatcher::Dispatcher;
     let dispatcher_send = DispatcherPtr(dispatcher_ptr, store as *mut _);
 
@@ -938,9 +1098,9 @@ async fn run_geek_board(p: embassy_rp::Peripherals) {
                 .modify(|v| v | (1 << 18));
         }
 
-        let executor = CORE1_EXECUTOR.init(embassy_executor::Executor::new());
-        executor.run(|spawner| spawner.spawn(dispatcher_task(dispatcher_send).expect("dispatcher task")));
+        dispatcher_loop(dispatcher_send);
     });
+    serial_println!("Core1 spawned, starting USB+CCID join...");
 
     let usb_fut = usb.run();
 
@@ -950,13 +1110,17 @@ async fn run_geek_board(p: embassy_rp::Peripherals) {
     let mut display_state = DisplayState::new();
     display_state.status = LedStatus::Ready;
     display_state.provisioned = provisioned;
+    display_state.key_count = KEY_COUNT.load(core::sync::atomic::Ordering::Relaxed);
     let mut last_activity = embassy_time::Instant::now();
     let mut screensaver = ScreensaverState::Active;
 
     let ccid_fut = async {
         // Render the full UI at boot (replaces the solid green from set_status).
+        serial_println!("Rendering boot UI...");
         pico2hsm_firmware::display::render(board.led(), &display_state, &layout);
+        serial_println!("Flushing display...");
         board.led().flush().await;
+        serial_println!("Display flushed ok");
 
         loop {
             serial_println!("waiting for USB connect...");
@@ -991,6 +1155,7 @@ async fn run_geek_board(p: embassy_rp::Peripherals) {
                         let apdu_ins = apdu_bytes.get(1).copied().unwrap_or(0);
                         let apdu_p1  = apdu_bytes.get(2).copied().unwrap_or(0);
                         let _ = APDU_CHANNEL.send(apdu_bytes).await;
+                        cortex_m::asm::sev(); // wake core1 from WFE
 
                         // Wait for core1 response (with time extensions every 1.5s)
                         let response = {
@@ -1027,6 +1192,7 @@ async fn run_geek_board(p: embassy_rp::Peripherals) {
                                     Either3::Third(op) => {
                                         let result = handle_flash_op(op, store, dispatcher_ptr);
                                         FLASH_RESP.send(result).await;
+                                        cortex_m::asm::sev(); // wake core1 from WFE
                                     }
                                 }
                             }
@@ -1090,6 +1256,7 @@ async fn run_geek_board(p: embassy_rp::Peripherals) {
                             }
                             Err(CcidError::UsbDisconnected) => {
                                 let _ = APDU_CHANNEL.send(heapless::Vec::new()).await;
+                                cortex_m::asm::sev(); // wake core1 from WFE
                                 let _ = RESP_CHANNEL.receive().await;
                                 display_state.status = LedStatus::Ready;
                                 break;
@@ -1100,6 +1267,7 @@ async fn run_geek_board(p: embassy_rp::Peripherals) {
 
                     Err(CcidError::UsbDisconnected) => {
                         let _ = APDU_CHANNEL.send(heapless::Vec::new()).await;
+                                cortex_m::asm::sev(); // wake core1 from WFE
                         let _ = RESP_CHANNEL.receive().await;
                         display_state.status = LedStatus::Ready;
                         break;
@@ -1215,6 +1383,10 @@ async fn run_pico2_board(p: embassy_rp::Peripherals) {
         use pico2hsm_firmware::storage::KeyStore as _;
         dispatcher_ref.load_keys_from_store(store);
     }
+    KEY_COUNT.store(
+        dispatcher_ref.in_memory_key_count(),
+        core::sync::atomic::Ordering::Relaxed,
+    );
     let dispatcher_ptr = dispatcher_ref as *mut pico2hsm_firmware::apdu::dispatcher::Dispatcher;
     let dispatcher_send = DispatcherPtr(dispatcher_ptr, store as *mut _);
 
@@ -1233,8 +1405,7 @@ async fn run_pico2_board(p: embassy_rp::Peripherals) {
                 .modify(|v| v | (1 << 18));
         }
 
-        let executor = CORE1_EXECUTOR.init(embassy_executor::Executor::new());
-        executor.run(|spawner| spawner.spawn(dispatcher_task(dispatcher_send).expect("dispatcher task")));
+        dispatcher_loop(dispatcher_send);
     });
     defmt::info!("core0: core1 spawned, building usb_fut");
 
@@ -1254,6 +1425,7 @@ async fn run_pico2_board(p: embassy_rp::Peripherals) {
                         // embassy_rp USB logs; any defmt call here blocks Core0 before
                         // the APDU reaches Core1, causing a permanent hang.
                         let _ = APDU_CHANNEL.send(apdu_bytes).await;
+                        cortex_m::asm::sev(); // wake core1 from WFE
                         let response = {
                             use embassy_futures::select::{select3, Either3};
                             let mut stall_count: u32 = 0;
@@ -1288,6 +1460,7 @@ async fn run_pico2_board(p: embassy_rp::Peripherals) {
                                     Either3::Third(op) => {
                                         let result = handle_flash_op(op, store, dispatcher_ptr);
                                         FLASH_RESP.send(result).await;
+                                        cortex_m::asm::sev(); // wake core1 from WFE
                                     }
                                 }
                             }
@@ -1300,6 +1473,7 @@ async fn run_pico2_board(p: embassy_rp::Peripherals) {
                             }
                             Err(CcidError::UsbDisconnected) => {
                                 let _ = APDU_CHANNEL.send(heapless::Vec::new()).await;
+                                cortex_m::asm::sev(); // wake core1 from WFE
                                 let _ = RESP_CHANNEL.receive().await;
                                 break;
                             }
@@ -1309,6 +1483,7 @@ async fn run_pico2_board(p: embassy_rp::Peripherals) {
                     }
                     Err(CcidError::UsbDisconnected) => {
                         let _ = APDU_CHANNEL.send(heapless::Vec::new()).await;
+                                cortex_m::asm::sev(); // wake core1 from WFE
                         let _ = RESP_CHANNEL.receive().await;
                         board.led().set_status(LedStatus::Ready);
                         break;
@@ -1328,6 +1503,102 @@ async fn run_pico2_board(p: embassy_rp::Peripherals) {
     feature = "waveshare_rp2350_lcd_16m",
     feature = "waveshare_rp2350_lcd_sdcard",
 )))]
+/// Initialise the SD card keystore on SPI1 in its own stack frame.
+///
+/// All SPI bus setup, SD card probe, CMD0 warmup, and keystore mount happen
+/// here.  When this function returns, those temporaries (SPI config, SdCard
+/// driver, KeyFilesystem, StorageManager) are freed — reclaiming ~2 KB of
+/// stack that would otherwise persist through the entire async main loop.
+#[cfg(all(target_arch = "arm", feature = "waveshare_rp2350_lcd_sdcard"))]
+fn init_sd_keystore(
+    spi1: embassy_rp::Peri<'static, embassy_rp::peripherals::SPI1>,
+    sck: embassy_rp::Peri<'static, embassy_rp::peripherals::PIN_10>,
+    mosi: embassy_rp::Peri<'static, embassy_rp::peripherals::PIN_11>,
+    miso: embassy_rp::Peri<'static, embassy_rp::peripherals::PIN_12>,
+    cs_pin: embassy_rp::Peri<'static, embassy_rp::peripherals::PIN_15>,
+    smk: zeroize::Zeroizing<[u8; 32]>,
+) -> &'static mut pico2hsm_firmware::storage::BoardKeyStore {
+    use embassy_rp::gpio::{Level, Output};
+    use embassy_rp::spi::{Config as SpiConfig, Phase, Polarity, Spi};
+    use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+    use embassy_sync::blocking_mutex::Mutex;
+    use static_cell::StaticCell;
+
+    defmt::info!("SD card init (SPI1, CS=GPIO15)");
+
+    // SPI1 bus at 400 kHz — SD spec requires ≤400 kHz for card identification.
+    let mut spi1_cfg = SpiConfig::default();
+    spi1_cfg.frequency = 400_000;
+    spi1_cfg.phase = Phase::CaptureOnFirstTransition;
+    spi1_cfg.polarity = Polarity::IdleLow;
+    let mut spi1_bus = Spi::new_blocking(spi1, sck, mosi, miso, spi1_cfg);
+
+    // Enable internal pull-up on MISO (GPIO12) — SD card DO is high-impedance
+    // until SPI mode is entered.
+    embassy_rp::pac::PADS_BANK0.gpio(12).modify(|w| w.set_pue(true));
+
+    // SD spec requires ≥74 clock cycles with CS high before first command.
+    {
+        use embedded_hal::spi::SpiBus;
+        let _ = spi1_bus.write(&[0xFF; 80]);
+    }
+
+    // Wrap SPI1 in a shared-bus SpiDevice with CS + CriticalSectionRawMutex.
+    static SPI1_BUS: StaticCell<
+        Mutex<
+            CriticalSectionRawMutex,
+            core::cell::RefCell<
+                embassy_rp::spi::Spi<'static, embassy_rp::peripherals::SPI1, embassy_rp::spi::Blocking>,
+            >,
+        >,
+    > = StaticCell::new();
+    let spi1_bus_ref = SPI1_BUS.init(Mutex::new(core::cell::RefCell::new(spi1_bus)));
+    let sd_cs = Output::new(cs_pin, Level::High);
+    let spi_device = embassy_embedded_hal::shared_bus::blocking::spi::SpiDevice::new(
+        spi1_bus_ref, sd_cs,
+    );
+
+    // SD card probe — CMD0 warmup pre-transitions the card into SPI mode
+    // before embedded-sdmmc's acquire() sequence.
+    let delay = embassy_time::Delay;
+    let card = embedded_sdmmc::SdCard::new(spi_device, delay);
+    {
+        use embedded_hal::spi::SpiDevice as _;
+        card.spi(|spi| {
+            let cmd0 = [0x40u8, 0x00, 0x00, 0x00, 0x00, 0x95];
+            let _ = spi.write(&cmd0);
+            for _ in 0..10u8 {
+                let mut resp = [0xFFu8; 1];
+                let _ = spi.transfer_in_place(&mut resp);
+                if resp[0] != 0xFF { break; }
+            }
+        });
+    }
+
+    let sd_chip = match card.num_bytes() {
+        Ok(total_bytes) => {
+            defmt::info!("SD card: {} MiB", total_bytes / (1024*1024));
+            let capacity_bytes = total_bytes.saturating_sub(4096);
+            pico2hsm_firmware::storage::sdcard::SdCardFlash::from_initialized(card, capacity_bytes)
+        }
+        Err(_) => {
+            defmt::error!("SD card init FAILED — halting");
+            loop { cortex_m::asm::wfi(); }
+        }
+    };
+
+    let mut fs = pico2hsm_firmware::storage::filesystem::KeyFilesystem::new();
+    fs.add_chip(sd_chip).expect("add SD chip");
+    let sm = pico2hsm_firmware::storage::StorageManager::new(fs);
+    let mut ks = pico2hsm_firmware::storage::FlashKeyStore::new(sm, smk);
+    match ks.init() {
+        Ok(()) => defmt::info!("KeyStore: initialized (SD card)"),
+        Err(_) => defmt::warn!("KeyStore: init failed — SD card degraded"),
+    }
+    KEYSTORE_CELL.init(ks)
+}
+
+#[cfg(any(feature = "waveshare_rp2350_lcd_16m", feature = "waveshare_rp2350_lcd_sdcard"))]
 async fn run_waveshare_lcd_board(p: embassy_rp::Peripherals) {
     use embassy_futures::join::join;
     use embassy_rp::gpio::{Level, Output};
@@ -1345,6 +1616,13 @@ async fn run_waveshare_lcd_board(p: embassy_rp::Peripherals) {
     use pico2hsm_firmware::display::{DisplayState, LastOperation, ScreensaverState, SCREENSAVER_TIMEOUT_SECS, LAST_OP_DISPLAY_SECS};
     use pico2hsm_firmware::transport::ccid::CcidError;
     use pico2hsm_firmware::transport::CcidTransport;
+
+    // ── UART0 init for serial_debug macros (GPIO0=TX, GPIO1=RX, 115200 8N1) ──
+    use embassy_rp::uart::{Config as UartConfig, Uart};
+    let _dbg = Uart::new_blocking(p.UART0, p.PIN_0, p.PIN_1, UartConfig::default());
+    pico2hsm_firmware::serial_debug::uart1_write_bytes(b"\r\n\r\n");
+    serial_println!("=== pico2hsm Waveshare RP2350-LCD-1.47-B boot ===");
+    serial_println!("UART0 GPIO0=TX GPIO1=RX 115200 8N1");
 
     defmt::info!("Board: Waveshare RP2350-LCD-1.47-B initialising");
 
@@ -1408,51 +1686,13 @@ async fn run_waveshare_lcd_board(p: embassy_rp::Peripherals) {
     let smk = zeroize::Zeroizing::new(smk_bytes);
 
     // waveshare_rp2350_lcd_sdcard: single SD card keystore on SPI1.
+    // Extracted to a separate function so SPI1 bus, SdCard driver, and
+    // intermediate buffers live in their own stack frame and are freed
+    // before USB init begins.
     #[cfg(feature = "waveshare_rp2350_lcd_sdcard")]
-    let store: &'static mut _ = {
-        use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
-        use embassy_sync::blocking_mutex::Mutex;
-        use static_cell::StaticCell;
-
-        // SPI1 bus at 400 kHz for SD card — SD spec requires ≤400 kHz for card identification.
-        // embedded-sdmmc does not negotiate clock speed, so the host must supply ≤400 kHz.
-        let mut spi1_cfg = SpiConfig::default();
-        spi1_cfg.frequency = 400_000;
-        spi1_cfg.phase = Phase::CaptureOnFirstTransition;
-        spi1_cfg.polarity = Polarity::IdleLow;
-        let spi1_bus = Spi::new_blocking(p.SPI1, p.PIN_10, p.PIN_11, p.PIN_12, spi1_cfg);
-
-        // Wrap SPI1 bus in a shared-bus SpiDevice with CS=GPIO15.
-        // The shared_bus SpiDevice wrapper requires Mutex<M, RefCell<BUS>>.
-        static SPI1_BUS: StaticCell<
-            Mutex<
-                CriticalSectionRawMutex,
-                core::cell::RefCell<
-                    embassy_rp::spi::Spi<'static, embassy_rp::peripherals::SPI1, embassy_rp::spi::Blocking>,
-                >,
-            >,
-        > = StaticCell::new();
-        let spi1_bus_ref = SPI1_BUS.init(Mutex::new(core::cell::RefCell::new(spi1_bus)));
-        let sd_cs = Output::new(p.PIN_15, Level::High);
-        let spi_device = embassy_embedded_hal::shared_bus::blocking::spi::SpiDevice::new(
-            spi1_bus_ref, sd_cs,
-        );
-
-        // Construct SdCardFlash and add to filesystem.
-        let delay = embassy_time::Delay;
-        let sd_chip = pico2hsm_firmware::storage::sdcard::SdCardFlash::new(spi_device, delay)
-            .expect("SD card init failed");
-
-        let mut fs = pico2hsm_firmware::storage::filesystem::KeyFilesystem::new();
-        fs.add_chip(sd_chip).expect("add SD chip");
-        let sm = pico2hsm_firmware::storage::StorageManager::new(fs);
-        let mut ks = pico2hsm_firmware::storage::FlashKeyStore::new(sm, smk);
-        match ks.init() {
-            Ok(()) => defmt::info!("KeyStore: initialized (waveshare_rp2350_lcd — SD card)"),
-            Err(_) => defmt::warn!("KeyStore: init failed — SD card degraded"),
-        }
-        KEYSTORE_CELL.init(ks)
-    };
+    let store: &'static mut _ = init_sd_keystore(
+        p.SPI1, p.PIN_10, p.PIN_11, p.PIN_12, p.PIN_15, smk,
+    );
 
     // waveshare_rp2350_lcd_16m: internal QMI flash keystore (upper 2 MB).
     #[cfg(not(feature = "waveshare_rp2350_lcd_sdcard"))]
@@ -1492,7 +1732,7 @@ async fn run_waveshare_lcd_board(p: embassy_rp::Peripherals) {
     usb_config.serial_number = Some("0001");
     usb_config.max_power = 100;
 
-    let mut config_descriptor_buf = [0u8; 512];  // bump to 512 for CDC+CCID
+    let mut config_descriptor_buf = [0u8; 512];
     let mut bos_descriptor_buf = [0u8; 256];
     let mut msos_descriptor_buf = [0u8; 256];
     let mut control_buf = [0u8; 64];
@@ -1514,7 +1754,6 @@ async fn run_waveshare_lcd_board(p: embassy_rp::Peripherals) {
 
     let mut usb = builder.build();
 
-    defmt::info!("pico2hsm (RP2350-LCD-1.47-B): USB CCID+CDC ready, entering main loop");
     display_state.status = LedStatus::Ready;
     {
         let (disp, spi) = board.led_and_spi0_mut();
@@ -1528,6 +1767,11 @@ async fn run_waveshare_lcd_board(p: embassy_rp::Peripherals) {
         use pico2hsm_firmware::storage::KeyStore as _;
         dispatcher_ref.load_keys_from_store(store);
     }
+    KEY_COUNT.store(
+        dispatcher_ref.in_memory_key_count(),
+        core::sync::atomic::Ordering::Relaxed,
+    );
+    display_state.key_count = dispatcher_ref.in_memory_key_count();
     let dispatcher_ptr = dispatcher_ref as *mut pico2hsm_firmware::apdu::dispatcher::Dispatcher;
     let dispatcher_send = DispatcherPtr(dispatcher_ptr, store as *mut _);
 
@@ -1545,8 +1789,7 @@ async fn run_waveshare_lcd_board(p: embassy_rp::Peripherals) {
                 .modify(|v| v | (1 << 18));
         }
 
-        let executor = CORE1_EXECUTOR.init(embassy_executor::Executor::new());
-        executor.run(|spawner| spawner.spawn(dispatcher_task(dispatcher_send).expect("dispatcher task")));
+        dispatcher_loop(dispatcher_send);
     });
 
     // ── Concurrent USB + CCID command loop (core0) ───────────────────────────
@@ -1598,6 +1841,7 @@ async fn run_waveshare_lcd_board(p: embassy_rp::Peripherals) {
                         let apdu_ins = apdu_bytes.get(1).copied().unwrap_or(0);
                         let apdu_p1  = apdu_bytes.get(2).copied().unwrap_or(0);
                         let _ = APDU_CHANNEL.send(apdu_bytes).await;
+                        cortex_m::asm::sev(); // wake core1 from WFE
                         // Wait for response with time-extension support.
                         let response = {
                             use embassy_futures::select::{select3, Either3};
@@ -1633,6 +1877,7 @@ async fn run_waveshare_lcd_board(p: embassy_rp::Peripherals) {
                                     Either3::Third(op) => {
                                         let result = handle_flash_op(op, store, dispatcher_ptr);
                                         FLASH_RESP.send(result).await;
+                                        cortex_m::asm::sev(); // wake core1 from WFE
                                     }
                                 }
                             }
@@ -1695,6 +1940,7 @@ async fn run_waveshare_lcd_board(p: embassy_rp::Peripherals) {
                             }
                             Err(CcidError::UsbDisconnected) => {
                                 let _ = APDU_CHANNEL.send(heapless::Vec::new()).await;
+                                cortex_m::asm::sev(); // wake core1 from WFE
                                 let _ = RESP_CHANNEL.receive().await;
                                 display_state.status = LedStatus::Ready;
                                 break;
@@ -1704,6 +1950,7 @@ async fn run_waveshare_lcd_board(p: embassy_rp::Peripherals) {
                     }
                     Err(CcidError::UsbDisconnected) => {
                         let _ = APDU_CHANNEL.send(heapless::Vec::new()).await;
+                                cortex_m::asm::sev(); // wake core1 from WFE
                         let _ = RESP_CHANNEL.receive().await;
                         display_state.status = LedStatus::Ready;
                         break;

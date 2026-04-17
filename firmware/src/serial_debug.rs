@@ -25,15 +25,21 @@
 //! - `[ONE]`  — rp2350_one_4m
 //! - `[PICO]` — pico2_4m (only if uart-debug were manually enabled)
 
-/// Write raw bytes to UART1 via PAC registers (spin-wait on TX FIFO).
+/// Write raw bytes to the debug UART via PAC registers (spin-wait on TX FIFO).
 ///
 /// This is safe to call from either core and from async or sync contexts.
 /// It does NOT require an embassy Uart handle — it accesses the hardware
 /// directly via the PAC singleton.
+///
+/// - Waveshare RP2350-LCD boards use **UART0** (GPIO0=TX, GPIO1=RX).
+/// - All other boards (Geek, One) use **UART1** (GPIO4=TX, GPIO5=RX).
 #[cfg(all(target_arch = "arm", feature = "uart-debug"))]
 #[inline(never)]
 pub fn uart1_write_bytes(msg: &[u8]) {
     unsafe {
+        #[cfg(any(feature = "waveshare_rp2350_lcd_16m", feature = "waveshare_rp2350_lcd_sdcard"))]
+        let uart = embassy_rp::pac::UART0;
+        #[cfg(not(any(feature = "waveshare_rp2350_lcd_16m", feature = "waveshare_rp2350_lcd_sdcard")))]
         let uart = embassy_rp::pac::UART1;
         for &b in msg {
             while uart.uartfr().read().txff() {}

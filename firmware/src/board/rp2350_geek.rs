@@ -65,29 +65,27 @@ pub const LCD_RST_PIN: u8 = 12;
 /// LCD backlight enable pin (active-high).
 pub const LCD_BL_PIN: u8 = 25;
 
-/// SPI0 SCK pin (shared with keystore flash).
+/// SPI0 SCK pin (SD card interface).
 pub const SPI0_SCK: u8 = 18;
-/// SPI0 MOSI pin.
+/// SPI0 MOSI pin (SD card interface).
 pub const SPI0_MOSI: u8 = 19;
-/// SPI0 MISO pin.
+/// SPI0 MISO pin (SD card interface).
 pub const SPI0_MISO: u8 = 20;
-/// SPI0 software CS pins — keystore flash chips.
-pub const SPI0_CS: [u8; 4] = [17, 21, 22, 26];
 
 /// SPI1 SCK pin (shared with LCD SCK).
 pub const SPI1_SCK: u8 = LCD_SCK_PIN;
 /// SPI1 MOSI pin (shared with LCD MOSI).
 pub const SPI1_MOSI: u8 = LCD_MOSI_PIN;
-/// SPI1 MISO pin (unused for LCD; available for SD or mirror flash if needed).
-pub const SPI1_MISO: u8 = 24;
-/// SPI1 software CS pins — LCD CS is GPIO9; extra CS slots for mirror flash.
-pub const SPI1_CS: [u8; 4] = [9, 13, 14, 15];
 
-/// SD-Card slot chip-select pin.
-pub const SDCARD0_CS: u8 = 5;
+/// SD card chip-select pin (active-low, directly driven via GPIO).
+/// On the RP2350-Geek schematic this is SD_CS / SDIO_D3 = GPIO23.
+/// SDIO_D1 (GPIO21) and SDIO_D2 (GPIO22) are unused in SPI mode.
+pub const SDCARD0_CS: u8 = 23;
 
-/// SPI0 frequency — flash chips at 40 MHz.
-pub const SPI_FREQ_HZ: u32 = 40_000_000;
+/// SPI0 frequency for SD card — must start ≤ 400 kHz for initialisation,
+/// then may increase to 25 MHz after CMD0 response.  embedded-sdmmc handles
+/// the speed switch internally; this is the post-init transfer speed.
+pub const SD_SPI_FREQ_HZ: u32 = 25_000_000;
 /// SPI1 / LCD frequency — ST7789 at 30 MHz (conservative; rated up to 62.5 MHz).
 pub const LCD_SPI_FREQ_HZ: u32 = 30_000_000;
 
@@ -512,11 +510,6 @@ impl LedController for St7789StatusDisplay {
         if self.current_status != status {
             self.current_status = status;
             let color = Self::status_color(status);
-            defmt::info!(
-                "LCD status: {:?} → color=0x{:04X}",
-                defmt::Debug2Format(&status),
-                color
-            );
             self.fill_screen(color);
         }
     }
@@ -678,7 +671,7 @@ impl LedController for St7789StatusDisplay {
 
 // ─── SPI bus type aliases ─────────────────────────────────────────────────────
 
-/// Blocking SPI0 type for the RP2350-Geek (flash bus).
+/// Blocking SPI0 type for the RP2350-Geek (SD card bus in sdcard variant, unused in 16m).
 /// `'static` lifetime: peripherals come from `embassy_rp::init()` which
 /// returns `Peri<'static, ...>` tokens.
 pub type Rp2350GeekSpi0 =
@@ -697,44 +690,32 @@ pub type Rp2350GeekSpi1 =
 /// Concrete board representation for the Waveshare RP2350-Geek.
 pub struct Rp2350GeekBoard {
     display: St7789StatusDisplay,
-    pub spi0: Rp2350GeekSpi0,
     // SPI1 is owned by St7789StatusDisplay (the LCD lives on SPI1).
     // The Board::spi1() accessor borrows it back from the display struct.
 }
 
 #[cfg(target_arch = "arm")]
 impl Rp2350GeekBoard {
-    /// Create a board from pre-constructed SPI buses.
+    /// Create the board with only the LCD on SPI1.
     ///
-    /// SPI0 is the keystore flash bus.
-    /// SPI1 is taken by the LCD driver — the `Board::spi1()` accessor
-    /// returns a mutable reference to it via the display struct.
+    /// For `rp2350_geek_sdcard`, SPI0 is consumed by the SD card keystore
+    /// and is not part of the board struct.  For `rp2350_geek_16m`, SPI0
+    /// is unused (no external flash chips on this board).
     ///
     /// The four LCD GPIO pins (DC=GPIO8, CS=GPIO9, RST=GPIO12, BL=GPIO25)
     /// are acquired inside this call via `AnyPin::steal()` — see the safety
     /// note on [`St7789StatusDisplay`].
-    pub fn new(spi0: Rp2350GeekSpi0, spi1: Rp2350GeekSpi1) -> Self {
-        defmt::info!(
-            "RP2350-Geek: board init (SPI0 flash @ {} Hz, SPI1 LCD @ {} Hz)",
-            SPI_FREQ_HZ,
-            LCD_SPI_FREQ_HZ,
-        );
+    pub fn new(spi1: Rp2350GeekSpi1) -> Self {
         let display = St7789StatusDisplay::new(spi1);
-        defmt::info!("RP2350-Geek: ST7789 LCD ready");
-        Self { display, spi0 }
+        Self { display }
     }
 }
 
 #[cfg(not(target_arch = "arm"))]
 impl Rp2350GeekBoard {
-    // Stub constructor used only when compiling for the test host (x86_64).
-    // On the host there are no real SPI peripherals; unit tests instantiate
-    // the board by other means.  This constructor is never called in practice
-    // (the feature-gated Board impl is also absent on non-ARM) but it keeps
-    // the type resolvable during `cargo test`.
     #[allow(dead_code)]
     fn _new_stub() -> Self {
-        Self { display: St7789StatusDisplay::new_stub(), spi0: unimplemented!() }
+        Self { display: St7789StatusDisplay::new_stub() }
     }
 }
 
@@ -752,14 +733,9 @@ impl Board for Rp2350GeekBoard {
     }
 
     fn spi0(&mut self) -> &mut Self::Spi0 {
-        &mut self.spi0
+        unimplemented!("SPI0 not in board struct — consumed by SD card or unused")
     }
 
-    /// Return a mutable reference to the SPI1 bus, which is owned by the
-    /// LCD display driver.  Callers that need to use SPI1 directly (e.g.,
-    /// a mirror-flash storage layer) must coordinate with the LCD driver
-    /// to avoid concurrent access — the LCD deasserts CS after each frame,
-    /// so SPI1 is safe to borrow between renders.
     fn spi1(&mut self) -> &mut Self::Spi1 {
         #[cfg(target_arch = "arm")]
         return &mut self.display.spi;
@@ -767,11 +743,6 @@ impl Board for Rp2350GeekBoard {
         unimplemented!("spi1 not available on non-ARM test build")
     }
 
-    fn spi0_cs_pins(&self) -> &[u8] {
-        &SPI0_CS
-    }
-
-    fn spi1_cs_pins(&self) -> &[u8] {
-        &SPI1_CS
-    }
+    fn spi0_cs_pins(&self) -> &[u8] { &[] }
+    fn spi1_cs_pins(&self) -> &[u8] { &[] }
 }

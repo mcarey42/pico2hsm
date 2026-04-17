@@ -971,10 +971,10 @@ where
         // not need `smart_leds` as a direct dependency (it is already resolved
         // as a transitive dep of embassy-rp in Cargo.lock).
         //
-        // The `Grb` ORDER type parameter on `PioWs2812` means the driver will
-        // repack the RGB8 { r, g, b } values into G-R-B order before writing to
-        // the PIO FIFO.  We therefore provide { r, g, b } in standard order here.
-        let rgb_bytes: [u8; 3] = [grb.1, grb.0, grb.2]; // [r=grb.1, g=grb.0, b=grb.2]
+        // PioWs2812 sends RGB8 fields in order (r, g, b) to the PIO FIFO.
+        // WS2812B LEDs expect GRB byte order on the wire, so place G in the
+        // r-slot, R in the g-slot, and B in the b-slot.
+        let rgb_bytes: [u8; 3] = [grb.0, grb.1, grb.2]; // [G, R, B] → wire GRB
         // SAFETY: `smart_leds::RGB8` is `#[repr(C)]` with fields `r, g, b: u8`
         // in that order, making it layout-identical to `[u8; 3]`.
         let pixels: [_; 1] = [unsafe { core::mem::transmute::<[u8; 3], _>(rgb_bytes) }];

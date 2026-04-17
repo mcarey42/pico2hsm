@@ -35,17 +35,18 @@ bus speed configured in the board init is used for post-init transfers.
 
 ## Waveshare RP2350-Geek — SD Card Wiring
 
-The RP2350-Geek has a **built-in microSD slot** connected to SPI1. The SD card
-interface shares the SPI1 bus with the RAID mirror flash chips.
+The RP2350-Geek has a **built-in microSD slot** connected to SPI0. The PCB
+wires the slot for SDIO 4-bit mode (GPIO18–23), but the RP2350 lacks an SDIO
+controller, so we use SPI mode with SCK/MOSI/MISO/CS only.
 
 ### Pin assignments
 
-| SD card signal | RP2350-Geek GPIO | Notes                    |
-|----------------|------------------|--------------------------|
-| SCK            | GPIO10           | SPI1 clock               |
-| MOSI           | GPIO11           | SPI1 TX                  |
-| MISO           | GPIO12           | SPI1 RX                  |
-| CS             | GPIO5            | Built-in slot CS         |
+| SD card signal | RP2350-Geek GPIO | Notes                              |
+|----------------|------------------|------------------------------------|
+| SCK            | GPIO18           | SPI0 clock                         |
+| MOSI           | GPIO19           | SPI0 TX (SD CMD line)              |
+| MISO           | GPIO20           | SPI0 RX (SD DAT0)                  |
+| CS             | GPIO23           | Directly driven (SD DAT3 in SDIO)  |
 
 ### Feature flags
 

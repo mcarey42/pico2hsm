@@ -99,6 +99,24 @@ where
             write_errors: 0,
         })
     }
+
+    /// Wrap an already-initialized `SdCard` as a `SdCardFlash`.
+    ///
+    /// `capacity_bytes` is the usable capacity (total minus reserved region).
+    /// The caller must have already called `card.num_bytes()` to trigger init.
+    pub fn from_initialized(card: SdCard<SPI, DELAY>, capacity_bytes: u64) -> Self {
+        SdCardFlash {
+            card,
+            capacity_bytes,
+            degraded: false,
+            write_errors: 0,
+        }
+    }
+
+    /// Borrow the underlying `SdCard` for direct block-level operations.
+    pub fn card(&self) -> &SdCard<SPI, DELAY> {
+        &self.card
+    }
 }
 
 impl<SPI, DELAY> FlashChip for SdCardFlash<SPI, DELAY>
@@ -123,13 +141,20 @@ where
         let first_sd_sector = physical_addr / SD_SECTOR_BYTES;
         let byte_offset = (physical_addr % SD_SECTOR_BYTES) as usize;
         let total = buf.len();
+
+        // Read one SD sector at a time into a static buffer to avoid
+        // putting 4 KB (8 × Block) on the stack — critical on boards where
+        // BSS leaves < 50 KB for the core0 stack.
         let mut written = 0usize;
         let mut sd_sector_idx = first_sd_sector;
-
         while written < total {
-            let mut block = [Block::new()];
+            // SAFETY: SdCardFlash I/O is single-threaded (no concurrent callers).
+            static mut SD_BLOCK: [Block; 1] = [Block {
+                contents: [0u8; 512],
+            }];
+            let block = unsafe { &mut *core::ptr::addr_of_mut!(SD_BLOCK) };
             self.card
-                .read(&mut block, BlockIdx(sd_sector_idx))
+                .read(block, BlockIdx(sd_sector_idx))
                 .map_err(|_| StorageError::ReadError)?;
 
             let src_start = if written == 0 { byte_offset } else { 0 };

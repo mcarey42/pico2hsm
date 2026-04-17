@@ -180,13 +180,25 @@ impl Directory {
 
     /// Deserialise a directory from a 4096-byte sector buffer.
     pub fn deserialize(buf: &[u8; SECTOR_SIZE]) -> Result<Self, StorageError> {
+        let mut dir = Directory::new();
+        dir.deserialize_from(buf)?;
+        Ok(dir)
+    }
+
+    /// Deserialise a directory sector into `self`, replacing all existing entries.
+    ///
+    /// Unlike `deserialize()` (which returns a new `Directory` on the stack),
+    /// this writes directly into `self` — avoiding a 6 KB stack allocation
+    /// for `Vec<DirectoryEntry, 512>` that can overflow core0's stack on
+    /// boards with tight SRAM headroom (SD card variants).
+    pub fn deserialize_from(&mut self, buf: &[u8; SECTOR_SIZE]) -> Result<(), StorageError> {
         if buf[0..4] != DIR_MAGIC {
             return Err(StorageError::NotFormatted);
         }
         let count = u16::from_le_bytes([buf[4], buf[5]]) as usize;
         let stored_crc = u16::from_le_bytes([buf[6], buf[7]]);
 
-        let mut entries: Vec<DirectoryEntry, MAX_DIRECTORY_ENTRIES> = Vec::new();
+        self.entries.clear();
         let mut crc_accum: u16 = 0;
         let mut offset = DIR_HEADER_SIZE;
 
@@ -213,7 +225,7 @@ impl Directory {
                 flags,
                 _pad: [pad],
             };
-            entries.push(entry).map_err(|_| StorageError::KeystoreFull)?;
+            self.entries.push(entry).map_err(|_| StorageError::KeystoreFull)?;
             offset += DIR_ENTRY_SIZE;
         }
 
@@ -222,7 +234,8 @@ impl Directory {
             return Err(StorageError::IntegrityFailure);
         }
 
-        Ok(Directory { entries, dirty: false })
+        self.dirty = false;
+        Ok(())
     }
 
     /// Return an iterator over all live key IDs.
@@ -301,18 +314,23 @@ impl<Chip: FlashChip> KeyFilesystem<Chip> {
             }
 
             // Read sector 0 to check if it has a valid directory.
-            let mut sector0 = [0u8; SECTOR_SIZE];
-            if chip.read(0, &mut sector0).is_err() {
+            // Static buffer avoids 4 KB stack allocation — critical on
+            // SD card boards with tight core0 stack headroom.
+            // SAFETY: mount() is single-threaded, called once at init.
+            static mut SECTOR0: [u8; SECTOR_SIZE] = [0u8; SECTOR_SIZE];
+            let sector0 = unsafe { &mut *core::ptr::addr_of_mut!(SECTOR0) };
+            if chip.read(0, sector0).is_err() {
                 defmt::warn!("KeyFilesystem: chip {} read sector 0 failed", chip_index);
                 continue;
             }
 
             // Check for directory magic.
             if sector0[0..4] == DIR_MAGIC {
-                match Directory::deserialize(&sector0) {
-                    Ok(dir) => {
-                        if !loaded {
-                            self.directory = dir;
+                if !loaded {
+                    // Deserialise directly into self.directory to avoid a 6 KB
+                    // stack-allocated Directory (Vec<DirectoryEntry, 512>).
+                    match self.directory.deserialize_from(sector0) {
+                        Ok(()) => {
                             loaded = true;
                             defmt::info!(
                                 "KeyFilesystem: loaded directory from chip {} ({} entries)",
@@ -320,16 +338,16 @@ impl<Chip: FlashChip> KeyFilesystem<Chip> {
                                 self.directory.len(),
                             );
                         }
-                    }
-                    Err(e) => {
-                        defmt::warn!(
-                            "KeyFilesystem: chip {} directory CRC/parse error: {:?}",
-                            chip_index,
-                            defmt::Debug2Format(&e),
-                        );
+                        Err(e) => {
+                            defmt::warn!(
+                                "KeyFilesystem: chip {} directory CRC/parse error: {:?}",
+                                chip_index,
+                                defmt::Debug2Format(&e),
+                            );
+                        }
                     }
                 }
-            } else if IntegrityChecker::is_blank(&sector0) {
+            } else if IntegrityChecker::is_blank(sector0) {
                 defmt::info!("KeyFilesystem: chip {} sector 0 is blank — needs format", chip_index);
             } else {
                 defmt::warn!("KeyFilesystem: chip {} sector 0 has unexpected content", chip_index);

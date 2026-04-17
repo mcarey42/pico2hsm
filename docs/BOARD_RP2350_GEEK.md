@@ -32,8 +32,8 @@ row along the bottom edge.
 |   1  | UART0 RX / SPI0 CS0     | —                                |
 |   2  | SPI0 SCK                | —                                |
 |   3  | SPI0 MOSI               | —                                |
-|   4  | GPIO                    | — (free)                         |
-|   5  | SDCARD0 CS              | SD variant: slot 0 CS            |
+|   4  | UART1 TX                | **Debug UART TX** (115200 8N1)   |
+|   5  | UART1 RX                | **Debug UART RX**                |
 |   6  | I2C1 SDA                | —                                |
 |   7  | I2C1 SCL                | —                                |
 |   8  | SPI1 RX / GPIO          | **LCD DC** (Data/Command select)  |
@@ -41,20 +41,20 @@ row along the bottom edge.
 |  10  | SPI1 SCK                | **LCD SCK** + SPI1 clock          |
 |  11  | SPI1 MOSI               | **LCD MOSI**                      |
 |  12  | SPI1 MISO / GPIO        | **LCD RST** (hardware reset)      |
-|  13  | SPI1 CS1 / GPIO         | SPI1 CS[1] (mirror flash)         |
-|  14  | SPI1 CS2 / GPIO         | SPI1 CS[2] (mirror flash)         |
-|  15  | SPI1 CS3 / GPIO         | SPI1 CS[3] (mirror flash)         |
-|  16  | SPI0 RX / GPIO          | —                                 |
-|  17  | SPI0 CS0 / GPIO         | SPI0 CS[0] (keystore flash)       |
-|  18  | SPI0 SCK                | SPI0 clock (keystore flash)       |
-|  19  | SPI0 MOSI               | SPI0 data out (keystore flash)    |
-|  20  | SPI0 MISO               | SPI0 data in (keystore flash)     |
-|  21  | SPI0 CS1 / GPIO         | SPI0 CS[1] (keystore flash)       |
-|  22  | SPI0 CS2 / GPIO         | SPI0 CS[2] (keystore flash)       |
-|  23  | (internal use)          | —                                 |
-|  24  | SPI1 RX (free)          | SPI1 MISO (available if needed)   |
+|  13  | GPIO                    | —                                 |
+|  14  | GPIO                    | —                                 |
+|  15  | GPIO                    | —                                 |
+|  16  | GPIO                    | —                                 |
+|  17  | GPIO                    | —                                 |
+|  18  | SPI0 SCK                | **SD card SCK**                   |
+|  19  | SPI0 MOSI               | **SD card MOSI**                  |
+|  20  | SPI0 MISO               | **SD card MISO**                  |
+|  21  | GPIO                    | SDIO D1 (unused in SPI mode)      |
+|  22  | GPIO                    | SDIO D2 (unused in SPI mode)      |
+|  23  | GPIO                    | **SD card CS** (SDIO D3)          |
+|  24  | GPIO                    | —                                 |
 |  25  | GPIO                    | **LCD BL** (backlight enable)     |
-|  26  | SPI0 CS3 / ADC0         | SPI0 CS[3] (keystore flash)       |
+|  26  | ADC0                    | —                                 |
 |  27  | ADC1                    | —                                 |
 |  28  | ADC2                    | —                                 |
 |  29  | ADC3 / VBUS sense       | —                                 |
@@ -187,28 +187,17 @@ transaction.  Both ST7789 and typical SPI NOR flash operate in Mode 0.
 
 ### Single SD card variant (`rp2350_geek_sdcard`)
 
-The SD card connects to SPI1 (the same bus as the LCD).  The card is accessed
-by deassering the LCD CS and asserting the SD card CS.
+The built-in microSD slot connects to SPI0 (separate from the LCD on SPI1).
+The SD card interface is wired for SDIO 4-bit mode on the PCB, but the RP2350
+lacks an SDIO controller, so we use SPI mode with only SCK, MOSI, MISO, and
+CS (DAT3).  SDIO D1 (GPIO21) and D2 (GPIO22) are unused.
 
-| Signal   | GPIO | Note                   |
-|----------|------|------------------------|
-| SCK      |  10  | Shared SPI1 clock      |
-| MOSI     |  11  | Shared SPI1 MOSI       |
-| MISO     |  24  | SD card data out       |
-| CS       |   5  | SD card 0 chip select  |
-
-### SD card module wiring
-
-Connect a standard SD card breakout module to the RP2350-Geek header:
-
-| SD module pin | Signal | RP2350-Geek GPIO |
-|---------------|--------|-------------------|
-| CLK / SCK     | SPI1 clock | GPIO 10       |
-| CMD / MOSI    | SPI1 data out | GPIO 11    |
-| DAT0 / MISO   | SPI1 data in  | GPIO 24    |
-| CS / SS       | Chip select   | GPIO 5     |
-| VCC           | 3.3 V         | 3V3 rail   |
-| GND           | Ground        | GND        |
+| Signal   | GPIO | Note                            |
+|----------|------|---------------------------------|
+| SCK      |  18  | SPI0 clock                      |
+| MOSI     |  19  | SPI0 TX (SD CMD)                |
+| MISO     |  20  | SPI0 RX (SD DAT0)               |
+| CS       |  23  | SD card chip select (SD DAT3)   |
 
 ---
 

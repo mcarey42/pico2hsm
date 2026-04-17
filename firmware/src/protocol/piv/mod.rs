@@ -151,14 +151,47 @@ impl Piv {
         }
     }
 
-    /// Initialise a `Piv` directly into a destination pointer, avoiding
-    /// a ~8 KB stack temporary from `PivState::data_objects`.
+    /// Initialise a `Piv` directly into a destination pointer, writing
+    /// each field individually to avoid an ~8 KB stack temporary.
+    ///
+    /// `PivState` contains `data_objects: Vec<PivDataObject, 4>` where each
+    /// element holds `Vec<u8, 2048>`.  Constructing the full struct via
+    /// `PivState::new()` places ~8 KB on the caller's stack, which overflows
+    /// core0 on boards with display framebuffers (observed on rp2350_geek_16m).
+    ///
+    /// `#[inline(never)]` ensures this frame stays separate from
+    /// `Dispatcher::init_in_place`.
     #[cfg(feature = "applet-piv")]
+    #[inline(never)]
     pub fn init_in_place(dest: *mut Self) {
+        use core::ptr::addr_of_mut;
+
+        let device_id = [0u8; 16];
+        let pin_salt = [0x50, 0x49, 0x56, 0x2D, 0x70, 0x69, 0x6E, 0x2D,
+                        0x73, 0x61, 0x6C, 0x74, 0x2D, 0x76, 0x31, 0x00];
+        let puk_salt = [0x50, 0x49, 0x56, 0x2D, 0x70, 0x75, 0x6B, 0x2D,
+                        0x73, 0x61, 0x6C, 0x74, 0x2D, 0x76, 0x31, 0x00];
+
+        let pin_state = crate::security::pin::PinState::new(
+            DEFAULT_PIV_PIN,
+            DEFAULT_PIV_PUK,
+            &device_id,
+            pin_salt,
+            puk_salt,
+            crate::security::pin::MAX_PIN_RETRIES,
+            crate::security::pin::MAX_PUK_RETRIES,
+        ).expect("default PIV PIN/PUK must be valid");
+
         unsafe {
-            // PivState::new() does PBKDF2 so we can't split it further,
-            // but we write it directly to the destination to avoid a copy.
-            core::ptr::addr_of_mut!((*dest).state).write(PivState::new());
+            let state = addr_of_mut!((*dest).state);
+            addr_of_mut!((*state).pin_state).write(pin_state);
+            addr_of_mut!((*state).pin_verified).write(false);
+            addr_of_mut!((*state).mgmt_key).write(DEFAULT_MGMT_KEY);
+            addr_of_mut!((*state).mgmt_key_authenticated).write(false);
+            addr_of_mut!((*state).mgmt_challenge).write(None);
+            addr_of_mut!((*state).device_id).write(device_id);
+            addr_of_mut!((*state).key_index).write(heapless::Vec::new());
+            addr_of_mut!((*state).data_objects).write(heapless::Vec::new());
         }
     }
 

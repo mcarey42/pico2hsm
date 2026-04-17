@@ -58,6 +58,8 @@ pub mod raid;
 #[cfg(target_arch = "arm")]
 pub mod sdcard;
 #[cfg(target_arch = "arm")]
+pub mod sdcard_spi;
+#[cfg(target_arch = "arm")]
 pub use sdcard::{SdCardCheckResult, compute_device_fingerprint, check_sd_signature, write_sd_signature};
 #[cfg(target_arch = "arm")]
 pub mod wal;
@@ -244,9 +246,13 @@ impl<Chip: FlashChip> StorageManager<Chip> {
                 continue;
             }
             // Try reading sector 0 to detect blank vs formatted.
-            let mut sector0 = [0u8; SECTOR_SIZE];
-            match chip.read(0, &mut sector0) {
-                Ok(()) if integrity::is_blank(&sector0) => {
+            // Use a static buffer to avoid putting 4 KB on the stack —
+            // critical on SD card boards where BSS leaves < 50 KB for core0.
+            // SAFETY: init() is called once, single-threaded, before dispatch.
+            static mut SECTOR0: [u8; SECTOR_SIZE] = [0u8; SECTOR_SIZE];
+            let sector0 = unsafe { &mut *core::ptr::addr_of_mut!(SECTOR0) };
+            match chip.read(0, sector0) {
+                Ok(()) if integrity::is_blank(sector0) => {
                     self.chip_states[idx] = ChipState::Blank;
                 }
                 Ok(()) => {
@@ -259,7 +265,7 @@ impl<Chip: FlashChip> StorageManager<Chip> {
         }
 
         // Update mirror pair states from chip states.
-        for (pair_idx, pair) in self.mirror_pairs.iter_mut().enumerate() {
+        for (_pair_idx, pair) in self.mirror_pairs.iter_mut().enumerate() {
             let primary_state = self.chip_states[pair.primary as usize];
             let mirror_state = self.chip_states[pair.mirror as usize];
             pair.state = match (primary_state, mirror_state) {
@@ -272,11 +278,6 @@ impl<Chip: FlashChip> StorageManager<Chip> {
 
         // Mount the filesystem (load directory from first valid chip).
         self.filesystem.mount()?;
-
-        defmt::info!(
-            "StorageManager: init complete, {} keys in directory",
-            self.filesystem.directory.len(),
-        );
         Ok(())
     }
 
