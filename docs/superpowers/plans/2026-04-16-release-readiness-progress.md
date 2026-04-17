@@ -104,6 +104,29 @@ Chronological record. One entry per `Agent` invocation.
 - Pure whitespace + line-wrap + import reordering across 90 files
 **No blocking concerns.** F-C-001 resolution commit is now verified.
 
+### [2026-04-16] DISPATCH → license-hygienist (parallel)
+**Task:** Resolve F-C-002, F-H-004, F-M-001, F-M-009, F-L-004
+**Context provided:** worktree path, canonical URL, copyright holder, finding evidence from audit
+**Expected deliverable:** LICENSE deduped; `Cargo.toml` members carry full metadata; `THIRD_PARTY_NOTICES.md` new; `rust-version.workspace` enabled
+**Explicit exclusions:** F-M-005 (version scheme) — admin decides before bumping versions
+
+### [2026-04-16] DISPATCH → docs-engineer (parallel)
+**Task:** Resolve F-C-003, F-H-005, F-H-006, F-H-008, F-H-009, F-M-003, F-M-004, F-M-006, F-M-007, F-M-008, F-L-001, F-L-006
+**Context provided:** worktree path, canonical URL, CHANGELOG format convention, finding evidence
+**Expected deliverable:** new `CHANGELOG.md`, `CODE_OF_CONDUCT.md`, `docs/INCIDENT_RESPONSE.md`, `docs/SUPPORT.md`, `.github/ISSUE_TEMPLATE/*`, PR template; targeted edits to `README.md`, `CONTRIBUTING.md`, `SECURITY.md`, `PUNCHOUT.md`, `docs/PROVISIONING.md`
+**Explicit exclusions:** must NOT write `docs/RELEASE_PROCESS.md` (ci-engineer owns); must NOT edit `Cargo.toml` (license-hygienist owns)
+
+### [2026-04-16] DISPATCH → ci-engineer (parallel)
+**Task:** Resolve F-H-001, F-H-002, F-H-007, F-M-002, F-M-010
+**Context provided:** worktree path, release workflow requirements from spec, finding evidence
+**Expected deliverable:** new `.github/workflows/release.yml`, `docs/RELEASE_PROCESS.md`; targeted edits to `.github/workflows/build.yml` for audit step improvements
+**Explicit exclusions:** F-L-005 (clippy -A warnings) — admin scope decision pending
+
+### [2026-04-16] DISPATCH → examples-author (parallel)
+**Task:** Resolve F-H-003
+**Context provided:** worktree path, examples-author agent spec (4-example initial set)
+**Expected deliverable:** new `examples/` directory with 4 examples (01-opensc-smoke, 02-pkcs11-keygen, 03-piv-cli-auth, 04-gnupg-signing), each with README + run.sh, plus top-level index
+
 ### Supplemental findings surfaced during F-C-001 diagnosis (informational, user decides triage)
 While diagnosing why CI wasn't catching fmt drift, observed that recent CI runs on `main` also fail in other jobs, not in the audit:
 - `python-tests` → `Python daemon install and unit tests` step fails
