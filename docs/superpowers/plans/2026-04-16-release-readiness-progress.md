@@ -16,8 +16,8 @@ This document is the **source of truth** for where the release-prep effort is. T
 | 0 — Setup | completed | 2026-04-16 | 2026-04-16 | worktree + agents + progress doc seeded |
 | 1 — Audit | completed | 2026-04-16 | 2026-04-16 | 30 findings (3 C / 9 H / 11 M / 7 L) |
 | 2 — Triage | completed | 2026-04-16 | 2026-04-16 | gate #1 — user approved all 30 findings with auditor's proposed owners |
-| 3 — Parallel execution | in_progress | 2026-04-16 | — | F-C-001 admin diagnosis first; then 4-specialist parallel dispatch |
-| 4 — Firmware items | pending | — | — | gate #2, on demand only |
+| 3 — Parallel execution | completed | 2026-04-16 | 2026-04-16 | 24 findings resolved; 6 admin-retained pending user decisions; supplemental CI-failure findings pending user triage |
+| 4 — Firmware items | pending | — | — | gate #2, on demand only (none expected) |
 | 5 — Verification sweep | pending | — | — | auditor rerun |
 | 6 — Finalize | pending | — | — | gate #3, CHANGELOG + PR |
 
@@ -36,28 +36,28 @@ All 30 findings approved by user on 2026-04-16 with auditor's proposed owners.
 | F-H-002 | H | ci | ci-engineer | approved | resolved | 78dcfc1 |
 | F-H-003 | H | examples | examples-author | approved | resolved | 7152de5, 945a192, 2ca3696, b3e8368, d796153 (needs HW validation in Phase 5) |
 | F-H-004 | H | metadata | license-hygienist | approved | resolved | 537b8ce |
-| F-H-005 | H | docs | docs-engineer | approved | pending | blocked-content-filter; re-dispatch |
-| F-H-006 | H | docs | docs-engineer | approved | pending | blocked-content-filter; re-dispatch |
+| F-H-005 | H | docs | docs-engineer | approved | resolved | 0655272 (CC2.1 short-form) |
+| F-H-006 | H | docs | docs-engineer | approved | resolved | 5d6988d |
 | F-H-007 | H | ci | ci-engineer | approved | resolved | 4fcfddd |
-| F-H-008 | H | docs | docs-engineer | approved | pending | blocked-content-filter; re-dispatch |
-| F-H-009 | H | docs | docs-engineer | approved | pending | blocked-content-filter; re-dispatch |
+| F-H-008 | H | docs | docs-engineer | approved | resolved | 3e54cb1 |
+| F-H-009 | H | docs | docs-engineer | approved | resolved | 0655272 |
 | F-M-001 | M | metadata | license-hygienist | approved | resolved | 537b8ce |
 | F-M-002 | M | ci | ci-engineer | approved | resolved | a28b773 |
-| F-M-003 | M | docs | docs-engineer | approved | pending | blocked-content-filter; re-dispatch |
-| F-M-004 | M | docs | docs-engineer | approved | pending | blocked-content-filter; re-dispatch |
+| F-M-003 | M | docs | docs-engineer | approved | resolved | 5d6988d |
+| F-M-004 | M | docs | docs-engineer | approved | resolved | 5d6988d |
 | F-M-005 | M | metadata | admin→license-hygienist | approved | pending | needs user decision on version scheme |
-| F-M-006 | M | docs | docs-engineer | approved | pending | blocked-content-filter; re-dispatch |
-| F-M-007 | M | docs | docs-engineer | approved | pending | blocked-content-filter; re-dispatch |
-| F-M-008 | M | docs | docs-engineer | approved | pending | blocked-content-filter; re-dispatch |
+| F-M-006 | M | docs | docs-engineer | approved | resolved | 5d6988d |
+| F-M-007 | M | docs | docs-engineer | approved | resolved | 3e54cb1 |
+| F-M-008 | M | docs | docs-engineer | approved | resolved | 3e54cb1 |
 | F-M-009 | M | licensing | license-hygienist | approved | resolved | 537b8ce (THIRD_PARTY_NOTICES.md) |
 | F-M-010 | M | ci | ci-engineer | approved | resolved | a28b773 |
 | F-M-011 | M | ci | admin | approved | pending | admin — deferred |
-| F-L-001 | L | docs | docs-engineer | approved | pending | blocked-content-filter; re-dispatch |
+| F-L-001 | L | docs | docs-engineer | approved | resolved | 0655272 (CODEOWNERS + CONTRIBUTING edits) |
 | F-L-002 | L | docs | admin | approved | pending | admin — deferred |
 | F-L-003 | L | docs | admin | approved | pending | admin — deferred |
 | F-L-004 | L | metadata | license-hygienist | approved | resolved | 537b8ce (rust-version.workspace) |
 | F-L-005 | L | ci | admin→ci-engineer | approved | pending | admin — deferred |
-| F-L-006 | L | docs | docs-engineer | approved | pending | blocked-content-filter; re-dispatch |
+| F-L-006 | L | docs | docs-engineer | approved | resolved | 5d6988d |
 | F-L-007 | L | metadata | admin | approved | pending | admin — deferred |
 
 ---
@@ -187,11 +187,60 @@ These have been red since at least `v1.0.0-rc2`. Not in audit scope (auditor did
 **Context provided:** worktree path, **explicit instruction** to write `CODE_OF_CONDUCT.md` as a short-form reference to Contributor Covenant 2.1 (canonical URL + attribution, NOT inline the full text) to avoid content-filter block
 **Expected deliverable:** new `CODE_OF_CONDUCT.md` (short-form), targeted edits to `CONTRIBUTING.md`
 
+### [2026-04-16] RETURN ← docs-engineer (Chunk A)
+**Verdict:** SUCCESS
+**Commit:** `5d6988d` — "docs: date-stamp refresh + README badges + board-target note (F-M-003 F-M-004 F-M-006 F-H-006 F-L-006)"
+**Findings addressed:** F-M-003, F-M-004, F-M-006, F-H-006, F-L-006
+**Files:** `docs/PROVISIONING.md` (+1/-1), `PUNCHOUT.md` (+1/-1), `SECURITY.md` (+2/-2), `README.md` (+7/-0)
+**Notes:** PROVISIONING.md needed no factual edits for rc4 (core1 WFE/SEV change doesn't affect provisioning). SECURITY.md rewritten to be valid both before and after F-M-005 version bump.
+
+### [2026-04-16] RETURN ← docs-engineer (Chunk B)
+**Verdict:** SUCCESS
+**Commit:** `3e54cb1` — "docs: incident-response + support runbooks + GitHub issue/PR templates (F-M-007 F-M-008 F-H-008)"
+**Findings addressed:** F-M-007, F-M-008, F-H-008
+**Files:** `docs/INCIDENT_RESPONSE.md` (new, 107 lines), `docs/SUPPORT.md` (new, 75 lines), `.github/ISSUE_TEMPLATE/bug_report.yml` (new, 76 lines), `.github/ISSUE_TEMPLATE/feature_request.yml` (new, 38 lines), `.github/pull_request_template.md` (new, 29 lines)
+
+### [2026-04-16] RETURN ← docs-engineer (Chunk C)
+**Verdict:** SUCCESS
+**Commit:** `0655272` — "docs: CODE_OF_CONDUCT (CC2.1 short-form) + CONTRIBUTING licensing + CODEOWNERS (F-H-005 F-H-009 F-L-001)"
+**Findings addressed:** F-H-005, F-H-009, F-L-001
+**Files:** `CODE_OF_CONDUCT.md` (new, 30 lines — short-form, canonical URL only), `CONTRIBUTING.md` (+19/-2), `.github/CODEOWNERS` (new, 1 line: `* @mcarey42`)
+**Notes:** SECURITY.md currently uses GitHub Security Advisories with no dedicated email; CoC reporting section points to the same channel. Admin may want to add a dedicated email later.
+
+---
+
+## Phase 3 summary (2026-04-16)
+
+**24 of 30 findings resolved** across 13 commits. **6 findings remain pending** — all admin-retained; none blocking per se but some block Phase 6.
+
+### Pending — user decisions required (5)
+
+| ID | Description | Why user |
+|---|---|---|
+| F-M-005 | Workspace member versions diverged (core 0.7.0 / firmware 0.9.0 / integration 0.1.0); none are 1.0.0-rc4 | User needs to decide the v1.0.0 version scheme: single workspace version, or keep independent? Blocks license-hygienist final bump. |
+| F-M-011 | Python daemon lacks `pyproject.toml` or setup.cfg metadata | Scope call: is Python daemon part of v1.0.0 OSS release, or deferred? |
+| F-L-002 | `CLAUDE.md` public-facing (AI-assistant guide in root) | Keep, rename, or move? Subjective. |
+| F-L-003 | `ec_firmware_signing_key.*` naming — `test-only` isn't obvious | Rename file prefix, or document in CLAUDE.md? |
+| F-L-005 | `cargo clippy -D warnings` not wired into CI | Scope call: should CI be upgraded to fail on warnings? |
+| F-L-007 | No `[workspace.lints]` in root `Cargo.toml` | Scope call: add strict lint policy now, or defer? |
+
+### Pending — supplemental CI findings surfaced during F-C-001 (user triage)
+
+These are red on `main` since at least v1.0.0-rc2 but were NOT in the audit:
+- `python-tests` → "Python daemon install and unit tests" fails
+- `build (all boards)` → "Rust unit tests (firmware library, host target)" fails
+
+**Both need user decision on whether to expand Phase 3 scope and address now, or defer to post-v1.0.0.**
+
+### Ready for Phase 5
+
+Once user decisions above land (or are deferred), auditor can re-run to verify the full-diff and produce a Phase 5 sweep-2 report.
+
 ---
 
 ## Open user approvals
 
-*(none pending — Phase 3 recovery in progress)*
+*(Phase 3 is done; waiting on user decisions for 6 admin-retained findings and the 2 supplemental CI-failure findings before proceeding to Phase 5.)*
 
 ---
 
