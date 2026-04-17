@@ -8,5 +8,7 @@ tools/python/**/__pycache__/
 **/__pycache__/
 *.orig
 .claude/
+!.claude/agents/
+!.claude/agents/**
 ec_firmware_signing_key.pem
 ec_firmware_signing_key.pub
