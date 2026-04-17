@@ -29,7 +29,7 @@ All 30 findings approved by user on 2026-04-16 with auditor's proposed owners.
 
 | ID | Sev | Category | Owner | Decision | Status | Commit |
 |---|---|---|---|---|---|---|
-| F-C-001 | C | code-hygiene | admin | approved | pending | — |
+| F-C-001 | C | code-hygiene | admin | approved | resolved | 34b6ce2 (verifier ACCEPT) |
 | F-C-002 | C | licensing | license-hygienist | approved | pending | — |
 | F-C-003 | C | docs | docs-engineer | approved | pending | — |
 | F-H-001 | H | ci | ci-engineer | approved | pending | — |
@@ -87,6 +87,28 @@ Chronological record. One entry per `Agent` invocation.
 **Task:** Phase 1 initial OSS-release readiness audit
 **Context provided:** worktree path `/home/mcarey/pico2hsm-release-prep`, canonical docs (spec/plan/progress), auditor system prompt inlined (Mode B — session cwd is main repo, not worktree), full audit checklist
 **Expected deliverable:** `docs/superpowers/audit/2026-04-16-release-audit.md` with severity-tagged findings covering every checklist section
+
+### [2026-04-16] DISPATCH → security-verifier
+**Task:** Review fmt-only commit 34b6ce2 (resolves F-C-001)
+**Context provided:** worktree path, commit SHA, rationale (whitespace-only cargo fmt --all)
+**Expected deliverable:** ACCEPT or REJECT verdict
+**Note:** Touches firmware/ and pico2hsm-core/ — non-negotiable rule requires verifier ACCEPT before commit counts as F-C-001 resolution.
+
+### [2026-04-16] RETURN ← security-verifier
+**Verdict:** **ACCEPT** (for commit 34b6ce2)
+**Verification:**
+- `cargo check -p pico2hsm-core` clean (host target)
+- `cargo check --manifest-path firmware/Cargo.toml --no-default-features --features pico2_4m,applet-piv,applet-openpgp-curve25519 --target thumbv8m.main-none-eabihf` clean
+- `cargo clippy -p pico2hsm-core -- -D warnings` clean
+- Zero new `unsafe` blocks; zero new `.unwrap()` in core1 / apdu / main paths
+- Pure whitespace + line-wrap + import reordering across 90 files
+**No blocking concerns.** F-C-001 resolution commit is now verified.
+
+### Supplemental findings surfaced during F-C-001 diagnosis (informational, user decides triage)
+While diagnosing why CI wasn't catching fmt drift, observed that recent CI runs on `main` also fail in other jobs, not in the audit:
+- `python-tests` → `Python daemon install and unit tests` step fails
+- `build (all boards)` → `Rust unit tests (firmware library, host target)` step fails
+These have been red since at least `v1.0.0-rc2`. Not in audit scope (auditor did not run CI jobs locally). Flagging to admin for user decision on whether to expand scope.
 
 ### [2026-04-16] RETURN ← release-auditor
 **Files changed:** `docs/superpowers/audit/2026-04-16-release-audit.md` (new, 341 lines, 28 KB)
