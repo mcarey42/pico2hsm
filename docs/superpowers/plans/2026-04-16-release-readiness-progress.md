@@ -13,8 +13,8 @@ This document is the **source of truth** for where the release-prep effort is. T
 
 | Phase | Status | Started | Completed | Notes |
 |---|---|---|---|---|
-| 0 — Setup | in_progress | 2026-04-16 | — | worktree + agents + progress doc seeded |
-| 1 — Audit | pending | — | — | awaits Phase 0 complete |
+| 0 — Setup | completed | 2026-04-16 | 2026-04-16 | worktree + agents + progress doc seeded |
+| 1 — Audit | in_progress | 2026-04-16 | — | auditor dispatch pending |
 | 2 — Triage | pending | — | — | gate #1 |
 | 3 — Parallel execution | pending | — | — | depends on triage |
 | 4 — Firmware items | pending | — | — | gate #2, on demand only |
