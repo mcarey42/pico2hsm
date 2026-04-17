@@ -28,7 +28,11 @@ pub fn handle(state: &mut PivState, cmd: &ApduCommand<'_>) -> ApduResponse {
 }
 
 /// Handle a GENERAL AUTHENTICATE APDU command with access to persistent storage.
-pub fn handle_with_store(state: &mut PivState, store: &mut dyn crate::storage::KeyStore, cmd: &ApduCommand<'_>) -> ApduResponse {
+pub fn handle_with_store(
+    state: &mut PivState,
+    store: &mut dyn crate::storage::KeyStore,
+    cmd: &ApduCommand<'_>,
+) -> ApduResponse {
     let alg_id = cmd.p1;
     let key_ref = cmd.p2;
 
@@ -50,7 +54,7 @@ pub fn handle_with_store(state: &mut PivState, store: &mut dyn crate::storage::K
         0x9B => handle_mgmt_auth(state, alg_id, inner),
         0x9A | 0x9C | 0x9D | 0x9E => handle_asymmetric_auth(state, store, alg_id, key_ref, inner),
         0x82..=0x95 => ApduResponse::err(0x6A86), // retired slots: incorrect parameters
-        _ => ApduResponse::err(0x6A86), // incorrect P2
+        _ => ApduResponse::err(0x6A86),           // incorrect P2
     }
 }
 
@@ -271,9 +275,9 @@ fn handle_asymmetric_auth(
 // ---------------------------------------------------------------------------
 
 struct DatTags<'a> {
-    tag_80: Option<&'a [u8]>,  // Witness
-    tag_81: Option<&'a [u8]>,  // Challenge
-    tag_82_empty: bool,        // Response (empty = request)
+    tag_80: Option<&'a [u8]>, // Witness
+    tag_81: Option<&'a [u8]>, // Challenge
+    tag_82_empty: bool,       // Response (empty = request)
 }
 
 /// Parse the inner tags of a Dynamic Authentication Template.

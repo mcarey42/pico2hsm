@@ -93,7 +93,14 @@ impl<'a> ApduCommand<'a> {
 
         if raw.len() == 4 {
             // Case 1 — no Lc, no Le
-            return Ok(ApduCommand { cla, ins, p1, p2, data: &[], le: None });
+            return Ok(ApduCommand {
+                cla,
+                ins,
+                p1,
+                p2,
+                data: &[],
+                le: None,
+            });
         }
 
         // Extended APDU: first byte after header is 0x00.
@@ -104,7 +111,14 @@ impl<'a> ApduCommand<'a> {
             if raw.len() == 7 {
                 // Case 2E — two-byte Le; 0x0000 means 65536 (stored as 0)
                 let le = (raw[5] as u16) << 8 | (raw[6] as u16);
-                return Ok(ApduCommand { cla, ins, p1, p2, data: &[], le: Some(le) });
+                return Ok(ApduCommand {
+                    cla,
+                    ins,
+                    p1,
+                    p2,
+                    data: &[],
+                    le: Some(le),
+                });
             }
             if raw.len() >= 7 {
                 let nc = (raw[5] as usize) << 8 | (raw[6] as usize);
@@ -123,7 +137,14 @@ impl<'a> ApduCommand<'a> {
                 } else {
                     return Err(ProtocolError::InvalidLe);
                 };
-                return Ok(ApduCommand { cla, ins, p1, p2, data, le });
+                return Ok(ApduCommand {
+                    cla,
+                    ins,
+                    p1,
+                    p2,
+                    data,
+                    le,
+                });
             }
         }
 
@@ -132,7 +153,14 @@ impl<'a> ApduCommand<'a> {
         if raw.len() == 5 {
             // Case 2S — Le only (Lc byte is actually Le)
             let le = if lc == 0 { 256 } else { lc as u16 };
-            return Ok(ApduCommand { cla, ins, p1, p2, data: &[], le: Some(le) });
+            return Ok(ApduCommand {
+                cla,
+                ins,
+                p1,
+                p2,
+                data: &[],
+                le: Some(le),
+            });
         }
 
         // Case 3S or 4S
@@ -153,7 +181,14 @@ impl<'a> ApduCommand<'a> {
             return Err(ProtocolError::InvalidLe);
         };
 
-        Ok(ApduCommand { cla, ins, p1, p2, data, le })
+        Ok(ApduCommand {
+            cla,
+            ins,
+            p1,
+            p2,
+            data,
+            le,
+        })
     }
 }
 
@@ -179,12 +214,18 @@ impl ApduResponse {
         let mut buf: Vec<u8, 4096> = Vec::new();
         // Truncate silently if data exceeds buffer — callers must check capacity.
         let _ = buf.extend_from_slice(&data[..data.len().min(4096)]);
-        ApduResponse { data: buf, sw: SW_OK }
+        ApduResponse {
+            data: buf,
+            sw: SW_OK,
+        }
     }
 
     /// Construct an error response with no data.
     pub fn err(sw: u16) -> Self {
-        ApduResponse { data: Vec::new(), sw }
+        ApduResponse {
+            data: Vec::new(),
+            sw,
+        }
     }
 
     /// Construct a SW=61xx response indicating more data is available.
@@ -194,7 +235,10 @@ impl ApduResponse {
     pub fn ok_more(data: &[u8], next_len: u8) -> Self {
         let mut buf: Vec<u8, 4096> = Vec::new();
         let _ = buf.extend_from_slice(&data[..data.len().min(4096)]);
-        ApduResponse { data: buf, sw: 0x6100 | (next_len as u16) }
+        ApduResponse {
+            data: buf,
+            sw: 0x6100 | (next_len as u16),
+        }
     }
 
     /// Serialize the response to bytes: `data || SW1 || SW2`.

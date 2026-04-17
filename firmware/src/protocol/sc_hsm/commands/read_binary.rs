@@ -72,11 +72,11 @@ pub const INS_READ_BINARY_ODD: u8 = 0xB1;
 /// Map EC algo byte to field size in bits.
 fn ec_field_size(algo: u8) -> u16 {
     match algo {
-        0x13 | 0x23 => 256,  // P-256
-        0x15 | 0x25 => 384,  // P-384
-        0x17 | 0x27 => 521,  // P-521
-        0x19 | 0x29 => 256,  // secp256k1
-        _ => 256,            // default
+        0x13 | 0x23 => 256, // P-256
+        0x15 | 0x25 => 384, // P-384
+        0x17 | 0x27 => 521, // P-521
+        0x19 | 0x29 => 256, // secp256k1
+        _ => 256,           // default
     }
 }
 
@@ -326,7 +326,13 @@ const EF_DEV_AUT: &[u8] = &[
 /// Inner read: return up to `max_len` bytes from file `file_id` starting at
 /// byte `offset`. Used by both the standard (INS=0xB0) and odd (INS=0xB1)
 /// READ BINARY handlers.
-fn read_file(state: &mut ScHsmState, store: &mut dyn KeyStore, file_id: u16, offset: usize, max_len: usize) -> ApduResponse {
+fn read_file(
+    state: &mut ScHsmState,
+    store: &mut dyn KeyStore,
+    file_id: u16,
+    offset: usize,
+    max_len: usize,
+) -> ApduResponse {
     // Static EFs
     let static_data: Option<&[u8]> = match file_id {
         0x2F00 => Some(pkcs15_objects::EF_DIR),
@@ -360,7 +366,11 @@ fn read_file(state: &mut ScHsmState, store: &mut dyn KeyStore, file_id: u16, off
     let file_id_hi = (file_id >> 8) as u8;
     let file_id_lo = (file_id & 0xFF) as u8;
     let ef_key_id = KeyId::sc_hsm_ef(0, file_id_hi, file_id_lo).0;
-    if state.key_index.iter().any(|m| m.key_type == 16 && m.key_id == ef_key_id) {
+    if state
+        .key_index
+        .iter()
+        .any(|m| m.key_type == 16 && m.key_id == ef_key_id)
+    {
         if let Some(data) = state.ef_cache_get(ef_key_id) {
             let start = offset.min(data.len());
             let slice = &data[start..data.len().min(start + max_len)];
@@ -386,7 +396,10 @@ fn read_file(state: &mut ScHsmState, store: &mut dyn KeyStore, file_id: u16, off
     match hi {
         0xC4 => {
             // Look up key in key_index by key_id.
-            let meta = state.key_index.iter().find(|m| m.key_id == full_key_id && m.key_type != 16);
+            let meta = state
+                .key_index
+                .iter()
+                .find(|m| m.key_id == full_key_id && m.key_type != 16);
             if let Some(meta) = meta {
                 if is_rsa_algo(meta.algo) {
                     #[cfg(feature = "rsa")]
@@ -416,7 +429,11 @@ fn read_file(state: &mut ScHsmState, store: &mut dyn KeyStore, file_id: u16, off
 
 /// Handle a READ BINARY APDU (INS=0xB0).
 /// P1P2 encodes the file identifier (SC-HSM convention: not an offset).
-pub fn handle(state: &mut ScHsmState, store: &mut dyn KeyStore, cmd: &ApduCommand<'_>) -> ApduResponse {
+pub fn handle(
+    state: &mut ScHsmState,
+    store: &mut dyn KeyStore,
+    cmd: &ApduCommand<'_>,
+) -> ApduResponse {
     if cmd.p1 & 0x80 != 0 {
         return ApduResponse::err(SW_FILE_NOT_FOUND);
     }
@@ -437,7 +454,11 @@ pub fn handle(state: &mut ScHsmState, store: &mut dyn KeyStore, cmd: &ApduComman
 /// OpenSC's `sc_hsm_read_binary` always sends `54 02 <offset>` (implicit file,
 /// selected by the preceding SELECT command).  It may send extended-length APDUs
 /// (ISO 7816-4 Case 4E) so the parser must handle those too.
-pub fn handle_odd(state: &mut ScHsmState, store: &mut dyn KeyStore, cmd: &ApduCommand<'_>) -> ApduResponse {
+pub fn handle_odd(
+    state: &mut ScHsmState,
+    store: &mut dyn KeyStore,
+    cmd: &ApduCommand<'_>,
+) -> ApduResponse {
     let data = cmd.data;
     // Minimum: tag(1) + len(1) + offset-or-fid(2) = 4 bytes
     if data.len() < 4 || data[0] != 0x54 {

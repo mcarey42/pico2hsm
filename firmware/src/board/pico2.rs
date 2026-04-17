@@ -15,9 +15,9 @@
 //! initialised on their standard header pins for bringup and testing, but
 //! storage operations will fail gracefully (no devices on the bus).
 
-use super::{LedController, LedStatus};
 #[cfg(feature = "pico2_4m")]
 use super::Board;
+use super::{LedController, LedStatus};
 
 use embassy_rp::gpio::{Level, Output};
 
@@ -61,7 +61,9 @@ pub struct GpioLed {
 
 impl GpioLed {
     pub fn new(pin: embassy_rp::Peri<'static, embassy_rp::peripherals::PIN_25>) -> Self {
-        Self { pin: Output::new(pin, Level::Low) }
+        Self {
+            pin: Output::new(pin, Level::Low),
+        }
     }
 }
 
@@ -104,7 +106,11 @@ impl Pico2Board {
         spi1: Pico2Spi1,
     ) -> Self {
         defmt::info!("Pico 2: board created (SPI0 + SPI1 @ {} Hz)", SPI_FREQ_HZ);
-        Self { led: GpioLed::new(led_pin), spi0, spi1 }
+        Self {
+            led: GpioLed::new(led_pin),
+            spi0,
+            spi1,
+        }
     }
 }
 
@@ -114,9 +120,19 @@ impl Board for Pico2Board {
     type Spi0 = Pico2Spi0;
     type Spi1 = Pico2Spi1;
 
-    fn led(&mut self) -> &mut Self::Led { &mut self.led }
-    fn spi0(&mut self) -> &mut Self::Spi0 { &mut self.spi0 }
-    fn spi1(&mut self) -> &mut Self::Spi1 { &mut self.spi1 }
-    fn spi0_cs_pins(&self) -> &[u8] { &SPI0_CS }
-    fn spi1_cs_pins(&self) -> &[u8] { &SPI1_CS }
+    fn led(&mut self) -> &mut Self::Led {
+        &mut self.led
+    }
+    fn spi0(&mut self) -> &mut Self::Spi0 {
+        &mut self.spi0
+    }
+    fn spi1(&mut self) -> &mut Self::Spi1 {
+        &mut self.spi1
+    }
+    fn spi0_cs_pins(&self) -> &[u8] {
+        &SPI0_CS
+    }
+    fn spi1_cs_pins(&self) -> &[u8] {
+        &SPI1_CS
+    }
 }

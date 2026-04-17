@@ -49,19 +49,19 @@ pub const MAX_APDU_SIZE: usize = 4096;
 ///   14 historical bytes (includes "THsm1" tag)
 ///   TCK=FA  (XOR of all bytes from T0 to last historical = 0x00)
 pub const ATR: &[u8] = &[
-    0x3B,                               // TS: direct convention
-    0xFE,                               // T0: TA1 TB1 TC1 TD1 present, K=14
-    0x18,                               // TA1: Fi=372 Di=12
-    0x00,                               // TB1: no programming voltage
-    0x00,                               // TC1: guard time = 0
-    0x81,                               // TD1: TD2 present, T=1
-    0x31,                               // TD2: TA3 TB3 present, T=1
-    0xFE,                               // TA3: IFSC = 254
-    0x45,                               // TB3: BWI=4 CWI=5
-    0x80, 0x31, 0x81,                   // historical: card service / capabilities
-    0x54, 0x48, 0x53, 0x4D, 0x31,      // historical: "THsm1" (SmartCard-HSM marker)
+    0x3B, // TS: direct convention
+    0xFE, // T0: TA1 TB1 TC1 TD1 present, K=14
+    0x18, // TA1: Fi=372 Di=12
+    0x00, // TB1: no programming voltage
+    0x00, // TC1: guard time = 0
+    0x81, // TD1: TD2 present, T=1
+    0x31, // TD2: TA3 TB3 present, T=1
+    0xFE, // TA3: IFSC = 254
+    0x45, // TB3: BWI=4 CWI=5
+    0x80, 0x31, 0x81, // historical: card service / capabilities
+    0x54, 0x48, 0x53, 0x4D, 0x31, // historical: "THsm1" (SmartCard-HSM marker)
     0x73, 0x80, 0x21, 0x40, 0x81, 0x07, // historical
-    0xFA,                               // TCK: makes XOR(T0..last_hist) == 0x00
+    0xFA, // TCK: makes XOR(T0..last_hist) == 0x00
 ];
 
 /// Card status — used by CCID to report card presence.

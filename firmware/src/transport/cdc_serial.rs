@@ -95,13 +95,19 @@ macro_rules! cdc_error {
 // No-op stubs for host (x86_64) builds.
 #[cfg(not(target_arch = "arm"))]
 #[macro_export]
-macro_rules! cdc_log   { ($($arg:tt)*) => {{}} }
+macro_rules! cdc_log {
+    ($($arg:tt)*) => {{}};
+}
 #[cfg(not(target_arch = "arm"))]
 #[macro_export]
-macro_rules! cdc_warn  { ($($arg:tt)*) => {{}} }
+macro_rules! cdc_warn {
+    ($($arg:tt)*) => {{}};
+}
 #[cfg(not(target_arch = "arm"))]
 #[macro_export]
-macro_rules! cdc_error { ($($arg:tt)*) => {{}} }
+macro_rules! cdc_error {
+    ($($arg:tt)*) => {{}};
+}
 
 // ─── CDC-ACM setup helper ────────────────────────────────────────────────────
 

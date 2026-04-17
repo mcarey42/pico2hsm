@@ -41,7 +41,7 @@ use crate::storage::{
 use pico2hsm_core::{
     error::StorageError,
     flash::{FlashChip, SECTOR_SIZE},
-    storage::{ChipState, DATA_START_SECTOR, MirrorPair, MirrorState},
+    storage::{ChipState, MirrorPair, MirrorState, DATA_START_SECTOR},
 };
 
 // ─── RaidManager<P, M> ────────────────────────────────────────────────────────
@@ -76,7 +76,9 @@ impl<P: FlashChip, M: FlashChip> RaidManager<P, M> {
             mirror_idx,
             primary_state: ChipState::NotPresent,
             mirror_state: ChipState::NotPresent,
-            pair_state: MirrorState::Degraded { failed_member: mirror_idx },
+            pair_state: MirrorState::Degraded {
+                failed_member: mirror_idx,
+            },
         }
     }
 
@@ -128,7 +130,9 @@ impl<P: FlashChip, M: FlashChip> RaidManager<P, M> {
             (_, ChipState::Healthy) => MirrorState::Degraded {
                 failed_member: self.primary_idx,
             },
-            _ => MirrorState::Degraded { failed_member: self.mirror_idx },
+            _ => MirrorState::Degraded {
+                failed_member: self.mirror_idx,
+            },
         };
 
         // If neither is present, return an error.
@@ -196,7 +200,9 @@ impl<P: FlashChip, M: FlashChip> RaidManager<P, M> {
                 sector,
             );
             self.primary_state = ChipState::Degraded;
-            self.pair_state = MirrorState::Degraded { failed_member: self.primary_idx };
+            self.pair_state = MirrorState::Degraded {
+                failed_member: self.primary_idx,
+            };
         }
 
         // Fall back to mirror.
@@ -275,7 +281,9 @@ impl<P: FlashChip, M: FlashChip> RaidManager<P, M> {
                 sector,
             );
             self.mirror_state = ChipState::Degraded;
-            self.pair_state = MirrorState::Degraded { failed_member: self.mirror_idx };
+            self.pair_state = MirrorState::Degraded {
+                failed_member: self.mirror_idx,
+            };
         }
 
         // Step 3: Write to primary.
@@ -292,7 +300,9 @@ impl<P: FlashChip, M: FlashChip> RaidManager<P, M> {
                     sector,
                 );
                 self.primary_state = ChipState::Degraded;
-                self.pair_state = MirrorState::Degraded { failed_member: self.primary_idx };
+                self.pair_state = MirrorState::Degraded {
+                    failed_member: self.primary_idx,
+                };
             } else {
                 // Both failed.
                 defmt::error!(
@@ -318,7 +328,8 @@ impl<P: FlashChip, M: FlashChip> RaidManager<P, M> {
         self.primary.erase_sector(addr)?;
         for p in 0..16usize {
             let page_addr = addr + (p * 256) as u32;
-            self.primary.write_page(page_addr, &data[p * 256..(p + 1) * 256])?;
+            self.primary
+                .write_page(page_addr, &data[p * 256..(p + 1) * 256])?;
         }
         Ok(())
     }
@@ -332,7 +343,8 @@ impl<P: FlashChip, M: FlashChip> RaidManager<P, M> {
         self.mirror.erase_sector(addr)?;
         for p in 0..16usize {
             let page_addr = addr + (p * 256) as u32;
-            self.mirror.write_page(page_addr, &data[p * 256..(p + 1) * 256])?;
+            self.mirror
+                .write_page(page_addr, &data[p * 256..(p + 1) * 256])?;
         }
         Ok(())
     }
@@ -440,19 +452,27 @@ impl<P: FlashChip, M: FlashChip> RaidManager<P, M> {
                 self.mirror.erase_sector(addr)?;
                 for p in 0..16usize {
                     let pa = addr + (p * 256) as u32;
-                    self.mirror.write_page(pa, &sector_buf[p * 256..(p + 1) * 256])?;
+                    self.mirror
+                        .write_page(pa, &sector_buf[p * 256..(p + 1) * 256])?;
                 }
-                self.mirror_state = ChipState::Resyncing { progress_sector: sector };
+                self.mirror_state = ChipState::Resyncing {
+                    progress_sector: sector,
+                };
             } else {
                 self.primary.erase_sector(addr)?;
                 for p in 0..16usize {
                     let pa = addr + (p * 256) as u32;
-                    self.primary.write_page(pa, &sector_buf[p * 256..(p + 1) * 256])?;
+                    self.primary
+                        .write_page(pa, &sector_buf[p * 256..(p + 1) * 256])?;
                 }
-                self.primary_state = ChipState::Resyncing { progress_sector: sector };
+                self.primary_state = ChipState::Resyncing {
+                    progress_sector: sector,
+                };
             }
 
-            self.pair_state = MirrorState::Resyncing { progress_sector: sector };
+            self.pair_state = MirrorState::Resyncing {
+                progress_sector: sector,
+            };
 
             sector += 1;
 
@@ -489,7 +509,9 @@ impl<P: FlashChip, M: FlashChip> RaidManager<P, M> {
                     self.primary_idx,
                 );
                 self.primary_state = ChipState::Blank;
-                self.pair_state = MirrorState::Resyncing { progress_sector: DATA_START_SECTOR };
+                self.pair_state = MirrorState::Resyncing {
+                    progress_sector: DATA_START_SECTOR,
+                };
                 return true;
             }
         }
@@ -503,7 +525,9 @@ impl<P: FlashChip, M: FlashChip> RaidManager<P, M> {
                     self.mirror_idx,
                 );
                 self.mirror_state = ChipState::Blank;
-                self.pair_state = MirrorState::Resyncing { progress_sector: DATA_START_SECTOR };
+                self.pair_state = MirrorState::Resyncing {
+                    progress_sector: DATA_START_SECTOR,
+                };
                 return true;
             }
         }

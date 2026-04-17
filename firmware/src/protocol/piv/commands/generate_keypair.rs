@@ -166,7 +166,11 @@ pub fn handle_with_store(
     }
     let _ = resp.extend_from_slice(&tag_7f49);
 
-    crate::cdc_log!("PIV GENERATE KEY PAIR done key=0x{:08x} algo=0x{:02x}", key_id.0, alg_id);
+    crate::cdc_log!(
+        "PIV GENERATE KEY PAIR done key=0x{:08x} algo=0x{:02x}",
+        key_id.0,
+        alg_id
+    );
     ApduResponse::ok(&resp)
 }
 

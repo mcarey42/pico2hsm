@@ -143,9 +143,7 @@ fn test_select_sc_hsm_fci_contains_aid() {
     let body = data_of(&r);
     // The AID bytes should appear somewhere in the FCI.
     let aid_bytes = SC_HSM_AID;
-    let found = body
-        .windows(aid_bytes.len())
-        .any(|w| w == aid_bytes);
+    let found = body.windows(aid_bytes.len()).any(|w| w == aid_bytes);
     assert!(found, "FCI must embed the SC-HSM AID bytes");
 }
 
@@ -156,7 +154,11 @@ fn test_select_unknown_aid() {
     let r = d.dispatch(&sel);
 
     // SW_FILE_NOT_FOUND = 0x6A82
-    assert_eq!(sw(&r), 0x6A82, "Unknown AID must return 6A82 (FILE NOT FOUND)");
+    assert_eq!(
+        sw(&r),
+        0x6A82,
+        "Unknown AID must return 6A82 (FILE NOT FOUND)"
+    );
 }
 
 #[test]
@@ -195,7 +197,11 @@ fn test_initialize_basic() {
     let cmd = apdu(0x80, INS_INITIALIZE, 0x00, 0x00, &data);
     let r = d.dispatch(&cmd);
 
-    assert_eq!(sw(&r), 0x9000, "INITIALIZE with valid SO-PIN must return 9000");
+    assert_eq!(
+        sw(&r),
+        0x9000,
+        "INITIALIZE with valid SO-PIN must return 9000"
+    );
 }
 
 #[test]
@@ -284,7 +290,11 @@ fn test_verify_wrong_pin() {
         status
     );
     // Initial retry count is 3; first wrong attempt → 2 remaining
-    assert_eq!(status & 0x000F, 2, "Retries remaining should be 2 after first wrong PIN");
+    assert_eq!(
+        status & 0x000F,
+        2,
+        "Retries remaining should be 2 after first wrong PIN"
+    );
 }
 
 #[test]
@@ -414,7 +424,11 @@ fn test_get_challenge_default_length() {
 
     assert_eq!(sw(&r), 0x9000, "GET CHALLENGE must return 9000");
     let body = data_of(&r);
-    assert_eq!(body.len(), 8, "Default GET CHALLENGE must return exactly 8 bytes");
+    assert_eq!(
+        body.len(),
+        8,
+        "Default GET CHALLENGE must return exactly 8 bytes"
+    );
 }
 
 #[test]
@@ -427,7 +441,11 @@ fn test_get_challenge_with_le() {
 
     assert_eq!(sw(&r), 0x9000, "GET CHALLENGE Le=16 must return 9000");
     let body = data_of(&r);
-    assert_eq!(body.len(), 16, "GET CHALLENGE Le=16 must return exactly 16 bytes");
+    assert_eq!(
+        body.len(),
+        16,
+        "GET CHALLENGE Le=16 must return exactly 16 bytes"
+    );
 }
 
 #[test]
@@ -689,11 +707,7 @@ fn test_malformed_apdu_too_short() {
     let r = d.dispatch(&[0x00, 0xA4]);
 
     // SW_INS_NOT_SUPPORTED is returned on parse failure
-    assert_eq!(
-        sw(&r),
-        0x6D00,
-        "Malformed APDU must return 6D00"
-    );
+    assert_eq!(sw(&r), 0x6D00, "Malformed APDU must return 6D00");
 }
 
 #[test]

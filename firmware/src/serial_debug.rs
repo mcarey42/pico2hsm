@@ -37,9 +37,15 @@
 #[inline(never)]
 pub fn uart1_write_bytes(msg: &[u8]) {
     unsafe {
-        #[cfg(any(feature = "waveshare_rp2350_lcd_16m", feature = "waveshare_rp2350_lcd_sdcard"))]
+        #[cfg(any(
+            feature = "waveshare_rp2350_lcd_16m",
+            feature = "waveshare_rp2350_lcd_sdcard"
+        ))]
         let uart = embassy_rp::pac::UART0;
-        #[cfg(not(any(feature = "waveshare_rp2350_lcd_16m", feature = "waveshare_rp2350_lcd_sdcard")))]
+        #[cfg(not(any(
+            feature = "waveshare_rp2350_lcd_16m",
+            feature = "waveshare_rp2350_lcd_sdcard"
+        )))]
         let uart = embassy_rp::pac::UART1;
         for &b in msg {
             while uart.uartfr().read().txff() {}
@@ -52,13 +58,24 @@ pub fn uart1_write_bytes(msg: &[u8]) {
 #[cfg(feature = "uart-debug")]
 pub const BOARD_TAG: &[u8] = {
     #[cfg(any(feature = "rp2350_geek_16m", feature = "rp2350_geek_sdcard"))]
-    { b"[GEEK] " }
-    #[cfg(any(feature = "waveshare_rp2350_lcd_16m", feature = "waveshare_rp2350_lcd_sdcard"))]
-    { b"[LCD] " }
+    {
+        b"[GEEK] "
+    }
+    #[cfg(any(
+        feature = "waveshare_rp2350_lcd_16m",
+        feature = "waveshare_rp2350_lcd_sdcard"
+    ))]
+    {
+        b"[LCD] "
+    }
     #[cfg(feature = "rp2350_one_4m")]
-    { b"[ONE] " }
+    {
+        b"[ONE] "
+    }
     #[cfg(feature = "pico2_4m")]
-    { b"[PICO] " }
+    {
+        b"[PICO] "
+    }
 };
 
 /// Write a literal string with board tag prefix and `\r\n` suffix to UART1.

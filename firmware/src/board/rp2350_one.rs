@@ -136,17 +136,23 @@ pub mod timing {
 
 /// RGB colour stored in component order; packed into GRB on the wire.
 #[derive(Clone, Copy)]
-struct RgbColor { r: u8, g: u8, b: u8 }
+struct RgbColor {
+    r: u8,
+    g: u8,
+    b: u8,
+}
 
 impl RgbColor {
-    const fn new(r: u8, g: u8, b: u8) -> Self { Self { r, g, b } }
-    const OFF:      Self = Self::new(0, 0, 0);
-    const READY:    Self = Self::new(0, 32, 0);    // dim green
-    const BUSY:     Self = Self::new(0, 0, 32);    // dim blue
-    const ERROR:    Self = Self::new(32, 0, 0);    // dim red
-    const DEGRADED: Self = Self::new(16, 16, 0);   // yellow (R + G)
-    const RESYNCING:Self = Self::new(0, 16, 16);   // cyan   (G + B)
-    const WAITING:  Self = Self::new(0, 0, 64);    // bright blue
+    const fn new(r: u8, g: u8, b: u8) -> Self {
+        Self { r, g, b }
+    }
+    const OFF: Self = Self::new(0, 0, 0);
+    const READY: Self = Self::new(0, 32, 0); // dim green
+    const BUSY: Self = Self::new(0, 0, 32); // dim blue
+    const ERROR: Self = Self::new(32, 0, 0); // dim red
+    const DEGRADED: Self = Self::new(16, 16, 0); // yellow (R + G)
+    const RESYNCING: Self = Self::new(0, 16, 16); // cyan   (G + B)
+    const WAITING: Self = Self::new(0, 0, 64); // bright blue
 }
 
 // ─── ARM-specific PIO handle ──────────────────────────────────────────────────
@@ -167,7 +173,7 @@ struct Ws2812Pio {
 /// initialised exactly once in `Ws2812Led::new()`.
 #[cfg(target_arch = "arm")]
 static PIO0_COMMON_CELL: static_cell::StaticCell<
-    embassy_rp::pio::Common<'static, embassy_rp::peripherals::PIO0>
+    embassy_rp::pio::Common<'static, embassy_rp::peripherals::PIO0>,
 > = static_cell::StaticCell::new();
 
 /// `StaticCell` holding the `LoadedProgram` for the WS2812 PIO program.
@@ -178,7 +184,7 @@ static PIO0_COMMON_CELL: static_cell::StaticCell<
 /// opcodes regardless).
 #[cfg(target_arch = "arm")]
 static WS2812_LOADED_PROGRAM_CELL: static_cell::StaticCell<
-    embassy_rp::pio::LoadedProgram<'static, embassy_rp::peripherals::PIO0>
+    embassy_rp::pio::LoadedProgram<'static, embassy_rp::peripherals::PIO0>,
 > = static_cell::StaticCell::new();
 
 /// WS2812B LED controller for the Waveshare RP2350-One.
@@ -224,22 +230,22 @@ impl Ws2812Led {
         }
 
         #[cfg(not(target_arch = "arm"))]
-        Self { current: RgbColor::OFF }
+        Self {
+            current: RgbColor::OFF,
+        }
     }
 
     /// ARM-only initialisation (kept in a separate method to avoid deep nesting).
     #[cfg(target_arch = "arm")]
     fn init_arm() -> Self {
-        use embassy_rp::pio::{
-            Config, FifoJoin, Pio, ShiftConfig, ShiftDirection,
-        };
         use embassy_rp::clocks::clk_sys_freq;
+        use embassy_rp::pio::{Config, FifoJoin, Pio, ShiftConfig, ShiftDirection};
 
         // ── Steal PIO0 and PIN_16 ─────────────────────────────────────────────
         //
         // SAFETY: Only called once; PIO0 / PIN_16 are not taken by main.rs.
         let pio0_peri = unsafe { embassy_rp::peripherals::PIO0::steal() };
-        let pin16     = unsafe { embassy_rp::peripherals::PIN_16::steal() };
+        let pin16 = unsafe { embassy_rp::peripherals::PIN_16::steal() };
 
         // ── Satisfy the Binding trait bound required by Pio::new() ───────────
         //
@@ -256,13 +262,18 @@ impl Ws2812Led {
         struct PioIrqBinding;
         // SAFETY: We are the exclusive owner of PIO0; no other code holds a
         // Pio<PIO0> or calls enable() on PIO0_IRQ_0 concurrently.
-        unsafe impl embassy_rp::interrupt::typelevel::Binding<
-            embassy_rp::interrupt::typelevel::PIO0_IRQ_0,
-            embassy_rp::pio::InterruptHandler<embassy_rp::peripherals::PIO0>,
-        > for PioIrqBinding {}
+        unsafe impl
+            embassy_rp::interrupt::typelevel::Binding<
+                embassy_rp::interrupt::typelevel::PIO0_IRQ_0,
+                embassy_rp::pio::InterruptHandler<embassy_rp::peripherals::PIO0>,
+            > for PioIrqBinding
+        {
+        }
 
         // ── Construct the Pio peripheral (splits PIO0 into Common + SMs) ─────
-        let Pio { mut common, sm0, .. } = Pio::new(pio0_peri, PioIrqBinding);
+        let Pio {
+            mut common, sm0, ..
+        } = Pio::new(pio0_peri, PioIrqBinding);
 
         // ── Assemble the WS2812 PIO program ───────────────────────────────────
         //
@@ -285,7 +296,7 @@ impl Ws2812Led {
 
             let mut wrap_target = a.label();
             let mut wrap_source = a.label();
-            let mut do_zero     = a.label();
+            let mut do_zero = a.label();
 
             a.set_with_side_set(SetDestination::PINDIRS, 1, 0);
             a.bind(&mut wrap_target);
@@ -333,16 +344,16 @@ impl Ws2812Led {
         // a transitive dep; we leave it at default (1.0) and override via PAC.
         // The override is applied immediately after sm.set_config() below.
         let pio_divisor = timing::FREQ_HZ * timing::CYCLES_PER_BIT; // 8_000_000
-        let sys_freq    = clk_sys_freq();
-        let clkdiv_int  = sys_freq / pio_divisor;
+        let sys_freq = clk_sys_freq();
+        let clkdiv_int = sys_freq / pio_divisor;
         let clkdiv_frac = ((sys_freq % pio_divisor) as u64 * 256 / pio_divisor as u64) as u8;
 
         // TX FIFO only; 24-bit auto-shift left.
         cfg.fifo_join = FifoJoin::TxOnly;
         cfg.shift_out = ShiftConfig {
-            auto_fill:  true,
-            threshold:  24,
-            direction:  ShiftDirection::Left,
+            auto_fill: true,
+            threshold: 24,
+            direction: ShiftDirection::Left,
         };
 
         let mut sm0 = sm0;
@@ -397,9 +408,8 @@ impl Ws2812Led {
             // GRB wire order: G[31:24] R[23:16] B[15:8] (zeros at [7:0]).
             // PIO shift_out auto_fill with threshold=24 and direction=Left
             // sends bit 31 first, consuming exactly 24 bits per word.
-            let grb: u32 = (u32::from(color.g) << 24)
-                         | (u32::from(color.r) << 16)
-                         | (u32::from(color.b) << 8);
+            let grb: u32 =
+                (u32::from(color.g) << 24) | (u32::from(color.r) << 16) | (u32::from(color.b) << 8);
 
             // Spin-wait for TX FIFO not-full.
             // With threshold=24 and a 4-entry TX FIFO (TxOnly doubles to 8),
@@ -420,22 +430,19 @@ impl Ws2812Led {
         }
 
         #[cfg(not(target_arch = "arm"))]
-        defmt::debug!(
-            "LED (stub) → R={} G={} B={}",
-            color.r, color.g, color.b,
-        );
+        defmt::debug!("LED (stub) → R={} G={} B={}", color.r, color.g, color.b,);
     }
 }
 
 impl LedController for Ws2812Led {
     fn set_status(&mut self, status: LedStatus) {
         let color = match status {
-            LedStatus::Off          => RgbColor::OFF,
-            LedStatus::Ready        => RgbColor::READY,
-            LedStatus::Busy         => RgbColor::BUSY,
-            LedStatus::Error        => RgbColor::ERROR,
-            LedStatus::Degraded     => RgbColor::DEGRADED,
-            LedStatus::Resyncing    => RgbColor::RESYNCING,
+            LedStatus::Off => RgbColor::OFF,
+            LedStatus::Ready => RgbColor::READY,
+            LedStatus::Busy => RgbColor::BUSY,
+            LedStatus::Error => RgbColor::ERROR,
+            LedStatus::Degraded => RgbColor::DEGRADED,
+            LedStatus::Resyncing => RgbColor::RESYNCING,
             LedStatus::WaitingForPin => RgbColor::WAITING,
         };
         self.set_color(color);
@@ -460,7 +467,7 @@ pub type Rp2350OneSpi1 =
 
 /// Concrete board representation for the Waveshare RP2350-One.
 pub struct Rp2350OneBoard {
-    led:  Ws2812Led,
+    led: Ws2812Led,
     pub spi0: Rp2350OneSpi0,
     pub spi1: Rp2350OneSpi1,
 }
@@ -481,23 +488,40 @@ impl Rp2350OneBoard {
     /// | PIO0     | `Ws2812Led::new()` — stolen here     |
     /// | GPIO 16  | `Ws2812Led::new()` — stolen here     |
     pub fn new(spi0: Rp2350OneSpi0, spi1: Rp2350OneSpi1) -> Self {
-        defmt::info!("RP2350-One: board created (SPI0 + SPI1 @ {} Hz)", SPI_FREQ_HZ);
-        Self { led: Ws2812Led::new(), spi0, spi1 }
+        defmt::info!(
+            "RP2350-One: board created (SPI0 + SPI1 @ {} Hz)",
+            SPI_FREQ_HZ
+        );
+        Self {
+            led: Ws2812Led::new(),
+            spi0,
+            spi1,
+        }
     }
 }
 
 #[cfg(feature = "rp2350_one_4m")]
 impl Board for Rp2350OneBoard {
-    type Led  = Ws2812Led;
+    type Led = Ws2812Led;
     type Spi0 = Rp2350OneSpi0;
     type Spi1 = Rp2350OneSpi1;
 
-    fn led(&mut self)  -> &mut Self::Led  { &mut self.led  }
-    fn spi0(&mut self) -> &mut Self::Spi0 { &mut self.spi0 }
-    fn spi1(&mut self) -> &mut Self::Spi1 { &mut self.spi1 }
+    fn led(&mut self) -> &mut Self::Led {
+        &mut self.led
+    }
+    fn spi0(&mut self) -> &mut Self::Spi0 {
+        &mut self.spi0
+    }
+    fn spi1(&mut self) -> &mut Self::Spi1 {
+        &mut self.spi1
+    }
 
-    fn spi0_cs_pins(&self) -> &[u8] { &SPI0_CS }
-    fn spi1_cs_pins(&self) -> &[u8] { &SPI1_CS }
+    fn spi0_cs_pins(&self) -> &[u8] {
+        &SPI0_CS
+    }
+    fn spi1_cs_pins(&self) -> &[u8] {
+        &SPI1_CS
+    }
 }
 
 // ─── Legacy free function (kept for source compatibility) ─────────────────────

@@ -39,7 +39,7 @@
 //! - rp-pac GLITCH_DETECTOR peripheral (0x4015_8000)
 //! - "Fault Attacks on Secure Embedded Software", Riscure (2020)
 
-use core::sync::atomic::{AtomicU32, Ordering, compiler_fence};
+use core::sync::atomic::{compiler_fence, AtomicU32, Ordering};
 
 // ─── Double-check result ──────────────────────────────────────────────────────
 
@@ -173,18 +173,16 @@ pub fn arm_glitch_detector() {
         // The _inv fields must be the 2-bit bitwise complement of the
         // sensitivity value: NOT(3) & 0x03 = 0.
         GLITCH_DETECTOR.sensitivity().write(|w| {
-            w.set_det0(3);       // max sensitivity
+            w.set_det0(3); // max sensitivity
             w.set_det1(3);
             w.set_det2(3);
             w.set_det3(3);
-            w.set_det0_inv(0);   // bitwise complement of 3 within 2 bits
+            w.set_det0_inv(0); // bitwise complement of 3 within 2 bits
             w.set_det1_inv(0);
             w.set_det2_inv(0);
             w.set_det3_inv(0);
             // Override OTP defaults — use register values instead.
-            w.set_default(
-                embassy_rp::pac::glitch_detector::vals::Default::NO,
-            );
+            w.set_default(embassy_rp::pac::glitch_detector::vals::Default::NO);
         });
 
         // Step 2: Arm the glitch detector.

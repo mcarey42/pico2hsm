@@ -8,8 +8,8 @@
 //! - Data: derivation path (sequence of 4-byte index values, MSB = hardened)
 
 use pico2hsm_core::apdu::{
-    ApduCommand, ApduResponse, SW_CONDITIONS_NOT_SATISFIED, SW_FILE_NOT_FOUND,
-    SW_SECURITY_STATUS, SW_WRONG_DATA,
+    ApduCommand, ApduResponse, SW_CONDITIONS_NOT_SATISFIED, SW_FILE_NOT_FOUND, SW_SECURITY_STATUS,
+    SW_WRONG_DATA,
 };
 use pico2hsm_core::key::{KeyId, KeyMaterial, KeyType};
 
@@ -23,16 +23,16 @@ pub const INS_BIP_SLIP: u8 = 0x60;
 fn key_type_from_u8(v: u8) -> Option<KeyType> {
     // Discriminant order matches the enum declaration in pico2hsm-core/src/key.rs.
     match v {
-        0  => Some(KeyType::RsaPrivate2048),
-        1  => Some(KeyType::RsaPrivate4096),
-        2  => Some(KeyType::EcPrivateP256),
-        3  => Some(KeyType::EcPrivateP384),
-        4  => Some(KeyType::EcPrivateP521),
-        5  => Some(KeyType::EcPrivateK256),
-        6  => Some(KeyType::EcPrivateBrainpoolP256),
-        7  => Some(KeyType::EcPrivateBrainpoolP384),
-        8  => Some(KeyType::EcPrivateBrainpoolP512),
-        9  => Some(KeyType::Aes128),
+        0 => Some(KeyType::RsaPrivate2048),
+        1 => Some(KeyType::RsaPrivate4096),
+        2 => Some(KeyType::EcPrivateP256),
+        3 => Some(KeyType::EcPrivateP384),
+        4 => Some(KeyType::EcPrivateP521),
+        5 => Some(KeyType::EcPrivateK256),
+        6 => Some(KeyType::EcPrivateBrainpoolP256),
+        7 => Some(KeyType::EcPrivateBrainpoolP384),
+        8 => Some(KeyType::EcPrivateBrainpoolP512),
+        9 => Some(KeyType::Aes128),
         10 => Some(KeyType::Aes192),
         11 => Some(KeyType::Aes256),
         12 => Some(KeyType::Bip32Master),
@@ -40,12 +40,16 @@ fn key_type_from_u8(v: u8) -> Option<KeyType> {
         14 => Some(KeyType::X25519),
         15 => Some(KeyType::RsaPrivate3072),
         16 => Some(KeyType::EfFile),
-        _  => None,
+        _ => None,
     }
 }
 
 /// Handle a BIP32/SLIP-0010 HD KEY DERIVE APDU command.
-pub fn handle(state: &mut ScHsmState, store: &mut dyn KeyStore, cmd: &ApduCommand<'_>) -> ApduResponse {
+pub fn handle(
+    state: &mut ScHsmState,
+    store: &mut dyn KeyStore,
+    cmd: &ApduCommand<'_>,
+) -> ApduResponse {
     // Require PIN authentication
     if !state.pin_verified {
         return ApduResponse::err(SW_SECURITY_STATUS);
@@ -135,8 +139,8 @@ mod tests {
     use super::*;
     use pico2hsm_core::{
         apdu::{SW_FILE_NOT_FOUND, SW_OK, SW_SECURITY_STATUS, SW_WRONG_DATA},
-        key::{AppletId, KeyId, KeyType as CoreKeyType},
         error::HsmError,
+        key::{AppletId, KeyId, KeyType as CoreKeyType},
     };
 
     use crate::protocol::sc_hsm::{KeyMeta, ScHsmState};
@@ -147,7 +151,11 @@ mod tests {
         keys: heapless::Vec<KeyObject, 4>,
     }
     impl TestStore {
-        fn new() -> Self { TestStore { keys: heapless::Vec::new() } }
+        fn new() -> Self {
+            TestStore {
+                keys: heapless::Vec::new(),
+            }
+        }
     }
     impl KeyStore for TestStore {
         fn save_key(&mut self, obj: &KeyObject) -> Result<(), HsmError> {
@@ -173,9 +181,16 @@ mod tests {
             self.keys.retain(|k| k.key_id != key_id.0);
             Ok(())
         }
-        fn wipe_all(&mut self) -> Result<(), HsmError> { self.keys.clear(); Ok(()) }
-        fn wipe_by_owner(&mut self, _: AppletId) -> Result<(), HsmError> { Ok(()) }
-        fn enumerate_keys(&self) -> heapless::Vec<KeyId, 64> { heapless::Vec::new() }
+        fn wipe_all(&mut self) -> Result<(), HsmError> {
+            self.keys.clear();
+            Ok(())
+        }
+        fn wipe_by_owner(&mut self, _: AppletId) -> Result<(), HsmError> {
+            Ok(())
+        }
+        fn enumerate_keys(&self) -> heapless::Vec<KeyId, 64> {
+            heapless::Vec::new()
+        }
         fn for_each_key(&self, _f: &mut dyn FnMut(KeyId)) {}
     }
 
@@ -183,9 +198,9 @@ mod tests {
     fn make_apdu(ins: u8, p1: u8, p2: u8, data: &[u8]) -> heapless::Vec<u8, 256> {
         let mut v: heapless::Vec<u8, 256> = heapless::Vec::new();
         v.push(0x00).unwrap(); // CLA
-        v.push(ins).unwrap();  // INS
-        v.push(p1).unwrap();   // P1
-        v.push(p2).unwrap();   // P2
+        v.push(ins).unwrap(); // INS
+        v.push(p1).unwrap(); // P1
+        v.push(p2).unwrap(); // P2
         v.push(data.len() as u8).unwrap(); // Lc
         v.extend_from_slice(data).unwrap();
         v
@@ -206,23 +221,34 @@ mod tests {
     }
 
     /// Build a state + store with a BIP32 master key (64 bytes = key || chain).
-    fn make_state_with_bip32_master(key_proto_ref: u8, key_bytes: &[u8]) -> (ScHsmState, TestStore) {
+    fn make_state_with_bip32_master(
+        key_proto_ref: u8,
+        key_bytes: &[u8],
+    ) -> (ScHsmState, TestStore) {
         let mut state = ScHsmState::new();
         state.pin_verified = true;
 
         let full_key_id = KeyId::sc_hsm(0, key_proto_ref).0;
 
         // Add metadata to key_index
-        state.key_index.push(KeyMeta {
-            key_id: full_key_id,
-            key_type: CoreKeyType::Bip32Master as u8,
-            algo: 0x00,
-            key_flags: 0,
-        }).unwrap();
+        state
+            .key_index
+            .push(KeyMeta {
+                key_id: full_key_id,
+                key_type: CoreKeyType::Bip32Master as u8,
+                algo: 0x00,
+                key_flags: 0,
+            })
+            .unwrap();
 
         // Add key material to store
         let mut store = TestStore::new();
-        let mut obj = KeyObject::new(KmType::Ec, full_key_id, AppletId::ScHsm, AlgorithmId::EcdsaP256);
+        let mut obj = KeyObject::new(
+            KmType::Ec,
+            full_key_id,
+            AppletId::ScHsm,
+            AlgorithmId::EcdsaP256,
+        );
         let _ = obj.private_key.extend_from_slice(key_bytes);
         let _ = store.keys.push(obj);
 
@@ -231,14 +257,12 @@ mod tests {
 
     /// SLIP-0010 test vector 1 master (seed = 000102030405060708090a0b0c0d0e0f)
     fn slip10_tv1_master() -> ([u8; 32], [u8; 32]) {
-        let master_key = hex::decode(
-            "e8f32e723decf4051aefac8e2c93c9c5b214313817cdb01a1494b917c8436b35",
-        )
-        .unwrap();
-        let master_chain = hex::decode(
-            "873dff81c02f525623fd1fe5167eac3a55a049de3d314bb42ee227ffed37d508",
-        )
-        .unwrap();
+        let master_key =
+            hex::decode("e8f32e723decf4051aefac8e2c93c9c5b214313817cdb01a1494b917c8436b35")
+                .unwrap();
+        let master_chain =
+            hex::decode("873dff81c02f525623fd1fe5167eac3a55a049de3d314bb42ee227ffed37d508")
+                .unwrap();
         let mut k = [0u8; 32];
         let mut c = [0u8; 32];
         k.copy_from_slice(&master_key);
@@ -303,15 +327,23 @@ mod tests {
 
         let full_key_id = KeyId::sc_hsm(0, 0x01).0;
         // Store only 32 bytes (wrong — BIP32 master must be 64 bytes)
-        state.key_index.push(KeyMeta {
-            key_id: full_key_id,
-            key_type: CoreKeyType::Bip32Master as u8,
-            algo: 0x00,
-            key_flags: 0,
-        }).unwrap();
+        state
+            .key_index
+            .push(KeyMeta {
+                key_id: full_key_id,
+                key_type: CoreKeyType::Bip32Master as u8,
+                algo: 0x00,
+                key_flags: 0,
+            })
+            .unwrap();
 
         let mut store = TestStore::new();
-        let mut obj = KeyObject::new(KmType::Ec, full_key_id, AppletId::ScHsm, AlgorithmId::EcdsaP256);
+        let mut obj = KeyObject::new(
+            KmType::Ec,
+            full_key_id,
+            AppletId::ScHsm,
+            AlgorithmId::EcdsaP256,
+        );
         for i in 0..32u8 {
             let _ = obj.private_key.push(i);
         }
@@ -335,12 +367,20 @@ mod tests {
         let cmd = pico2hsm_core::apdu::ApduCommand::parse(&raw).unwrap();
         let resp = handle(&mut state, &mut store, &cmd);
         assert_eq!(resp.sw, SW_OK);
-        assert_eq!(resp.data.len(), 64, "response must be 64 bytes (key || chain_code)");
+        assert_eq!(
+            resp.data.len(),
+            64,
+            "response must be 64 bytes (key || chain_code)"
+        );
 
         // Verify the bytes match the original master
         let (k, c) = slip10_tv1_master();
         assert_eq!(&resp.data[..32], &k, "first 32 bytes must be master key");
-        assert_eq!(&resp.data[32..], &c, "last 32 bytes must be master chain code");
+        assert_eq!(
+            &resp.data[32..],
+            &c,
+            "last 32 bytes must be master chain code"
+        );
     }
 
     #[test]
@@ -358,17 +398,23 @@ mod tests {
         assert_eq!(resp.sw, SW_OK, "expected SW_OK");
         assert_eq!(resp.data.len(), 64);
 
-        let expected_key = hex::decode(
-            "edb2e14f9ee77d26dd93b4ecede8d16ed408ce149b6cd80b0715a2d911a0afea",
-        )
-        .unwrap();
-        let expected_chain = hex::decode(
-            "47fdacbd0f1097043b78c63c20c34ef4ed9a111d980047ad16282c7ae6236141",
-        )
-        .unwrap();
+        let expected_key =
+            hex::decode("edb2e14f9ee77d26dd93b4ecede8d16ed408ce149b6cd80b0715a2d911a0afea")
+                .unwrap();
+        let expected_chain =
+            hex::decode("47fdacbd0f1097043b78c63c20c34ef4ed9a111d980047ad16282c7ae6236141")
+                .unwrap();
 
-        assert_eq!(&resp.data[..32], expected_key.as_slice(), "child key mismatch");
-        assert_eq!(&resp.data[32..], expected_chain.as_slice(), "child chain mismatch");
+        assert_eq!(
+            &resp.data[..32],
+            expected_key.as_slice(),
+            "child key mismatch"
+        );
+        assert_eq!(
+            &resp.data[32..],
+            expected_chain.as_slice(),
+            "child chain mismatch"
+        );
     }
 
     #[test]
@@ -386,16 +432,22 @@ mod tests {
         assert_eq!(resp.sw, SW_OK, "expected SW_OK");
         assert_eq!(resp.data.len(), 64);
 
-        let expected_key = hex::decode(
-            "3c6cb8d0f6a264c91ea8b5030fadaa8e538b020f0a387421a12de9319dc93368",
-        )
-        .unwrap();
-        let expected_chain = hex::decode(
-            "2a7857631386ba23dacac34180dd1983734e444fdbf774041578e9b6adb37c19",
-        )
-        .unwrap();
+        let expected_key =
+            hex::decode("3c6cb8d0f6a264c91ea8b5030fadaa8e538b020f0a387421a12de9319dc93368")
+                .unwrap();
+        let expected_chain =
+            hex::decode("2a7857631386ba23dacac34180dd1983734e444fdbf774041578e9b6adb37c19")
+                .unwrap();
 
-        assert_eq!(&resp.data[..32], expected_key.as_slice(), "child key mismatch (m/0'/1)");
-        assert_eq!(&resp.data[32..], expected_chain.as_slice(), "child chain mismatch (m/0'/1)");
+        assert_eq!(
+            &resp.data[..32],
+            expected_key.as_slice(),
+            "child key mismatch (m/0'/1)"
+        );
+        assert_eq!(
+            &resp.data[32..],
+            expected_chain.as_slice(),
+            "child chain mismatch (m/0'/1)"
+        );
     }
 }

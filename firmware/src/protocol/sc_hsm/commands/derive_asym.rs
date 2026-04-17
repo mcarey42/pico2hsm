@@ -8,8 +8,8 @@
 //! a KDF-based deterministic derivation (X9.63 or HKDF).
 
 use pico2hsm_core::apdu::{
-    ApduCommand, ApduResponse, SW_CONDITIONS_NOT_SATISFIED, SW_FILE_NOT_FOUND,
-    SW_SECURITY_STATUS, SW_WRONG_DATA,
+    ApduCommand, ApduResponse, SW_CONDITIONS_NOT_SATISFIED, SW_FILE_NOT_FOUND, SW_SECURITY_STATUS,
+    SW_WRONG_DATA,
 };
 
 use crate::protocol::sc_hsm::ScHsmState;
@@ -22,7 +22,11 @@ pub const INS_DERIVE_ASYM: u8 = 0x62;
 pub const P1_DERIVE: u8 = 0x01;
 
 /// Handle a DERIVE ASYMMETRIC KEY APDU command.
-pub fn handle(state: &mut ScHsmState, store: &mut dyn KeyStore, cmd: &ApduCommand<'_>) -> ApduResponse {
+pub fn handle(
+    state: &mut ScHsmState,
+    store: &mut dyn KeyStore,
+    cmd: &ApduCommand<'_>,
+) -> ApduResponse {
     // Require PIN authentication
     if !state.pin_verified {
         return ApduResponse::err(SW_SECURITY_STATUS);
@@ -94,12 +98,18 @@ mod tests {
     }
 
     impl crate::storage::KeyStore for TestStore {
-        fn save_key(&mut self, _: &KeyObject) -> Result<(), pico2hsm_core::error::HsmError> { Ok(()) }
-        fn fetch_key(&mut self, key_id: KeyId) -> Result<Option<KeyObject>, pico2hsm_core::error::HsmError> {
+        fn save_key(&mut self, _: &KeyObject) -> Result<(), pico2hsm_core::error::HsmError> {
+            Ok(())
+        }
+        fn fetch_key(
+            &mut self,
+            key_id: KeyId,
+        ) -> Result<Option<KeyObject>, pico2hsm_core::error::HsmError> {
             if let Some(ref obj) = self.obj {
                 if obj.key_id == key_id.0 {
                     // Clone the KeyObject fields manually
-                    let mut clone = KeyObject::new(obj.key_type, obj.key_id, obj.owner, obj.algorithm);
+                    let mut clone =
+                        KeyObject::new(obj.key_type, obj.key_id, obj.owner, obj.algorithm);
                     clone.key_flags = obj.key_flags;
                     let _ = clone.private_key.extend_from_slice(&obj.private_key);
                     let _ = clone.public_key.extend_from_slice(&obj.public_key);
@@ -108,10 +118,18 @@ mod tests {
             }
             Ok(None)
         }
-        fn erase_key(&mut self, _: KeyId) -> Result<(), pico2hsm_core::error::HsmError> { Ok(()) }
-        fn wipe_all(&mut self) -> Result<(), pico2hsm_core::error::HsmError> { Ok(()) }
-        fn wipe_by_owner(&mut self, _: AppletId) -> Result<(), pico2hsm_core::error::HsmError> { Ok(()) }
-        fn enumerate_keys(&self) -> heapless::Vec<KeyId, 64> { heapless::Vec::new() }
+        fn erase_key(&mut self, _: KeyId) -> Result<(), pico2hsm_core::error::HsmError> {
+            Ok(())
+        }
+        fn wipe_all(&mut self) -> Result<(), pico2hsm_core::error::HsmError> {
+            Ok(())
+        }
+        fn wipe_by_owner(&mut self, _: AppletId) -> Result<(), pico2hsm_core::error::HsmError> {
+            Ok(())
+        }
+        fn enumerate_keys(&self) -> heapless::Vec<KeyId, 64> {
+            heapless::Vec::new()
+        }
         fn for_each_key(&self, _f: &mut dyn FnMut(KeyId)) {}
     }
 
@@ -119,9 +137,9 @@ mod tests {
     fn make_apdu(ins: u8, p1: u8, p2: u8, data: &[u8]) -> heapless::Vec<u8, 128> {
         let mut v: heapless::Vec<u8, 128> = heapless::Vec::new();
         v.push(0x00).unwrap(); // CLA
-        v.push(ins).unwrap();  // INS
-        v.push(p1).unwrap();   // P1
-        v.push(p2).unwrap();   // P2
+        v.push(ins).unwrap(); // INS
+        v.push(p1).unwrap(); // P1
+        v.push(p2).unwrap(); // P2
         v.push(data.len() as u8).unwrap(); // Lc
         v.extend_from_slice(data).unwrap();
         v
@@ -139,11 +157,21 @@ mod tests {
         let full_key_id = KeyId::sc_hsm(0, key_proto_ref).0;
 
         // Push metadata into key_index
-        let meta = KeyMeta { key_id: full_key_id, key_type: 0, algo: 0x13, key_flags: 0 };
+        let meta = KeyMeta {
+            key_id: full_key_id,
+            key_type: 0,
+            algo: 0x13,
+            key_flags: 0,
+        };
         state.key_index.push(meta).unwrap();
 
         // Create a KeyObject with fake EC private key
-        let mut key_obj = KeyObject::new(KmType::Ec, full_key_id, AppletId::ScHsm, AlgorithmId::EcdsaP256);
+        let mut key_obj = KeyObject::new(
+            KmType::Ec,
+            full_key_id,
+            AppletId::ScHsm,
+            AlgorithmId::EcdsaP256,
+        );
         for i in 0..32u8 {
             let _ = key_obj.private_key.push(i + 1);
         }
@@ -159,11 +187,21 @@ mod tests {
         let full_key_id = KeyId::sc_hsm(0, key_proto_ref).0;
 
         // Push metadata into key_index
-        let meta = KeyMeta { key_id: full_key_id, key_type: 0, algo: 0x60, key_flags: 0 };
+        let meta = KeyMeta {
+            key_id: full_key_id,
+            key_type: 0,
+            algo: 0x60,
+            key_flags: 0,
+        };
         state.key_index.push(meta).unwrap();
 
         // Create a KeyObject with fake AES-256 key
-        let mut key_obj = KeyObject::new(KmType::Aes, full_key_id, AppletId::ScHsm, AlgorithmId::AesCbc);
+        let mut key_obj = KeyObject::new(
+            KmType::Aes,
+            full_key_id,
+            AppletId::ScHsm,
+            AlgorithmId::AesCbc,
+        );
         for i in 0..32u8 {
             let _ = key_obj.private_key.push(0xA0 ^ i);
         }

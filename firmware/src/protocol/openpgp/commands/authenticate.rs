@@ -5,12 +5,11 @@
 //! Does NOT increment the signature counter.
 
 use pico2hsm_core::apdu::{
-    ApduCommand, ApduResponse, SW_CONDITIONS_NOT_SATISFIED, SW_SECURITY_STATUS,
-    SW_WRONG_DATA,
+    ApduCommand, ApduResponse, SW_CONDITIONS_NOT_SATISFIED, SW_SECURITY_STATUS, SW_WRONG_DATA,
 };
 
-use crate::protocol::openpgp::OpenPgpState;
 use crate::protocol::openpgp::commands::pso::der_to_raw_rs;
+use crate::protocol::openpgp::OpenPgpState;
 
 /// INS byte for INTERNAL AUTHENTICATE.
 pub const INS_AUTHENTICATE: u8 = 0x88;

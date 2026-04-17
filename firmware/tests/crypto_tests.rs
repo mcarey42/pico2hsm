@@ -4,18 +4,17 @@
 //! No embassy-rp, embassy-executor, or embassy-time is imported.
 //! All tests run on x86_64 via `cargo test --test crypto_tests`.
 
-use pico2hsm_firmware::crypto::symmetric::{
-    aes_gcm_decrypt_raw, aes_gcm_encrypt_raw,
-    aes_cbc_decrypt, aes_cbc_encrypt,
+use pico2hsm_core::error::CryptoError;
+use pico2hsm_core::key::{KeyId, KeyMaterial, KeyType};
+use pico2hsm_firmware::crypto::asymmetric::{
+    ecdh_agree, ecdsa_sign, ecdsa_verify, generate_ec_keypair,
 };
 use pico2hsm_firmware::crypto::kdf::{
     hkdf_sha256, pbkdf2_hmac_sha256, slip10_master_key, Slip10Curve,
 };
-use pico2hsm_firmware::crypto::asymmetric::{
-    ecdsa_sign, ecdsa_verify, ecdh_agree, generate_ec_keypair,
+use pico2hsm_firmware::crypto::symmetric::{
+    aes_cbc_decrypt, aes_cbc_encrypt, aes_gcm_decrypt_raw, aes_gcm_encrypt_raw,
 };
-use pico2hsm_core::key::{KeyId, KeyMaterial, KeyType};
-use pico2hsm_core::error::CryptoError;
 
 // ---------------------------------------------------------------------------
 // RNG: deterministic LCG for tests (implements RngCore + CryptoRng marker)
@@ -71,8 +70,8 @@ impl rand_core::CryptoRng for DeterministicRng {}
 fn make_key256(raw: &[u8; 32]) -> KeyMaterial {
     let mut km = KeyMaterial {
         key_type: KeyType::Aes256,
-        key_id:   KeyId(0x0001),
-        raw:      heapless::Vec::new(),
+        key_id: KeyId(0x0001),
+        raw: heapless::Vec::new(),
     };
     km.raw.extend_from_slice(raw).unwrap();
     km
@@ -81,8 +80,8 @@ fn make_key256(raw: &[u8; 32]) -> KeyMaterial {
 fn make_key128(raw: &[u8; 16]) -> KeyMaterial {
     let mut km = KeyMaterial {
         key_type: KeyType::Aes128,
-        key_id:   KeyId(0x0001),
-        raw:      heapless::Vec::new(),
+        key_id: KeyId(0x0001),
+        raw: heapless::Vec::new(),
     };
     km.raw.extend_from_slice(raw).unwrap();
     km
@@ -108,12 +107,15 @@ fn test_aes_gcm_256_empty_plaintext_nist() {
     // Tag = 530f8afbc74536b9a963b4f1c4cb738b
     let key = [0u8; 32];
     let nonce = [0u8; 12];
-    let expected_tag =
-        hex::decode("530f8afbc74536b9a963b4f1c4cb738b").unwrap();
+    let expected_tag = hex::decode("530f8afbc74536b9a963b4f1c4cb738b").unwrap();
 
     let result = aes_gcm_encrypt_raw(&key, &nonce, &[], &[]).unwrap();
     // result = ciphertext(0) || tag(16)
-    assert_eq!(result.len(), 16, "Empty PT should produce only the 16-byte tag");
+    assert_eq!(
+        result.len(),
+        16,
+        "Empty PT should produce only the 16-byte tag"
+    );
     assert_eq!(
         result.as_slice(),
         expected_tag.as_slice(),
@@ -134,10 +136,8 @@ fn test_aes_gcm_256_nist_case2() {
     let nonce = [0u8; 12];
     let pt = [0u8; 16];
 
-    let expected_ct =
-        hex::decode("cea7403d4d606b6e074ec5d3baf39d18").unwrap();
-    let expected_tag =
-        hex::decode("d0d1c8a799996bf0265b98b5d48ab919").unwrap();
+    let expected_ct = hex::decode("cea7403d4d606b6e074ec5d3baf39d18").unwrap();
+    let expected_tag = hex::decode("d0d1c8a799996bf0265b98b5d48ab919").unwrap();
 
     let result = aes_gcm_encrypt_raw(&key, &nonce, &pt, &[]).unwrap();
     assert_eq!(result.len(), 32, "16 bytes PT + 16 bytes tag = 32 bytes");
@@ -237,16 +237,14 @@ fn test_aes_gcm_roundtrip_with_aad() {
 /// Source: NIST SP 800-38A, Section F.2.1
 #[test]
 fn test_aes_128_cbc_encrypt_nist_sp800_38a() {
-    let key_raw: [u8; 16] =
-        hex::decode("2b7e151628aed2a6abf7158809cf4f3c")
-            .unwrap()
-            .try_into()
-            .unwrap();
-    let iv: [u8; 16] =
-        hex::decode("000102030405060708090a0b0c0d0e0f")
-            .unwrap()
-            .try_into()
-            .unwrap();
+    let key_raw: [u8; 16] = hex::decode("2b7e151628aed2a6abf7158809cf4f3c")
+        .unwrap()
+        .try_into()
+        .unwrap();
+    let iv: [u8; 16] = hex::decode("000102030405060708090a0b0c0d0e0f")
+        .unwrap()
+        .try_into()
+        .unwrap();
     let pt = hex::decode("6bc1bee22e409f96e93d7e117393172a").unwrap();
     let expected_ct = hex::decode("7649abac8119b246cee98e9b12e9197d").unwrap();
 
@@ -324,12 +322,13 @@ fn test_aes_cbc_wrong_key_fails_to_decrypt_correctly() {
 /// OKM  = 3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865
 #[test]
 fn test_hkdf_sha256_rfc5869_case1() {
-    let ikm  = hex::decode("0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b").unwrap();
+    let ikm = hex::decode("0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b").unwrap();
     let salt = hex::decode("000102030405060708090a0b0c").unwrap();
     let info = hex::decode("f0f1f2f3f4f5f6f7f8f9").unwrap();
     let expected_okm = hex::decode(
         "3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865",
-    ).unwrap();
+    )
+    .unwrap();
 
     let mut out = [0u8; 42];
     hkdf_sha256(&salt, &ikm, &info, &mut out).unwrap();
@@ -349,7 +348,7 @@ fn test_hkdf_sha256_rfc5869_case1() {
 /// OKM  = b11e398dc80327a1c8e7f78c596a49344f012eda2d4efad8a050cc4c19afa97c59045a99cac7827271cb41c65e590e09da3275600c2f09b8367793a9aca3db71cc30c58179ec3e87c14c01d5c1f3434f1d87
 #[test]
 fn test_hkdf_sha256_rfc5869_case2() {
-    let ikm: Vec<u8>  = (0x00u8..=0x4f).collect();
+    let ikm: Vec<u8> = (0x00u8..=0x4f).collect();
     let salt: Vec<u8> = (0x60u8..=0xaf).collect();
     let info: Vec<u8> = (0xb0u8..=0xff).collect();
     let expected_okm = hex::decode(
@@ -377,7 +376,8 @@ fn test_hkdf_sha256_rfc5869_case3_no_salt() {
     let ikm = hex::decode("0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b").unwrap();
     let expected_okm = hex::decode(
         "8da4e775a563c18f715f802a063c5a31b8a11f5c5ee1879ec3454e5f3c738d2d9d201395faa4b61a96c8",
-    ).unwrap();
+    )
+    .unwrap();
 
     let mut out = [0u8; 42];
     // Empty salt → HKDF uses zero-filled salt of hash-length per RFC 5869 §2.2
@@ -407,20 +407,15 @@ fn test_pbkdf2_sha256_basic() {
     // Source: https://www.ietf.org/rfc/rfc7914.txt / NIST test vectors
     // c=1: single iteration
     let password = b"password";
-    let salt     = b"salt";
+    let salt = b"salt";
     let c = 1u32;
-    let expected = hex::decode(
-        "120fb6cffcf8b32c43e7225256c4f837a86548c92ccc35480805987cb70be17b",
-    ).unwrap();
+    let expected =
+        hex::decode("120fb6cffcf8b32c43e7225256c4f837a86548c92ccc35480805987cb70be17b").unwrap();
 
     let mut out = [0u8; 32];
     pbkdf2_hmac_sha256(password, salt, c, &mut out).unwrap();
 
-    assert_eq!(
-        &out,
-        expected.as_slice(),
-        "PBKDF2-HMAC-SHA256 c=1 mismatch"
-    );
+    assert_eq!(&out, expected.as_slice(), "PBKDF2-HMAC-SHA256 c=1 mismatch");
 }
 
 /// PBKDF2-HMAC-SHA256 determinism: same inputs → same output.
@@ -442,7 +437,10 @@ fn test_pbkdf2_sha256_different_passwords() {
     pbkdf2_hmac_sha256(b"password1", b"salt", 1000, &mut out1).unwrap();
     pbkdf2_hmac_sha256(b"password2", b"salt", 1000, &mut out2).unwrap();
 
-    assert_ne!(out1, out2, "Different passwords must produce different derived keys");
+    assert_ne!(
+        out1, out2,
+        "Different passwords must produce different derived keys"
+    );
 }
 
 /// PBKDF2-HMAC-SHA256 different salts → different keys.
@@ -453,7 +451,10 @@ fn test_pbkdf2_sha256_different_salts() {
     pbkdf2_hmac_sha256(b"password", b"salt1", 1000, &mut out1).unwrap();
     pbkdf2_hmac_sha256(b"password", b"salt2", 1000, &mut out2).unwrap();
 
-    assert_ne!(out1, out2, "Different salts must produce different derived keys");
+    assert_ne!(
+        out1, out2,
+        "Different salts must produce different derived keys"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -469,21 +470,14 @@ fn test_ecdsa_p256_sign_verify_roundtrip() {
     // Use a 32-byte pre-hash (as if SHA-256 was applied to a message)
     let hash = [0xABu8; 32];
 
-    let sig = ecdsa_sign(
-        KeyType::EcPrivateP256,
-        &pair.private_key,
-        &hash,
-        &mut rng,
-    ).unwrap();
+    let sig = ecdsa_sign(KeyType::EcPrivateP256, &pair.private_key, &hash, &mut rng).unwrap();
 
-    let valid = ecdsa_verify(
-        KeyType::EcPrivateP256,
-        &pair.public_key,
-        &hash,
-        &sig,
-    ).unwrap();
+    let valid = ecdsa_verify(KeyType::EcPrivateP256, &pair.public_key, &hash, &sig).unwrap();
 
-    assert!(valid, "ECDSA P-256 signature must verify against own public key");
+    assert!(
+        valid,
+        "ECDSA P-256 signature must verify against own public key"
+    );
 }
 
 /// ECDSA P-256: verify fails for a different hash.
@@ -492,22 +486,18 @@ fn test_ecdsa_p256_wrong_hash_fails() {
     let mut rng = DeterministicRng::seeded(0x1234_5678u64);
     let pair = generate_ec_keypair(KeyType::EcPrivateP256, &mut rng).unwrap();
 
-    let hash         = [0x01u8; 32];
+    let hash = [0x01u8; 32];
     let different_hash = [0x02u8; 32];
 
-    let sig = ecdsa_sign(
-        KeyType::EcPrivateP256,
-        &pair.private_key,
-        &hash,
-        &mut rng,
-    ).unwrap();
+    let sig = ecdsa_sign(KeyType::EcPrivateP256, &pair.private_key, &hash, &mut rng).unwrap();
 
     let valid = ecdsa_verify(
         KeyType::EcPrivateP256,
         &pair.public_key,
         &different_hash,
         &sig,
-    ).unwrap();
+    )
+    .unwrap();
 
     assert!(!valid, "ECDSA verify must fail for a different hash");
 }
@@ -520,22 +510,15 @@ fn test_ecdsa_p256_wrong_pubkey_fails() {
     let pair2 = generate_ec_keypair(KeyType::EcPrivateP256, &mut rng).unwrap();
 
     let hash = [0x55u8; 32];
-    let sig = ecdsa_sign(
-        KeyType::EcPrivateP256,
-        &pair1.private_key,
-        &hash,
-        &mut rng,
-    ).unwrap();
+    let sig = ecdsa_sign(KeyType::EcPrivateP256, &pair1.private_key, &hash, &mut rng).unwrap();
 
     // Verify with pair2's public key — should fail
-    let valid = ecdsa_verify(
-        KeyType::EcPrivateP256,
-        &pair2.public_key,
-        &hash,
-        &sig,
-    ).unwrap();
+    let valid = ecdsa_verify(KeyType::EcPrivateP256, &pair2.public_key, &hash, &sig).unwrap();
 
-    assert!(!valid, "Signature must not verify with a different public key");
+    assert!(
+        !valid,
+        "Signature must not verify with a different public key"
+    );
 }
 
 /// ECDSA P-384: generate keypair, sign, verify.
@@ -547,19 +530,9 @@ fn test_ecdsa_p384_sign_verify_roundtrip() {
     // Use 48-byte pre-hash (matching P-384 field size)
     let hash = [0x77u8; 48];
 
-    let sig = ecdsa_sign(
-        KeyType::EcPrivateP384,
-        &pair.private_key,
-        &hash,
-        &mut rng,
-    ).unwrap();
+    let sig = ecdsa_sign(KeyType::EcPrivateP384, &pair.private_key, &hash, &mut rng).unwrap();
 
-    let valid = ecdsa_verify(
-        KeyType::EcPrivateP384,
-        &pair.public_key,
-        &hash,
-        &sig,
-    ).unwrap();
+    let valid = ecdsa_verify(KeyType::EcPrivateP384, &pair.public_key, &hash, &sig).unwrap();
 
     assert!(valid, "ECDSA P-384 signature must verify");
 }
@@ -571,19 +544,9 @@ fn test_ecdsa_k256_sign_verify_roundtrip() {
     let pair = generate_ec_keypair(KeyType::EcPrivateK256, &mut rng).unwrap();
 
     let hash = [0x3Cu8; 32];
-    let sig = ecdsa_sign(
-        KeyType::EcPrivateK256,
-        &pair.private_key,
-        &hash,
-        &mut rng,
-    ).unwrap();
+    let sig = ecdsa_sign(KeyType::EcPrivateK256, &pair.private_key, &hash, &mut rng).unwrap();
 
-    let valid = ecdsa_verify(
-        KeyType::EcPrivateK256,
-        &pair.public_key,
-        &hash,
-        &sig,
-    ).unwrap();
+    let valid = ecdsa_verify(KeyType::EcPrivateK256, &pair.public_key, &hash, &sig).unwrap();
 
     assert!(valid, "ECDSA K-256 signature must verify");
 }
@@ -597,21 +560,13 @@ fn test_ecdsa_k256_sign_verify_roundtrip() {
 fn test_ecdh_p256_shared_secret_symmetric() {
     let mut rng = DeterministicRng::seeded(0xEC_D_CAFE_BABEu64);
     let alice = generate_ec_keypair(KeyType::EcPrivateP256, &mut rng).unwrap();
-    let bob   = generate_ec_keypair(KeyType::EcPrivateP256, &mut rng).unwrap();
+    let bob = generate_ec_keypair(KeyType::EcPrivateP256, &mut rng).unwrap();
 
     // Alice computes shared secret using her private key and Bob's public key
-    let ss_alice = ecdh_agree(
-        KeyType::EcPrivateP256,
-        &alice.private_key,
-        &bob.public_key,
-    ).unwrap();
+    let ss_alice = ecdh_agree(KeyType::EcPrivateP256, &alice.private_key, &bob.public_key).unwrap();
 
     // Bob computes shared secret using his private key and Alice's public key
-    let ss_bob = ecdh_agree(
-        KeyType::EcPrivateP256,
-        &bob.private_key,
-        &alice.public_key,
-    ).unwrap();
+    let ss_bob = ecdh_agree(KeyType::EcPrivateP256, &bob.private_key, &alice.public_key).unwrap();
 
     assert_eq!(
         ss_alice.as_slice(),
@@ -625,20 +580,18 @@ fn test_ecdh_p256_shared_secret_symmetric() {
 fn test_ecdh_p256_different_parties_different_secrets() {
     let mut rng = DeterministicRng::seeded(0xABCDu64);
     let alice = generate_ec_keypair(KeyType::EcPrivateP256, &mut rng).unwrap();
-    let bob   = generate_ec_keypair(KeyType::EcPrivateP256, &mut rng).unwrap();
+    let bob = generate_ec_keypair(KeyType::EcPrivateP256, &mut rng).unwrap();
     let carol = generate_ec_keypair(KeyType::EcPrivateP256, &mut rng).unwrap();
 
-    let ss_alice_bob = ecdh_agree(
-        KeyType::EcPrivateP256,
-        &alice.private_key,
-        &bob.public_key,
-    ).unwrap();
+    let ss_alice_bob =
+        ecdh_agree(KeyType::EcPrivateP256, &alice.private_key, &bob.public_key).unwrap();
 
     let ss_alice_carol = ecdh_agree(
         KeyType::EcPrivateP256,
         &alice.private_key,
         &carol.public_key,
-    ).unwrap();
+    )
+    .unwrap();
 
     assert_ne!(
         ss_alice_bob.as_slice(),
@@ -652,10 +605,10 @@ fn test_ecdh_p256_different_parties_different_secrets() {
 fn test_ecdh_p384_shared_secret_symmetric() {
     let mut rng = DeterministicRng::seeded(0x3848u64);
     let alice = generate_ec_keypair(KeyType::EcPrivateP384, &mut rng).unwrap();
-    let bob   = generate_ec_keypair(KeyType::EcPrivateP384, &mut rng).unwrap();
+    let bob = generate_ec_keypair(KeyType::EcPrivateP384, &mut rng).unwrap();
 
     let ss_alice = ecdh_agree(KeyType::EcPrivateP384, &alice.private_key, &bob.public_key).unwrap();
-    let ss_bob   = ecdh_agree(KeyType::EcPrivateP384, &bob.private_key, &alice.public_key).unwrap();
+    let ss_bob = ecdh_agree(KeyType::EcPrivateP384, &bob.private_key, &alice.public_key).unwrap();
 
     assert_eq!(
         ss_alice.as_slice(),
@@ -678,12 +631,10 @@ fn test_ecdh_p384_shared_secret_symmetric() {
 fn test_slip10_secp256k1_vector1_master() {
     let seed = hex::decode("000102030405060708090a0b0c0d0e0f").unwrap();
 
-    let expected_key = hex::decode(
-        "e8f32e723decf4051aefac8e2c93c9c5b214313817cdb01a1494b917c8436b35",
-    ).unwrap();
-    let expected_chain = hex::decode(
-        "873dff81c02f525623fd1fe5167eac3a55a049de3d314bb42ee227ffed37d508",
-    ).unwrap();
+    let expected_key =
+        hex::decode("e8f32e723decf4051aefac8e2c93c9c5b214313817cdb01a1494b917c8436b35").unwrap();
+    let expected_chain =
+        hex::decode("873dff81c02f525623fd1fe5167eac3a55a049de3d314bb42ee227ffed37d508").unwrap();
 
     let (key, chain) = slip10_master_key(&seed, Slip10Curve::Secp256k1).unwrap();
 
@@ -709,12 +660,10 @@ fn test_slip10_secp256k1_vector1_master() {
 fn test_slip10_nist256p1_vector1_master() {
     let seed = hex::decode("000102030405060708090a0b0c0d0e0f").unwrap();
 
-    let expected_key = hex::decode(
-        "612091aaa12e22dd2abef664f8a01a82cae99ad7441b7ef8110424915c268bc2",
-    ).unwrap();
-    let expected_chain = hex::decode(
-        "beeb672fe4621673f722f38529c07392fecaa61015c80c34f29ce8b41b3cb6ea",
-    ).unwrap();
+    let expected_key =
+        hex::decode("612091aaa12e22dd2abef664f8a01a82cae99ad7441b7ef8110424915c268bc2").unwrap();
+    let expected_chain =
+        hex::decode("beeb672fe4621673f722f38529c07392fecaa61015c80c34f29ce8b41b3cb6ea").unwrap();
 
     let (key, chain) = slip10_master_key(&seed, Slip10Curve::Nist256p1).unwrap();
 
@@ -742,12 +691,10 @@ fn test_slip10_secp256k1_vector2_master() {
         "fffcf9f6f3f0edeae7e4e1dedbd8d5d2cfccc9c6c3c0bdbab7b4b1aeaba8a5a29f9c999693908d8a8784817e7b7875726f6c696663605d5a5754514e4b484542",
     ).unwrap();
 
-    let expected_key = hex::decode(
-        "4b03d6fc340455b363f51020ad3ecca4f0850280cf436c70c727923f6db46c3e",
-    ).unwrap();
-    let expected_chain = hex::decode(
-        "60499f801b896d83179a4374aeb7822aaeaceaa0db1f85ee3e904c4defbd9689",
-    ).unwrap();
+    let expected_key =
+        hex::decode("4b03d6fc340455b363f51020ad3ecca4f0850280cf436c70c727923f6db46c3e").unwrap();
+    let expected_chain =
+        hex::decode("60499f801b896d83179a4374aeb7822aaeaceaa0db1f85ee3e904c4defbd9689").unwrap();
 
     let (key, chain) = slip10_master_key(&seed, Slip10Curve::Secp256k1).unwrap();
 
@@ -773,12 +720,10 @@ fn test_slip10_secp256k1_vector2_master() {
 fn test_slip10_ed25519_vector1_master() {
     let seed = hex::decode("000102030405060708090a0b0c0d0e0f").unwrap();
 
-    let expected_key = hex::decode(
-        "2b4be7f19ee27bbf30c667b642d5f4aa69fd169872f8fc3059c08ebae2eb19e7",
-    ).unwrap();
-    let expected_chain = hex::decode(
-        "90046a93de5380a72b5e45010748567d5ea02bbf6522f979e05c0d8d8ca9fffb",
-    ).unwrap();
+    let expected_key =
+        hex::decode("2b4be7f19ee27bbf30c667b642d5f4aa69fd169872f8fc3059c08ebae2eb19e7").unwrap();
+    let expected_chain =
+        hex::decode("90046a93de5380a72b5e45010748567d5ea02bbf6522f979e05c0d8d8ca9fffb").unwrap();
 
     let (key, chain) = slip10_master_key(&seed, Slip10Curve::Ed25519).unwrap();
 
@@ -799,10 +744,7 @@ fn test_slip10_ed25519_vector1_master() {
 fn test_slip10_seed_too_short_fails() {
     let short_seed = [0u8; 15]; // minimum is 16 bytes
     let result = slip10_master_key(&short_seed, Slip10Curve::Secp256k1);
-    assert!(
-        result.is_err(),
-        "SLIP-10 with 15-byte seed must fail"
-    );
+    assert!(result.is_err(), "SLIP-10 with 15-byte seed must fail");
 }
 
 /// SLIP-0010: invalid seed (too long) returns Err.
@@ -810,10 +752,7 @@ fn test_slip10_seed_too_short_fails() {
 fn test_slip10_seed_too_long_fails() {
     let long_seed = [0u8; 65]; // maximum is 64 bytes
     let result = slip10_master_key(&long_seed, Slip10Curve::Secp256k1);
-    assert!(
-        result.is_err(),
-        "SLIP-10 with 65-byte seed must fail"
-    );
+    assert!(result.is_err(), "SLIP-10 with 65-byte seed must fail");
 }
 
 // ---------------------------------------------------------------------------
@@ -825,9 +764,20 @@ fn test_generate_p256_keypair_sizes() {
     let mut rng = DeterministicRng::seeded(0x1111u64);
     let pair = generate_ec_keypair(KeyType::EcPrivateP256, &mut rng).unwrap();
 
-    assert_eq!(pair.private_key.len(), 32, "P-256 private key must be 32 bytes");
-    assert_eq!(pair.public_key.len(), 65, "P-256 uncompressed public key must be 65 bytes");
-    assert_eq!(pair.public_key[0], 0x04, "Uncompressed point must start with 0x04");
+    assert_eq!(
+        pair.private_key.len(),
+        32,
+        "P-256 private key must be 32 bytes"
+    );
+    assert_eq!(
+        pair.public_key.len(),
+        65,
+        "P-256 uncompressed public key must be 65 bytes"
+    );
+    assert_eq!(
+        pair.public_key[0], 0x04,
+        "Uncompressed point must start with 0x04"
+    );
 }
 
 #[test]
@@ -835,9 +785,20 @@ fn test_generate_p384_keypair_sizes() {
     let mut rng = DeterministicRng::seeded(0x2222u64);
     let pair = generate_ec_keypair(KeyType::EcPrivateP384, &mut rng).unwrap();
 
-    assert_eq!(pair.private_key.len(), 48, "P-384 private key must be 48 bytes");
-    assert_eq!(pair.public_key.len(), 97, "P-384 uncompressed public key must be 97 bytes");
-    assert_eq!(pair.public_key[0], 0x04, "Uncompressed point must start with 0x04");
+    assert_eq!(
+        pair.private_key.len(),
+        48,
+        "P-384 private key must be 48 bytes"
+    );
+    assert_eq!(
+        pair.public_key.len(),
+        97,
+        "P-384 uncompressed public key must be 97 bytes"
+    );
+    assert_eq!(
+        pair.public_key[0], 0x04,
+        "Uncompressed point must start with 0x04"
+    );
 }
 
 #[test]
@@ -845,8 +806,16 @@ fn test_generate_k256_keypair_sizes() {
     let mut rng = DeterministicRng::seeded(0x3333u64);
     let pair = generate_ec_keypair(KeyType::EcPrivateK256, &mut rng).unwrap();
 
-    assert_eq!(pair.private_key.len(), 32, "K-256 private key must be 32 bytes");
-    assert_eq!(pair.public_key.len(), 65, "K-256 uncompressed public key must be 65 bytes");
+    assert_eq!(
+        pair.private_key.len(),
+        32,
+        "K-256 private key must be 32 bytes"
+    );
+    assert_eq!(
+        pair.public_key.len(),
+        65,
+        "K-256 uncompressed public key must be 65 bytes"
+    );
 }
 
 #[test]
@@ -858,4 +827,3 @@ fn test_generate_brainpool_not_supported() {
         "Brainpool key generation must return UnsupportedAlgorithm (not yet implemented)"
     );
 }
-

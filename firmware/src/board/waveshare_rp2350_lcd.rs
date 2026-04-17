@@ -271,12 +271,12 @@ pub struct Grb(pub u8, pub u8, pub u8); // (G, R, B)
 
 impl Grb {
     pub const OFF: Self = Self(0, 0, 0);
-    pub const READY: Self = Self(8, 0, 0);      // dim green
-    pub const BUSY: Self = Self(0, 0, 8);       // dim blue
-    pub const ERROR: Self = Self(0, 8, 0);      // dim red
-    pub const DEGRADED: Self = Self(8, 8, 0);   // dim yellow  (G+R)
-    pub const RESYNCING: Self = Self(8, 0, 8);  // dim cyan    (G+B)
-    pub const WAITING: Self = Self(0, 0, 24);   // brighter blue
+    pub const READY: Self = Self(8, 0, 0); // dim green
+    pub const BUSY: Self = Self(0, 0, 8); // dim blue
+    pub const ERROR: Self = Self(0, 8, 0); // dim red
+    pub const DEGRADED: Self = Self(8, 8, 0); // dim yellow  (G+R)
+    pub const RESYNCING: Self = Self(8, 0, 8); // dim cyan    (G+B)
+    pub const WAITING: Self = Self(0, 0, 24); // brighter blue
 }
 
 /// Map a `LedStatus` to an RGB565 LCD fill colour and a WS2812B GRB tuple.
@@ -332,7 +332,9 @@ pub struct St7789V3StatusDisplay {
 
 impl St7789V3StatusDisplay {
     pub fn new() -> Self {
-        Self { current_status: LedStatus::Off }
+        Self {
+            current_status: LedStatus::Off,
+        }
     }
 }
 
@@ -374,7 +376,10 @@ static mut FRAMEBUF: [u8; FB_W * FB_H * 3 / 2] = [0u8; FB_W * FB_H * 3 / 2];
 use embedded_graphics::{
     draw_target::DrawTarget,
     geometry::{OriginDimensions, Size},
-    pixelcolor::{Rgb565, raw::{RawData, RawU16}},
+    pixelcolor::{
+        raw::{RawData, RawU16},
+        Rgb565,
+    },
     primitives::Rectangle,
     Pixel,
 };
@@ -429,11 +434,7 @@ impl DrawTarget for St7789V3StatusDisplay {
         // SAFETY: FRAMEBUF is only accessed from core0 display code; no concurrent access.
         let fb = unsafe { &mut *(&raw mut FRAMEBUF) };
         for Pixel(coord, color) in pixels {
-            if coord.x < 0
-                || coord.y < 0
-                || coord.x >= FB_W as i32
-                || coord.y >= FB_H as i32
-            {
+            if coord.x < 0 || coord.y < 0 || coord.x >= FB_W as i32 || coord.y >= FB_H as i32 {
                 continue;
             }
             let (r, g, b) = rgb565_to_rgb444(color);
@@ -456,16 +457,21 @@ impl DrawTarget for St7789V3StatusDisplay {
         let fb = unsafe { &mut *(&raw mut FRAMEBUF) };
         let x0 = area.top_left.x as usize;
         let y0 = area.top_left.y as usize;
-        let w  = area.size.width as usize;
+        let w = area.size.width as usize;
         let mut col = 0usize;
         let mut row = 0usize;
         for color in colors {
-            if row >= area.size.height as usize { break; }
+            if row >= area.size.height as usize {
+                break;
+            }
             let (r, g, b) = rgb565_to_rgb444(color);
             let linear = (y0 + row) * FB_W + (x0 + col);
             pack_pixel_444(fb, linear, r, g, b);
             col += 1;
-            if col >= w { col = 0; row += 1; }
+            if col >= w {
+                col = 0;
+                row += 1;
+            }
         }
         Ok(())
     }
@@ -481,8 +487,8 @@ impl DrawTarget for St7789V3StatusDisplay {
         let fb = unsafe { &mut *(&raw mut FRAMEBUF) };
         let x0 = area.top_left.x as usize;
         let y0 = area.top_left.y as usize;
-        let w  = area.size.width as usize;
-        let h  = area.size.height as usize;
+        let w = area.size.width as usize;
+        let h = area.size.height as usize;
         for row in y0..(y0 + h) {
             for col in 0..w {
                 let linear = row * FB_W + (x0 + col);
@@ -664,14 +670,30 @@ fn lcd_set_window(
     x1: u16,
     y1: u16,
 ) {
-    lcd_cmd_data(spi, dc, cs, CMD_CASET, &[
-        (x0 >> 8) as u8, (x0 & 0xFF) as u8,
-        (x1 >> 8) as u8, (x1 & 0xFF) as u8,
-    ]);
-    lcd_cmd_data(spi, dc, cs, CMD_RASET, &[
-        (y0 >> 8) as u8, (y0 & 0xFF) as u8,
-        (y1 >> 8) as u8, (y1 & 0xFF) as u8,
-    ]);
+    lcd_cmd_data(
+        spi,
+        dc,
+        cs,
+        CMD_CASET,
+        &[
+            (x0 >> 8) as u8,
+            (x0 & 0xFF) as u8,
+            (x1 >> 8) as u8,
+            (x1 & 0xFF) as u8,
+        ],
+    );
+    lcd_cmd_data(
+        spi,
+        dc,
+        cs,
+        CMD_RASET,
+        &[
+            (y0 >> 8) as u8,
+            (y0 & 0xFF) as u8,
+            (y1 >> 8) as u8,
+            (y1 & 0xFF) as u8,
+        ],
+    );
 }
 
 /// Flood-fill the entire LCD with a single RGB565 colour (converted to RGB444).
@@ -703,8 +725,8 @@ pub async fn fill_screen(
 
     // Convert RGB565 to RGB444: extract top 4 bits of each channel.
     let r = ((color >> 12) & 0x0F) as u8;
-    let g = ((color >> 7)  & 0x0F) as u8;
-    let b = ((color >> 1)  & 0x0F) as u8;
+    let g = ((color >> 7) & 0x0F) as u8;
+    let b = ((color >> 1) & 0x0F) as u8;
 
     // Pack two identical pixels into 3 bytes (RGB444 Interface II):
     //   Byte 0: R1G1, Byte 1: B1R2, Byte 2: G2B2
@@ -716,7 +738,7 @@ pub async fn fill_screen(
     // Each chunk yields to the executor, keeping USB serviced.
     let mut chunk = [0u8; 192]; // 64 pixel pairs × 3 bytes = 192 bytes
     for i in 0..64 {
-        chunk[i * 3]     = byte0;
+        chunk[i * 3] = byte0;
         chunk[i * 3 + 1] = byte1;
         chunk[i * 3 + 2] = byte2;
     }
@@ -809,8 +831,12 @@ pub async fn init_lcd(
         let total_bytes: u32 = LCD_WIDTH as u32 * CTRL_HEIGHT as u32 * 3 / 2; // 115 200
         let full_chunks = total_bytes / 192;
         let remainder = (total_bytes % 192) as usize;
-        for _ in 0..full_chunks { let _ = spi.write(&chunk).await; }
-        if remainder > 0 { let _ = spi.write(&chunk[..remainder]).await; }
+        for _ in 0..full_chunks {
+            let _ = spi.write(&chunk).await;
+        }
+        if remainder > 0 {
+            let _ = spi.write(&chunk[..remainder]).await;
+        }
         cs.set_high();
     }
 
@@ -975,8 +1001,8 @@ where
         // WS2812B LEDs expect GRB byte order on the wire, so place G in the
         // r-slot, R in the g-slot, and B in the b-slot.
         let rgb_bytes: [u8; 3] = [grb.0, grb.1, grb.2]; // [G, R, B] → wire GRB
-        // SAFETY: `smart_leds::RGB8` is `#[repr(C)]` with fields `r, g, b: u8`
-        // in that order, making it layout-identical to `[u8; 3]`.
+                                                        // SAFETY: `smart_leds::RGB8` is `#[repr(C)]` with fields `r, g, b: u8`
+                                                        // in that order, making it layout-identical to `[u8; 3]`.
         let pixels: [_; 1] = [unsafe { core::mem::transmute::<[u8; 3], _>(rgb_bytes) }];
         self.inner.write(&pixels).await;
     }

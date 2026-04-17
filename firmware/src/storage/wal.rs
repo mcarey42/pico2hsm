@@ -69,7 +69,10 @@ impl<'a, C: FlashChip> Wal<'a, C> {
     /// The active slot is initialised to 0; `scan_and_replay` should be
     /// called immediately after construction during boot.
     pub fn new(chip: &'a mut C) -> Self {
-        Wal { chip, active_slot: 0 }
+        Wal {
+            chip,
+            active_slot: 0,
+        }
     }
 
     // ── Helper: sector address from slot index ───────────────────────────────
@@ -77,7 +80,11 @@ impl<'a, C: FlashChip> Wal<'a, C> {
     /// Byte address on the chip for the WAL slot (`WAL_SECTOR_0` or
     /// `WAL_SECTOR_1`).
     fn slot_addr(slot: u8) -> u32 {
-        let sector = if slot == 0 { WAL_SECTOR_0 } else { WAL_SECTOR_1 };
+        let sector = if slot == 0 {
+            WAL_SECTOR_0
+        } else {
+            WAL_SECTOR_1
+        };
         sector * SECTOR_SIZE as u32
     }
 
@@ -149,8 +156,7 @@ impl<'a, C: FlashChip> Wal<'a, C> {
         hdr[OFF_MAGIC..OFF_MAGIC + 4].copy_from_slice(&WAL_MAGIC);
         hdr[OFF_STATUS] = WAL_STATUS_PENDING;
         // bytes [5..8] = 0x00 (reserved, already zero)
-        hdr[OFF_TARGET_SECTOR..OFF_TARGET_SECTOR + 4]
-            .copy_from_slice(&target_sector.to_le_bytes());
+        hdr[OFF_TARGET_SECTOR..OFF_TARGET_SECTOR + 4].copy_from_slice(&target_sector.to_le_bytes());
         hdr[OFF_CRC32..OFF_CRC32 + 4].copy_from_slice(&payload_crc32.to_le_bytes());
         self.chip.write_page(addr, &hdr[..PAGE_SIZE])
     }
@@ -247,10 +253,7 @@ impl<'a, C: FlashChip> Wal<'a, C> {
                 }
                 WAL_STATUS_PENDING => {
                     // Interrupted before commit — safe to discard.
-                    defmt::warn!(
-                        "WAL: discarding uncommitted pending entry in slot {}",
-                        slot,
-                    );
+                    defmt::warn!("WAL: discarding uncommitted pending entry in slot {}", slot,);
                     self.erase_slot(slot)?;
                     return Ok(WalRecovery::RolledBack);
                 }

@@ -25,14 +25,17 @@ use embassy_rp::gpio::Output;
 
 #[cfg(target_arch = "arm")]
 use crate::storage::{
-    AnyChip,
     flash_chip::{QmiFlash, SpiFlash},
+    AnyChip,
 };
 
-#[cfg(all(target_arch = "arm", any(
-    feature = "waveshare_rp2350_lcd_sdcard",
-    feature = "rp2350_geek_sdcard",
-)))]
+#[cfg(all(
+    target_arch = "arm",
+    any(
+        feature = "waveshare_rp2350_lcd_sdcard",
+        feature = "rp2350_geek_sdcard",
+    )
+))]
 use crate::storage::sdcard::SdCardFlash;
 
 // ── pico2_4m ─────────────────────────────────────────────────────────────────

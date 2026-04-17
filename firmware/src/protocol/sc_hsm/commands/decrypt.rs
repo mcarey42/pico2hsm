@@ -68,7 +68,11 @@ fn is_ec_private(kt: KeyType) -> bool {
 }
 
 /// Handle a DECIPHER APDU command.
-pub fn handle(state: &mut ScHsmState, store: &mut dyn KeyStore, cmd: &ApduCommand<'_>) -> ApduResponse {
+pub fn handle(
+    state: &mut ScHsmState,
+    store: &mut dyn KeyStore,
+    cmd: &ApduCommand<'_>,
+) -> ApduResponse {
     // Require PIN authentication
     if !state.pin_verified {
         return ApduResponse::err(SW_SECURITY_STATUS);
@@ -167,14 +171,11 @@ pub fn handle(state: &mut ScHsmState, store: &mut dyn KeyStore, cmd: &ApduComman
     let priv_len = key_obj.private_key.len();
     priv_buf[..priv_len].copy_from_slice(&key_obj.private_key);
 
-    let shared = match crate::crypto::asymmetric::ecdh_agree(
-        key_type,
-        &priv_buf[..priv_len],
-        cmd.data,
-    ) {
-        Ok(s) => s,
-        Err(_) => return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
-    };
+    let shared =
+        match crate::crypto::asymmetric::ecdh_agree(key_type, &priv_buf[..priv_len], cmd.data) {
+            Ok(s) => s,
+            Err(_) => return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
+        };
 
     if needs_04_prefix {
         // Prepend 0x04 so OpenSC can strip it and get the exact field-size

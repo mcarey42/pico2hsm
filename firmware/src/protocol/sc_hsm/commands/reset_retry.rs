@@ -7,8 +7,8 @@
 //! Requires SO-PIN or PUK authentication.
 
 use pico2hsm_core::apdu::{
-    ApduCommand, ApduResponse, SW_INS_NOT_SUPPORTED, SW_SECURITY_STATUS, SW_WRONG_DATA,
-    SW_WRONG_LENGTH, SW_OK,
+    ApduCommand, ApduResponse, SW_INS_NOT_SUPPORTED, SW_OK, SW_SECURITY_STATUS, SW_WRONG_DATA,
+    SW_WRONG_LENGTH,
 };
 
 use crate::protocol::sc_hsm::ScHsmState;
@@ -33,7 +33,11 @@ fn hash_pin_pbkdf2(pin: &[u8], salt: &[u8; 16]) -> [u8; 32] {
 }
 
 /// Handle a RESET RETRY COUNTER APDU command with flash persistence.
-pub fn handle_with_store(state: &mut ScHsmState, store: &mut dyn crate::storage::KeyStore, cmd: &ApduCommand<'_>) -> ApduResponse {
+pub fn handle_with_store(
+    state: &mut ScHsmState,
+    store: &mut dyn crate::storage::KeyStore,
+    cmd: &ApduCommand<'_>,
+) -> ApduResponse {
     let resp = handle(state, cmd);
     if resp.sw == pico2hsm_core::apdu::SW_OK {
         crate::protocol::sc_hsm::ScHsm::save_pin_to_store(state, store);

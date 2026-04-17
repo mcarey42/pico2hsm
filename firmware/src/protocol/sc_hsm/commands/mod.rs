@@ -11,8 +11,8 @@
 pub mod bip_slip;
 pub mod challenge;
 pub mod change_pin;
-pub mod create_file;
 pub mod cipher_sym;
+pub mod create_file;
 #[cfg(feature = "debug")]
 pub mod debug_dump;
 pub mod decrypt;

@@ -11,13 +11,13 @@
 use subtle::ConstantTimeEq;
 
 use pico2hsm_core::apdu::{
-    ApduCommand, ApduResponse, SW_AUTH_BLOCKED, SW_SECURITY_STATUS, SW_WRONG_DATA,
-    SW_WRONG_LENGTH, SW_OK,
+    ApduCommand, ApduResponse, SW_AUTH_BLOCKED, SW_OK, SW_SECURITY_STATUS, SW_WRONG_DATA,
+    SW_WRONG_LENGTH,
 };
 
+use super::verify::{P2_SO_PIN, P2_USER_PIN};
 use crate::protocol::sc_hsm::ScHsmState;
 use crate::security::pin::PinState;
-use super::verify::{P2_USER_PIN, P2_SO_PIN};
 
 /// INS byte for CHANGE REFERENCE DATA.
 pub const INS_CHANGE_PIN: u8 = 0x24;
@@ -62,7 +62,11 @@ fn find_tlv<'a>(data: &'a [u8], tag: u8) -> Option<&'a [u8]> {
 }
 
 /// Handle a CHANGE REFERENCE DATA APDU command with flash persistence.
-pub fn handle_with_store(state: &mut ScHsmState, store: &mut dyn crate::storage::KeyStore, cmd: &ApduCommand<'_>) -> ApduResponse {
+pub fn handle_with_store(
+    state: &mut ScHsmState,
+    store: &mut dyn crate::storage::KeyStore,
+    cmd: &ApduCommand<'_>,
+) -> ApduResponse {
     let resp = handle(state, cmd);
     if resp.sw == SW_OK {
         crate::protocol::sc_hsm::ScHsm::save_pin_to_store(state, store);

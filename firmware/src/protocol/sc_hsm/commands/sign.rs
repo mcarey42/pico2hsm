@@ -47,7 +47,11 @@ fn meta_algo_to_ec_key_type(algo: u8) -> Option<pico2hsm_core::key::KeyType> {
 }
 
 /// Handle a COMPUTE DIGITAL SIGNATURE APDU command.
-pub fn handle(state: &mut ScHsmState, store: &mut dyn KeyStore, cmd: &ApduCommand<'_>) -> ApduResponse {
+pub fn handle(
+    state: &mut ScHsmState,
+    store: &mut dyn KeyStore,
+    cmd: &ApduCommand<'_>,
+) -> ApduResponse {
     // Require PIN authentication
     if !state.pin_verified {
         return ApduResponse::err(SW_SECURITY_STATUS);
@@ -73,7 +77,9 @@ pub fn handle(state: &mut ScHsmState, store: &mut dyn KeyStore, cmd: &ApduComman
     #[cfg(feature = "rsa")]
     match algo {
         0x20 | 0x31 | 0x32 | 0x33 | 0x34 | 0x40 => {
-            use crate::crypto::asymmetric::{HashAlgorithm, rsa_private_raw, rsa_sign_pkcs1v15, rsa_sign_pss};
+            use crate::crypto::asymmetric::{
+                rsa_private_raw, rsa_sign_pkcs1v15, rsa_sign_pss, HashAlgorithm,
+            };
 
             // Check metadata index for the key
             let _meta = match state.key_index.iter().find(|m| m.key_id == full_key_id) {
@@ -133,7 +139,7 @@ pub fn handle(state: &mut ScHsmState, store: &mut dyn KeyStore, cmd: &ApduComman
                         0x31 => HashAlgorithm::Sha256,
                         0x32 => HashAlgorithm::Sha384,
                         0x33 => HashAlgorithm::Sha512,
-                        _    => return ApduResponse::err(SW_INS_NOT_SUPPORTED),
+                        _ => return ApduResponse::err(SW_INS_NOT_SUPPORTED),
                     };
                     match rsa_sign_pkcs1v15(
                         key_type,

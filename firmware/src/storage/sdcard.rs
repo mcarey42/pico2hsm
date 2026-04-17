@@ -77,9 +77,7 @@ where
     pub fn new(spi: SPI, delay: DELAY) -> Result<Self, StorageError> {
         let card = SdCard::new(spi, delay);
 
-        let total_bytes = card
-            .num_bytes()
-            .map_err(|_| StorageError::NotFormatted)?;
+        let total_bytes = card.num_bytes().map_err(|_| StorageError::NotFormatted)?;
 
         // Subtract the reserved region (signature block) from usable capacity.
         let capacity_bytes = total_bytes.saturating_sub(SD_BYTE_OFFSET as u64);
@@ -201,11 +199,20 @@ where
                         self.write_errors,
                     );
                     #[cfg(target_arch = "arm")]
-                    crate::cdc_error!("SD write err {} consec, sector {} — degraded", self.write_errors, sd_sector_idx);
+                    crate::cdc_error!(
+                        "SD write err {} consec, sector {} — degraded",
+                        self.write_errors,
+                        sd_sector_idx
+                    );
                     self.degraded = true;
                 } else {
                     #[cfg(target_arch = "arm")]
-                    crate::cdc_warn!("SD write err on sector {} ({}/{})", sd_sector_idx, self.write_errors, BAD_WRITE_THRESHOLD);
+                    crate::cdc_warn!(
+                        "SD write err on sector {} ({}/{})",
+                        sd_sector_idx,
+                        self.write_errors,
+                        BAD_WRITE_THRESHOLD
+                    );
                 }
                 StorageError::WriteError
             })?;
@@ -283,7 +290,7 @@ const SD_SIG_VERSION: u8 = 0x01;
 /// Compute device fingerprint: SHA-256 of the 8-byte flash chip unique ID.
 /// This is stable, hardware-unique, and works before OTP provisioning.
 pub fn compute_device_fingerprint(flash_uid: &[u8; 8]) -> [u8; 32] {
-    use sha2::{Sha256, Digest};
+    use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
     h.update(flash_uid);
     h.finalize().into()
@@ -411,7 +418,10 @@ pub struct SdCardFlashLegacy {
 impl SdCardFlashLegacy {
     #[allow(dead_code)]
     pub fn new_stub(capacity: u64) -> Self {
-        SdCardFlashLegacy { capacity, degraded: false }
+        SdCardFlashLegacy {
+            capacity,
+            degraded: false,
+        }
     }
 }
 

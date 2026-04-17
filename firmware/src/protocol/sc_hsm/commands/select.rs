@@ -31,10 +31,19 @@ const P2_NO_FCI: u8 = 0x0C;
 fn build_fcp(fid: u16, size: u16) -> Vec<u8, 16> {
     let mut fci: Vec<u8, 16> = Vec::new();
     let _ = fci.extend_from_slice(&[
-        0x62, 0x0B,                              // FCP template, 11 bytes content
-        0x80, 0x02, (size >> 8) as u8, (size & 0xFF) as u8, // file size
-        0x82, 0x01, 0x01,                        // transparent EF
-        0x83, 0x02, (fid >> 8) as u8, (fid & 0xFF) as u8,   // file ID
+        0x62,
+        0x0B, // FCP template, 11 bytes content
+        0x80,
+        0x02,
+        (size >> 8) as u8,
+        (size & 0xFF) as u8, // file size
+        0x82,
+        0x01,
+        0x01, // transparent EF
+        0x83,
+        0x02,
+        (fid >> 8) as u8,
+        (fid & 0xFF) as u8, // file ID
     ]);
     fci
 }
@@ -45,16 +54,16 @@ fn build_fcp(fid: u16, size: u16) -> Vec<u8, 16> {
 fn select_fid(fid: u16, want_fci: bool) -> Option<ApduResponse> {
     // Known static file sizes (0 = empty; 0x0200 = placeholder for dynamic files)
     let size: u16 = match fid {
-        0x3F00 => 0,          // MF — DF, no data size
-        0x5015 => 0,          // DF.CIA — DF
-        0x2F00 => 19,         // EF.DIR
-        0x2F02 => 0x0200,     // EF.C_DevAut — device cert stub
-        0x2F03 => 0x0200,     // EF.TokenInfo — written by sc-hsm-tool during INITIALIZE
-        0x5031 => 24,         // EF.ODF
-        0x5032 => 42,         // EF.TokenInfo
-        0xC000 => 40,         // EF.AODF
-        0xC100 => 0,          // EF.PrKDF — always empty for SC-HSM
-        0xC200 => 0,          // EF.PuKDF — empty initially
+        0x3F00 => 0,      // MF — DF, no data size
+        0x5015 => 0,      // DF.CIA — DF
+        0x2F00 => 19,     // EF.DIR
+        0x2F02 => 0x0200, // EF.C_DevAut — device cert stub
+        0x2F03 => 0x0200, // EF.TokenInfo — written by sc-hsm-tool during INITIALIZE
+        0x5031 => 24,     // EF.ODF
+        0x5032 => 42,     // EF.TokenInfo
+        0xC000 => 40,     // EF.AODF
+        0xC100 => 0,      // EF.PrKDF — always empty for SC-HSM
+        0xC200 => 0,      // EF.PuKDF — empty initially
         _ => {
             // Dynamic EF ranges: key descriptors (C4xx), key blobs (CCxx), certs (CExx)
             let hi = fid >> 8;
@@ -120,7 +129,11 @@ pub fn handle(state: &mut ScHsmState, cmd: &ApduCommand<'_>) -> ApduResponse {
         // EE certificate files exist only if written via WRITE DATA.
         let file_id_lo = (fid & 0xFF) as u8;
         let ef_key_id = pico2hsm_core::key::KeyId::sc_hsm_ef(0, hi as u8, file_id_lo).0;
-        if !state.key_index.iter().any(|m| m.key_type == 16 && m.key_id == ef_key_id) {
+        if !state
+            .key_index
+            .iter()
+            .any(|m| m.key_type == 16 && m.key_id == ef_key_id)
+        {
             return ApduResponse::err(SW_FILE_NOT_FOUND);
         }
     }
@@ -128,7 +141,10 @@ pub fn handle(state: &mut ScHsmState, cmd: &ApduCommand<'_>) -> ApduResponse {
         // Key blob files exist when the corresponding key is in the keystore.
         let key_id_proto = (fid & 0xFF) as u8;
         let full_key_id = pico2hsm_core::key::KeyId::sc_hsm(0, key_id_proto).0;
-        let exists = state.key_index.iter().any(|m| m.key_id == full_key_id && m.key_type != 16);
+        let exists = state
+            .key_index
+            .iter()
+            .any(|m| m.key_id == full_key_id && m.key_type != 16);
         if !exists {
             return ApduResponse::err(SW_FILE_NOT_FOUND);
         }
@@ -139,10 +155,16 @@ pub fn handle(state: &mut ScHsmState, cmd: &ApduCommand<'_>) -> ApduResponse {
         // - the file was written via WRITE DATA and is in key_index as EfFile.
         let key_id_proto = (fid & 0xFF) as u8;
         let full_key_id = pico2hsm_core::key::KeyId::sc_hsm(0, key_id_proto).0;
-        let in_keys = state.key_index.iter().any(|m| m.key_id == full_key_id && m.key_type != 16);
+        let in_keys = state
+            .key_index
+            .iter()
+            .any(|m| m.key_id == full_key_id && m.key_type != 16);
         let file_id_lo = (fid & 0xFF) as u8;
         let ef_key_id = pico2hsm_core::key::KeyId::sc_hsm_ef(0, hi as u8, file_id_lo).0;
-        let in_ef = state.key_index.iter().any(|m| m.key_type == 16 && m.key_id == ef_key_id);
+        let in_ef = state
+            .key_index
+            .iter()
+            .any(|m| m.key_type == 16 && m.key_id == ef_key_id);
         if !in_keys && !in_ef {
             return ApduResponse::err(SW_FILE_NOT_FOUND);
         }

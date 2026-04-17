@@ -24,18 +24,15 @@ use aes::Aes192;
 use aes::Aes256;
 use aes_gcm::{
     aead::{AeadInPlace, KeyInit as GcmKeyInit},
-    Aes256Gcm,
-    Nonce as GcmNonce,
-    Tag as GcmTag,
+    Aes256Gcm, Nonce as GcmNonce, Tag as GcmTag,
 };
 use cbc::{Decryptor as CbcDecryptor, Encryptor as CbcEncryptor};
 use chacha20poly1305::{
     aead::{AeadInPlace as ChachaAeadInPlace, KeyInit as ChachaKeyInit},
-    ChaCha20Poly1305,
-    Nonce as ChaChaNonce,
+    ChaCha20Poly1305, Nonce as ChaChaNonce,
 };
-use cipher::{BlockDecryptMut, BlockEncryptMut, KeyIvInit, StreamCipher};
 use cipher::block_padding::NoPadding;
+use cipher::{BlockDecryptMut, BlockEncryptMut, KeyIvInit, StreamCipher};
 use cmac::{Cmac, Mac as CmacMac};
 use ctr::Ctr128BE;
 use sha1::{Digest as Sha1Digest, Sha1};
@@ -111,9 +108,8 @@ pub fn aes_ctr_crypt(
     nonce: &[u8; AES_BLOCK_SIZE],
     data: &mut [u8],
 ) -> Result<(), CryptoError> {
-    let mut cipher =
-        <Ctr128BE<Aes256> as KeyIvInit>::new_from_slices(key, nonce)
-            .map_err(|_| CryptoError::EncryptFailure)?;
+    let mut cipher = <Ctr128BE<Aes256> as KeyIvInit>::new_from_slices(key, nonce)
+        .map_err(|_| CryptoError::EncryptFailure)?;
     cipher.apply_keystream(data);
     Ok(())
 }
@@ -136,8 +132,7 @@ pub fn aes_gcm_encrypt(
         return Err(CryptoError::BufferTooSmall);
     }
     let raw = key256(key)?;
-    let cipher =
-        Aes256Gcm::new_from_slice(&raw).map_err(|_| CryptoError::EncryptFailure)?;
+    let cipher = Aes256Gcm::new_from_slice(&raw).map_err(|_| CryptoError::EncryptFailure)?;
     let nonce_arr = GcmNonce::from_slice(nonce);
 
     out.clear();
@@ -173,8 +168,7 @@ pub fn aes_gcm_decrypt(
     }
 
     let raw = key256(key)?;
-    let cipher =
-        Aes256Gcm::new_from_slice(&raw).map_err(|_| CryptoError::DecryptFailure)?;
+    let cipher = Aes256Gcm::new_from_slice(&raw).map_err(|_| CryptoError::DecryptFailure)?;
     let nonce_arr = GcmNonce::from_slice(nonce);
 
     let ciphertext = &ciphertext_and_tag[..ct_len];
@@ -206,17 +200,19 @@ pub fn aes_gcm_encrypt_raw(
     if plaintext.len() > MAX_CIPHER_BLOCK {
         return Err(CryptoError::BufferTooSmall);
     }
-    let cipher =
-        Aes256Gcm::new_from_slice(key).map_err(|_| CryptoError::EncryptFailure)?;
+    let cipher = Aes256Gcm::new_from_slice(key).map_err(|_| CryptoError::EncryptFailure)?;
     let nonce_arr = GcmNonce::from_slice(nonce);
 
-    let mut buf: heapless::Vec<u8, { MAX_CIPHER_BLOCK + GCM_TAG_SIZE }> =
-        heapless::Vec::new();
+    let mut buf: heapless::Vec<u8, { MAX_CIPHER_BLOCK + GCM_TAG_SIZE }> = heapless::Vec::new();
     buf.extend_from_slice(plaintext)
         .map_err(|_| CryptoError::BufferTooSmall)?;
 
     let tag = cipher
-        .encrypt_in_place_detached(nonce_arr, aad, buf.as_mut_slice()[..plaintext.len()].as_mut())
+        .encrypt_in_place_detached(
+            nonce_arr,
+            aad,
+            buf.as_mut_slice()[..plaintext.len()].as_mut(),
+        )
         .map_err(|_| CryptoError::EncryptFailure)?;
 
     buf.extend_from_slice(tag.as_slice())
@@ -239,8 +235,7 @@ pub fn aes_gcm_decrypt_raw(
     if ct_len > MAX_CIPHER_BLOCK {
         return Err(CryptoError::BufferTooSmall);
     }
-    let cipher =
-        Aes256Gcm::new_from_slice(key).map_err(|_| CryptoError::DecryptFailure)?;
+    let cipher = Aes256Gcm::new_from_slice(key).map_err(|_| CryptoError::DecryptFailure)?;
     let nonce_arr = GcmNonce::from_slice(nonce);
 
     let ciphertext = &ciphertext_with_tag[..ct_len];
@@ -415,10 +410,7 @@ fn aes_cbc_decrypt_raw(
 /// Compute AES-CMAC over the given input.
 ///
 /// Returns a 16-byte MAC tag.
-pub fn aes_cmac(
-    key: &KeyMaterial,
-    input: &[u8],
-) -> Result<[u8; AES_BLOCK_SIZE], CryptoError> {
+pub fn aes_cmac(key: &KeyMaterial, input: &[u8]) -> Result<[u8; AES_BLOCK_SIZE], CryptoError> {
     let raw = key_bytes(key)?;
     aes_cmac_raw(raw, input)
 }
@@ -481,8 +473,7 @@ pub fn chacha20poly1305_seal(
     if plaintext.len() > MAX_CIPHER_BLOCK {
         return Err(CryptoError::BufferTooSmall);
     }
-    let cipher = ChaCha20Poly1305::new_from_slice(key)
-        .map_err(|_| CryptoError::EncryptFailure)?;
+    let cipher = ChaCha20Poly1305::new_from_slice(key).map_err(|_| CryptoError::EncryptFailure)?;
     let nonce_arr = ChaChaNonce::from_slice(nonce);
 
     out.clear();
@@ -516,14 +507,12 @@ pub fn chacha20poly1305_open(
         return Err(CryptoError::BufferTooSmall);
     }
 
-    let cipher = ChaCha20Poly1305::new_from_slice(key)
-        .map_err(|_| CryptoError::DecryptFailure)?;
+    let cipher = ChaCha20Poly1305::new_from_slice(key).map_err(|_| CryptoError::DecryptFailure)?;
     let nonce_arr = ChaChaNonce::from_slice(nonce);
 
     let ciphertext = &ciphertext_and_tag[..ct_len];
     let tag_slice = &ciphertext_and_tag[ct_len..];
-    let tag =
-        chacha20poly1305::Tag::clone_from_slice(tag_slice);
+    let tag = chacha20poly1305::Tag::clone_from_slice(tag_slice);
 
     out.clear();
     out.extend_from_slice(ciphertext)
@@ -550,8 +539,7 @@ pub fn chacha20poly1305_encrypt(
     if plaintext.len() > MAX_CIPHER_BLOCK {
         return Err(CryptoError::BufferTooSmall);
     }
-    let cipher = ChaCha20Poly1305::new_from_slice(key)
-        .map_err(|_| CryptoError::EncryptFailure)?;
+    let cipher = ChaCha20Poly1305::new_from_slice(key).map_err(|_| CryptoError::EncryptFailure)?;
     let nonce_arr = ChaChaNonce::from_slice(nonce);
 
     let mut buf: heapless::Vec<u8, { MAX_CIPHER_BLOCK + 16 }> = heapless::Vec::new();
@@ -584,8 +572,7 @@ pub fn chacha20poly1305_decrypt(
         return Err(CryptoError::BufferTooSmall);
     }
 
-    let cipher = ChaCha20Poly1305::new_from_slice(key)
-        .map_err(|_| CryptoError::DecryptFailure)?;
+    let cipher = ChaCha20Poly1305::new_from_slice(key).map_err(|_| CryptoError::DecryptFailure)?;
     let nonce_arr = ChaChaNonce::from_slice(nonce);
 
     let ciphertext = &ciphertext_with_tag[..ct_len];
@@ -644,7 +631,10 @@ pub fn sha512(data: &[u8]) -> [u8; 64] {
 /// Used by PIV GENERAL AUTHENTICATE (challenge/response, no IV, single block).
 #[cfg(feature = "applet-piv")]
 pub fn tdes_ecb_encrypt(key: &[u8; 24], block: &[u8; 8]) -> [u8; 8] {
-    use des::{TdesEde3, cipher::{BlockEncrypt, KeyInit, generic_array::GenericArray}};
+    use des::{
+        cipher::{generic_array::GenericArray, BlockEncrypt, KeyInit},
+        TdesEde3,
+    };
     let cipher = TdesEde3::new(GenericArray::from_slice(key));
     let mut ga: GenericArray<u8, _> = GenericArray::clone_from_slice(block);
     cipher.encrypt_block(&mut ga);
@@ -658,7 +648,10 @@ pub fn tdes_ecb_encrypt(key: &[u8; 24], block: &[u8; 8]) -> [u8; 8] {
 /// Used by PIV GENERAL AUTHENTICATE (challenge/response, no IV, single block).
 #[cfg(feature = "applet-piv")]
 pub fn tdes_ecb_decrypt(key: &[u8; 24], block: &[u8; 8]) -> [u8; 8] {
-    use des::{TdesEde3, cipher::{BlockDecrypt, KeyInit, generic_array::GenericArray}};
+    use des::{
+        cipher::{generic_array::GenericArray, BlockDecrypt, KeyInit},
+        TdesEde3,
+    };
     let cipher = TdesEde3::new(GenericArray::from_slice(key));
     let mut ga: GenericArray<u8, _> = GenericArray::clone_from_slice(block);
     cipher.decrypt_block(&mut ga);
@@ -831,11 +824,10 @@ mod tests {
     #[test]
     fn test_aes_cmac_verify() {
         let key = hex::decode("2b7e151628aed2a6abf7158809cf4f3c").unwrap();
-        let expected: [u8; 16] =
-            hex::decode("bb1d6929e95937287fa37d129b756746")
-                .unwrap()
-                .try_into()
-                .unwrap();
+        let expected: [u8; 16] = hex::decode("bb1d6929e95937287fa37d129b756746")
+            .unwrap()
+            .try_into()
+            .unwrap();
         assert!(aes_cmac_verify(&key, b"", &expected).unwrap());
 
         let mut bad = expected;
@@ -855,9 +847,9 @@ mod tests {
         // Build key: 0x80..0x9f
         let key: [u8; 32] = core::array::from_fn(|i| 0x80 + i as u8);
         // Nonce: 07 00 00 00  40 41 42 43  44 45 46 47
-        let nonce: [u8; 12] = [0x07, 0x00, 0x00, 0x00,
-                               0x40, 0x41, 0x42, 0x43,
-                               0x44, 0x45, 0x46, 0x47];
+        let nonce: [u8; 12] = [
+            0x07, 0x00, 0x00, 0x00, 0x40, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47,
+        ];
         let plaintext = b"Ladies and Gentlemen of the class of '99: If I could offer you only one tip for the future, sunscreen would be it.";
         let aad = hex::decode("50515253c0c1c2c3c4c5c6c7").unwrap();
 
@@ -998,9 +990,8 @@ mod tests {
     #[test]
     fn tdes_ecb_roundtrip() {
         let key: [u8; 24] = [
-            0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF,
-            0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF, 0x01,
-            0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF, 0x01, 0x23,
+            0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD,
+            0xEF, 0x01, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF, 0x01, 0x23,
         ];
         let plaintext: [u8; 8] = [0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF];
 

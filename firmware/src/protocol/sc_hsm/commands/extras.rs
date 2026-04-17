@@ -35,7 +35,11 @@ use crate::storage::KeyStore;
 pub const INS_EXTRAS: u8 = 0x54;
 
 /// Handle an EXTRAS APDU command.
-pub fn handle(state: &mut ScHsmState, store: &mut dyn KeyStore, cmd: &ApduCommand<'_>) -> ApduResponse {
+pub fn handle(
+    state: &mut ScHsmState,
+    store: &mut dyn KeyStore,
+    cmd: &ApduCommand<'_>,
+) -> ApduResponse {
     match cmd.p1 {
         // No-PIN sub-commands.
         0x30 => handle_get_device_public_key(state, store, cmd),
@@ -87,7 +91,11 @@ pub fn handle(state: &mut ScHsmState, store: &mut dyn KeyStore, cmd: &ApduComman
 // P1=0x30  GET_DEVICE_PUBLIC_KEY
 // ---------------------------------------------------------------------------
 
-fn handle_get_device_public_key(state: &mut ScHsmState, store: &mut dyn KeyStore, _cmd: &ApduCommand<'_>) -> ApduResponse {
+fn handle_get_device_public_key(
+    state: &mut ScHsmState,
+    store: &mut dyn KeyStore,
+    _cmd: &ApduCommand<'_>,
+) -> ApduResponse {
     let dev_key_id = KeyId::sc_hsm(0, 0xFE);
 
     // Try persistent store (key object has public_key field).
@@ -130,7 +138,11 @@ fn handle_get_generation(state: &mut ScHsmState, _cmd: &ApduCommand<'_>) -> Apdu
 // P1=0x35  NOISE_TARGET_INIT (V2 mutual-auth)
 // ---------------------------------------------------------------------------
 
-fn handle_noise_target_init(state: &mut ScHsmState, store: &mut dyn KeyStore, cmd: &ApduCommand<'_>) -> ApduResponse {
+fn handle_noise_target_init(
+    state: &mut ScHsmState,
+    store: &mut dyn KeyStore,
+    cmd: &ApduCommand<'_>,
+) -> ApduResponse {
     use crate::crypto::asymmetric::generate_ec_keypair;
     use pico2hsm_core::key::KeyType as CoreKeyType;
     use sha2::{Digest, Sha256};
@@ -192,7 +204,11 @@ fn handle_noise_target_init(state: &mut ScHsmState, store: &mut dyn KeyStore, cm
 // P1=0x36  NOISE_SOURCE_RESPOND (V2 mutual-auth)
 // ---------------------------------------------------------------------------
 
-fn handle_noise_source_respond(state: &mut ScHsmState, store: &mut dyn KeyStore, cmd: &ApduCommand<'_>) -> ApduResponse {
+fn handle_noise_source_respond(
+    state: &mut ScHsmState,
+    store: &mut dyn KeyStore,
+    cmd: &ApduCommand<'_>,
+) -> ApduResponse {
     use sha2::{Digest, Sha256};
 
     // Input: ephem_T_pub(65) || challenge(32) || Sig_T(64) = 161 bytes
@@ -273,9 +289,16 @@ fn handle_noise_source_respond(state: &mut ScHsmState, store: &mut dyn KeyStore,
 // P1=0x37  NOISE_FINALIZE_SEND_V2
 // ---------------------------------------------------------------------------
 
-fn handle_noise_finalize_send_v2(state: &mut ScHsmState, _store: &mut dyn KeyStore, cmd: &ApduCommand<'_>) -> ApduResponse {
+fn handle_noise_finalize_send_v2(
+    state: &mut ScHsmState,
+    _store: &mut dyn KeyStore,
+    cmd: &ApduCommand<'_>,
+) -> ApduResponse {
     use crate::security::dkek::{derive_session_key_v2, p256_ecdh};
-    use aes_gcm::{aead::{AeadInPlace, KeyInit}, Aes256Gcm, Nonce as GcmNonce};
+    use aes_gcm::{
+        aead::{AeadInPlace, KeyInit},
+        Aes256Gcm, Nonce as GcmNonce,
+    };
     use zeroize::Zeroizing;
 
     // Require DKEK ready.
@@ -334,15 +357,16 @@ fn handle_noise_finalize_send_v2(state: &mut ScHsmState, _store: &mut dyn KeySto
 
     // Derive session key with channel binding.
     // info = b"pico2hsm-dkek-v2" || source_ephem_pub || target_ephem_pub || challenge
-    let session_key = match derive_session_key_v2(&shared_secret, &ephem_pub, target_ephem_pub, challenge) {
-        Ok(k) => k,
-        Err(_) => {
-            state.exchange_ephem_priv = None;
-            state.exchange_ephem_pub = None;
-            state.exchange_challenge = None;
-            return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED);
-        }
-    };
+    let session_key =
+        match derive_session_key_v2(&shared_secret, &ephem_pub, target_ephem_pub, challenge) {
+            Ok(k) => k,
+            Err(_) => {
+                state.exchange_ephem_priv = None;
+                state.exchange_ephem_pub = None;
+                state.exchange_challenge = None;
+                return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED);
+            }
+        };
 
     // Encrypt DKEK with AES-256-GCM.
     let dkek = match state.dkek.get_dkek() {
@@ -403,9 +427,16 @@ fn handle_noise_finalize_send_v2(state: &mut ScHsmState, _store: &mut dyn KeySto
 // P1=0x38  NOISE_FINALIZE_RECV_V2
 // ---------------------------------------------------------------------------
 
-fn handle_noise_finalize_recv_v2(state: &mut ScHsmState, store: &mut dyn KeyStore, cmd: &ApduCommand<'_>) -> ApduResponse {
+fn handle_noise_finalize_recv_v2(
+    state: &mut ScHsmState,
+    store: &mut dyn KeyStore,
+    cmd: &ApduCommand<'_>,
+) -> ApduResponse {
     use crate::security::dkek::{derive_session_key_v2, p256_ecdh};
-    use aes_gcm::{aead::{AeadInPlace, KeyInit}, Aes256Gcm, Nonce as GcmNonce, Tag as GcmTag};
+    use aes_gcm::{
+        aead::{AeadInPlace, KeyInit},
+        Aes256Gcm, Nonce as GcmNonce, Tag as GcmTag,
+    };
     use zeroize::Zeroizing;
 
     // Input: source_ephem_pub(65) || Sig_S(64) || encrypted_dkek(60) = 189 bytes
@@ -500,15 +531,16 @@ fn handle_noise_finalize_recv_v2(state: &mut ScHsmState, store: &mut dyn KeyStor
 
     // Derive session key with channel binding.
     // info = b"pico2hsm-dkek-v2" || source_ephem_pub || our_ephem_pub || challenge
-    let session_key = match derive_session_key_v2(&shared_secret, source_ephem_pub, &ephem_pub, &challenge) {
-        Ok(k) => k,
-        Err(_) => {
-            state.exchange_ephem_priv = None;
-            state.exchange_ephem_pub = None;
-            state.exchange_challenge = None;
-            return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED);
-        }
-    };
+    let session_key =
+        match derive_session_key_v2(&shared_secret, source_ephem_pub, &ephem_pub, &challenge) {
+            Ok(k) => k,
+            Err(_) => {
+                state.exchange_ephem_priv = None;
+                state.exchange_ephem_pub = None;
+                state.exchange_challenge = None;
+                return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED);
+            }
+        };
 
     // AAD = own_static_pub(65) — device's own static pubkey.
     let own_static_pub = match get_device_static_pub(state, store) {
@@ -541,7 +573,10 @@ fn handle_noise_finalize_recv_v2(state: &mut ScHsmState, store: &mut dyn KeyStor
     let mut dkek_buf = Zeroizing::new([0u8; 32]);
     dkek_buf.copy_from_slice(ct_bytes);
 
-    if cipher.decrypt_in_place_detached(nonce, &own_static_pub, dkek_buf.as_mut(), &tag).is_err() {
+    if cipher
+        .decrypt_in_place_detached(nonce, &own_static_pub, dkek_buf.as_mut(), &tag)
+        .is_err()
+    {
         state.exchange_ephem_priv = None;
         state.exchange_ephem_pub = None;
         state.exchange_challenge = None;
@@ -572,7 +607,11 @@ fn handle_noise_finalize_recv_v2(state: &mut ScHsmState, store: &mut dyn KeyStor
 // P1=0x39  GET_KEY_MANIFEST
 // ---------------------------------------------------------------------------
 
-fn handle_get_key_manifest(state: &mut ScHsmState, store: &mut dyn KeyStore, _cmd: &ApduCommand<'_>) -> ApduResponse {
+fn handle_get_key_manifest(
+    state: &mut ScHsmState,
+    store: &mut dyn KeyStore,
+    _cmd: &ApduCommand<'_>,
+) -> ApduResponse {
     use sha2::{Digest, Sha256};
 
     // Each entry: key_ref(1) || algo(1) || key_flags(1) || deleted(1) || timestamp_ms_BE(8) || pubkey_hash(32) = 44 bytes
@@ -624,7 +663,11 @@ fn handle_get_key_manifest(state: &mut ScHsmState, store: &mut dyn KeyStore, _cm
 // P1=0x3A  GET_STATE_HASH
 // ---------------------------------------------------------------------------
 
-fn handle_get_state_hash(state: &mut ScHsmState, store: &mut dyn KeyStore, _cmd: &ApduCommand<'_>) -> ApduResponse {
+fn handle_get_state_hash(
+    state: &mut ScHsmState,
+    store: &mut dyn KeyStore,
+    _cmd: &ApduCommand<'_>,
+) -> ApduResponse {
     use sha2::{Digest, Sha256};
 
     // Build a map of key_ref -> key info from in-memory and flash.
@@ -682,7 +725,11 @@ fn handle_get_state_hash(state: &mut ScHsmState, store: &mut dyn KeyStore, _cmd:
 // P1=0x3B  SIGN_ENROLLMENT
 // ---------------------------------------------------------------------------
 
-fn handle_sign_enrollment(state: &mut ScHsmState, store: &mut dyn KeyStore, cmd: &ApduCommand<'_>) -> ApduResponse {
+fn handle_sign_enrollment(
+    state: &mut ScHsmState,
+    store: &mut dyn KeyStore,
+    cmd: &ApduCommand<'_>,
+) -> ApduResponse {
     use sha2::{Digest, Sha256};
 
     // Input: tls_cert_fingerprint(32) || cluster_id(16) = 48 bytes
@@ -716,7 +763,11 @@ fn handle_sign_enrollment(state: &mut ScHsmState, store: &mut dyn KeyStore, cmd:
 /// SO-PIN VERIFY is required before calling this command (checked in the
 /// dispatch match above).  Re-enrollment (overwriting an existing peer)
 /// is allowed with SO-PIN to support HSM replacement scenarios.
-fn handle_enroll_peer_pubkey(state: &mut ScHsmState, store: &mut dyn KeyStore, cmd: &ApduCommand<'_>) -> ApduResponse {
+fn handle_enroll_peer_pubkey(
+    state: &mut ScHsmState,
+    store: &mut dyn KeyStore,
+    cmd: &ApduCommand<'_>,
+) -> ApduResponse {
     // Validate input length: must be exactly 65 bytes (uncompressed P-256).
     if cmd.data.len() != 65 {
         return ApduResponse::err(SW_WRONG_LENGTH);
@@ -755,10 +806,14 @@ fn handle_get_generation_v2(state: &mut ScHsmState, _cmd: &ApduCommand<'_>) -> A
 
 /// Load device static private key and sign a pre-hashed message.
 /// Returns fixed 64-byte r||s signature.
-fn sign_with_device_key(state: &ScHsmState, store: &mut dyn KeyStore, msg_hash: &[u8; 32]) -> Result<[u8; 64], ()> {
+fn sign_with_device_key(
+    state: &ScHsmState,
+    store: &mut dyn KeyStore,
+    msg_hash: &[u8; 32],
+) -> Result<[u8; 64], ()> {
     use ecdsa::signature::hazmat::PrehashSigner;
-    use p256::SecretKey;
     use ecdsa::SigningKey;
+    use p256::SecretKey;
     use zeroize::Zeroizing;
 
     let dev_key_id = KeyId::sc_hsm(0, 0xFE);
@@ -780,7 +835,8 @@ fn sign_with_device_key(state: &ScHsmState, store: &mut dyn KeyStore, msg_hash: 
     let signing_key = SigningKey::from(&secret);
 
     // sign_prehash is RFC 6979 deterministic.
-    let signature: ecdsa::Signature<p256::NistP256> = signing_key.sign_prehash(msg_hash).map_err(|_| ())?;
+    let signature: ecdsa::Signature<p256::NistP256> =
+        signing_key.sign_prehash(msg_hash).map_err(|_| ())?;
     let sig = signature.to_bytes();
 
     let mut out = [0u8; 64];
@@ -834,7 +890,8 @@ fn check_and_add_challenge(state: &mut ScHsmState, challenge: &[u8; 32]) -> bool
     let cap = crate::protocol::sc_hsm::MAX_EXCHANGE_CHALLENGE_CACHE as u8;
     let idx = (state.exchange_challenge_cache_write_idx % cap) as usize;
     state.exchange_challenge_cache[idx] = *challenge;
-    state.exchange_challenge_cache_write_idx = state.exchange_challenge_cache_write_idx.wrapping_add(1);
+    state.exchange_challenge_cache_write_idx =
+        state.exchange_challenge_cache_write_idx.wrapping_add(1);
     if state.exchange_challenge_cache_count < cap {
         state.exchange_challenge_cache_count += 1;
     }
@@ -856,7 +913,11 @@ fn find_key_info_for_slot(
     let key_id = KeyId::sc_hsm(0, slot);
 
     // Check key_index for metadata.
-    if let Some(meta) = state.key_index.iter().find(|m| m.key_id == key_id.0 && m.key_type != 16) {
+    if let Some(meta) = state
+        .key_index
+        .iter()
+        .find(|m| m.key_id == key_id.0 && m.key_type != 16)
+    {
         // Fetch from flash for pubkey hash and timestamp.
         if let Ok(Some(key_obj)) = store.fetch_key(key_id) {
             let pubkey_hash = if !key_obj.public_key.is_empty() {
@@ -877,7 +938,12 @@ fn find_key_info_for_slot(
         } else {
             [0u8; 32]
         };
-        return Some((key_obj.algorithm as u8, key_obj.key_flags, key_obj.timestamp_ms, pubkey_hash));
+        return Some((
+            key_obj.algorithm as u8,
+            key_obj.key_flags,
+            key_obj.timestamp_ms,
+            pubkey_hash,
+        ));
     }
 
     None
@@ -1110,16 +1176,16 @@ mod tests {
     // -----------------------------------------------------------------------
     #[test]
     fn test_hkdf_extract_rfc5869_a1() {
-        let salt: [u8; 13] = [0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
-                               0x08, 0x09, 0x0a, 0x0b, 0x0c];
+        let salt: [u8; 13] = [
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c,
+        ];
         let ikm: [u8; 22] = [0x0b; 22];
 
         let data = make_data(&[&[salt.len() as u8], &salt, &ikm]);
         let resp = hkdf_extract(&data);
 
-        let expected = hex_to_32(
-            b"077709362c2e32df0ddc3f0dc47bba6390b6c73bb50f9c3122ec844ad7c2b3e5",
-        );
+        let expected =
+            hex_to_32(b"077709362c2e32df0ddc3f0dc47bba6390b6c73bb50f9c3122ec844ad7c2b3e5");
         assert_eq!(resp.sw, 0x9000, "expected SW_OK");
         assert_eq!(&resp.data[..], &expected[..]);
     }
@@ -1130,9 +1196,7 @@ mod tests {
     #[test]
     fn test_hkdf_expand_produces_output() {
         // PRK from A.1
-        let prk = hex_to_32(
-            b"077709362c2e32df0ddc3f0dc47bba6390b6c73bb50f9c3122ec844ad7c2b3e5",
-        );
+        let prk = hex_to_32(b"077709362c2e32df0ddc3f0dc47bba6390b6c73bb50f9c3122ec844ad7c2b3e5");
         let info: &[u8] = &[0xf0, 0xf1, 0xf2, 0xf3, 0xf4, 0xf5, 0xf6, 0xf7, 0xf8, 0xf9];
         let output_len: u8 = 42;
 
@@ -1141,7 +1205,10 @@ mod tests {
 
         assert_eq!(resp.sw, 0x9000, "expected SW_OK");
         assert_eq!(resp.data.len(), 42);
-        assert!(resp.data.iter().any(|&b| b != 0), "output should be non-zero");
+        assert!(
+            resp.data.iter().any(|&b| b != 0),
+            "output should be non-zero"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1211,9 +1278,8 @@ mod tests {
         let data = make_data(&[&[key.len() as u8], &key, message]);
         let resp = hmac_sha256(&data);
 
-        let expected = hex_to_32(
-            b"b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7",
-        );
+        let expected =
+            hex_to_32(b"b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7");
         assert_eq!(resp.sw, 0x9000, "expected SW_OK");
         assert_eq!(&resp.data[..], &expected[..]);
     }
@@ -1246,11 +1312,11 @@ mod tests {
     // V2 DKEK Exchange Tests
     // -----------------------------------------------------------------------
 
-    use crate::protocol::sc_hsm::{ScHsmState, KeyMeta};
+    use crate::protocol::sc_hsm::{KeyMeta, ScHsmState};
     use crate::storage::KeyStore;
     use pico2hsm_core::key::{AppletId, KeyId, KeyType as CoreKeyType};
 
-    use crate::security::key_management::{KeyObject, AlgorithmId, KeyType as KmType};
+    use crate::security::key_management::{AlgorithmId, KeyObject, KeyType as KmType};
 
     /// Copy a KeyObject (KeyObject doesn't impl Clone).
     fn copy_key_object(obj: &KeyObject) -> KeyObject {
@@ -1268,7 +1334,10 @@ mod tests {
     }
     impl DevKeyStore {
         fn new() -> Self {
-            DevKeyStore { dev_key: None, ef_key: None }
+            DevKeyStore {
+                dev_key: None,
+                ef_key: None,
+            }
         }
     }
     impl KeyStore for DevKeyStore {
@@ -1282,7 +1351,10 @@ mod tests {
             }
             Ok(())
         }
-        fn fetch_key(&mut self, kid: KeyId) -> Result<Option<KeyObject>, pico2hsm_core::error::HsmError> {
+        fn fetch_key(
+            &mut self,
+            kid: KeyId,
+        ) -> Result<Option<KeyObject>, pico2hsm_core::error::HsmError> {
             let dev_key_id = KeyId::sc_hsm(0, 0xFE).0;
             let ef_key_id = KeyId::sc_hsm_ef(0, 0x2F, 0x02).0;
             if kid.0 == dev_key_id {
@@ -1293,10 +1365,18 @@ mod tests {
             }
             Ok(None)
         }
-        fn erase_key(&mut self, _: KeyId) -> Result<(), pico2hsm_core::error::HsmError> { Ok(()) }
-        fn wipe_all(&mut self) -> Result<(), pico2hsm_core::error::HsmError> { Ok(()) }
-        fn wipe_by_owner(&mut self, _: AppletId) -> Result<(), pico2hsm_core::error::HsmError> { Ok(()) }
-        fn enumerate_keys(&self) -> heapless::Vec<KeyId, 64> { heapless::Vec::new() }
+        fn erase_key(&mut self, _: KeyId) -> Result<(), pico2hsm_core::error::HsmError> {
+            Ok(())
+        }
+        fn wipe_all(&mut self) -> Result<(), pico2hsm_core::error::HsmError> {
+            Ok(())
+        }
+        fn wipe_by_owner(&mut self, _: AppletId) -> Result<(), pico2hsm_core::error::HsmError> {
+            Ok(())
+        }
+        fn enumerate_keys(&self) -> heapless::Vec<KeyId, 64> {
+            heapless::Vec::new()
+        }
         fn for_each_key(&self, _f: &mut dyn FnMut(KeyId)) {}
     }
 
@@ -1350,7 +1430,7 @@ mod tests {
         let ef_meta = KeyMeta {
             key_id: ef_key_id.0,
             key_type: 16, // EfFile
-            algo: 0x2F, // high byte of file_id 0x2F02
+            algo: 0x2F,   // high byte of file_id 0x2F02
             key_flags: 0,
         };
         state.key_index.push(ef_meta).unwrap();
@@ -1378,7 +1458,11 @@ mod tests {
 
         let resp = handle(&mut state, &mut store, &cmd);
         assert_eq!(resp.sw, 0x9000, "expected SW_OK, got {:04X}", resp.sw);
-        assert_eq!(resp.data.len(), 161, "expected 161 bytes: ephem_pub(65) + challenge(32) + sig(64)");
+        assert_eq!(
+            resp.data.len(),
+            161,
+            "expected 161 bytes: ephem_pub(65) + challenge(32) + sig(64)"
+        );
 
         // Verify ephemeral state was stored.
         assert!(state.exchange_ephem_priv.is_some());
@@ -1422,7 +1506,11 @@ mod tests {
 
         let resp = handle(&mut state, &mut store, &cmd);
         assert_eq!(resp.sw, 0x9000, "expected SW_OK, got {:04X}", resp.sw);
-        assert_eq!(resp.data.len(), 129, "expected 129 bytes: ephem_S_pub(65) + Sig_S(64)");
+        assert_eq!(
+            resp.data.len(),
+            129,
+            "expected 129 bytes: ephem_S_pub(65) + Sig_S(64)"
+        );
 
         // Verify challenge was stored.
         assert!(state.exchange_challenge.is_some());
@@ -1451,34 +1539,54 @@ mod tests {
         for i in 0u8..8 {
             let mut c = [0u8; 32];
             c[0] = i;
-            assert!(check_and_add_challenge(&mut state, &c), "challenge {} should succeed", i);
+            assert!(
+                check_and_add_challenge(&mut state, &c),
+                "challenge {} should succeed",
+                i
+            );
         }
         assert_eq!(state.exchange_challenge_cache_count, 8);
 
         // Add a 9th challenge — this should evict slot 0 (challenge with c[0]=0).
         let mut c9 = [0u8; 32];
         c9[0] = 0x08; // 8
-        assert!(check_and_add_challenge(&mut state, &c9), "9th challenge should succeed");
+        assert!(
+            check_and_add_challenge(&mut state, &c9),
+            "9th challenge should succeed"
+        );
 
         // The 9th challenge should be found (it was just inserted in slot 0).
-        assert!(!check_and_add_challenge(&mut state, &c9), "9th challenge should be detected as replay");
+        assert!(
+            !check_and_add_challenge(&mut state, &c9),
+            "9th challenge should be detected as replay"
+        );
 
         // Challenge 0 (c[0]=0) was evicted from slot 0 and should NOT be detected.
         let c0 = [0u8; 32];
-        assert!(check_and_add_challenge(&mut state, &c0), "evicted challenge 0 should be accepted as new");
+        assert!(
+            check_and_add_challenge(&mut state, &c0),
+            "evicted challenge 0 should be accepted as new"
+        );
         // c0 was written to slot 1 (write_idx=10, 10%8=2 — wait, 9%8=1), evicting challenge 1.
 
         // Challenges 2..7 should still be in the cache (slots 2..7 untouched).
         for i in 2u8..8 {
             let mut c = [0u8; 32];
             c[0] = i;
-            assert!(!check_and_add_challenge(&mut state, &c), "challenge {} should still be in cache", i);
+            assert!(
+                !check_and_add_challenge(&mut state, &c),
+                "challenge {} should still be in cache",
+                i
+            );
         }
 
         // Challenge 1 was evicted by c0's insert and should be accepted as new.
         let mut c1 = [0u8; 32];
         c1[0] = 1;
-        assert!(check_and_add_challenge(&mut state, &c1), "evicted challenge 1 should be accepted as new");
+        assert!(
+            check_and_add_challenge(&mut state, &c1),
+            "evicted challenge 1 should be accepted as new"
+        );
 
         // Verify write pointer advances correctly: after 11 inserts (8+3),
         // write_idx should be 11.
@@ -1529,7 +1637,11 @@ mod tests {
 
         let resp = handle(&mut state, &mut store, &cmd);
         assert_eq!(resp.sw, 0x9000, "expected SW_OK, got {:04X}", resp.sw);
-        assert_eq!(resp.data.len(), 104, "expected 104 bytes: generation(8) + state_root(32) + sig(64)");
+        assert_eq!(
+            resp.data.len(),
+            104,
+            "expected 104 bytes: generation(8) + state_root(32) + sig(64)"
+        );
     }
 
     #[test]
@@ -1565,7 +1677,11 @@ mod tests {
         assert_eq!(resp2.sw, 0x9000);
 
         // The state_root portion (bytes 8..40) should differ.
-        assert_ne!(&hash1[8..40], &resp2.data[8..40], "state_root should change after adding a key");
+        assert_ne!(
+            &hash1[8..40],
+            &resp2.data[8..40],
+            "state_root should change after adding a key"
+        );
     }
 
     #[test]
@@ -1651,7 +1767,11 @@ mod tests {
         assert_eq!(resp.sw, 0x9000);
         // State has only the device static key at 0xFE, which is filtered out
         // from the manifest (only user keys 0x01–0xFD are exported).
-        assert_eq!(resp.data.len(), 0, "device key (0xFE) must be excluded from manifest");
+        assert_eq!(
+            resp.data.len(),
+            0,
+            "device key (0xFE) must be excluded from manifest"
+        );
     }
 
     #[test]
@@ -1682,7 +1802,10 @@ mod tests {
         let key1 = derive_session_key_v2(&shared_secret, &ephem1, &ephem2, &challenge).unwrap();
         let key2 = derive_session_key_v2(&shared_secret, &ephem1, &ephem3, &challenge).unwrap();
 
-        assert_ne!(*key1, *key2, "different ephem pubkeys should produce different session keys");
+        assert_ne!(
+            *key1, *key2,
+            "different ephem pubkeys should produce different session keys"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1787,8 +1910,12 @@ mod tests {
 
         // Enroll first key.
         let cmd1 = ApduCommand {
-            cla: 0x80, ins: INS_EXTRAS, p1: 0x3D, p2: 0x00,
-            data: &pubkey1, le: None,
+            cla: 0x80,
+            ins: INS_EXTRAS,
+            p1: 0x3D,
+            p2: 0x00,
+            data: &pubkey1,
+            le: None,
         };
         let resp1 = handle(&mut state, &mut store, &cmd1);
         assert_eq!(resp1.sw, 0x9000);
@@ -1796,27 +1923,45 @@ mod tests {
 
         // Re-enroll with second key (SO-PIN still verified).
         let cmd2 = ApduCommand {
-            cla: 0x80, ins: INS_EXTRAS, p1: 0x3D, p2: 0x00,
-            data: &pubkey2, le: None,
+            cla: 0x80,
+            ins: INS_EXTRAS,
+            p1: 0x3D,
+            p2: 0x00,
+            data: &pubkey2,
+            le: None,
         };
         let resp2 = handle(&mut state, &mut store, &cmd2);
         assert_eq!(resp2.sw, 0x9000);
-        assert_eq!(state.noise_enrolled_peer_pubkey.unwrap(), pubkey2, "re-enrollment should overwrite");
+        assert_eq!(
+            state.noise_enrolled_peer_pubkey.unwrap(),
+            pubkey2,
+            "re-enrollment should overwrite"
+        );
     }
 
     #[test]
     fn test_enroll_peer_locks_unauthenticated() {
         let (mut state, mut store) = state_with_device_key();
 
-        assert!(state.dkek_unauthenticated_allowed, "should start as allowed");
+        assert!(
+            state.dkek_unauthenticated_allowed,
+            "should start as allowed"
+        );
 
         let pubkey = generate_test_p256_pubkey();
         let cmd = ApduCommand {
-            cla: 0x80, ins: INS_EXTRAS, p1: 0x3D, p2: 0x00,
-            data: &pubkey, le: None,
+            cla: 0x80,
+            ins: INS_EXTRAS,
+            p1: 0x3D,
+            p2: 0x00,
+            data: &pubkey,
+            le: None,
         };
         let resp = handle(&mut state, &mut store, &cmd);
         assert_eq!(resp.sw, 0x9000);
-        assert!(!state.dkek_unauthenticated_allowed, "should be locked after enrollment");
+        assert!(
+            !state.dkek_unauthenticated_allowed,
+            "should be locked after enrollment"
+        );
     }
 }

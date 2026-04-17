@@ -13,8 +13,10 @@
 use subtle::ConstantTimeEq;
 
 use pico2hsm_core::{
-    apdu::{ApduCommand, ApduResponse, SW_CONDITIONS_NOT_SATISFIED, SW_OK, SW_SECURITY_STATUS,
-        SW_WRONG_DATA, SW_WRONG_LENGTH},
+    apdu::{
+        ApduCommand, ApduResponse, SW_CONDITIONS_NOT_SATISFIED, SW_OK, SW_SECURITY_STATUS,
+        SW_WRONG_DATA, SW_WRONG_LENGTH,
+    },
     key::AppletId,
 };
 
@@ -78,7 +80,11 @@ fn gen_salt() -> [u8; 16] {
 ///   0x82  Init code / SO-PIN (always exactly 8 bytes, hex-decoded by the tool)
 ///   0x91  User PIN retry counter (1 byte)
 ///   0x92  DKEK share count (1 byte, 0 = no DKEK)
-pub fn handle(state: &mut ScHsmState, store: &mut dyn crate::storage::KeyStore, cmd: &ApduCommand<'_>) -> ApduResponse {
+pub fn handle(
+    state: &mut ScHsmState,
+    store: &mut dyn crate::storage::KeyStore,
+    cmd: &ApduCommand<'_>,
+) -> ApduResponse {
     crate::CORE1_PROGRESS.store(30, core::sync::atomic::Ordering::Relaxed);
     // cdc_log removed — CriticalSectionRawMutex is single-core only, unsafe on core1
     if cmd.p1 != 0x00 || cmd.p2 != 0x00 {
@@ -118,14 +124,22 @@ pub fn handle(state: &mut ScHsmState, store: &mut dyn crate::storage::KeyStore, 
 
     // Tag 0x80: Options bitmask (optional, 2 bytes LE).
     let options = find_tlv(data, 0x80).and_then(|v| {
-        if v.len() >= 2 { Some(u16::from_le_bytes([v[0], v[1]])) } else { None }
+        if v.len() >= 2 {
+            Some(u16::from_le_bytes([v[0], v[1]]))
+        } else {
+            None
+        }
     });
 
     // Tag 0x91: User PIN retry counter (optional).
-    let retry_counter = find_tlv(data, 0x91).and_then(|v| v.first().copied()).unwrap_or(3);
+    let retry_counter = find_tlv(data, 0x91)
+        .and_then(|v| v.first().copied())
+        .unwrap_or(3);
 
     // Tag 0x92: DKEK share count (optional, 0 = no DKEK).
-    let dkek_count = find_tlv(data, 0x92).and_then(|v| v.first().copied()).unwrap_or(0);
+    let dkek_count = find_tlv(data, 0x92)
+        .and_then(|v| v.first().copied())
+        .unwrap_or(0);
 
     // Generate fresh random salts for all credentials.
     let so_salt = gen_salt();
@@ -219,7 +233,12 @@ pub fn handle(state: &mut ScHsmState, store: &mut dyn crate::storage::KeyStore, 
             // Persist to flash.
             {
                 use crate::security::key_management::{AlgorithmId, KeyObject, KeyType as KmType};
-                let mut key_obj = KeyObject::new(KmType::Ec, dev_identity_key_id, AppletId::ScHsm, AlgorithmId::EcdsaP256);
+                let mut key_obj = KeyObject::new(
+                    KmType::Ec,
+                    dev_identity_key_id,
+                    AppletId::ScHsm,
+                    AlgorithmId::EcdsaP256,
+                );
                 let _ = key_obj.private_key.extend_from_slice(&pair.private_key);
                 let _ = key_obj.public_key.extend_from_slice(&pair.public_key);
                 crate::CORE1_PROGRESS.store(80, core::sync::atomic::Ordering::Relaxed);
@@ -241,7 +260,12 @@ pub fn handle(state: &mut ScHsmState, store: &mut dyn crate::storage::KeyStore, 
             {
                 let ef_key_id = pico2hsm_core::key::KeyId::sc_hsm_ef(0, 0x2F, 0x02);
                 let _ = store.erase_key(ef_key_id);
-                let mut ef_obj = KeyObject::new(KmType::Generic, ef_key_id.0, AppletId::ScHsm, AlgorithmId::EcdsaP256);
+                let mut ef_obj = KeyObject::new(
+                    KmType::Generic,
+                    ef_key_id.0,
+                    AppletId::ScHsm,
+                    AlgorithmId::EcdsaP256,
+                );
                 let _ = ef_obj.private_key.extend_from_slice(&pair.public_key);
                 let _ = store.save_key(&ef_obj);
                 // Populate ef_cache so READ BINARY can serve this data.
@@ -251,12 +275,11 @@ pub fn handle(state: &mut ScHsmState, store: &mut dyn crate::storage::KeyStore, 
                 let ef_meta = crate::protocol::sc_hsm::KeyMeta {
                     key_id: ef_key_id.0,
                     key_type: 16, // EfFile
-                    algo: 0x2F, // high byte of file_id 0x2F02
+                    algo: 0x2F,   // high byte of file_id 0x2F02
                     key_flags: 0,
                 };
                 let _ = state.key_index.push(ef_meta);
             }
-
         }
     }
 

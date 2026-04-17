@@ -3,7 +3,9 @@
 //! Returns a list of all key objects stored in the keystore. The response
 //! contains a sequence of key descriptor TLV structures.
 
-use pico2hsm_core::apdu::{ApduCommand, ApduResponse, SW_CONDITIONS_NOT_SATISFIED, SW_INCORRECT_P1P2, SW_OK};
+use pico2hsm_core::apdu::{
+    ApduCommand, ApduResponse, SW_CONDITIONS_NOT_SATISFIED, SW_INCORRECT_P1P2, SW_OK,
+};
 
 use crate::protocol::sc_hsm::ScHsmState;
 
@@ -25,7 +27,6 @@ pub fn handle(state: &mut ScHsmState, cmd: &ApduCommand<'_>) -> ApduResponse {
     // sc_hsm_determine_free_id uses KEY_PREFIX=0xCC to find occupied slots.
     // sc_pkcs15emu_sc_hsm_init also scans for 0xCC to call add_prkd per key.
     let mut resp: heapless::Vec<u8, 256> = heapless::Vec::new();
-
 
     // Iterate key_index: emit CC xx for non-EfFile entries (crypto keys).
     for meta in &state.key_index {

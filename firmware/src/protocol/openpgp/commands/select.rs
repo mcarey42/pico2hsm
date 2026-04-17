@@ -30,7 +30,7 @@ pub fn handle(state: &mut OpenPgpState, cmd: &ApduCommand<'_>) -> ApduResponse {
 
     // A5 inner: 9F 6E 04 <version 4 bytes> = 7 bytes
     let a5_inner_len: u8 = 2 + 1 + version.len() as u8; // tag(2) + len(1) + data(4) = 7
-    // 6F inner: 84 TLV + A5 TLV
+                                                        // 6F inner: 84 TLV + A5 TLV
     let outer_len: u8 = (2 + aid.len() as u8) + (2 + a5_inner_len);
 
     let mut fci: Vec<u8, 48> = Vec::new();

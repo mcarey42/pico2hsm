@@ -9,8 +9,7 @@
 //! Wrapped key blob in SC-HSM wrap format.
 
 use pico2hsm_core::apdu::{
-    ApduCommand, ApduResponse, SW_CONDITIONS_NOT_SATISFIED,
-    SW_SECURITY_STATUS, SW_WRONG_DATA,
+    ApduCommand, ApduResponse, SW_CONDITIONS_NOT_SATISFIED, SW_SECURITY_STATUS, SW_WRONG_DATA,
 };
 use pico2hsm_core::key::{AppletId, KeyId};
 
@@ -28,7 +27,11 @@ pub const INS_IMPORT_KEY: u8 = 0x74;
 pub const P2_IMPORT: u8 = 0x93;
 
 /// Handle an IMPORT KEY APDU command.
-pub fn handle(state: &mut ScHsmState, store: &mut dyn KeyStore, cmd: &ApduCommand<'_>) -> ApduResponse {
+pub fn handle(
+    state: &mut ScHsmState,
+    store: &mut dyn KeyStore,
+    cmd: &ApduCommand<'_>,
+) -> ApduResponse {
     // Require PIN authentication
     if !state.pin_verified {
         return ApduResponse::err(SW_SECURITY_STATUS);
@@ -141,10 +144,16 @@ pub fn handle(state: &mut ScHsmState, store: &mut dyn KeyStore, cmd: &ApduComman
         0x55 => pico2hsm_core::key::KeyType::EcPrivateBrainpoolP512,
         0x20 => pico2hsm_core::key::KeyType::Ed25519,
         0x21 => pico2hsm_core::key::KeyType::X25519,
-        0x05 | 0x07 | 0x31 | 0x32 | 0x33 | 0x34 | 0x41 => pico2hsm_core::key::KeyType::RsaPrivate2048, // RSA family placeholder
+        0x05 | 0x07 | 0x31 | 0x32 | 0x33 | 0x34 | 0x41 => {
+            pico2hsm_core::key::KeyType::RsaPrivate2048
+        } // RSA family placeholder
         0x60 | 0x61 | 0x62 | 0x63 => pico2hsm_core::key::KeyType::Aes256,
         _ => {
-            crate::cdc_log!("SC-HSM IMPORT KEY done key=0x{:08x} algo=0x{:02x}", full_key_id.0, algo_id);
+            crate::cdc_log!(
+                "SC-HSM IMPORT KEY done key=0x{:08x} algo=0x{:02x}",
+                full_key_id.0,
+                algo_id
+            );
             return ApduResponse::ok(&[]);
         }
     };
@@ -158,27 +167,49 @@ pub fn handle(state: &mut ScHsmState, store: &mut dyn KeyStore, cmd: &ApduComman
         key_flags,
     });
 
-    crate::cdc_log!("SC-HSM IMPORT KEY done key=0x{:08x} algo=0x{:02x}", full_key_id.0, algo_id);
+    crate::cdc_log!(
+        "SC-HSM IMPORT KEY done key=0x{:08x} algo=0x{:02x}",
+        full_key_id.0,
+        algo_id
+    );
     ApduResponse::ok(&[])
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pico2hsm_core::apdu::{ApduCommand, SW_OK};
-    use pico2hsm_core::key::{KeyId, KeyType as CoreKeyType};
-    use pico2hsm_core::error::HsmError;
     use crate::protocol::sc_hsm::{FwRng, ScHsmState};
     use crate::storage::KeyStore;
+    use pico2hsm_core::apdu::{ApduCommand, SW_OK};
+    use pico2hsm_core::error::HsmError;
+    use pico2hsm_core::key::{KeyId, KeyType as CoreKeyType};
 
     struct NullStore;
     impl KeyStore for NullStore {
-        fn save_key(&mut self, _: &crate::security::key_management::KeyObject) -> Result<(), HsmError> { Ok(()) }
-        fn fetch_key(&mut self, _: KeyId) -> Result<Option<crate::security::key_management::KeyObject>, HsmError> { Ok(None) }
-        fn erase_key(&mut self, _: KeyId) -> Result<(), HsmError> { Ok(()) }
-        fn wipe_all(&mut self) -> Result<(), HsmError> { Ok(()) }
-        fn wipe_by_owner(&mut self, _: AppletId) -> Result<(), HsmError> { Ok(()) }
-        fn enumerate_keys(&self) -> heapless::Vec<KeyId, 64> { heapless::Vec::new() }
+        fn save_key(
+            &mut self,
+            _: &crate::security::key_management::KeyObject,
+        ) -> Result<(), HsmError> {
+            Ok(())
+        }
+        fn fetch_key(
+            &mut self,
+            _: KeyId,
+        ) -> Result<Option<crate::security::key_management::KeyObject>, HsmError> {
+            Ok(None)
+        }
+        fn erase_key(&mut self, _: KeyId) -> Result<(), HsmError> {
+            Ok(())
+        }
+        fn wipe_all(&mut self) -> Result<(), HsmError> {
+            Ok(())
+        }
+        fn wipe_by_owner(&mut self, _: AppletId) -> Result<(), HsmError> {
+            Ok(())
+        }
+        fn enumerate_keys(&self) -> heapless::Vec<KeyId, 64> {
+            heapless::Vec::new()
+        }
         fn for_each_key(&self, _f: &mut dyn FnMut(KeyId)) {}
     }
 
@@ -200,7 +231,14 @@ mod tests {
     }
 
     fn make_cmd<'a>(p1: u8, p2: u8, data: &'a [u8]) -> ApduCommand<'a> {
-        ApduCommand { cla: 0x80, ins: INS_IMPORT_KEY, p1, p2, data, le: None }
+        ApduCommand {
+            cla: 0x80,
+            ins: INS_IMPORT_KEY,
+            p1,
+            p2,
+            data,
+            le: None,
+        }
     }
 
     #[test]
@@ -215,7 +253,10 @@ mod tests {
 
         assert_eq!(resp.sw, SW_OK, "expected SW_OK for valid import");
         // Verify the key metadata was added to key_index.
-        let found = state.key_index.iter().find(|m| m.key_id == KeyId::sc_hsm(0, 0x01).0);
+        let found = state
+            .key_index
+            .iter()
+            .find(|m| m.key_id == KeyId::sc_hsm(0, 0x01).0);
         assert!(found.is_some(), "imported key should be in key_index");
         let meta = found.unwrap();
         assert_eq!(meta.algo, 0x13);
@@ -261,7 +302,10 @@ mod tests {
         let mut store = NullStore;
         let resp = handle(&mut state, &mut store, &cmd);
 
-        assert_eq!(resp.sw, SW_WRONG_DATA, "empty data with no EF 0x2F10 should fail");
+        assert_eq!(
+            resp.sw, SW_WRONG_DATA,
+            "empty data with no EF 0x2F10 should fail"
+        );
     }
 
     /// A store that holds one EF 0x2F10 blob for testing the standard import path.
@@ -269,7 +313,10 @@ mod tests {
         ef_data: Option<heapless::Vec<u8, 2400>>,
     }
     impl KeyStore for EfStore {
-        fn save_key(&mut self, obj: &crate::security::key_management::KeyObject) -> Result<(), HsmError> {
+        fn save_key(
+            &mut self,
+            obj: &crate::security::key_management::KeyObject,
+        ) -> Result<(), HsmError> {
             // Store EF 0x2F10 data
             let ef_key_id = KeyId::sc_hsm_ef(0, 0x2F, 0x10).0;
             if obj.key_id == ef_key_id {
@@ -279,7 +326,10 @@ mod tests {
             }
             Ok(())
         }
-        fn fetch_key(&mut self, kid: KeyId) -> Result<Option<crate::security::key_management::KeyObject>, HsmError> {
+        fn fetch_key(
+            &mut self,
+            kid: KeyId,
+        ) -> Result<Option<crate::security::key_management::KeyObject>, HsmError> {
             let ef_key_id = KeyId::sc_hsm_ef(0, 0x2F, 0x10);
             if kid == ef_key_id {
                 if let Some(ref data) = self.ef_data {
@@ -302,9 +352,15 @@ mod tests {
             }
             Ok(())
         }
-        fn wipe_all(&mut self) -> Result<(), HsmError> { Ok(()) }
-        fn wipe_by_owner(&mut self, _: AppletId) -> Result<(), HsmError> { Ok(()) }
-        fn enumerate_keys(&self) -> heapless::Vec<KeyId, 64> { heapless::Vec::new() }
+        fn wipe_all(&mut self) -> Result<(), HsmError> {
+            Ok(())
+        }
+        fn wipe_by_owner(&mut self, _: AppletId) -> Result<(), HsmError> {
+            Ok(())
+        }
+        fn enumerate_keys(&self) -> heapless::Vec<KeyId, 64> {
+            heapless::Vec::new()
+        }
         fn for_each_key(&self, _f: &mut dyn FnMut(KeyId)) {}
     }
 
@@ -341,7 +397,10 @@ mod tests {
             "EF 0x2F10 should be cleared from ef_cache after import"
         );
         // Key metadata must be in the key_index.
-        let found = state.key_index.iter().find(|m| m.key_id == KeyId::sc_hsm(0, 0x01).0);
+        let found = state
+            .key_index
+            .iter()
+            .find(|m| m.key_id == KeyId::sc_hsm(0, 0x01).0);
         assert!(found.is_some(), "imported key should be in key_index");
         assert_eq!(found.unwrap().algo, 0x13);
     }

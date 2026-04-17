@@ -133,7 +133,11 @@ impl<'a> T1Block<'a> {
             return Err(T1Error::InvalidBlock);
         };
 
-        Ok(T1Block { nad, block_type, inf })
+        Ok(T1Block {
+            nad,
+            block_type,
+            inf,
+        })
     }
 
     /// Compute LRC: XOR of all bytes in `data`.
@@ -200,11 +204,7 @@ impl T1State {
     /// Returns `CompleteApdu` when the last block of a (possibly chained) APDU
     /// is received.  Returns `SBlockResponse` for S-block exchanges that must
     /// be completed before the next I-block arrives.
-    pub fn process_block(
-        &mut self,
-        block: &[u8],
-        apdu_buf: &mut Vec<u8, 4096>,
-    ) -> T1Result {
+    pub fn process_block(&mut self, block: &[u8], apdu_buf: &mut Vec<u8, 4096>) -> T1Result {
         let parsed = match T1Block::parse(block) {
             Ok(b) => b,
             Err(e) => return T1Result::Error(e),
@@ -277,7 +277,9 @@ impl T1State {
         if apdu_response.is_empty() {
             // Empty response — send single I-block with 0-byte INF
             let block = self.build_iblock(&[], false)?;
-            blocks_out.push(block).map_err(|_| T1Error::BufferOverflow)?;
+            blocks_out
+                .push(block)
+                .map_err(|_| T1Error::BufferOverflow)?;
             self.send_seq = self.send_seq.wrapping_add(1) & 1;
             return Ok(());
         }
@@ -288,7 +290,9 @@ impl T1State {
             let more = end < apdu_response.len();
 
             let block = self.build_iblock(chunk, more)?;
-            blocks_out.push(block).map_err(|_| T1Error::BufferOverflow)?;
+            blocks_out
+                .push(block)
+                .map_err(|_| T1Error::BufferOverflow)?;
 
             // Advance send sequence number for each I-block sent
             self.send_seq = self.send_seq.wrapping_add(1) & 1;
@@ -319,8 +323,12 @@ impl T1State {
 
         block.push(0x00).map_err(|_| T1Error::BufferOverflow)?; // NAD
         block.push(pcb).map_err(|_| T1Error::BufferOverflow)?; // PCB
-        block.push(inf.len() as u8).map_err(|_| T1Error::BufferOverflow)?; // LEN
-        block.extend_from_slice(inf).map_err(|_| T1Error::BufferOverflow)?; // INF
+        block
+            .push(inf.len() as u8)
+            .map_err(|_| T1Error::BufferOverflow)?; // LEN
+        block
+            .extend_from_slice(inf)
+            .map_err(|_| T1Error::BufferOverflow)?; // INF
 
         let lrc = Self::compute_lrc(&block);
         block.push(lrc).map_err(|_| T1Error::BufferOverflow)?; // LRC
@@ -359,9 +367,13 @@ impl T1State {
 
         block.push(0x00).map_err(|_| T1Error::BufferOverflow)?; // NAD
         block.push(resp_code).map_err(|_| T1Error::BufferOverflow)?; // PCB
-        block.push(resp_inf.len() as u8).map_err(|_| T1Error::BufferOverflow)?; // LEN
+        block
+            .push(resp_inf.len() as u8)
+            .map_err(|_| T1Error::BufferOverflow)?; // LEN
         if !resp_inf.is_empty() {
-            block.extend_from_slice(resp_inf).map_err(|_| T1Error::BufferOverflow)?;
+            block
+                .extend_from_slice(resp_inf)
+                .map_err(|_| T1Error::BufferOverflow)?;
         }
         let lrc = compute_lrc_slice(&block);
         block.push(lrc).map_err(|_| T1Error::BufferOverflow)?;
@@ -387,7 +399,10 @@ pub struct T1Reassembler {
 impl T1Reassembler {
     /// Create a new reassembler.
     pub fn new() -> Self {
-        T1Reassembler { buf: Vec::new(), expected_seq: false }
+        T1Reassembler {
+            buf: Vec::new(),
+            expected_seq: false,
+        }
     }
 
     /// Feed one I-block fragment. Returns `Some(&[u8])` when the last block
@@ -400,7 +415,9 @@ impl T1Reassembler {
                     return Err(T1Error::SequenceError);
                 }
                 // Append INF
-                self.buf.extend_from_slice(block.inf).map_err(|_| T1Error::BufferOverflow)?;
+                self.buf
+                    .extend_from_slice(block.inf)
+                    .map_err(|_| T1Error::BufferOverflow)?;
                 // Advance expected sequence
                 self.expected_seq = !self.expected_seq;
 

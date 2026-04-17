@@ -34,8 +34,6 @@
 
 // ─── ARM-only imports ─────────────────────────────────────────────────────────
 
-#[allow(unused_imports)]
-use pico2hsm_firmware::{serial_println, serial_print, serial_fmt};
 #[cfg(target_arch = "arm")]
 use defmt_rtt as _;
 #[cfg(target_arch = "arm")]
@@ -44,6 +42,8 @@ use embassy_executor::Spawner;
 use embassy_time::Timer;
 #[cfg(target_arch = "arm")]
 use panic_probe as _;
+#[allow(unused_imports)]
+use pico2hsm_firmware::{serial_fmt, serial_print, serial_println};
 
 #[cfg(target_arch = "arm")]
 use core::ptr::addr_of_mut;
@@ -52,7 +52,7 @@ extern "C" {
     static __ebss: u8;
 }
 #[cfg(target_arch = "arm")]
-use embassy_rp::multicore::{Stack, spawn_core1};
+use embassy_rp::multicore::{spawn_core1, Stack};
 #[cfg(target_arch = "arm")]
 use embassy_rp::spinlock_mutex::SpinlockRawMutex;
 #[cfg(target_arch = "arm")]
@@ -199,8 +199,10 @@ impl pico2hsm_firmware::storage::KeyStore for FlashQueueKeyStore {
     fn fetch_key(
         &mut self,
         key_id: pico2hsm_core::key::KeyId,
-    ) -> Result<Option<pico2hsm_firmware::security::key_management::KeyObject>, pico2hsm_core::error::HsmError>
-    {
+    ) -> Result<
+        Option<pico2hsm_firmware::security::key_management::KeyObject>,
+        pico2hsm_core::error::HsmError,
+    > {
         // Direct read — safe from any core.
         // For QMI flash this is XIP memory-mapped; for SD card it's SPI reads.
         use pico2hsm_firmware::storage::KeyStore;
@@ -247,8 +249,7 @@ impl pico2hsm_firmware::storage::KeyStore for FlashQueueKeyStore {
     fn enumerate_keys(&self) -> heapless::Vec<pico2hsm_core::key::KeyId, 64> {
         heapless::Vec::new()
     }
-    fn for_each_key(&self, _f: &mut dyn FnMut(pico2hsm_core::key::KeyId)) {
-    }
+    fn for_each_key(&self, _f: &mut dyn FnMut(pico2hsm_core::key::KeyId)) {}
 }
 
 /// One-time initialised key store — lives for the duration of the firmware.
@@ -498,8 +499,11 @@ async fn main(_spawner: Spawner) {
             .shcsr
             .modify(|v| v | (1 << 18));
 
-        defmt::info!("core0: MSPLIM set to 0x{:08X} (__ebss=0x{:08X})",
-            ebss, ebss);
+        defmt::info!(
+            "core0: MSPLIM set to 0x{:08X} (__ebss=0x{:08X})",
+            ebss,
+            ebss
+        );
     }
 
     defmt::info!("pico2hsm: peripherals initialised");
@@ -511,7 +515,11 @@ async fn main(_spawner: Spawner) {
         pico2hsm_firmware::allocator::init();
 
         let otp = pico2hsm_firmware::security::otp::Otp::new();
-        defmt::info!("OTP: provisioned={} production={}", otp.is_provisioned(), otp.is_production_mode());
+        defmt::info!(
+            "OTP: provisioned={} production={}",
+            otp.is_provisioned(),
+            otp.is_production_mode()
+        );
         match pico2hsm_firmware::security::otp::derive_smk() {
             Ok(_) => defmt::info!("OTP: SMK derived"),
             Err(_) => defmt::warn!("OTP: derive_smk failed — unprovisioned?"),
@@ -527,7 +535,11 @@ async fn main(_spawner: Spawner) {
         pico2hsm_firmware::allocator::init();
 
         let otp = pico2hsm_firmware::security::otp::Otp::new();
-        defmt::info!("OTP: provisioned={} production={}", otp.is_provisioned(), otp.is_production_mode());
+        defmt::info!(
+            "OTP: provisioned={} production={}",
+            otp.is_provisioned(),
+            otp.is_production_mode()
+        );
         match pico2hsm_firmware::security::otp::derive_smk() {
             Ok(_) => defmt::info!("OTP: SMK derived"),
             Err(_) => defmt::warn!("OTP: derive_smk failed — unprovisioned?"),
@@ -537,10 +549,7 @@ async fn main(_spawner: Spawner) {
     }
 
     // ── RP2350-Geek: pass p intact; run_geek_board initialises UART first ────
-    #[cfg(any(
-        feature = "rp2350_geek_16m",
-        feature = "rp2350_geek_sdcard",
-    ))]
+    #[cfg(any(feature = "rp2350_geek_16m", feature = "rp2350_geek_sdcard",))]
     {
         run_geek_board(p).await;
     }
@@ -555,7 +564,11 @@ async fn main(_spawner: Spawner) {
         pico2hsm_firmware::allocator::init();
 
         let otp = pico2hsm_firmware::security::otp::Otp::new();
-        defmt::info!("OTP: provisioned={} production={}", otp.is_provisioned(), otp.is_production_mode());
+        defmt::info!(
+            "OTP: provisioned={} production={}",
+            otp.is_provisioned(),
+            otp.is_production_mode()
+        );
         match pico2hsm_firmware::security::otp::derive_smk() {
             Ok(_) => defmt::info!("OTP: SMK derived"),
             Err(_) => defmt::warn!("OTP: derive_smk failed — unprovisioned?"),
@@ -575,7 +588,9 @@ async fn main(_spawner: Spawner) {
     )))]
     {
         defmt::error!("No board feature flag set — spinning forever");
-        loop { Timer::after_millis(1000).await; }
+        loop {
+            Timer::after_millis(1000).await;
+        }
     }
 }
 
@@ -596,14 +611,20 @@ fn handle_flash_op(
     match op {
         FlashOp::SaveKey(ref obj) => {
             let result = store.save_key(obj);
-            defmt::info!("FLASH_SVC: save_key 0x{:08x} => {}", obj.key_id,
-                if result.is_ok() { "ok" } else { "FAIL" });
+            defmt::info!(
+                "FLASH_SVC: save_key 0x{:08x} => {}",
+                obj.key_id,
+                if result.is_ok() { "ok" } else { "FAIL" }
+            );
             result
         }
         FlashOp::EraseKey(kid) => {
             let result = store.erase_key(kid);
-            defmt::info!("FLASH_SVC: erase_key 0x{:08x} => {}", kid.0,
-                if result.is_ok() { "ok" } else { "FAIL" });
+            defmt::info!(
+                "FLASH_SVC: erase_key 0x{:08x} => {}",
+                kid.0,
+                if result.is_ok() { "ok" } else { "FAIL" }
+            );
             result
         }
         FlashOp::WipeAll => {
@@ -662,8 +683,7 @@ async fn run_one_board(p: embassy_rp::Peripherals) {
     board.led().set_status(LedStatus::Busy);
 
     // ── Storage initialization (rp2350_one: internal QMI flash) ───────────────
-    let smk_bytes = pico2hsm_firmware::security::otp::derive_smk()
-        .unwrap_or([0u8; 32]);
+    let smk_bytes = pico2hsm_firmware::security::otp::derive_smk().unwrap_or([0u8; 32]);
     let smk = zeroize::Zeroizing::new(smk_bytes);
 
     let qmi_flash = embassy_rp::flash::Flash::<
@@ -745,22 +765,26 @@ async fn run_one_board(p: embassy_rp::Peripherals) {
     let dispatcher_ptr = dispatcher_ref as *mut pico2hsm_firmware::apdu::dispatcher::Dispatcher;
     let dispatcher_send = DispatcherPtr(dispatcher_ptr, store as *mut _);
 
-    spawn_core1(p.CORE1, unsafe { &mut *addr_of_mut!(CORE1_STACK) }, move || {
-        // MSPLIM — hardware stack overflow detection for Core1.
-        // MSPLIM at stack base — hardware UsageFault fires at exact boundary.
-        // No defmt here — Core1 defmt contends on Spinlock31 with Core0 USB.
-        #[cfg(target_arch = "arm")]
-        unsafe {
-            let stack_bottom = core::ptr::addr_of!(CORE1_STACK) as u32;
-            cortex_m::register::msplim::write(stack_bottom);
-            // SHCSR bit 18 = USGFAULTENA
-            (*cortex_m::peripheral::SCB::PTR)
-                .shcsr
-                .modify(|v| v | (1 << 18));
-        }
+    spawn_core1(
+        p.CORE1,
+        unsafe { &mut *addr_of_mut!(CORE1_STACK) },
+        move || {
+            // MSPLIM — hardware stack overflow detection for Core1.
+            // MSPLIM at stack base — hardware UsageFault fires at exact boundary.
+            // No defmt here — Core1 defmt contends on Spinlock31 with Core0 USB.
+            #[cfg(target_arch = "arm")]
+            unsafe {
+                let stack_bottom = core::ptr::addr_of!(CORE1_STACK) as u32;
+                cortex_m::register::msplim::write(stack_bottom);
+                // SHCSR bit 18 = USGFAULTENA
+                (*cortex_m::peripheral::SCB::PTR)
+                    .shcsr
+                    .modify(|v| v | (1 << 18));
+            }
 
-        dispatcher_loop(dispatcher_send);
-    });
+            dispatcher_loop(dispatcher_send);
+        },
+    );
 
     // ── Concurrent USB + CCID command loop (core0) ───────────────────────────
     let usb_fut = usb.run();
@@ -779,18 +803,29 @@ async fn run_one_board(p: embassy_rp::Peripherals) {
                         let response = {
                             use embassy_futures::select::{select3, Either3};
                             let mut stall_count: u32 = 0;
-                            let mut last_heartbeat = WATCHDOG_HEARTBEAT.load(core::sync::atomic::Ordering::Relaxed);
+                            let mut last_heartbeat =
+                                WATCHDOG_HEARTBEAT.load(core::sync::atomic::Ordering::Relaxed);
                             loop {
-                                match select3(RESP_CHANNEL.receive(), embassy_time::Timer::after_millis(1500), FLASH_REQ.receive()).await {
+                                match select3(
+                                    RESP_CHANNEL.receive(),
+                                    embassy_time::Timer::after_millis(1500),
+                                    FLASH_REQ.receive(),
+                                )
+                                .await
+                                {
                                     Either3::First(r) => break r,
                                     Either3::Second(_) => {
-                                        let progress = CORE1_PROGRESS.load(core::sync::atomic::Ordering::Relaxed);
-                                        let heartbeat = WATCHDOG_HEARTBEAT.load(core::sync::atomic::Ordering::Relaxed);
+                                        let progress = CORE1_PROGRESS
+                                            .load(core::sync::atomic::Ordering::Relaxed);
+                                        let heartbeat = WATCHDOG_HEARTBEAT
+                                            .load(core::sync::atomic::Ordering::Relaxed);
                                         if heartbeat == last_heartbeat {
                                             stall_count += 1;
                                             defmt::warn!("time ext: core1 progress={} heartbeat={} STALL {}/{}", progress, heartbeat, stall_count, WATCHDOG_STALL_LIMIT);
                                             if stall_count >= WATCHDOG_STALL_LIMIT {
-                                                defmt::error!("watchdog: core1 stuck — aborting APDU");
+                                                defmt::error!(
+                                                    "watchdog: core1 stuck — aborting APDU"
+                                                );
                                                 // Return SW 6F00 (internal error) to unblock the host.
                                                 let mut err_resp = heapless::Vec::<u8, 4098>::new();
                                                 let _ = err_resp.push(0x6F);
@@ -800,9 +835,15 @@ async fn run_one_board(p: embassy_rp::Peripherals) {
                                         } else {
                                             stall_count = 0;
                                             last_heartbeat = heartbeat;
-                                            defmt::warn!("time ext: core1 progress={} heartbeat={}", progress, heartbeat);
+                                            defmt::warn!(
+                                                "time ext: core1 progress={} heartbeat={}",
+                                                progress,
+                                                heartbeat
+                                            );
                                         }
-                                        if let Err(CcidError::UsbDisconnected) = ccid.send_time_extension().await {
+                                        if let Err(CcidError::UsbDisconnected) =
+                                            ccid.send_time_extension().await
+                                        {
                                             let _ = RESP_CHANNEL.receive().await;
                                             break heapless::Vec::new();
                                         }
@@ -818,7 +859,10 @@ async fn run_one_board(p: embassy_rp::Peripherals) {
                         match ccid.send_response(&response).await {
                             Ok(()) => {
                                 for _ in 0..16 {
-                                    pico2hsm_firmware::transport::cdc_serial::drain_one(&mut cdc_sender).await;
+                                    pico2hsm_firmware::transport::cdc_serial::drain_one(
+                                        &mut cdc_sender,
+                                    )
+                                    .await;
                                 }
                             }
                             Err(CcidError::UsbDisconnected) => {
@@ -833,7 +877,7 @@ async fn run_one_board(p: embassy_rp::Peripherals) {
                     }
                     Err(CcidError::UsbDisconnected) => {
                         let _ = APDU_CHANNEL.send(heapless::Vec::new()).await;
-                                cortex_m::asm::sev(); // wake core1 from WFE
+                        cortex_m::asm::sev(); // wake core1 from WFE
                         let _ = RESP_CHANNEL.receive().await;
                         board.led().set_status(LedStatus::Ready);
                         break;
@@ -849,10 +893,10 @@ async fn run_one_board(p: embassy_rp::Peripherals) {
 
 // ─── RP2350-Geek main function ────────────────────────────────────────────────
 
-#[cfg(all(target_arch = "arm", any(
-    feature = "rp2350_geek_16m",
-    feature = "rp2350_geek_sdcard",
-)))]
+#[cfg(all(
+    target_arch = "arm",
+    any(feature = "rp2350_geek_16m", feature = "rp2350_geek_sdcard",)
+))]
 async fn run_geek_board(p: embassy_rp::Peripherals) {
     use embassy_futures::join::join;
     use embassy_rp::gpio::{Level, Output};
@@ -894,8 +938,16 @@ async fn run_geek_board(p: embassy_rp::Peripherals) {
     let otp = pico2hsm_firmware::security::otp::Otp::new();
     let provisioned = otp.is_provisioned();
     let prod_mode = otp.is_production_mode();
-    serial_fmt!("OTP ok: provisioned={} production_mode={}", provisioned, prod_mode);
-    defmt::info!("OTP: provisioned={}, production_mode={}", provisioned, prod_mode);
+    serial_fmt!(
+        "OTP ok: provisioned={} production_mode={}",
+        provisioned,
+        prod_mode
+    );
+    defmt::info!(
+        "OTP: provisioned={}, production_mode={}",
+        provisioned,
+        prod_mode
+    );
 
     serial_println!("OTP derive_smk...");
     match pico2hsm_firmware::security::otp::derive_smk() {
@@ -916,7 +968,9 @@ async fn run_geek_board(p: embassy_rp::Peripherals) {
     spi1_cfg.frequency = pico2hsm_firmware::board::rp2350_geek::LCD_SPI_FREQ_HZ;
     spi1_cfg.phase = Phase::CaptureOnFirstTransition;
     spi1_cfg.polarity = Polarity::IdleLow;
-    let spi1 = Spi::new(p.SPI1, p.PIN_10, p.PIN_11, p.PIN_12, p.DMA_CH3, p.DMA_CH4, Irqs, spi1_cfg);
+    let spi1 = Spi::new(
+        p.SPI1, p.PIN_10, p.PIN_11, p.PIN_12, p.DMA_CH3, p.DMA_CH4, Irqs, spi1_cfg,
+    );
     serial_println!("SPI1 ok");
 
     // ── CHECKPOINT 2 — board struct (LCD only, SPI0 not in board) ────────────
@@ -944,7 +998,7 @@ async fn run_geek_board(p: embassy_rp::Peripherals) {
 
     // ── CHECKPOINT 4 — USB descriptor builder ───────────────────────────────
     serial_println!("USB builder init...");
-    let mut config_descriptor_buf = [0u8; 512];  // bump to 512 for CDC+CCID
+    let mut config_descriptor_buf = [0u8; 512]; // bump to 512 for CDC+CCID
     let mut bos_descriptor_buf = [0u8; 256];
     let mut msos_descriptor_buf = [0u8; 256];
     let mut control_buf = [0u8; 64];
@@ -976,8 +1030,7 @@ async fn run_geek_board(p: embassy_rp::Peripherals) {
     board.led().set_status(LedStatus::Ready);
 
     // ── Storage initialization ──────────────────────────────────────────────
-    let smk_bytes = pico2hsm_firmware::security::otp::derive_smk()
-        .unwrap_or([0u8; 32]);
+    let smk_bytes = pico2hsm_firmware::security::otp::derive_smk().unwrap_or([0u8; 32]);
     let smk = zeroize::Zeroizing::new(smk_bytes);
 
     // rp2350_geek_sdcard: SD card keystore on SPI0 (GPIO18/19/20, CS=GPIO23).
@@ -998,22 +1051,27 @@ async fn run_geek_board(p: embassy_rp::Peripherals) {
 
         // Enable internal pull-up on MISO (GPIO20).  SD cards require a pull-up
         // on DO (MISO) — the card's output is high-impedance until SPI mode.
-        embassy_rp::pac::PADS_BANK0.gpio(20).modify(|w| w.set_pue(true));
+        embassy_rp::pac::PADS_BANK0
+            .gpio(20)
+            .modify(|w| w.set_pue(true));
 
         // Wrap SPI0 in a shared-bus SpiDevice with CS=GPIO23.
         static SPI0_BUS: StaticCell<
             Mutex<
                 CriticalSectionRawMutex,
                 core::cell::RefCell<
-                    embassy_rp::spi::Spi<'static, embassy_rp::peripherals::SPI0, embassy_rp::spi::Blocking>,
+                    embassy_rp::spi::Spi<
+                        'static,
+                        embassy_rp::peripherals::SPI0,
+                        embassy_rp::spi::Blocking,
+                    >,
                 >,
             >,
         > = StaticCell::new();
         let spi0_bus_ref = SPI0_BUS.init(Mutex::new(core::cell::RefCell::new(spi0_bus)));
         let sd_cs = Output::new(p.PIN_23, Level::High);
-        let spi_device = embassy_embedded_hal::shared_bus::blocking::spi::SpiDevice::new(
-            spi0_bus_ref, sd_cs,
-        );
+        let spi_device =
+            embassy_embedded_hal::shared_bus::blocking::spi::SpiDevice::new(spi0_bus_ref, sd_cs);
 
         let delay = embassy_time::Delay;
         let sd_chip = pico2hsm_firmware::storage::sdcard::SdCardFlash::new(spi_device, delay)
@@ -1084,27 +1142,34 @@ async fn run_geek_board(p: embassy_rp::Peripherals) {
     let dispatcher_ptr = dispatcher_ref as *mut pico2hsm_firmware::apdu::dispatcher::Dispatcher;
     let dispatcher_send = DispatcherPtr(dispatcher_ptr, store as *mut _);
 
-    spawn_core1(p.CORE1, unsafe { &mut *addr_of_mut!(CORE1_STACK) }, move || {
-        // MSPLIM — hardware stack overflow detection for Core1.
-        // MSPLIM at stack base — hardware UsageFault fires at exact boundary.
-        // No defmt here — Core1 defmt contends on Spinlock31 with Core0 USB.
-        #[cfg(target_arch = "arm")]
-        unsafe {
-            let stack_bottom = core::ptr::addr_of!(CORE1_STACK) as u32;
-            cortex_m::register::msplim::write(stack_bottom);
-            // SHCSR bit 18 = USGFAULTENA
-            (*cortex_m::peripheral::SCB::PTR)
-                .shcsr
-                .modify(|v| v | (1 << 18));
-        }
+    spawn_core1(
+        p.CORE1,
+        unsafe { &mut *addr_of_mut!(CORE1_STACK) },
+        move || {
+            // MSPLIM — hardware stack overflow detection for Core1.
+            // MSPLIM at stack base — hardware UsageFault fires at exact boundary.
+            // No defmt here — Core1 defmt contends on Spinlock31 with Core0 USB.
+            #[cfg(target_arch = "arm")]
+            unsafe {
+                let stack_bottom = core::ptr::addr_of!(CORE1_STACK) as u32;
+                cortex_m::register::msplim::write(stack_bottom);
+                // SHCSR bit 18 = USGFAULTENA
+                (*cortex_m::peripheral::SCB::PTR)
+                    .shcsr
+                    .modify(|v| v | (1 << 18));
+            }
 
-        dispatcher_loop(dispatcher_send);
-    });
+            dispatcher_loop(dispatcher_send);
+        },
+    );
     serial_println!("Core1 spawned, starting USB+CCID join...");
 
     let usb_fut = usb.run();
 
-    use pico2hsm_firmware::display::{DisplayState, LastOperation, ScreenLayout, ScreensaverState, SCREENSAVER_TIMEOUT_SECS, LAST_OP_DISPLAY_SECS};
+    use pico2hsm_firmware::display::{
+        DisplayState, LastOperation, ScreenLayout, ScreensaverState, LAST_OP_DISPLAY_SECS,
+        SCREENSAVER_TIMEOUT_SECS,
+    };
     let layout = ScreenLayout::geek_240x135();
 
     let mut display_state = DisplayState::new();
@@ -1140,7 +1205,8 @@ async fn run_geek_board(p: embassy_rp::Peripherals) {
                             screensaver = ScreensaverState::Active;
                             board.led().backlight_on();
                         }
-                        if now.duration_since(last_activity).as_secs() >= SCREENSAVER_TIMEOUT_SECS as u64
+                        if now.duration_since(last_activity).as_secs()
+                            >= SCREENSAVER_TIMEOUT_SECS as u64
                             && screensaver == ScreensaverState::Active
                         {
                             screensaver = ScreensaverState::Sleeping;
@@ -1153,7 +1219,7 @@ async fn run_geek_board(p: embassy_rp::Peripherals) {
                         board.led().flush().await;
 
                         let apdu_ins = apdu_bytes.get(1).copied().unwrap_or(0);
-                        let apdu_p1  = apdu_bytes.get(2).copied().unwrap_or(0);
+                        let apdu_p1 = apdu_bytes.get(2).copied().unwrap_or(0);
                         let _ = APDU_CHANNEL.send(apdu_bytes).await;
                         cortex_m::asm::sev(); // wake core1 from WFE
 
@@ -1161,18 +1227,29 @@ async fn run_geek_board(p: embassy_rp::Peripherals) {
                         let response = {
                             use embassy_futures::select::{select3, Either3};
                             let mut stall_count: u32 = 0;
-                            let mut last_heartbeat = WATCHDOG_HEARTBEAT.load(core::sync::atomic::Ordering::Relaxed);
+                            let mut last_heartbeat =
+                                WATCHDOG_HEARTBEAT.load(core::sync::atomic::Ordering::Relaxed);
                             loop {
-                                match select3(RESP_CHANNEL.receive(), embassy_time::Timer::after_millis(1500), FLASH_REQ.receive()).await {
+                                match select3(
+                                    RESP_CHANNEL.receive(),
+                                    embassy_time::Timer::after_millis(1500),
+                                    FLASH_REQ.receive(),
+                                )
+                                .await
+                                {
                                     Either3::First(r) => break r,
                                     Either3::Second(_) => {
-                                        let progress = CORE1_PROGRESS.load(core::sync::atomic::Ordering::Relaxed);
-                                        let heartbeat = WATCHDOG_HEARTBEAT.load(core::sync::atomic::Ordering::Relaxed);
+                                        let progress = CORE1_PROGRESS
+                                            .load(core::sync::atomic::Ordering::Relaxed);
+                                        let heartbeat = WATCHDOG_HEARTBEAT
+                                            .load(core::sync::atomic::Ordering::Relaxed);
                                         if heartbeat == last_heartbeat {
                                             stall_count += 1;
                                             defmt::warn!("time ext: core1 progress={} heartbeat={} STALL {}/{}", progress, heartbeat, stall_count, WATCHDOG_STALL_LIMIT);
                                             if stall_count >= WATCHDOG_STALL_LIMIT {
-                                                defmt::error!("watchdog: core1 stuck — aborting APDU");
+                                                defmt::error!(
+                                                    "watchdog: core1 stuck — aborting APDU"
+                                                );
                                                 // Return SW 6F00 (internal error) to unblock the host.
                                                 let mut err_resp = heapless::Vec::<u8, 4098>::new();
                                                 let _ = err_resp.push(0x6F);
@@ -1182,9 +1259,15 @@ async fn run_geek_board(p: embassy_rp::Peripherals) {
                                         } else {
                                             stall_count = 0;
                                             last_heartbeat = heartbeat;
-                                            defmt::warn!("time ext: core1 progress={} heartbeat={}", progress, heartbeat);
+                                            defmt::warn!(
+                                                "time ext: core1 progress={} heartbeat={}",
+                                                progress,
+                                                heartbeat
+                                            );
                                         }
-                                        if let Err(CcidError::UsbDisconnected) = ccid.send_time_extension().await {
+                                        if let Err(CcidError::UsbDisconnected) =
+                                            ccid.send_time_extension().await
+                                        {
                                             let _ = RESP_CHANNEL.receive().await;
                                             break heapless::Vec::new();
                                         }
@@ -1201,9 +1284,11 @@ async fn run_geek_board(p: embassy_rp::Peripherals) {
                         match ccid.send_response(&response).await {
                             Ok(()) => {
                                 display_state.status = LedStatus::Ready;
-                                display_state.uptime_secs = embassy_time::Instant::now().as_secs() as u32;
+                                display_state.uptime_secs =
+                                    embassy_time::Instant::now().as_secs() as u32;
                                 // Update key count from core1 atomic.
-                                display_state.key_count = KEY_COUNT.load(core::sync::atomic::Ordering::Relaxed);
+                                display_state.key_count =
+                                    KEY_COUNT.load(core::sync::atomic::Ordering::Relaxed);
                                 // Derive last_op and authenticated from APDU INS byte + SW.
                                 let sw_ok = response.len() >= 2
                                     && response[response.len() - 2] == 0x90
@@ -1212,27 +1297,53 @@ async fn run_geek_board(p: embassy_rp::Peripherals) {
                                     match apdu_ins {
                                         0x20 => {
                                             display_state.authenticated = true;
-                                            display_state.last_op = Some((LastOperation::Verify, display_state.uptime_secs));
+                                            display_state.last_op = Some((
+                                                LastOperation::Verify,
+                                                display_state.uptime_secs,
+                                            ));
                                         }
-                                        0x50 => { // SC-HSM INITIALIZE
+                                        0x50 => {
+                                            // SC-HSM INITIALIZE
                                             display_state.authenticated = false;
-                                            display_state.last_op = Some((LastOperation::Initialize, display_state.uptime_secs));
+                                            display_state.last_op = Some((
+                                                LastOperation::Initialize,
+                                                display_state.uptime_secs,
+                                            ));
                                         }
-                                        0x47 | 0x48 => { // PIV/OpenPGP GENERATE KEYPAIR (0x47) or SC-HSM GENERATE KEY (0x48)
-                                            display_state.last_op = Some((LastOperation::KeyGen, display_state.uptime_secs));
+                                        0x47 | 0x48 => {
+                                            // PIV/OpenPGP GENERATE KEYPAIR (0x47) or SC-HSM GENERATE KEY (0x48)
+                                            display_state.last_op = Some((
+                                                LastOperation::KeyGen,
+                                                display_state.uptime_secs,
+                                            ));
                                         }
-                                        0xE4 => { // SC-HSM DELETE FILE
-                                            display_state.last_op = Some((LastOperation::DeleteKey, display_state.uptime_secs));
+                                        0xE4 => {
+                                            // SC-HSM DELETE FILE
+                                            display_state.last_op = Some((
+                                                LastOperation::DeleteKey,
+                                                display_state.uptime_secs,
+                                            ));
                                         }
-                                        0x2A => { // PSO: sign (P1=0x9E) or decrypt (P1=0x80)
+                                        0x2A => {
+                                            // PSO: sign (P1=0x9E) or decrypt (P1=0x80)
                                             if apdu_p1 == 0x9E {
-                                                display_state.last_op = Some((LastOperation::Sign, display_state.uptime_secs));
+                                                display_state.last_op = Some((
+                                                    LastOperation::Sign,
+                                                    display_state.uptime_secs,
+                                                ));
                                             } else if apdu_p1 == 0x80 {
-                                                display_state.last_op = Some((LastOperation::Decrypt, display_state.uptime_secs));
+                                                display_state.last_op = Some((
+                                                    LastOperation::Decrypt,
+                                                    display_state.uptime_secs,
+                                                ));
                                             }
                                         }
-                                        0x62 => { // SC-HSM DERIVE ASYM / ECDH
-                                            display_state.last_op = Some((LastOperation::Ecdh, display_state.uptime_secs));
+                                        0x62 => {
+                                            // SC-HSM DERIVE ASYM / ECDH
+                                            display_state.last_op = Some((
+                                                LastOperation::Ecdh,
+                                                display_state.uptime_secs,
+                                            ));
                                         }
                                         _ => {}
                                     }
@@ -1242,16 +1353,25 @@ async fn run_geek_board(p: embassy_rp::Peripherals) {
                                     display_state.authenticated = false;
                                 }
                                 if let Some((_, op_time)) = display_state.last_op {
-                                    if display_state.uptime_secs.saturating_sub(op_time) >= LAST_OP_DISPLAY_SECS {
+                                    if display_state.uptime_secs.saturating_sub(op_time)
+                                        >= LAST_OP_DISPLAY_SECS
+                                    {
                                         display_state.last_op = None;
                                     }
                                 }
                                 if screensaver == ScreensaverState::Active {
-                                    pico2hsm_firmware::display::render(board.led(), &display_state, &layout);
+                                    pico2hsm_firmware::display::render(
+                                        board.led(),
+                                        &display_state,
+                                        &layout,
+                                    );
                                     board.led().flush().await;
                                 }
                                 for _ in 0..16 {
-                                    pico2hsm_firmware::transport::cdc_serial::drain_one(&mut cdc_sender).await;
+                                    pico2hsm_firmware::transport::cdc_serial::drain_one(
+                                        &mut cdc_sender,
+                                    )
+                                    .await;
                                 }
                             }
                             Err(CcidError::UsbDisconnected) => {
@@ -1267,7 +1387,7 @@ async fn run_geek_board(p: embassy_rp::Peripherals) {
 
                     Err(CcidError::UsbDisconnected) => {
                         let _ = APDU_CHANNEL.send(heapless::Vec::new()).await;
-                                cortex_m::asm::sev(); // wake core1 from WFE
+                        cortex_m::asm::sev(); // wake core1 from WFE
                         let _ = RESP_CHANNEL.receive().await;
                         display_state.status = LedStatus::Ready;
                         break;
@@ -1315,8 +1435,7 @@ async fn run_pico2_board(p: embassy_rp::Peripherals) {
     board.led().set_status(LedStatus::Busy);
 
     // ── Storage initialization (pico2_4m: RP2350 internal QMI flash) ─────────
-    let smk_bytes = pico2hsm_firmware::security::otp::derive_smk()
-        .unwrap_or([0u8; 32]); // degraded mode if OTP unprovisioned
+    let smk_bytes = pico2hsm_firmware::security::otp::derive_smk().unwrap_or([0u8; 32]); // degraded mode if OTP unprovisioned
     let smk = zeroize::Zeroizing::new(smk_bytes);
 
     let qmi_flash = embassy_rp::flash::Flash::<
@@ -1351,7 +1470,7 @@ async fn run_pico2_board(p: embassy_rp::Peripherals) {
     usb_config.serial_number = Some("0001");
     usb_config.max_power = 100;
 
-    let mut config_descriptor_buf = [0u8; 512];  // bump to 512 for CDC+CCID
+    let mut config_descriptor_buf = [0u8; 512]; // bump to 512 for CDC+CCID
     let mut bos_descriptor_buf = [0u8; 256];
     let mut msos_descriptor_buf = [0u8; 256];
     let mut control_buf = [0u8; 64];
@@ -1391,22 +1510,26 @@ async fn run_pico2_board(p: embassy_rp::Peripherals) {
     let dispatcher_send = DispatcherPtr(dispatcher_ptr, store as *mut _);
 
     defmt::info!("core0: spawning core1");
-    spawn_core1(p.CORE1, unsafe { &mut *addr_of_mut!(CORE1_STACK) }, move || {
-        // MSPLIM — hardware stack overflow detection for Core1.
-        // MSPLIM at stack base — hardware UsageFault fires at exact boundary.
-        // No defmt here — Core1 defmt contends on Spinlock31 with Core0 USB.
-        #[cfg(target_arch = "arm")]
-        unsafe {
-            let stack_bottom = core::ptr::addr_of!(CORE1_STACK) as u32;
-            cortex_m::register::msplim::write(stack_bottom);
-            // SHCSR bit 18 = USGFAULTENA
-            (*cortex_m::peripheral::SCB::PTR)
-                .shcsr
-                .modify(|v| v | (1 << 18));
-        }
+    spawn_core1(
+        p.CORE1,
+        unsafe { &mut *addr_of_mut!(CORE1_STACK) },
+        move || {
+            // MSPLIM — hardware stack overflow detection for Core1.
+            // MSPLIM at stack base — hardware UsageFault fires at exact boundary.
+            // No defmt here — Core1 defmt contends on Spinlock31 with Core0 USB.
+            #[cfg(target_arch = "arm")]
+            unsafe {
+                let stack_bottom = core::ptr::addr_of!(CORE1_STACK) as u32;
+                cortex_m::register::msplim::write(stack_bottom);
+                // SHCSR bit 18 = USGFAULTENA
+                (*cortex_m::peripheral::SCB::PTR)
+                    .shcsr
+                    .modify(|v| v | (1 << 18));
+            }
 
-        dispatcher_loop(dispatcher_send);
-    });
+            dispatcher_loop(dispatcher_send);
+        },
+    );
     defmt::info!("core0: core1 spawned, building usb_fut");
 
     let usb_fut = usb.run();
@@ -1429,18 +1552,29 @@ async fn run_pico2_board(p: embassy_rp::Peripherals) {
                         let response = {
                             use embassy_futures::select::{select3, Either3};
                             let mut stall_count: u32 = 0;
-                            let mut last_heartbeat = WATCHDOG_HEARTBEAT.load(core::sync::atomic::Ordering::Relaxed);
+                            let mut last_heartbeat =
+                                WATCHDOG_HEARTBEAT.load(core::sync::atomic::Ordering::Relaxed);
                             loop {
-                                match select3(RESP_CHANNEL.receive(), embassy_time::Timer::after_millis(1500), FLASH_REQ.receive()).await {
+                                match select3(
+                                    RESP_CHANNEL.receive(),
+                                    embassy_time::Timer::after_millis(1500),
+                                    FLASH_REQ.receive(),
+                                )
+                                .await
+                                {
                                     Either3::First(r) => break r,
                                     Either3::Second(_) => {
-                                        let progress = CORE1_PROGRESS.load(core::sync::atomic::Ordering::Relaxed);
-                                        let heartbeat = WATCHDOG_HEARTBEAT.load(core::sync::atomic::Ordering::Relaxed);
+                                        let progress = CORE1_PROGRESS
+                                            .load(core::sync::atomic::Ordering::Relaxed);
+                                        let heartbeat = WATCHDOG_HEARTBEAT
+                                            .load(core::sync::atomic::Ordering::Relaxed);
                                         if heartbeat == last_heartbeat {
                                             stall_count += 1;
                                             defmt::warn!("time ext: core1 progress={} heartbeat={} STALL {}/{}", progress, heartbeat, stall_count, WATCHDOG_STALL_LIMIT);
                                             if stall_count >= WATCHDOG_STALL_LIMIT {
-                                                defmt::error!("watchdog: core1 stuck — aborting APDU");
+                                                defmt::error!(
+                                                    "watchdog: core1 stuck — aborting APDU"
+                                                );
                                                 // Return SW 6F00 (internal error) to unblock the host.
                                                 let mut err_resp = heapless::Vec::<u8, 4098>::new();
                                                 let _ = err_resp.push(0x6F);
@@ -1450,9 +1584,15 @@ async fn run_pico2_board(p: embassy_rp::Peripherals) {
                                         } else {
                                             stall_count = 0;
                                             last_heartbeat = heartbeat;
-                                            defmt::warn!("time ext: core1 progress={} heartbeat={}", progress, heartbeat);
+                                            defmt::warn!(
+                                                "time ext: core1 progress={} heartbeat={}",
+                                                progress,
+                                                heartbeat
+                                            );
                                         }
-                                        if let Err(CcidError::UsbDisconnected) = ccid.send_time_extension().await {
+                                        if let Err(CcidError::UsbDisconnected) =
+                                            ccid.send_time_extension().await
+                                        {
                                             let _ = RESP_CHANNEL.receive().await;
                                             break heapless::Vec::new();
                                         }
@@ -1468,7 +1608,10 @@ async fn run_pico2_board(p: embassy_rp::Peripherals) {
                         match ccid.send_response(&response).await {
                             Ok(()) => {
                                 for _ in 0..16 {
-                                    pico2hsm_firmware::transport::cdc_serial::drain_one(&mut cdc_sender).await;
+                                    pico2hsm_firmware::transport::cdc_serial::drain_one(
+                                        &mut cdc_sender,
+                                    )
+                                    .await;
                                 }
                             }
                             Err(CcidError::UsbDisconnected) => {
@@ -1483,7 +1626,7 @@ async fn run_pico2_board(p: embassy_rp::Peripherals) {
                     }
                     Err(CcidError::UsbDisconnected) => {
                         let _ = APDU_CHANNEL.send(heapless::Vec::new()).await;
-                                cortex_m::asm::sev(); // wake core1 from WFE
+                        cortex_m::asm::sev(); // wake core1 from WFE
                         let _ = RESP_CHANNEL.receive().await;
                         board.led().set_status(LedStatus::Ready);
                         break;
@@ -1499,10 +1642,13 @@ async fn run_pico2_board(p: embassy_rp::Peripherals) {
 
 // ─── Waveshare RP2350-LCD-1.47-B main function ───────────────────────────────
 
-#[cfg(all(target_arch = "arm", any(
-    feature = "waveshare_rp2350_lcd_16m",
-    feature = "waveshare_rp2350_lcd_sdcard",
-)))]
+#[cfg(all(
+    target_arch = "arm",
+    any(
+        feature = "waveshare_rp2350_lcd_16m",
+        feature = "waveshare_rp2350_lcd_sdcard",
+    )
+))]
 /// Initialise the SD card keystore on SPI1 in its own stack frame.
 ///
 /// All SPI bus setup, SD card probe, CMD0 warmup, and keystore mount happen
@@ -1535,7 +1681,9 @@ fn init_sd_keystore(
 
     // Enable internal pull-up on MISO (GPIO12) — SD card DO is high-impedance
     // until SPI mode is entered.
-    embassy_rp::pac::PADS_BANK0.gpio(12).modify(|w| w.set_pue(true));
+    embassy_rp::pac::PADS_BANK0
+        .gpio(12)
+        .modify(|w| w.set_pue(true));
 
     // SD spec requires ≥74 clock cycles with CS high before first command.
     {
@@ -1548,15 +1696,18 @@ fn init_sd_keystore(
         Mutex<
             CriticalSectionRawMutex,
             core::cell::RefCell<
-                embassy_rp::spi::Spi<'static, embassy_rp::peripherals::SPI1, embassy_rp::spi::Blocking>,
+                embassy_rp::spi::Spi<
+                    'static,
+                    embassy_rp::peripherals::SPI1,
+                    embassy_rp::spi::Blocking,
+                >,
             >,
         >,
     > = StaticCell::new();
     let spi1_bus_ref = SPI1_BUS.init(Mutex::new(core::cell::RefCell::new(spi1_bus)));
     let sd_cs = Output::new(cs_pin, Level::High);
-    let spi_device = embassy_embedded_hal::shared_bus::blocking::spi::SpiDevice::new(
-        spi1_bus_ref, sd_cs,
-    );
+    let spi_device =
+        embassy_embedded_hal::shared_bus::blocking::spi::SpiDevice::new(spi1_bus_ref, sd_cs);
 
     // SD card probe — CMD0 warmup pre-transitions the card into SPI mode
     // before embedded-sdmmc's acquire() sequence.
@@ -1570,20 +1721,24 @@ fn init_sd_keystore(
             for _ in 0..10u8 {
                 let mut resp = [0xFFu8; 1];
                 let _ = spi.transfer_in_place(&mut resp);
-                if resp[0] != 0xFF { break; }
+                if resp[0] != 0xFF {
+                    break;
+                }
             }
         });
     }
 
     let sd_chip = match card.num_bytes() {
         Ok(total_bytes) => {
-            defmt::info!("SD card: {} MiB", total_bytes / (1024*1024));
+            defmt::info!("SD card: {} MiB", total_bytes / (1024 * 1024));
             let capacity_bytes = total_bytes.saturating_sub(4096);
             pico2hsm_firmware::storage::sdcard::SdCardFlash::from_initialized(card, capacity_bytes)
         }
         Err(_) => {
             defmt::error!("SD card init FAILED — halting");
-            loop { cortex_m::asm::wfi(); }
+            loop {
+                cortex_m::asm::wfi();
+            }
         }
     };
 
@@ -1598,7 +1753,10 @@ fn init_sd_keystore(
     KEYSTORE_CELL.init(ks)
 }
 
-#[cfg(any(feature = "waveshare_rp2350_lcd_16m", feature = "waveshare_rp2350_lcd_sdcard"))]
+#[cfg(any(
+    feature = "waveshare_rp2350_lcd_16m",
+    feature = "waveshare_rp2350_lcd_sdcard"
+))]
 async fn run_waveshare_lcd_board(p: embassy_rp::Peripherals) {
     use embassy_futures::join::join;
     use embassy_rp::gpio::{Level, Output};
@@ -1609,11 +1767,13 @@ async fn run_waveshare_lcd_board(p: embassy_rp::Peripherals) {
     use embassy_usb::{Builder as UsbBuilder, Config as UsbConfig};
 
     use pico2hsm_firmware::board::waveshare_rp2350_lcd::{
-        WaveshareRp2350LcdBoard, SPI_FREQ_HZ,
-        init_lcd, update_status_display, PioWs2812Writer,
+        init_lcd, update_status_display, PioWs2812Writer, WaveshareRp2350LcdBoard, SPI_FREQ_HZ,
     };
     use pico2hsm_firmware::board::{Board, LedStatus};
-    use pico2hsm_firmware::display::{DisplayState, LastOperation, ScreensaverState, SCREENSAVER_TIMEOUT_SECS, LAST_OP_DISPLAY_SECS};
+    use pico2hsm_firmware::display::{
+        DisplayState, LastOperation, ScreensaverState, LAST_OP_DISPLAY_SECS,
+        SCREENSAVER_TIMEOUT_SECS,
+    };
     use pico2hsm_firmware::transport::ccid::CcidError;
     use pico2hsm_firmware::transport::CcidTransport;
 
@@ -1634,7 +1794,9 @@ async fn run_waveshare_lcd_board(p: embassy_rp::Peripherals) {
     spi0_cfg.frequency = SPI_FREQ_HZ;
     spi0_cfg.phase = Phase::CaptureOnFirstTransition;
     spi0_cfg.polarity = Polarity::IdleLow;
-    let spi0 = Spi::new(p.SPI0, p.PIN_18, p.PIN_19, p.PIN_4, p.DMA_CH1, p.DMA_CH2, Irqs, spi0_cfg);
+    let spi0 = Spi::new(
+        p.SPI0, p.PIN_18, p.PIN_19, p.PIN_4, p.DMA_CH1, p.DMA_CH2, Irqs, spi0_cfg,
+    );
 
     // ── SPI1: SD card bus (SCK=GPIO10, MOSI=GPIO11, MISO=GPIO12) ─────────────
     // For waveshare_rp2350_lcd_sdcard, SPI1 is consumed by the SD card keystore
@@ -1656,17 +1818,17 @@ async fn run_waveshare_lcd_board(p: embassy_rp::Peripherals) {
 
     // ── LCD control GPIO pins ─────────────────────────────────────────────────
     // DC=GPIO16, CS=GPIO17, RST=GPIO20, BL=GPIO21 per board schematic.
-    let mut dc  = Output::new(p.PIN_16, Level::Low);
-    let mut cs  = Output::new(p.PIN_17, Level::High);
+    let mut dc = Output::new(p.PIN_16, Level::Low);
+    let mut cs = Output::new(p.PIN_17, Level::High);
     let mut rst = Output::new(p.PIN_20, Level::High);
-    let mut bl  = Output::new(p.PIN_21, Level::Low);
+    let mut bl = Output::new(p.PIN_21, Level::Low);
 
     // ── WS2812B on GPIO22 via PIO0 SM0 / DMA_CH0 ────────────────────────────
-    let Pio { mut common, sm0, .. } = Pio::new(p.PIO0, Irqs);
+    let Pio {
+        mut common, sm0, ..
+    } = Pio::new(p.PIO0, Irqs);
     let ws2812_program = PioWs2812Program::new(&mut common);
-    let ws2812 = PioWs2812::new(
-        &mut common, sm0, p.DMA_CH0, Irqs, p.PIN_22, &ws2812_program,
-    );
+    let ws2812 = PioWs2812::new(&mut common, sm0, p.DMA_CH0, Irqs, p.PIN_22, &ws2812_program);
     let mut ws2812_writer = PioWs2812Writer::new(ws2812);
 
     // ── LCD hardware init — must happen before USB enumeration ───────────────
@@ -1675,14 +1837,21 @@ async fn run_waveshare_lcd_board(p: embassy_rp::Peripherals) {
     init_lcd(&mut board.spi0, &mut dc, &mut cs, &mut rst, &mut bl).await;
     {
         let (disp, spi) = board.led_and_spi0_mut();
-        update_status_display(disp, spi, &mut dc, &mut cs, &mut ws2812_writer, &display_state).await;
+        update_status_display(
+            disp,
+            spi,
+            &mut dc,
+            &mut cs,
+            &mut ws2812_writer,
+            &display_state,
+        )
+        .await;
     }
 
     // ── Storage initialisation ─────────────────────────────────────────────
 
     // Common: derive SMK from OTP.
-    let smk_bytes = pico2hsm_firmware::security::otp::derive_smk()
-        .unwrap_or([0u8; 32]);
+    let smk_bytes = pico2hsm_firmware::security::otp::derive_smk().unwrap_or([0u8; 32]);
     let smk = zeroize::Zeroizing::new(smk_bytes);
 
     // waveshare_rp2350_lcd_sdcard: single SD card keystore on SPI1.
@@ -1690,9 +1859,8 @@ async fn run_waveshare_lcd_board(p: embassy_rp::Peripherals) {
     // intermediate buffers live in their own stack frame and are freed
     // before USB init begins.
     #[cfg(feature = "waveshare_rp2350_lcd_sdcard")]
-    let store: &'static mut _ = init_sd_keystore(
-        p.SPI1, p.PIN_10, p.PIN_11, p.PIN_12, p.PIN_15, smk,
-    );
+    let store: &'static mut _ =
+        init_sd_keystore(p.SPI1, p.PIN_10, p.PIN_11, p.PIN_12, p.PIN_15, smk);
 
     // waveshare_rp2350_lcd_16m: internal QMI flash keystore (upper 2 MB).
     #[cfg(not(feature = "waveshare_rp2350_lcd_sdcard"))]
@@ -1709,7 +1877,9 @@ async fn run_waveshare_lcd_board(p: embassy_rp::Peripherals) {
         let sm = pico2hsm_firmware::storage::StorageManager::new(fs);
         let mut ks = pico2hsm_firmware::storage::FlashKeyStore::new(sm, smk);
         match ks.init() {
-            Ok(()) => defmt::info!("KeyStore: initialized (waveshare_rp2350_lcd_16m internal flash)"),
+            Ok(()) => {
+                defmt::info!("KeyStore: initialized (waveshare_rp2350_lcd_16m internal flash)")
+            }
             Err(_) => defmt::warn!("KeyStore: init failed — degraded mode (blank flash?)"),
         }
         KEYSTORE_CELL.init(ks)
@@ -1757,7 +1927,15 @@ async fn run_waveshare_lcd_board(p: embassy_rp::Peripherals) {
     display_state.status = LedStatus::Ready;
     {
         let (disp, spi) = board.led_and_spi0_mut();
-        update_status_display(disp, spi, &mut dc, &mut cs, &mut ws2812_writer, &display_state).await;
+        update_status_display(
+            disp,
+            spi,
+            &mut dc,
+            &mut cs,
+            &mut ws2812_writer,
+            &display_state,
+        )
+        .await;
     }
 
     // ── Init dispatcher on core0, then spawn core1 ─────────────────────────
@@ -1775,22 +1953,26 @@ async fn run_waveshare_lcd_board(p: embassy_rp::Peripherals) {
     let dispatcher_ptr = dispatcher_ref as *mut pico2hsm_firmware::apdu::dispatcher::Dispatcher;
     let dispatcher_send = DispatcherPtr(dispatcher_ptr, store as *mut _);
 
-    spawn_core1(p.CORE1, unsafe { &mut *addr_of_mut!(CORE1_STACK) }, move || {
-        // MSPLIM — hardware stack overflow detection for Core1.
-        // MSPLIM at stack base — hardware UsageFault fires at exact boundary.
-        // No defmt here — Core1 defmt contends on Spinlock31 with Core0 USB.
-        #[cfg(target_arch = "arm")]
-        unsafe {
-            let stack_bottom = core::ptr::addr_of!(CORE1_STACK) as u32;
-            cortex_m::register::msplim::write(stack_bottom);
-            // SHCSR bit 18 = USGFAULTENA
-            (*cortex_m::peripheral::SCB::PTR)
-                .shcsr
-                .modify(|v| v | (1 << 18));
-        }
+    spawn_core1(
+        p.CORE1,
+        unsafe { &mut *addr_of_mut!(CORE1_STACK) },
+        move || {
+            // MSPLIM — hardware stack overflow detection for Core1.
+            // MSPLIM at stack base — hardware UsageFault fires at exact boundary.
+            // No defmt here — Core1 defmt contends on Spinlock31 with Core0 USB.
+            #[cfg(target_arch = "arm")]
+            unsafe {
+                let stack_bottom = core::ptr::addr_of!(CORE1_STACK) as u32;
+                cortex_m::register::msplim::write(stack_bottom);
+                // SHCSR bit 18 = USGFAULTENA
+                (*cortex_m::peripheral::SCB::PTR)
+                    .shcsr
+                    .modify(|v| v | (1 << 18));
+            }
 
-        dispatcher_loop(dispatcher_send);
-    });
+            dispatcher_loop(dispatcher_send);
+        },
+    );
 
     // ── Concurrent USB + CCID command loop (core0) ───────────────────────────
     let usb_fut = usb.run();
@@ -1805,7 +1987,15 @@ async fn run_waveshare_lcd_board(p: embassy_rp::Peripherals) {
             display_state.status = LedStatus::Ready;
             {
                 let (disp, spi) = board.led_and_spi0_mut();
-                update_status_display(disp, spi, &mut dc, &mut cs, &mut ws2812_writer, &display_state).await;
+                update_status_display(
+                    disp,
+                    spi,
+                    &mut dc,
+                    &mut cs,
+                    &mut ws2812_writer,
+                    &display_state,
+                )
+                .await;
             }
             last_activity = embassy_time::Instant::now();
             screensaver = ScreensaverState::Active;
@@ -1818,17 +2008,29 @@ async fn run_waveshare_lcd_board(p: embassy_rp::Peripherals) {
                             screensaver = ScreensaverState::Active;
                             display_state.status = LedStatus::Ready;
                             let (disp, spi) = board.led_and_spi0_mut();
-                            update_status_display(disp, spi, &mut dc, &mut cs, &mut ws2812_writer, &display_state).await;
+                            update_status_display(
+                                disp,
+                                spi,
+                                &mut dc,
+                                &mut cs,
+                                &mut ws2812_writer,
+                                &display_state,
+                            )
+                            .await;
                         }
-                        if now.duration_since(last_activity).as_secs() >= SCREENSAVER_TIMEOUT_SECS as u64
+                        if now.duration_since(last_activity).as_secs()
+                            >= SCREENSAVER_TIMEOUT_SECS as u64
                             && screensaver == ScreensaverState::Active
                         {
                             screensaver = ScreensaverState::Sleeping;
-                            use pico2hsm_firmware::board::waveshare_rp2350_lcd::{Grb, Ws2812Writer};
+                            use pico2hsm_firmware::board::waveshare_rp2350_lcd::{
+                                Grb, Ws2812Writer,
+                            };
                             let (disp, spi) = board.led_and_spi0_mut();
                             pico2hsm_firmware::board::waveshare_rp2350_lcd::fill_screen(
                                 spi, &mut dc, &mut cs, 0x0000,
-                            ).await;
+                            )
+                            .await;
                             ws2812_writer.write_pixel(Grb::OFF).await;
                             let _ = disp;
                         }
@@ -1836,28 +2038,47 @@ async fn run_waveshare_lcd_board(p: embassy_rp::Peripherals) {
                         display_state.status = LedStatus::Busy;
                         {
                             let (disp, spi) = board.led_and_spi0_mut();
-                            update_status_display(disp, spi, &mut dc, &mut cs, &mut ws2812_writer, &display_state).await;
+                            update_status_display(
+                                disp,
+                                spi,
+                                &mut dc,
+                                &mut cs,
+                                &mut ws2812_writer,
+                                &display_state,
+                            )
+                            .await;
                         }
                         let apdu_ins = apdu_bytes.get(1).copied().unwrap_or(0);
-                        let apdu_p1  = apdu_bytes.get(2).copied().unwrap_or(0);
+                        let apdu_p1 = apdu_bytes.get(2).copied().unwrap_or(0);
                         let _ = APDU_CHANNEL.send(apdu_bytes).await;
                         cortex_m::asm::sev(); // wake core1 from WFE
-                        // Wait for response with time-extension support.
+                                              // Wait for response with time-extension support.
                         let response = {
                             use embassy_futures::select::{select3, Either3};
                             let mut stall_count: u32 = 0;
-                            let mut last_heartbeat = WATCHDOG_HEARTBEAT.load(core::sync::atomic::Ordering::Relaxed);
+                            let mut last_heartbeat =
+                                WATCHDOG_HEARTBEAT.load(core::sync::atomic::Ordering::Relaxed);
                             loop {
-                                match select3(RESP_CHANNEL.receive(), embassy_time::Timer::after_millis(1500), FLASH_REQ.receive()).await {
+                                match select3(
+                                    RESP_CHANNEL.receive(),
+                                    embassy_time::Timer::after_millis(1500),
+                                    FLASH_REQ.receive(),
+                                )
+                                .await
+                                {
                                     Either3::First(r) => break r,
                                     Either3::Second(_) => {
-                                        let progress = CORE1_PROGRESS.load(core::sync::atomic::Ordering::Relaxed);
-                                        let heartbeat = WATCHDOG_HEARTBEAT.load(core::sync::atomic::Ordering::Relaxed);
+                                        let progress = CORE1_PROGRESS
+                                            .load(core::sync::atomic::Ordering::Relaxed);
+                                        let heartbeat = WATCHDOG_HEARTBEAT
+                                            .load(core::sync::atomic::Ordering::Relaxed);
                                         if heartbeat == last_heartbeat {
                                             stall_count += 1;
                                             defmt::warn!("time ext: core1 progress={} heartbeat={} STALL {}/{}", progress, heartbeat, stall_count, WATCHDOG_STALL_LIMIT);
                                             if stall_count >= WATCHDOG_STALL_LIMIT {
-                                                defmt::error!("watchdog: core1 stuck — aborting APDU");
+                                                defmt::error!(
+                                                    "watchdog: core1 stuck — aborting APDU"
+                                                );
                                                 // Return SW 6F00 (internal error) to unblock the host.
                                                 let mut err_resp = heapless::Vec::<u8, 4098>::new();
                                                 let _ = err_resp.push(0x6F);
@@ -1867,9 +2088,15 @@ async fn run_waveshare_lcd_board(p: embassy_rp::Peripherals) {
                                         } else {
                                             stall_count = 0;
                                             last_heartbeat = heartbeat;
-                                            defmt::warn!("time ext: core1 progress={} heartbeat={}", progress, heartbeat);
+                                            defmt::warn!(
+                                                "time ext: core1 progress={} heartbeat={}",
+                                                progress,
+                                                heartbeat
+                                            );
                                         }
-                                        if let Err(CcidError::UsbDisconnected) = ccid.send_time_extension().await {
+                                        if let Err(CcidError::UsbDisconnected) =
+                                            ccid.send_time_extension().await
+                                        {
                                             let _ = RESP_CHANNEL.receive().await;
                                             break heapless::Vec::new();
                                         }
@@ -1885,9 +2112,11 @@ async fn run_waveshare_lcd_board(p: embassy_rp::Peripherals) {
                         match ccid.send_response(&response).await {
                             Ok(()) => {
                                 display_state.status = LedStatus::Ready;
-                                display_state.uptime_secs = embassy_time::Instant::now().as_secs() as u32;
+                                display_state.uptime_secs =
+                                    embassy_time::Instant::now().as_secs() as u32;
                                 // Update key count from core1 atomic.
-                                display_state.key_count = KEY_COUNT.load(core::sync::atomic::Ordering::Relaxed);
+                                display_state.key_count =
+                                    KEY_COUNT.load(core::sync::atomic::Ordering::Relaxed);
                                 // Derive last_op and authenticated from APDU INS byte + SW.
                                 let sw_ok = response.len() >= 2
                                     && response[response.len() - 2] == 0x90
@@ -1896,27 +2125,53 @@ async fn run_waveshare_lcd_board(p: embassy_rp::Peripherals) {
                                     match apdu_ins {
                                         0x20 => {
                                             display_state.authenticated = true;
-                                            display_state.last_op = Some((LastOperation::Verify, display_state.uptime_secs));
+                                            display_state.last_op = Some((
+                                                LastOperation::Verify,
+                                                display_state.uptime_secs,
+                                            ));
                                         }
-                                        0x50 => { // SC-HSM INITIALIZE
+                                        0x50 => {
+                                            // SC-HSM INITIALIZE
                                             display_state.authenticated = false;
-                                            display_state.last_op = Some((LastOperation::Initialize, display_state.uptime_secs));
+                                            display_state.last_op = Some((
+                                                LastOperation::Initialize,
+                                                display_state.uptime_secs,
+                                            ));
                                         }
-                                        0x47 | 0x48 => { // PIV/OpenPGP GENERATE KEYPAIR (0x47) or SC-HSM GENERATE KEY (0x48)
-                                            display_state.last_op = Some((LastOperation::KeyGen, display_state.uptime_secs));
+                                        0x47 | 0x48 => {
+                                            // PIV/OpenPGP GENERATE KEYPAIR (0x47) or SC-HSM GENERATE KEY (0x48)
+                                            display_state.last_op = Some((
+                                                LastOperation::KeyGen,
+                                                display_state.uptime_secs,
+                                            ));
                                         }
-                                        0xE4 => { // SC-HSM DELETE FILE
-                                            display_state.last_op = Some((LastOperation::DeleteKey, display_state.uptime_secs));
+                                        0xE4 => {
+                                            // SC-HSM DELETE FILE
+                                            display_state.last_op = Some((
+                                                LastOperation::DeleteKey,
+                                                display_state.uptime_secs,
+                                            ));
                                         }
-                                        0x2A => { // PSO: sign (P1=0x9E) or decrypt (P1=0x80)
+                                        0x2A => {
+                                            // PSO: sign (P1=0x9E) or decrypt (P1=0x80)
                                             if apdu_p1 == 0x9E {
-                                                display_state.last_op = Some((LastOperation::Sign, display_state.uptime_secs));
+                                                display_state.last_op = Some((
+                                                    LastOperation::Sign,
+                                                    display_state.uptime_secs,
+                                                ));
                                             } else if apdu_p1 == 0x80 {
-                                                display_state.last_op = Some((LastOperation::Decrypt, display_state.uptime_secs));
+                                                display_state.last_op = Some((
+                                                    LastOperation::Decrypt,
+                                                    display_state.uptime_secs,
+                                                ));
                                             }
                                         }
-                                        0x62 => { // SC-HSM DERIVE ASYM / ECDH
-                                            display_state.last_op = Some((LastOperation::Ecdh, display_state.uptime_secs));
+                                        0x62 => {
+                                            // SC-HSM DERIVE ASYM / ECDH
+                                            display_state.last_op = Some((
+                                                LastOperation::Ecdh,
+                                                display_state.uptime_secs,
+                                            ));
                                         }
                                         _ => {}
                                     }
@@ -1926,16 +2181,29 @@ async fn run_waveshare_lcd_board(p: embassy_rp::Peripherals) {
                                     display_state.authenticated = false;
                                 }
                                 if let Some((_, op_time)) = display_state.last_op {
-                                    if display_state.uptime_secs.saturating_sub(op_time) >= LAST_OP_DISPLAY_SECS {
+                                    if display_state.uptime_secs.saturating_sub(op_time)
+                                        >= LAST_OP_DISPLAY_SECS
+                                    {
                                         display_state.last_op = None;
                                     }
                                 }
                                 if screensaver == ScreensaverState::Active {
                                     let (disp, spi) = board.led_and_spi0_mut();
-                                    update_status_display(disp, spi, &mut dc, &mut cs, &mut ws2812_writer, &display_state).await;
+                                    update_status_display(
+                                        disp,
+                                        spi,
+                                        &mut dc,
+                                        &mut cs,
+                                        &mut ws2812_writer,
+                                        &display_state,
+                                    )
+                                    .await;
                                 }
                                 for _ in 0..16 {
-                                    pico2hsm_firmware::transport::cdc_serial::drain_one(&mut cdc_sender).await;
+                                    pico2hsm_firmware::transport::cdc_serial::drain_one(
+                                        &mut cdc_sender,
+                                    )
+                                    .await;
                                 }
                             }
                             Err(CcidError::UsbDisconnected) => {
@@ -1950,7 +2218,7 @@ async fn run_waveshare_lcd_board(p: embassy_rp::Peripherals) {
                     }
                     Err(CcidError::UsbDisconnected) => {
                         let _ = APDU_CHANNEL.send(heapless::Vec::new()).await;
-                                cortex_m::asm::sev(); // wake core1 from WFE
+                        cortex_m::asm::sev(); // wake core1 from WFE
                         let _ = RESP_CHANNEL.receive().await;
                         display_state.status = LedStatus::Ready;
                         break;
@@ -1974,19 +2242,20 @@ async fn run_waveshare_lcd_board(p: embassy_rp::Peripherals) {
 ///
 /// This is a debug diagnostic; it never logs raw key material.
 #[cfg(target_arch = "arm")]
-fn debug_dump_storage(
-    ks: &pico2hsm_firmware::storage::BoardKeyStore,
-) {
+fn debug_dump_storage(ks: &pico2hsm_firmware::storage::BoardKeyStore) {
     use pico2hsm_firmware::storage::KeyStore;
     let keys = ks.enumerate_keys();
     defmt::info!("=== storage namespace dump: {} key(s) ===", keys.len());
     for kid in keys.iter() {
         let partition = kid.partition();
-        let applet   = kid.applet_byte();
-        let proto    = kid.proto_ref();
+        let applet = kid.applet_byte();
+        let proto = kid.proto_ref();
         defmt::info!(
             "  KeyId(0x{:08X}): partition={} applet={} proto_ref=0x{:02X}",
-            kid.0, partition, applet, proto,
+            kid.0,
+            partition,
+            applet,
+            proto,
         );
     }
     defmt::info!("=== end storage namespace dump ===");

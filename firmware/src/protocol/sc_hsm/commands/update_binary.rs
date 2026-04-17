@@ -7,8 +7,7 @@
 //! P1/P2 encode the write offset (big-endian); only offset 0 is supported.
 
 use pico2hsm_core::apdu::{
-    ApduCommand, ApduResponse, SW_CONDITIONS_NOT_SATISFIED, SW_FILE_NOT_FOUND,
-    SW_SECURITY_STATUS,
+    ApduCommand, ApduResponse, SW_CONDITIONS_NOT_SATISFIED, SW_FILE_NOT_FOUND, SW_SECURITY_STATUS,
 };
 use pico2hsm_core::key::{AppletId, KeyId};
 
@@ -20,7 +19,11 @@ use crate::storage::KeyStore;
 pub const INS_UPDATE_BINARY: u8 = 0xD6;
 
 /// Handle an UPDATE BINARY APDU command.
-pub fn handle(state: &mut ScHsmState, store: &mut dyn KeyStore, cmd: &ApduCommand<'_>) -> ApduResponse {
+pub fn handle(
+    state: &mut ScHsmState,
+    store: &mut dyn KeyStore,
+    cmd: &ApduCommand<'_>,
+) -> ApduResponse {
     if !state.pin_verified && !state.so_pin_verified {
         return ApduResponse::err(SW_SECURITY_STATUS);
     }
@@ -36,13 +39,21 @@ pub fn handle(state: &mut ScHsmState, store: &mut dyn KeyStore, cmd: &ApduComman
     let key_id = KeyId::sc_hsm_ef(0, file_id_hi, file_id_lo);
 
     // Check if the EF already exists in key_index — if so, erase and rewrite.
-    let exists = state.key_index.iter().any(|m| m.key_type == 16 && m.key_id == key_id.0);
+    let exists = state
+        .key_index
+        .iter()
+        .any(|m| m.key_type == 16 && m.key_id == key_id.0);
     if exists {
         let _ = store.erase_key(key_id);
     }
 
     // Create a KeyObject with EF data in private_key field.
-    let mut key_obj = KeyObject::new(KmType::Generic, key_id.0, AppletId::ScHsm, AlgorithmId::AesGcm);
+    let mut key_obj = KeyObject::new(
+        KmType::Generic,
+        key_id.0,
+        AppletId::ScHsm,
+        AlgorithmId::AesGcm,
+    );
     let _ = key_obj.private_key.extend_from_slice(cmd.data);
 
     match store.save_key(&key_obj) {
@@ -53,7 +64,7 @@ pub fn handle(state: &mut ScHsmState, store: &mut dyn KeyStore, cmd: &ApduComman
                 let file_id_hi = (file_id >> 8) as u8;
                 let meta = KeyMeta {
                     key_id: key_id.0,
-                    key_type: 16, // EfFile
+                    key_type: 16,     // EfFile
                     algo: file_id_hi, // high byte of file_id
                     key_flags: 0,
                 };

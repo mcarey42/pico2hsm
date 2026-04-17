@@ -5,9 +5,7 @@
 //! and returns them to the host. The host may then use them exactly once via
 //! VERIFY with P2=0x82 to authenticate.
 
-use pico2hsm_core::apdu::{
-    ApduCommand, ApduResponse, SW_OK, SW_SECURITY_STATUS,
-};
+use pico2hsm_core::apdu::{ApduCommand, ApduResponse, SW_OK, SW_SECURITY_STATUS};
 
 use crate::protocol::sc_hsm::ScHsmState;
 

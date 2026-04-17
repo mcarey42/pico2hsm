@@ -11,9 +11,8 @@
 use sha2::Digest as _;
 
 use pico2hsm_core::apdu::{
-    ApduCommand, ApduResponse, SW_CONDITIONS_NOT_SATISFIED, SW_DATA_INVALID,
-    SW_FILE_NOT_FOUND, SW_INS_NOT_SUPPORTED, SW_OK, SW_SECURITY_STATUS, SW_WRONG_DATA,
-    SW_WRONG_LENGTH,
+    ApduCommand, ApduResponse, SW_CONDITIONS_NOT_SATISFIED, SW_DATA_INVALID, SW_FILE_NOT_FOUND,
+    SW_INS_NOT_SUPPORTED, SW_OK, SW_SECURITY_STATUS, SW_WRONG_DATA, SW_WRONG_LENGTH,
 };
 use pico2hsm_core::key::{KeyId, KeyMaterial, KeyType};
 
@@ -35,7 +34,11 @@ fn meta_algo_to_ec_key_type(algo: u8) -> Option<KeyType> {
 }
 
 /// Handle a PERFORM SECURITY OPERATION APDU command.
-pub fn handle(state: &mut ScHsmState, store: &mut dyn KeyStore, cmd: &ApduCommand<'_>) -> ApduResponse {
+pub fn handle(
+    state: &mut ScHsmState,
+    store: &mut dyn KeyStore,
+    cmd: &ApduCommand<'_>,
+) -> ApduResponse {
     // Require PIN authentication
     if !state.pin_verified {
         return ApduResponse::err(SW_SECURITY_STATUS);
@@ -58,7 +61,11 @@ pub fn handle(state: &mut ScHsmState, store: &mut dyn KeyStore, cmd: &ApduComman
 ///
 /// Delegates to the same ECDSA / RSA signing paths as INS=0x68 (sign.rs),
 /// but reads key_id and algo from the security environment set by MSE SET.
-fn pso_compute_digital_signature(state: &mut ScHsmState, store: &mut dyn KeyStore, cmd: &ApduCommand<'_>) -> ApduResponse {
+fn pso_compute_digital_signature(
+    state: &mut ScHsmState,
+    store: &mut dyn KeyStore,
+    cmd: &ApduCommand<'_>,
+) -> ApduResponse {
     // Require MSE SET to have configured key and algorithm
     let key_id_proto = match state.current_key_id {
         Some(id) => id,
@@ -82,7 +89,9 @@ fn pso_compute_digital_signature(state: &mut ScHsmState, store: &mut dyn KeyStor
     #[cfg(feature = "rsa")]
     match algo {
         0x20 | 0x31 | 0x32 | 0x33 | 0x34 | 0x40 => {
-            use crate::crypto::asymmetric::{HashAlgorithm, rsa_private_raw, rsa_sign_pkcs1v15, rsa_sign_pss};
+            use crate::crypto::asymmetric::{
+                rsa_private_raw, rsa_sign_pkcs1v15, rsa_sign_pss, HashAlgorithm,
+            };
 
             // Check metadata index for the key
             let rsa_meta = match state.key_index.iter().find(|m| m.key_id == key_id) {
@@ -101,13 +110,11 @@ fn pso_compute_digital_signature(state: &mut ScHsmState, store: &mut dyn KeyStor
                 0x05 => pico2hsm_core::key::KeyType::RsaPrivate2048,
                 0x06 => pico2hsm_core::key::KeyType::RsaPrivate3072,
                 0x07 => pico2hsm_core::key::KeyType::RsaPrivate4096,
-                _ => {
-                    match key_obj.private_key.len() {
-                        n if n <= 1200 => pico2hsm_core::key::KeyType::RsaPrivate2048,
-                        n if n <= 1800 => pico2hsm_core::key::KeyType::RsaPrivate3072,
-                        _ => pico2hsm_core::key::KeyType::RsaPrivate4096,
-                    }
-                }
+                _ => match key_obj.private_key.len() {
+                    n if n <= 1200 => pico2hsm_core::key::KeyType::RsaPrivate2048,
+                    n if n <= 1800 => pico2hsm_core::key::KeyType::RsaPrivate3072,
+                    _ => pico2hsm_core::key::KeyType::RsaPrivate4096,
+                },
             };
             let mut der_buf = [0u8; 2400];
             let der_len = key_obj.private_key.len();
@@ -141,7 +148,7 @@ fn pso_compute_digital_signature(state: &mut ScHsmState, store: &mut dyn KeyStor
                         0x31 => HashAlgorithm::Sha256,
                         0x32 => HashAlgorithm::Sha384,
                         0x33 => HashAlgorithm::Sha512,
-                        _    => return ApduResponse::err(SW_INS_NOT_SUPPORTED),
+                        _ => return ApduResponse::err(SW_INS_NOT_SUPPORTED),
                     };
                     match rsa_sign_pkcs1v15(
                         key_type,
@@ -277,7 +284,11 @@ fn is_ec_private(kt: KeyType) -> bool {
 ///
 /// Delegates to the same ECDH / RSA decryption paths as INS=0x62 (decrypt.rs),
 /// but reads key_id and algo from the security environment set by MSE SET.
-fn pso_decipher(state: &mut ScHsmState, store: &mut dyn KeyStore, cmd: &ApduCommand<'_>) -> ApduResponse {
+fn pso_decipher(
+    state: &mut ScHsmState,
+    store: &mut dyn KeyStore,
+    cmd: &ApduCommand<'_>,
+) -> ApduResponse {
     // Require MSE SET to have configured key and algorithm
     let key_id_proto = match state.current_key_id {
         Some(id) => id,
@@ -376,14 +387,11 @@ fn pso_decipher(state: &mut ScHsmState, store: &mut dyn KeyStore, cmd: &ApduComm
     let priv_len = key_obj.private_key.len();
     priv_buf[..priv_len].copy_from_slice(&key_obj.private_key);
 
-    let shared = match crate::crypto::asymmetric::ecdh_agree(
-        key_type,
-        &priv_buf[..priv_len],
-        cmd.data,
-    ) {
-        Ok(s) => s,
-        Err(_) => return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
-    };
+    let shared =
+        match crate::crypto::asymmetric::ecdh_agree(key_type, &priv_buf[..priv_len], cmd.data) {
+            Ok(s) => s,
+            Err(_) => return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
+        };
 
     if needs_04_prefix {
         // Prepend 0x04 so OpenSC can strip it and get the exact field-size
@@ -410,10 +418,13 @@ fn make_sym_key_material(key_id: u32, raw: &[u8]) -> Option<KeyMaterial> {
         32 => Kt::Aes256,
         _ => return None,
     };
-    let mut km_raw: heapless::Vec<u8, { pico2hsm_core::key::MAX_KEY_BYTES }> =
-        heapless::Vec::new();
+    let mut km_raw: heapless::Vec<u8, { pico2hsm_core::key::MAX_KEY_BYTES }> = heapless::Vec::new();
     km_raw.extend_from_slice(raw).ok()?;
-    Some(KeyMaterial { key_type, key_id: KeyId(key_id), raw: km_raw })
+    Some(KeyMaterial {
+        key_type,
+        key_id: KeyId(key_id),
+        raw: km_raw,
+    })
 }
 
 /// PSO Compute Cryptographic Checksum (P1=0x8E, P2=0x80).
@@ -424,7 +435,11 @@ fn make_sym_key_material(key_id: u32, raw: &[u8]) -> Option<KeyMaterial> {
 ///
 /// If `current_algo` is `0xA0` (HMAC-SHA256 indicator), HMAC-SHA256 is used
 /// instead and returns a 32-byte tag.
-fn pso_compute_checksum(state: &mut ScHsmState, store: &mut dyn KeyStore, cmd: &ApduCommand<'_>) -> ApduResponse {
+fn pso_compute_checksum(
+    state: &mut ScHsmState,
+    store: &mut dyn KeyStore,
+    cmd: &ApduCommand<'_>,
+) -> ApduResponse {
     let key_id_proto = match state.current_key_id {
         Some(id) => id,
         None => return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
@@ -476,7 +491,11 @@ fn pso_compute_checksum(state: &mut ScHsmState, store: &mut dyn KeyStore, cmd: &
 /// - HMAC-SHA256: tag is 32 bytes (if `current_algo == 0xA0`)
 ///
 /// Returns SW_OK if the tag matches, SW_DATA_INVALID otherwise.
-fn pso_verify_checksum(state: &mut ScHsmState, store: &mut dyn KeyStore, cmd: &ApduCommand<'_>) -> ApduResponse {
+fn pso_verify_checksum(
+    state: &mut ScHsmState,
+    store: &mut dyn KeyStore,
+    cmd: &ApduCommand<'_>,
+) -> ApduResponse {
     let key_id_proto = match state.current_key_id {
         Some(id) => id,
         None => return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
@@ -558,11 +577,17 @@ mod tests {
     }
 
     impl crate::storage::KeyStore for TestStore {
-        fn save_key(&mut self, _: &KeyObject) -> Result<(), pico2hsm_core::error::HsmError> { Ok(()) }
-        fn fetch_key(&mut self, key_id: KeyId) -> Result<Option<KeyObject>, pico2hsm_core::error::HsmError> {
+        fn save_key(&mut self, _: &KeyObject) -> Result<(), pico2hsm_core::error::HsmError> {
+            Ok(())
+        }
+        fn fetch_key(
+            &mut self,
+            key_id: KeyId,
+        ) -> Result<Option<KeyObject>, pico2hsm_core::error::HsmError> {
             if let Some(ref obj) = self.obj {
                 if obj.key_id == key_id.0 {
-                    let mut clone = KeyObject::new(obj.key_type, obj.key_id, obj.owner, obj.algorithm);
+                    let mut clone =
+                        KeyObject::new(obj.key_type, obj.key_id, obj.owner, obj.algorithm);
                     clone.key_flags = obj.key_flags;
                     let _ = clone.private_key.extend_from_slice(&obj.private_key);
                     let _ = clone.public_key.extend_from_slice(&obj.public_key);
@@ -571,10 +596,18 @@ mod tests {
             }
             Ok(None)
         }
-        fn erase_key(&mut self, _: KeyId) -> Result<(), pico2hsm_core::error::HsmError> { Ok(()) }
-        fn wipe_all(&mut self) -> Result<(), pico2hsm_core::error::HsmError> { Ok(()) }
-        fn wipe_by_owner(&mut self, _: AppletId) -> Result<(), pico2hsm_core::error::HsmError> { Ok(()) }
-        fn enumerate_keys(&self) -> heapless::Vec<KeyId, 64> { heapless::Vec::new() }
+        fn erase_key(&mut self, _: KeyId) -> Result<(), pico2hsm_core::error::HsmError> {
+            Ok(())
+        }
+        fn wipe_all(&mut self) -> Result<(), pico2hsm_core::error::HsmError> {
+            Ok(())
+        }
+        fn wipe_by_owner(&mut self, _: AppletId) -> Result<(), pico2hsm_core::error::HsmError> {
+            Ok(())
+        }
+        fn enumerate_keys(&self) -> heapless::Vec<KeyId, 64> {
+            heapless::Vec::new()
+        }
         fn for_each_key(&self, _f: &mut dyn FnMut(KeyId)) {}
     }
 
@@ -597,9 +630,7 @@ mod tests {
         fn fill_bytes(&mut self, dest: &mut [u8]) {
             for chunk in dest.chunks_mut(8) {
                 self.0 = self.0.wrapping_add(0x9e3779b97f4a7c15u64);
-                let v = self.0
-                    .wrapping_mul(0x6c62272e07bb0142u64)
-                    ^ 0xbf58476d1ce4e5b9u64;
+                let v = self.0.wrapping_mul(0x6c62272e07bb0142u64) ^ 0xbf58476d1ce4e5b9u64;
                 let vb = v.to_le_bytes();
                 chunk.copy_from_slice(&vb[..chunk.len()]);
             }
@@ -633,8 +664,7 @@ mod tests {
     /// Create a state+store with an EC key for PSO tests.
     fn make_ec_state_and_store(key_proto_ref: u8, algo: u8) -> (ScHsmState, TestStore) {
         let mut rng = CounterRng(algo as u64);
-        let kp = generate_ec_keypair(CoreKeyType::EcPrivateP256, &mut rng)
-            .expect("P-256 keygen");
+        let kp = generate_ec_keypair(CoreKeyType::EcPrivateP256, &mut rng).expect("P-256 keygen");
 
         let full_key_id = pico2hsm_core::key::KeyId::sc_hsm(0, key_proto_ref).0;
 
@@ -643,10 +673,20 @@ mod tests {
         state.current_key_id = Some(key_proto_ref);
         state.current_algo = Some(algo);
 
-        let meta = KeyMeta { key_id: full_key_id, key_type: 0, algo: 0x13, key_flags: 0 };
+        let meta = KeyMeta {
+            key_id: full_key_id,
+            key_type: 0,
+            algo: 0x13,
+            key_flags: 0,
+        };
         state.key_index.push(meta).unwrap();
 
-        let mut key_obj = KeyObject::new(KmType::Ec, full_key_id, AppletId::ScHsm, AlgorithmId::EcdsaP256);
+        let mut key_obj = KeyObject::new(
+            KmType::Ec,
+            full_key_id,
+            AppletId::ScHsm,
+            AlgorithmId::EcdsaP256,
+        );
         let _ = key_obj.private_key.extend_from_slice(&kp.private_key);
         let _ = key_obj.public_key.extend_from_slice(&kp.public_key);
 
@@ -662,10 +702,16 @@ mod tests {
         state.current_key_id = Some(0x10);
         state.current_algo = Some(0x61); // AES-CBC → default to CMAC
 
-        let meta = KeyMeta { key_id: full_id, key_type: 0, algo: 0x61, key_flags: 0 };
+        let meta = KeyMeta {
+            key_id: full_id,
+            key_type: 0,
+            algo: 0x61,
+            key_flags: 0,
+        };
         state.key_index.push(meta).unwrap();
 
-        let mut key_obj = KeyObject::new(KmType::Aes, full_id, AppletId::ScHsm, AlgorithmId::AesCbc);
+        let mut key_obj =
+            KeyObject::new(KmType::Aes, full_id, AppletId::ScHsm, AlgorithmId::AesCbc);
         let _ = key_obj.private_key.extend_from_slice(key_bytes);
 
         (state, TestStore::new(key_obj))
@@ -723,10 +769,9 @@ mod tests {
     fn test_pso_decipher_ecdh_p256() {
         let mut rng = CounterRng(3);
 
-        let alice = generate_ec_keypair(CoreKeyType::EcPrivateP256, &mut rng)
-            .expect("Alice keygen");
-        let bob = generate_ec_keypair(CoreKeyType::EcPrivateP256, &mut rng)
-            .expect("Bob keygen");
+        let alice =
+            generate_ec_keypair(CoreKeyType::EcPrivateP256, &mut rng).expect("Alice keygen");
+        let bob = generate_ec_keypair(CoreKeyType::EcPrivateP256, &mut rng).expect("Bob keygen");
 
         let full_key_id = pico2hsm_core::key::KeyId::sc_hsm(0, 0x01).0;
 
@@ -736,10 +781,20 @@ mod tests {
         state.current_algo = Some(0x80);
 
         // Use algo 0x13 (P-256 keygen algo) in metadata so meta_algo_to_ec_key_type works
-        let meta = KeyMeta { key_id: full_key_id, key_type: 0, algo: 0x13, key_flags: 0 };
+        let meta = KeyMeta {
+            key_id: full_key_id,
+            key_type: 0,
+            algo: 0x13,
+            key_flags: 0,
+        };
         state.key_index.push(meta).unwrap();
 
-        let mut key_obj = KeyObject::new(KmType::Ec, full_key_id, AppletId::ScHsm, AlgorithmId::EcdsaP256);
+        let mut key_obj = KeyObject::new(
+            KmType::Ec,
+            full_key_id,
+            AppletId::ScHsm,
+            AlgorithmId::EcdsaP256,
+        );
         let _ = key_obj.private_key.extend_from_slice(&alice.private_key);
         let _ = key_obj.public_key.extend_from_slice(&alice.public_key);
         let mut store = TestStore::new(key_obj);

@@ -57,10 +57,7 @@ where
     BUS: SpiBus,
     CS: OutputPin,
 {
-    fn transaction(
-        &mut self,
-        operations: &mut [Operation<'_, u8>],
-    ) -> Result<(), Self::Error> {
+    fn transaction(&mut self, operations: &mut [Operation<'_, u8>]) -> Result<(), Self::Error> {
         self.cs.set_low().map_err(SimpleDeviceError::Cs)?;
 
         let op_res = operations.iter_mut().try_for_each(|op| match op {
