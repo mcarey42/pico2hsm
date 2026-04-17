@@ -1,9 +1,16 @@
 [package]
 name = "pico2hsm-firmware"
 version = "0.9.0"
-edition = "2021"
-description = "pico2hsm HSM firmware for Raspberry Pi RP2350/RP2354"
-license = "MIT"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+description = "pico2hsm USB HSM firmware for Raspberry Pi RP2350/RP2354 — SC-HSM, PIV, OpenPGP applets over CCID"
+readme = "../README.md"
+keywords = ["hsm", "smartcard", "rp2350", "ccid", "pkcs11"]
+categories = ["embedded", "cryptography", "hardware-support"]
 
 [lib]
 name = "pico2hsm_firmware"
