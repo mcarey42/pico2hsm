@@ -167,10 +167,16 @@ class TestBuildVerifyPin:
         apdu = build_verify_pin("pässwörd")
         assert "pässwörd".encode("utf-8") in apdu
 
-    def test_empty_pin_has_zero_lc(self):
-        # Edge case: empty PIN — firmware may reject it but builder must handle it
+    def test_empty_pin_emits_case1_apdu(self):
+        # Edge case: empty PIN. Per ISO 7816-4, an APDU with no body and no Le
+        # encodes as Case 1 — a 4-byte header with no Lc. The firmware treats
+        # this VERIFY Case 1 as "query remaining retry count".
         apdu = build_verify_pin("")
-        assert apdu[4] == 0x00
+        assert len(apdu) == 4
+        assert apdu[0] == 0x00
+        assert apdu[1] == INS_VERIFY
+        assert apdu[2] == 0x00
+        assert apdu[3] == 0x81
 
 
 # ---------------------------------------------------------------------------
