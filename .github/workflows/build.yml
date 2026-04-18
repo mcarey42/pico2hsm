@@ -240,7 +240,11 @@ jobs:
           # builds to the shared target/ even with --manifest-path.
           ELF=target/thumbv8m.main-none-eabihf/release/pico2hsm
           UF2=pico2hsm-${{ matrix.board }}-unsigned.uf2
-          picotool uf2 convert "$ELF" "$UF2" --family rp2350-arm-s
+          # picotool 2.x infers input type from file extension; the cargo
+          # binary has no extension, so copy it to a .elf-named file first.
+          ELF_NAMED="${UF2%.uf2}.elf"
+          cp "$ELF" "$ELF_NAMED"
+          picotool uf2 convert "$ELF_NAMED" "$UF2" --family rp2350-arm-s
           echo "Built: $UF2 ($(stat -c%s "$UF2") bytes)"
 
       - name: Upload UF2 artifact

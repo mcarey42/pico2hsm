@@ -117,8 +117,11 @@ jobs:
           BASE="pico2hsm-${BOARD}-unsigned"
           ELF_DST="release-assets/${BASE}.elf"
           UF2_DST="release-assets/${BASE}.uf2"
+          # picotool 2.x infers input type from file extension; the cargo
+          # binary has no extension (`[[bin]] name = "pico2hsm"`), so pass
+          # the already-staged .elf copy instead of the raw ELF_SRC.
           cp "$ELF_SRC" "$ELF_DST"
-          picotool uf2 convert "$ELF_SRC" "$UF2_DST" --family rp2350-arm-s
+          picotool uf2 convert "$ELF_DST" "$UF2_DST" --family rp2350-arm-s
           ( cd release-assets && sha256sum "${BASE}.uf2" > "${BASE}.uf2.sha256" )
           ls -la release-assets
 
