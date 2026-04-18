@@ -73,11 +73,19 @@ pub fn handle_get_status(_state: &mut ScHsmState, _cmd: &ApduCommand<'_>) -> Apd
         #[cfg(target_arch = "arm")]
         {
             embassy_rp::otp::read_raw_word(OTP_BOOT_FLAGS_ROW)
-                .map(|flags| if flags & BOOT_FLAG_PRODUCTION_MODE != 0 { 1 } else { 0 })
+                .map(|flags| {
+                    if flags & BOOT_FLAG_PRODUCTION_MODE != 0 {
+                        1
+                    } else {
+                        0
+                    }
+                })
                 .unwrap_or(0)
         }
         #[cfg(not(target_arch = "arm"))]
-        { 0 }
+        {
+            0
+        }
     };
 
     // Read JTAG SW flag (bit 0 of OTP row 0x110).
@@ -89,7 +97,9 @@ pub fn handle_get_status(_state: &mut ScHsmState, _cmd: &ApduCommand<'_>) -> Apd
                 .unwrap_or(0)
         }
         #[cfg(not(target_arch = "arm"))]
-        { 0 }
+        {
+            0
+        }
     };
 
     // OTP row locking: not yet implemented, always report 0.
@@ -99,20 +109,32 @@ pub fn handle_get_status(_state: &mut ScHsmState, _cmd: &ApduCommand<'_>) -> Apd
     let secure_boot_enabled: u8 = {
         #[cfg(target_arch = "arm")]
         {
-            if crate::security::boot::is_secure_boot_enabled() { 1 } else { 0 }
+            if crate::security::boot::is_secure_boot_enabled() {
+                1
+            } else {
+                0
+            }
         }
         #[cfg(not(target_arch = "arm"))]
-        { 0 }
+        {
+            0
+        }
     };
 
     // Glitch detector armed status.
     let glitch_detector_armed: u8 = {
         #[cfg(target_arch = "arm")]
         {
-            if crate::security::anti_glitch::is_glitch_detector_armed() { 1 } else { 0 }
+            if crate::security::anti_glitch::is_glitch_detector_armed() {
+                1
+            } else {
+                0
+            }
         }
         #[cfg(not(target_arch = "arm"))]
-        { 0 }
+        {
+            0
+        }
     };
 
     // Build TLV response: 6F [len] 80 01 xx 81 01 xx 82 01 xx 83 01 xx 84 01 xx

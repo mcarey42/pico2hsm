@@ -13,8 +13,8 @@
 use sha2::Digest as _;
 
 use pico2hsm_core::apdu::{
-    ApduCommand, ApduResponse, SW_CONDITIONS_NOT_SATISFIED, SW_FILE_NOT_FOUND,
-    SW_SECURITY_STATUS, SW_WRONG_DATA,
+    ApduCommand, ApduResponse, SW_CONDITIONS_NOT_SATISFIED, SW_FILE_NOT_FOUND, SW_SECURITY_STATUS,
+    SW_WRONG_DATA,
 };
 
 use crate::protocol::sc_hsm::{FwRng, ScHsmState};
@@ -47,12 +47,7 @@ fn find_tlv<'a>(data: &'a [u8], tag: u8) -> Option<&'a [u8]> {
 /// Encode a two-level TLV: `outer [inner_content_len] inner [value_len] value`.
 ///
 /// Returns `None` if the output buffer is too small.
-fn encode_tlv(
-    outer: u8,
-    inner: u8,
-    value: &[u8],
-    out: &mut heapless::Vec<u8, 512>,
-) -> Option<()> {
+fn encode_tlv(outer: u8, inner: u8, value: &[u8], out: &mut heapless::Vec<u8, 512>) -> Option<()> {
     out.push(outer).ok()?;
     out.push((value.len() + 2) as u8).ok()?;
     out.push(inner).ok()?;
@@ -74,7 +69,11 @@ fn meta_algo_to_ec_key_type(algo: u8) -> Option<pico2hsm_core::key::KeyType> {
 }
 
 /// Handle a GENERAL AUTHENTICATE APDU command.
-pub fn handle(state: &mut ScHsmState, store: &mut dyn KeyStore, cmd: &ApduCommand<'_>) -> ApduResponse {
+pub fn handle(
+    state: &mut ScHsmState,
+    store: &mut dyn KeyStore,
+    cmd: &ApduCommand<'_>,
+) -> ApduResponse {
     // Require PIN authentication.
     if !state.pin_verified && !state.so_pin_verified {
         return ApduResponse::err(SW_SECURITY_STATUS);
@@ -153,7 +152,10 @@ pub fn handle(state: &mut ScHsmState, store: &mut dyn KeyStore, cmd: &ApduComman
 mod tests {
     use super::*;
     use pico2hsm_core::{
-        apdu::{SW_CONDITIONS_NOT_SATISFIED, SW_FILE_NOT_FOUND, SW_OK, SW_SECURITY_STATUS, SW_WRONG_DATA},
+        apdu::{
+            SW_CONDITIONS_NOT_SATISFIED, SW_FILE_NOT_FOUND, SW_OK, SW_SECURITY_STATUS,
+            SW_WRONG_DATA,
+        },
         key::{AppletId, KeyId, KeyType},
     };
     use rand_core::RngCore;
@@ -177,11 +179,17 @@ mod tests {
     }
 
     impl crate::storage::KeyStore for TestStore {
-        fn save_key(&mut self, _: &KeyObject) -> Result<(), pico2hsm_core::error::HsmError> { Ok(()) }
-        fn fetch_key(&mut self, key_id: KeyId) -> Result<Option<KeyObject>, pico2hsm_core::error::HsmError> {
+        fn save_key(&mut self, _: &KeyObject) -> Result<(), pico2hsm_core::error::HsmError> {
+            Ok(())
+        }
+        fn fetch_key(
+            &mut self,
+            key_id: KeyId,
+        ) -> Result<Option<KeyObject>, pico2hsm_core::error::HsmError> {
             if let Some(ref obj) = self.obj {
                 if obj.key_id == key_id.0 {
-                    let mut clone = KeyObject::new(obj.key_type, obj.key_id, obj.owner, obj.algorithm);
+                    let mut clone =
+                        KeyObject::new(obj.key_type, obj.key_id, obj.owner, obj.algorithm);
                     clone.key_flags = obj.key_flags;
                     let _ = clone.private_key.extend_from_slice(&obj.private_key);
                     let _ = clone.public_key.extend_from_slice(&obj.public_key);
@@ -190,10 +198,18 @@ mod tests {
             }
             Ok(None)
         }
-        fn erase_key(&mut self, _: KeyId) -> Result<(), pico2hsm_core::error::HsmError> { Ok(()) }
-        fn wipe_all(&mut self) -> Result<(), pico2hsm_core::error::HsmError> { Ok(()) }
-        fn wipe_by_owner(&mut self, _: AppletId) -> Result<(), pico2hsm_core::error::HsmError> { Ok(()) }
-        fn enumerate_keys(&self) -> heapless::Vec<KeyId, 64> { heapless::Vec::new() }
+        fn erase_key(&mut self, _: KeyId) -> Result<(), pico2hsm_core::error::HsmError> {
+            Ok(())
+        }
+        fn wipe_all(&mut self) -> Result<(), pico2hsm_core::error::HsmError> {
+            Ok(())
+        }
+        fn wipe_by_owner(&mut self, _: AppletId) -> Result<(), pico2hsm_core::error::HsmError> {
+            Ok(())
+        }
+        fn enumerate_keys(&self) -> heapless::Vec<KeyId, 64> {
+            heapless::Vec::new()
+        }
         fn for_each_key(&self, _f: &mut dyn FnMut(KeyId)) {}
     }
 
@@ -214,10 +230,7 @@ mod tests {
         fn fill_bytes(&mut self, dest: &mut [u8]) {
             for chunk in dest.chunks_mut(8) {
                 self.0 = self.0.wrapping_add(0x9e3779b97f4a7c15u64);
-                let v = self
-                    .0
-                    .wrapping_mul(0x6c62272e07bb0142u64)
-                    ^ 0xbf58476d1ce4e5b9u64;
+                let v = self.0.wrapping_mul(0x6c62272e07bb0142u64) ^ 0xbf58476d1ce4e5b9u64;
                 chunk.copy_from_slice(&v.to_le_bytes()[..chunk.len()]);
             }
         }
@@ -332,8 +345,7 @@ mod tests {
         // Full happy-path: P-256 key, valid 7C(81) challenge → SW_OK,
         // response starts with 0x7C.
         let mut rng = CounterRng(42);
-        let kp = generate_ec_keypair(KeyType::EcPrivateP256, &mut rng)
-            .expect("P-256 keygen");
+        let kp = generate_ec_keypair(KeyType::EcPrivateP256, &mut rng).expect("P-256 keygen");
 
         let mut state = ScHsmState::new();
         state.pin_verified = true;
@@ -343,11 +355,21 @@ mod tests {
         let full_key_id = pico2hsm_core::key::KeyId::sc_hsm(0, 0x01).0;
 
         // Push metadata into key_index
-        let meta = KeyMeta { key_id: full_key_id, key_type: 0, algo: 0x13, key_flags: 0 };
+        let meta = KeyMeta {
+            key_id: full_key_id,
+            key_type: 0,
+            algo: 0x13,
+            key_flags: 0,
+        };
         state.key_index.push(meta).unwrap();
 
         // Create KeyObject with the generated key
-        let mut key_obj = KeyObject::new(KmType::Ec, full_key_id, AppletId::ScHsm, AlgorithmId::EcdsaP256);
+        let mut key_obj = KeyObject::new(
+            KmType::Ec,
+            full_key_id,
+            AppletId::ScHsm,
+            AlgorithmId::EcdsaP256,
+        );
         let _ = key_obj.private_key.extend_from_slice(&kp.private_key);
         let _ = key_obj.public_key.extend_from_slice(&kp.public_key);
         let mut store = TestStore::new(key_obj);

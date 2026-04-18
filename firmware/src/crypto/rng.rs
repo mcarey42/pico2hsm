@@ -39,8 +39,8 @@
 //! replace the PAC fallback with a reference to the shared `Rng` instance
 //! passed through an Embassy channel or a global mutex.
 
-use chacha20::{ChaCha20, Key, Nonce};
 use chacha20::cipher::{KeyIvInit, StreamCipher};
+use chacha20::{ChaCha20, Key, Nonce};
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicU32, Ordering};
 use pico2hsm_core::error::CryptoError;
@@ -224,7 +224,8 @@ fn pac_trng_read_word() -> Result<u32, CryptoError> {
         // EHR is valid: reading ehr_data5 clears all EHR registers.
         let word = trng.ehr_data5().read();
         trng.rnd_source_enable().write(|w| w.set_rnd_src_en(false));
-        trng.rst_bits_counter().write(|w| w.set_rst_bits_counter(true));
+        trng.rst_bits_counter()
+            .write(|w| w.set_rst_bits_counter(true));
         return Ok(word);
     }
 }
@@ -293,7 +294,8 @@ pub fn get_random_bytes(n: usize) -> Result<heapless::Vec<u8, 256>, CryptoError>
     }
     let mut buf = heapless::Vec::new();
     // SAFETY: we just checked n <= 256 == capacity
-    buf.resize_default(n).map_err(|_| CryptoError::BufferTooSmall)?;
+    buf.resize_default(n)
+        .map_err(|_| CryptoError::BufferTooSmall)?;
     fill_random(&mut buf)?;
     Ok(buf)
 }

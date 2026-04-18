@@ -27,8 +27,8 @@ pub struct KeyId(pub u32);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum AppletId {
-    ScHsm   = 0x00,
-    Piv     = 0x01,
+    ScHsm = 0x00,
+    Piv = 0x01,
     OpenPgp = 0x02,
 }
 
@@ -49,9 +49,9 @@ impl zeroize::Zeroize for AppletId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum PinSlot {
-    ScHsmUser  = 0,
-    ScHsmSo    = 1,
-    PivPin     = 2,
+    ScHsmUser = 0,
+    ScHsmSo = 1,
+    PivPin = 2,
     OpenPgpPw1 = 3,
     OpenPgpPw3 = 4,
 }
@@ -164,7 +164,7 @@ impl KeyType {
     pub fn raw_key_len(&self) -> usize {
         match self {
             KeyType::RsaPrivate2048 => 1192, // PKCS#1 DER, ~1192 bytes
-            KeyType::EfFile => 0, // Variable-length; not a fixed-size key
+            KeyType::EfFile => 0,            // Variable-length; not a fixed-size key
             KeyType::RsaPrivate3072 => 1770, // PKCS#1 DER, ~1770 bytes
             KeyType::RsaPrivate4096 => 2350, // PKCS#1 DER, ~2350 bytes (capped at MAX_KEY_BYTES)
             KeyType::EcPrivateP256 => 32,

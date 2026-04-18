@@ -225,16 +225,16 @@ impl ScreenLayout {
     /// Layout for the Waveshare RP2350-Geek (ST7789, 240 × 135 landscape).
     pub const fn geek_240x135() -> Self {
         Self {
-            width:    240,
-            height:   135,
+            width: 240,
+            height: 135,
             header_h: 18,
-            pill_x:   86,
-            pill_y:   3,
-            pill_w:   68,
-            pill_h:   12,
+            pill_x: 86,
+            pill_y: 3,
+            pill_w: 68,
+            pill_h: 12,
             uptime_x: 168,
-            cells_y:  21,
-            cells_h:  36,
+            cells_y: 21,
+            cells_h: 36,
             lastop_y: 59,
             lastop_h: 32,
             storage_health_y: 93,
@@ -246,16 +246,16 @@ impl ScreenLayout {
     /// Layout for the Waveshare RP2350-LCD-1.47 (ST7789V3, 320 × 172 landscape).
     pub const fn waveshare_320x172() -> Self {
         Self {
-            width:    320,
-            height:   172,
+            width: 320,
+            height: 172,
             header_h: 22,
-            pill_x:   110,
-            pill_y:   4,
-            pill_w:   100,
-            pill_h:   14,
+            pill_x: 110,
+            pill_y: 4,
+            pill_w: 100,
+            pill_h: 14,
             uptime_x: 220,
-            cells_y:  25,
-            cells_h:  50,
+            cells_y: 25,
+            cells_h: 50,
             lastop_y: 78,
             lastop_h: 42,
             storage_health_y: 123,
@@ -271,16 +271,16 @@ impl ScreenLayout {
     /// and the last-op area.
     pub const fn waveshare_172x320() -> Self {
         Self {
-            width:    172,
-            height:   320,
-            header_h: 38,   // two text rows (2 × 19 px)
-            pill_x:   36,   // centred: (172 − 100) / 2
-            pill_y:   22,   // second header row
-            pill_w:   100,
-            pill_h:   14,
-            uptime_x: 116,  // right-aligned: 172 − 8 chars × 6 px − 8 px margin
-            cells_y:  41,
-            cells_h:  80,
+            width: 172,
+            height: 320,
+            header_h: 38, // two text rows (2 × 19 px)
+            pill_x: 36,   // centred: (172 − 100) / 2
+            pill_y: 22,   // second header row
+            pill_w: 100,
+            pill_h: 14,
+            uptime_x: 116, // right-aligned: 172 − 8 chars × 6 px − 8 px margin
+            cells_y: 41,
+            cells_h: 80,
             lastop_y: 126,
             lastop_h: 120,
             storage_health_y: 252,
@@ -316,7 +316,11 @@ where
 
 // ── Internal rendering ────────────────────────────────────────────────────────
 
-fn render_inner<D>(display: &mut D, state: &DisplayState, layout: &ScreenLayout) -> Result<(), D::Error>
+fn render_inner<D>(
+    display: &mut D,
+    state: &DisplayState,
+    layout: &ScreenLayout,
+) -> Result<(), D::Error>
 where
     D: DrawTarget<Color = Rgb565>,
 {
@@ -363,7 +367,13 @@ where
         let s = state.uptime_secs;
         let mut buf: String<9> = String::new();
         if s < 86400 {
-            let _ = write!(&mut buf, "{:02}:{:02}:{:02}", s / 3600, (s / 60) % 60, s % 60);
+            let _ = write!(
+                &mut buf,
+                "{:02}:{:02}:{:02}",
+                s / 3600,
+                (s / 60) % 60,
+                s % 60
+            );
         } else {
             let _ = write!(
                 &mut buf,
@@ -383,12 +393,9 @@ where
     }
 
     // ── 3. Divider line ──────────────────────────────────────────────────────
-    Rectangle::new(
-        Point::new(0, layout.header_h as i32),
-        Size::new(w, 1),
-    )
-    .into_styled(PrimitiveStyle::with_fill(COLOR_DIVIDER))
-    .draw(display)?;
+    Rectangle::new(Point::new(0, layout.header_h as i32), Size::new(w, 1))
+        .into_styled(PrimitiveStyle::with_fill(COLOR_DIVIDER))
+        .draw(display)?;
 
     // ── 4. Info grid — 3 equal cells ────────────────────────────────────────
     // Divide available width into 3 cells with 2px gaps and 2px side margins.
@@ -408,21 +415,43 @@ where
     {
         let mut s: String<4> = String::new();
         let _ = write!(&mut s, "{}", state.key_count);
-        draw_info_cell(display, cx0, cy, cell_w0, ch, "Keys", &s, COLOR_TEXT_PRI, text_top)?;
+        draw_info_cell(
+            display,
+            cx0,
+            cy,
+            cell_w0,
+            ch,
+            "Keys",
+            &s,
+            COLOR_TEXT_PRI,
+            text_top,
+        )?;
     }
     let (auth_str, auth_color) = if state.authenticated {
         ("YES", COLOR_TEAL)
     } else {
         ("NO", COLOR_TEXT_DIM)
     };
-    draw_info_cell(display, cx1, cy, cell_w0, ch, "Auth", auth_str, auth_color, text_top)?;
+    draw_info_cell(
+        display, cx1, cy, cell_w0, ch, "Auth", auth_str, auth_color, text_top,
+    )?;
 
     let (storage_str, storage_color) = if state.storage_ok {
         ("OK", COLOR_GREEN)
     } else {
         ("FAIL", COLOR_RED)
     };
-    draw_info_cell(display, cx2, cy, cell_w2, ch, "Storage", storage_str, storage_color, text_top)?;
+    draw_info_cell(
+        display,
+        cx2,
+        cy,
+        cell_w2,
+        ch,
+        "Storage",
+        storage_str,
+        storage_color,
+        text_top,
+    )?;
 
     // ── 5. Last op row ───────────────────────────────────────────────────────
     let lo_y = layout.lastop_y as i32;
@@ -450,7 +479,13 @@ where
     {
         let s = state.uptime_secs;
         let mut buf: String<9> = String::new();
-        let _ = write!(&mut buf, "{:02}:{:02}:{:02}", s / 3600, (s / 60) % 60, s % 60);
+        let _ = write!(
+            &mut buf,
+            "{:02}:{:02}:{:02}",
+            s / 3600,
+            (s / 60) % 60,
+            s % 60
+        );
         let uptime_style = MonoTextStyle::new(&FONT_8X13, COLOR_TEXT_DIM);
         Text::with_text_style(&buf, Point::new(ux, lo_y + 16), uptime_style, text_top)
             .draw(display)?;
@@ -488,9 +523,11 @@ where
             Text::with_text_style("QMI:", Point::new(x, sy), style_sec, text_top).draw(display)?;
             x += 30;
             if ok {
-                Text::with_text_style("OK", Point::new(x, sy), style_green, text_top).draw(display)?;
+                Text::with_text_style("OK", Point::new(x, sy), style_green, text_top)
+                    .draw(display)?;
             } else {
-                Text::with_text_style("FAIL", Point::new(x, sy), style_red, text_top).draw(display)?;
+                Text::with_text_style("FAIL", Point::new(x, sy), style_red, text_top)
+                    .draw(display)?;
             }
             x += 30;
         }
@@ -505,9 +542,11 @@ where
             Text::with_text_style("SD:", Point::new(x, sy), style_sec, text_top).draw(display)?;
             x += 24;
             if ok {
-                Text::with_text_style("OK", Point::new(x, sy), style_green, text_top).draw(display)?;
+                Text::with_text_style("OK", Point::new(x, sy), style_green, text_top)
+                    .draw(display)?;
             } else {
-                Text::with_text_style("DEGRAD", Point::new(x, sy), style_yellow, text_top).draw(display)?;
+                Text::with_text_style("DEGRAD", Point::new(x, sy), style_yellow, text_top)
+                    .draw(display)?;
             }
         } else if state.qmi_ok.is_some() {
             // Show SD as absent
@@ -523,11 +562,13 @@ where
         let ky = layout.keys_y as i32;
         let mut buf: String<20> = String::new();
         let _ = write!(&mut buf, "Keys: {}", state.key_count);
-        Text::with_text_style(&buf, Point::new(margin as i32 + 4, ky), style_pri, text_top).draw(display)?;
+        Text::with_text_style(&buf, Point::new(margin as i32 + 4, ky), style_pri, text_top)
+            .draw(display)?;
         if !state.provisioned {
             let unprov_x = margin as i32 + 4 + buf.len() as i32 * 6 + 6;
             let style_yellow = MonoTextStyle::new(&FONT_6X10, rgb565(0xFFE0));
-            Text::with_text_style("[UNPROV]", Point::new(unprov_x, ky), style_yellow, text_top).draw(display)?;
+            Text::with_text_style("[UNPROV]", Point::new(unprov_x, ky), style_yellow, text_top)
+                .draw(display)?;
         }
     }
 

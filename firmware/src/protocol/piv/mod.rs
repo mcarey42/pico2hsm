@@ -27,7 +27,9 @@ use pico2hsm_core::{
 };
 
 /// AID for NIST PIV.
-pub const PIV_AID: &[u8] = &[0xA0, 0x00, 0x00, 0x03, 0x08, 0x00, 0x00, 0x10, 0x00, 0x01, 0x00];
+pub const PIV_AID: &[u8] = &[
+    0xA0, 0x00, 0x00, 0x03, 0x08, 0x00, 0x00, 0x10, 0x00, 0x01, 0x00,
+];
 
 /// Maximum number of in-memory PIV key slots.
 pub const MAX_PIV_KEYS: usize = 4;
@@ -48,8 +50,7 @@ const DEFAULT_PIV_PUK: &[u8] = b"12345678";
 
 /// Default 3DES management key (24 bytes, three identical 8-byte DES keys).
 const DEFAULT_MGMT_KEY: [u8; 24] = [
-    0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
-    0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+    0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
     0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
 ];
 
@@ -107,10 +108,14 @@ impl PivState {
         // Generate deterministic salts for the default state.
         // On real hardware, these would be random. For initial setup,
         // we use fixed salts that will be replaced on first PIN change.
-        let pin_salt = [0x50, 0x49, 0x56, 0x2D, 0x70, 0x69, 0x6E, 0x2D,
-                        0x73, 0x61, 0x6C, 0x74, 0x2D, 0x76, 0x31, 0x00]; // "PIV-pin-salt-v1\0"
-        let puk_salt = [0x50, 0x49, 0x56, 0x2D, 0x70, 0x75, 0x6B, 0x2D,
-                        0x73, 0x61, 0x6C, 0x74, 0x2D, 0x76, 0x31, 0x00]; // "PIV-puk-salt-v1\0"
+        let pin_salt = [
+            0x50, 0x49, 0x56, 0x2D, 0x70, 0x69, 0x6E, 0x2D, 0x73, 0x61, 0x6C, 0x74, 0x2D, 0x76,
+            0x31, 0x00,
+        ]; // "PIV-pin-salt-v1\0"
+        let puk_salt = [
+            0x50, 0x49, 0x56, 0x2D, 0x70, 0x75, 0x6B, 0x2D, 0x73, 0x61, 0x6C, 0x74, 0x2D, 0x76,
+            0x31, 0x00,
+        ]; // "PIV-puk-salt-v1\0"
         let device_id = [0u8; 16]; // Will be overwritten by caller
 
         let pin_state = crate::security::pin::PinState::new(
@@ -121,7 +126,8 @@ impl PivState {
             puk_salt,
             crate::security::pin::MAX_PIN_RETRIES,
             crate::security::pin::MAX_PUK_RETRIES,
-        ).expect("default PIV PIN/PUK must be valid");
+        )
+        .expect("default PIV PIN/PUK must be valid");
 
         PivState {
             pin_state,
@@ -167,10 +173,14 @@ impl Piv {
         use core::ptr::addr_of_mut;
 
         let device_id = [0u8; 16];
-        let pin_salt = [0x50, 0x49, 0x56, 0x2D, 0x70, 0x69, 0x6E, 0x2D,
-                        0x73, 0x61, 0x6C, 0x74, 0x2D, 0x76, 0x31, 0x00];
-        let puk_salt = [0x50, 0x49, 0x56, 0x2D, 0x70, 0x75, 0x6B, 0x2D,
-                        0x73, 0x61, 0x6C, 0x74, 0x2D, 0x76, 0x31, 0x00];
+        let pin_salt = [
+            0x50, 0x49, 0x56, 0x2D, 0x70, 0x69, 0x6E, 0x2D, 0x73, 0x61, 0x6C, 0x74, 0x2D, 0x76,
+            0x31, 0x00,
+        ];
+        let puk_salt = [
+            0x50, 0x49, 0x56, 0x2D, 0x70, 0x75, 0x6B, 0x2D, 0x73, 0x61, 0x6C, 0x74, 0x2D, 0x76,
+            0x31, 0x00,
+        ];
 
         let pin_state = crate::security::pin::PinState::new(
             DEFAULT_PIV_PIN,
@@ -180,7 +190,8 @@ impl Piv {
             puk_salt,
             crate::security::pin::MAX_PIN_RETRIES,
             crate::security::pin::MAX_PUK_RETRIES,
-        ).expect("default PIV PIN/PUK must be valid");
+        )
+        .expect("default PIV PIN/PUK must be valid");
 
         unsafe {
             let state = addr_of_mut!((*dest).state);
@@ -320,9 +331,7 @@ impl Piv {
             general_authenticate::INS_GENERAL_AUTHENTICATE => {
                 general_authenticate::handle_with_store(&mut self.state, store, cmd)
             }
-            verify::INS_VERIFY => {
-                verify::handle_with_store(&mut self.state, store, cmd)
-            }
+            verify::INS_VERIFY => verify::handle_with_store(&mut self.state, store, cmd),
             change_reference_data::INS_CHANGE_REFERENCE_DATA => {
                 change_reference_data::handle_with_store(&mut self.state, store, cmd)
             }
@@ -378,7 +387,6 @@ impl Piv {
                 }
             });
             for kid in piv_ids.iter() {
-
                 if let Ok(Some(obj)) = store.fetch_key(*kid) {
                     use crate::security::key_management::{AlgorithmId, KeyType as KmKeyType};
                     use pico2hsm_core::key::KeyType as CoreKeyType;

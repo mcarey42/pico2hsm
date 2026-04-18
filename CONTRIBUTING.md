@@ -10,7 +10,21 @@ The areas where contributions are most needed: new board support for RP2350-base
 
 - Read `CLAUDE.md` for the full architecture overview: dual-core Embassy async model, APDU dispatch chain, feature flag discipline, board peripheral implementation, and known pitfalls. Note that `CLAUDE.md` doubles as the AI-assistant context file for this repository and the developer architecture guide.
 - Review `PUNCHOUT.md` for known issues and pick one to work on. Items are tagged by severity (CRITICAL, HIGH, LOW) and include suggested fixes.
-- Security-sensitive changes -- anything under `firmware/src/security/`, `firmware/src/crypto/`, or `firmware/src/protocol/` -- require a maintainer review pass before merge. Please request review from `@mcarey42` explicitly.
+- Security-sensitive changes -- anything under `firmware/src/security/`, `firmware/src/crypto/`, or `firmware/src/protocol/` -- require a maintainer review pass before merge. `CODEOWNERS` will request review from `@mcarey42` automatically on every PR.
+
+## Contributor licensing
+
+This project is MIT-licensed. Inbound contributions are accepted under the
+same MIT terms (inbound equals outbound). No Contributor License Agreement
+(CLA) is required. No Developer Certificate of Origin (DCO) sign-off is
+required on commits.
+
+By opening a pull request you affirm that you have the right to contribute
+the code under the MIT licence and that you are doing so under those terms.
+
+## Code of conduct
+
+This project adopts the Contributor Covenant 2.1. See `CODE_OF_CONDUCT.md`.
 
 ## Development environment
 
@@ -148,7 +162,7 @@ Closes PUNCHOUT C1
 4. If you changed firmware behavior, the hardware integration test suite must pass (`./run_tests.sh`). State this in the PR description.
 5. Add or update unit tests in `firmware/src/` for any new `#[cfg(test)]` modules.
 6. Update `PUNCHOUT.md` if your PR closes an item.
-7. For security-sensitive changes (anything under `firmware/src/security/`, `firmware/src/crypto/`, or `firmware/src/protocol/`), request review from `@mcarey42` explicitly.
+7. For security-sensitive changes (anything under `firmware/src/security/`, `firmware/src/crypto/`, or `firmware/src/protocol/`), `CODEOWNERS` will request review from `@mcarey42` automatically; no manual request is needed.
 
 ## What we are looking for
 

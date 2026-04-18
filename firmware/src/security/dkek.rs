@@ -59,16 +59,14 @@ use zeroize::{Zeroize, Zeroizing};
 
 use cmac::{Cmac, Mac as CmacMac};
 
+use aes::Aes256;
 use aes_gcm::{
     aead::{AeadInPlace, KeyInit as GcmKeyInit},
-    Aes256Gcm,
-    Nonce as GcmNonce,
-    Tag as GcmTag,
+    Aes256Gcm, Nonce as GcmNonce, Tag as GcmTag,
 };
-use aes::Aes256;
 use cbc::{Decryptor as CbcDecryptor, Encryptor as CbcEncryptor};
-use cipher::{BlockDecryptMut, BlockEncryptMut, KeyIvInit};
 use cipher::block_padding::NoPadding;
+use cipher::{BlockDecryptMut, BlockEncryptMut, KeyIvInit};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -152,10 +150,7 @@ pub enum DkekError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DkekImportResult {
     /// More shares are needed before the DKEK is complete.
-    MoreSharesNeeded {
-        received: u8,
-        total:    u8,
-    },
+    MoreSharesNeeded { received: u8, total: u8 },
     /// All shares have been received; DKEK is now ready.
     Complete,
 }
@@ -170,14 +165,12 @@ pub enum DkekStatus {
     NotInitialized,
     /// Shares are being collected; accumulator XORs each share as it arrives.
     CollectingShares {
-        received:    u8,
-        total:       u8,
+        received: u8,
+        total: u8,
         accumulated: Zeroizing<[u8; 32]>,
     },
     /// All shares received; DKEK is available.
-    Ready {
-        dkek: Zeroizing<[u8; 32]>,
-    },
+    Ready { dkek: Zeroizing<[u8; 32]> },
 }
 
 impl Zeroize for DkekStatus {
@@ -186,7 +179,9 @@ impl Zeroize for DkekStatus {
         // Drop on it (which would call zeroize() again → infinite recursion).
         let old = core::mem::replace(self, DkekStatus::NotInitialized);
         match old {
-            DkekStatus::CollectingShares { mut accumulated, .. } => accumulated.zeroize(),
+            DkekStatus::CollectingShares {
+                mut accumulated, ..
+            } => accumulated.zeroize(),
             DkekStatus::Ready { mut dkek } => dkek.zeroize(),
             DkekStatus::NotInitialized => {}
         }
@@ -207,10 +202,10 @@ impl Zeroize for DkekStatus {
 /// Tracks the XOR-split share collection state and provides access to the
 /// assembled DKEK once all shares have been imported.
 pub struct DkekManager {
-    status:      DkekStatus,
+    status: DkekStatus,
     total_shares: u8,
     /// 16-byte device identifier (used in exchange AAD and static key derivation).
-    device_id:   [u8; 16],
+    device_id: [u8; 16],
 }
 
 impl DkekManager {
@@ -241,8 +236,8 @@ impl DkekManager {
         }
 
         self.status = DkekStatus::CollectingShares {
-            received:    0,
-            total:       n_shares,
+            received: 0,
+            total: n_shares,
             accumulated: Zeroizing::new([0u8; 32]),
         };
     }
@@ -260,7 +255,7 @@ impl DkekManager {
     pub fn import_share(
         &mut self,
         share_blob: &[u8],
-        password:   &[u8],
+        password: &[u8],
     ) -> Result<DkekImportResult, DkekError> {
         // Validate blob length.
         if share_blob.len() != SHARE_BLOB_SIZE {
@@ -269,9 +264,11 @@ impl DkekManager {
 
         // Ensure we are in the right state.
         let (received, total, accumulated) = match &mut self.status {
-            DkekStatus::CollectingShares { received, total, accumulated } => {
-                (received, *total, accumulated)
-            }
+            DkekStatus::CollectingShares {
+                received,
+                total,
+                accumulated,
+            } => (received, *total, accumulated),
             _ => return Err(DkekError::WrongState),
         };
 
@@ -281,7 +278,7 @@ impl DkekManager {
         // Validate embedded SHA-256 hash.
         let share_value = &decrypted[..32];
         let expected_hash: [u8; 32] = Sha256::digest(share_value).into();
-        let stored_hash   = &decrypted[32..64];
+        let stored_hash = &decrypted[32..64];
         if !bool::from(expected_hash.ct_eq(stored_hash)) {
             return Err(DkekError::ShareIntegrityFailure);
         }
@@ -325,9 +322,11 @@ impl DkekManager {
     ) -> Result<DkekImportResult, DkekError> {
         // Ensure we are in the right state.
         let (received, total, accumulated) = match &mut self.status {
-            DkekStatus::CollectingShares { received, total, accumulated } => {
-                (received, *total, accumulated)
-            }
+            DkekStatus::CollectingShares {
+                received,
+                total,
+                accumulated,
+            } => (received, *total, accumulated),
             _ => return Err(DkekError::WrongState),
         };
 
@@ -363,10 +362,7 @@ impl DkekManager {
     ///
     /// The returned value is NOT encrypted; the caller must pass it through
     /// [`encrypt_share_blob`] before distributing it.
-    pub fn generate_share(
-        &self,
-        rng: &mut impl rand_core::RngCore,
-    ) -> Zeroizing<[u8; 32]> {
+    pub fn generate_share(&self, rng: &mut impl rand_core::RngCore) -> Zeroizing<[u8; 32]> {
         let mut share = Zeroizing::new([0u8; 32]);
         rng.fill_bytes(share.as_mut());
         share
@@ -460,8 +456,8 @@ impl DkekManager {
         // AAD = our device_id
         let aad = &self.device_id;
 
-        let cipher = Aes256Gcm::new_from_slice(&*session_key)
-            .map_err(|_| DkekError::EncryptFailure)?;
+        let cipher =
+            Aes256Gcm::new_from_slice(&*session_key).map_err(|_| DkekError::EncryptFailure)?;
         let nonce_arr = GcmNonce::from_slice(&nonce_buf);
 
         let mut ct = *dkek; // copy of DKEK — will be zeroized below
@@ -497,8 +493,8 @@ impl DkekManager {
     pub fn noise_recv_dkek_data(
         &mut self,
         initiator_ephem_pub: &[u8; P256_UNCOMPRESSED_SIZE],
-        our_ephem_priv:      &[u8; 32],
-        encrypted_dkek:      &[u8; NONCE_SIZE + 32 + TAG_SIZE],
+        our_ephem_priv: &[u8; 32],
+        encrypted_dkek: &[u8; NONCE_SIZE + 32 + TAG_SIZE],
         initiator_device_id: &[u8; 16],
     ) -> Result<(), DkekError> {
         // ECDH using P-256.
@@ -510,24 +506,19 @@ impl DkekManager {
         // Decrypt DKEK.
         let nonce_bytes: &[u8; 12] = encrypted_dkek[..NONCE_SIZE].try_into().unwrap();
         let ct_with_tag = &encrypted_dkek[NONCE_SIZE..];
-        let ct_end  = ct_with_tag.len() - TAG_SIZE;
+        let ct_end = ct_with_tag.len() - TAG_SIZE;
         let tag_bytes: &[u8; 16] = ct_with_tag[ct_end..].try_into().unwrap();
 
-        let cipher = Aes256Gcm::new_from_slice(&*session_key)
-            .map_err(|_| DkekError::DecryptFailure)?;
+        let cipher =
+            Aes256Gcm::new_from_slice(&*session_key).map_err(|_| DkekError::DecryptFailure)?;
         let nonce_arr = GcmNonce::from_slice(nonce_bytes);
-        let tag_val   = GcmTag::clone_from_slice(tag_bytes);
+        let tag_val = GcmTag::clone_from_slice(tag_bytes);
 
         let mut dkek_buf = Zeroizing::new([0u8; 32]);
         dkek_buf.copy_from_slice(&ct_with_tag[..ct_end]);
 
         cipher
-            .decrypt_in_place_detached(
-                nonce_arr,
-                initiator_device_id,
-                dkek_buf.as_mut(),
-                &tag_val,
-            )
+            .decrypt_in_place_detached(nonce_arr, initiator_device_id, dkek_buf.as_mut(), &tag_val)
             .map_err(|_| DkekError::DecryptFailure)?;
 
         // Store decrypted DKEK and move to Ready state.
@@ -551,13 +542,12 @@ impl DkekManager {
     /// The returned scalar can be used as a P-256 private key seed (must be
     /// reduced mod the P-256 curve order by the caller, but for key derivation
     /// purposes the raw 32 bytes are used as an HKDF output directly).
-    pub fn derive_static_private_key(
-        otp_identity_key: &[u8; 32],
-    ) -> Zeroizing<[u8; 32]> {
+    pub fn derive_static_private_key(otp_identity_key: &[u8; 32]) -> Zeroizing<[u8; 32]> {
         let hkdf = Hkdf::<Sha256>::new(None, otp_identity_key);
         let mut out = Zeroizing::new([0u8; 32]);
         // Infallible for len=32.
-        hkdf.expand(NOISE_STATIC_INFO, out.as_mut()).expect("HKDF expand cannot fail for 32 bytes");
+        hkdf.expand(NOISE_STATIC_INFO, out.as_mut())
+            .expect("HKDF expand cannot fail for 32 bytes");
         out
     }
 
@@ -592,18 +582,20 @@ impl DkekManager {
 
         // Build plaintext: key_material || algo_id || key_flags
         let plain_data_len = key_material.len() + 2; // +2 for algo_id + key_flags
-        // PKCS#7 pad to 16-byte boundary.
+                                                     // PKCS#7 pad to 16-byte boundary.
         let pad_len = 16 - (plain_data_len % 16);
         let padded_len = plain_data_len + pad_len;
 
         // Use a stack buffer. Max private key = ~2350 bytes (RSA-4096 PKCS#1 DER);
         // + 2 (algo_id + key_flags) + up to 16 pad = ~2368 bytes.
         let mut pt: heapless::Vec<u8, 2400> = heapless::Vec::new();
-        pt.extend_from_slice(key_material).map_err(|_| DkekError::EncryptFailure)?;
+        pt.extend_from_slice(key_material)
+            .map_err(|_| DkekError::EncryptFailure)?;
         pt.push(algo_id).map_err(|_| DkekError::EncryptFailure)?;
         pt.push(key_flags).map_err(|_| DkekError::EncryptFailure)?;
         for _ in 0..pad_len {
-            pt.push(pad_len as u8).map_err(|_| DkekError::EncryptFailure)?;
+            pt.push(pad_len as u8)
+                .map_err(|_| DkekError::EncryptFailure)?;
         }
 
         // Generate random IV.
@@ -622,13 +614,18 @@ impl DkekManager {
             .map_err(|_| DkekError::EncryptFailure)?;
 
         // Zeroize plaintext buffer.
-        for b in pt.iter_mut() { *b = 0; }
+        for b in pt.iter_mut() {
+            *b = 0;
+        }
 
         // Assemble output: KCV(8) || IV(16) || ciphertext(padded_len)
         let mut out: heapless::Vec<u8, 2448> = heapless::Vec::new();
-        out.extend_from_slice(&kcv).map_err(|_| DkekError::EncryptFailure)?;
-        out.extend_from_slice(&iv).map_err(|_| DkekError::EncryptFailure)?;
-        out.extend_from_slice(ct_slice).map_err(|_| DkekError::EncryptFailure)?;
+        out.extend_from_slice(&kcv)
+            .map_err(|_| DkekError::EncryptFailure)?;
+        out.extend_from_slice(&iv)
+            .map_err(|_| DkekError::EncryptFailure)?;
+        out.extend_from_slice(ct_slice)
+            .map_err(|_| DkekError::EncryptFailure)?;
 
         Ok(out)
     }
@@ -637,10 +634,7 @@ impl DkekManager {
     ///
     /// Verifies KCV, decrypts AES-256-CBC, removes PKCS#7 padding.
     /// Returns: (key_material, algo_id, key_flags)
-    pub fn unwrap(
-        &self,
-        blob: &[u8],
-    ) -> Result<(heapless::Vec<u8, 2400>, u8, u8), DkekError> {
+    pub fn unwrap(&self, blob: &[u8]) -> Result<(heapless::Vec<u8, 2400>, u8, u8), DkekError> {
         let dkek = self.get_dkek().ok_or(DkekError::WrongState)?;
 
         // Validate minimum length and alignment.
@@ -688,7 +682,10 @@ impl DkekManager {
         let mut bad = Choice::from(0u8);
         for i in 0..16usize {
             let in_range = Choice::from((i < pad_len && ct_len >= pad_len && i < ct_len) as u8);
-            let idx = ct_len.saturating_sub(pad_len).saturating_add(i).min(ct_len.saturating_sub(1));
+            let idx = ct_len
+                .saturating_sub(pad_len)
+                .saturating_add(i)
+                .min(ct_len.saturating_sub(1));
             let byte_ok = pt_slice[idx].ct_eq(&(pad_len as u8));
             // Only count mismatch if we're in the padding range.
             bad |= in_range & !byte_ok;
@@ -710,7 +707,8 @@ impl DkekManager {
         let key_flags = pt_slice[key_material_len + 1];
 
         let mut key_material: heapless::Vec<u8, 2400> = heapless::Vec::new();
-        key_material.extend_from_slice(&pt_slice[..key_material_len])
+        key_material
+            .extend_from_slice(&pt_slice[..key_material_len])
             .map_err(|_| DkekError::InvalidWrapBlob)?;
 
         // Zeroize pt_buf.
@@ -734,9 +732,9 @@ impl Drop for DkekManager {
 ///
 /// Format: `IV(16) || AES-256-CBC(key=SHA-256(password), IV, share||SHA-256(share))`
 pub fn encrypt_share_blob(
-    share:    &[u8; 32],
+    share: &[u8; 32],
     password: &[u8],
-    iv:       &[u8; 16],
+    iv: &[u8; 16],
 ) -> Result<[u8; SHARE_BLOB_SIZE], DkekError> {
     // Derive CBC key from password.
     let key: [u8; 32] = Sha256::digest(password).into();
@@ -809,27 +807,23 @@ pub fn p256_ecdh(
     priv_key: &[u8; 32],
     peer_pub: &[u8; P256_UNCOMPRESSED_SIZE],
 ) -> Result<Zeroizing<[u8; 32]>, DkekError> {
-    use p256::{
-        elliptic_curve::sec1::FromEncodedPoint,
-        EncodedPoint,
-        PublicKey,
-        NistP256,
-        NonZeroScalar,
-        ProjectivePoint,
-    };
-    use p256::elliptic_curve::ScalarPrimitive;
     use p256::elliptic_curve::sec1::ToEncodedPoint;
+    use p256::elliptic_curve::ScalarPrimitive;
+    use p256::{
+        elliptic_curve::sec1::FromEncodedPoint, EncodedPoint, NistP256, NonZeroScalar,
+        ProjectivePoint, PublicKey,
+    };
 
     // Parse peer public key.
-    let encoded = EncodedPoint::from_bytes(peer_pub.as_slice())
-        .map_err(|_| DkekError::EcdhFailure)?;
+    let encoded =
+        EncodedPoint::from_bytes(peer_pub.as_slice()).map_err(|_| DkekError::EcdhFailure)?;
     let peer_pk = PublicKey::from_encoded_point(&encoded)
         .into_option()
         .ok_or(DkekError::EcdhFailure)?;
 
     // Construct NonZeroScalar from the raw 32-byte private key.
-    let scalar_primitive = ScalarPrimitive::<NistP256>::from_slice(priv_key)
-        .map_err(|_| DkekError::EcdhFailure)?;
+    let scalar_primitive =
+        ScalarPrimitive::<NistP256>::from_slice(priv_key).map_err(|_| DkekError::EcdhFailure)?;
     let scalar: p256::Scalar = scalar_primitive.into();
     let nz_scalar = NonZeroScalar::new(scalar)
         .into_option()
@@ -892,19 +886,27 @@ mod tests {
     use super::*;
 
     fn test_device_id() -> [u8; 16] {
-        [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
-         0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10]
+        [
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E,
+            0x0F, 0x10,
+        ]
     }
 
     /// Deterministic RNG for tests (no OsRng in no_std firmware builds).
-    struct DeterministicRng { state: u64 }
+    struct DeterministicRng {
+        state: u64,
+    }
 
     impl DeterministicRng {
-        fn seeded(seed: u64) -> Self { DeterministicRng { state: seed | 1 } }
+        fn seeded(seed: u64) -> Self {
+            DeterministicRng { state: seed | 1 }
+        }
     }
 
     impl rand_core::RngCore for DeterministicRng {
-        fn next_u32(&mut self) -> u32 { self.next_u64() as u32 }
+        fn next_u32(&mut self) -> u32 {
+            self.next_u64() as u32
+        }
 
         fn next_u64(&mut self) -> u64 {
             self.state = self.state.wrapping_add(0x9e3779b97f4a7c15);
@@ -998,11 +1000,7 @@ mod tests {
         let mut mgr = DkekManager::new(test_device_id());
         mgr.init_shares(3);
 
-        let shares: [[u8; 32]; 3] = [
-            [0x01u8; 32],
-            [0x02u8; 32],
-            [0x04u8; 32],
-        ];
+        let shares: [[u8; 32]; 3] = [[0x01u8; 32], [0x02u8; 32], [0x04u8; 32]];
         let password = b"test-pw";
         let iv: [u8; 16] = [0x44u8; 16];
 
@@ -1026,7 +1024,7 @@ mod tests {
                     result,
                     DkekImportResult::MoreSharesNeeded {
                         received: (i + 1) as u8,
-                        total:    3,
+                        total: 3,
                     }
                 );
                 assert!(!mgr.is_ready());
@@ -1087,7 +1085,9 @@ mod tests {
         let algo_id = 0x13u8; // SC-HSM EC_P256
         let key_flags = 0x01u8; // exportable
 
-        let wrapped = mgr.wrap(&key_material, algo_id, key_flags, &mut rng).unwrap();
+        let wrapped = mgr
+            .wrap(&key_material, algo_id, key_flags, &mut rng)
+            .unwrap();
         let (recovered, recovered_algo, recovered_flags) = mgr.unwrap(&wrapped).unwrap();
 
         assert_eq!(&*recovered, &key_material);
@@ -1169,7 +1169,8 @@ mod tests {
         let result = mgr.unwrap(&wrapped);
         assert!(
             result == Err(DkekError::InvalidPadding) || result == Err(DkekError::InvalidWrapBlob),
-            "expected padding or blob error, got {:?}", result
+            "expected padding or blob error, got {:?}",
+            result
         );
     }
 
@@ -1201,7 +1202,11 @@ mod tests {
         let result = mgr.unwrap(&forged);
         // Could be InvalidPadding or InvalidWrapBlob depending on what the
         // decrypted garbage looks like.
-        assert!(result.is_err(), "forged ciphertext must be rejected, got {:?}", result);
+        assert!(
+            result.is_err(),
+            "forged ciphertext must be rejected, got {:?}",
+            result
+        );
     }
 
     /// H6: Verify that wrapping a large key (RSA-4096 size) succeeds with the
@@ -1226,9 +1231,11 @@ mod tests {
         let algo_id = 0x73u8; // hypothetical RSA-4096 algo ID
         let key_flags = 0x01u8;
 
-        let wrapped = mgr.wrap(&key_material, algo_id, key_flags, &mut rng)
+        let wrapped = mgr
+            .wrap(&key_material, algo_id, key_flags, &mut rng)
             .expect("wrap() must succeed for RSA-4096 sized key");
-        let (recovered, recovered_algo, recovered_flags) = mgr.unwrap(&wrapped)
+        let (recovered, recovered_algo, recovered_flags) = mgr
+            .unwrap(&wrapped)
             .expect("unwrap() must succeed for RSA-4096 sized key");
 
         assert_eq!(&*recovered, &key_material[..]);

@@ -62,7 +62,10 @@ pub fn handle(state: &mut PivState, cmd: &ApduCommand<'_>) -> ApduResponse {
     let mut new_salt = [0u8; 16];
     fill_random_bytes(&mut new_salt);
 
-    match state.pin_state.unblock_pin(puk, new_pin, &state.device_id, new_salt) {
+    match state
+        .pin_state
+        .unblock_pin(puk, new_pin, &state.device_id, new_salt)
+    {
         Ok(()) => {
             state.pin_verified = false; // Reset session auth after unblock
             ApduResponse::ok(&[])
@@ -77,13 +80,9 @@ pub fn handle(state: &mut PivState, cmd: &ApduCommand<'_>) -> ApduResponse {
                 ApduResponse::err(sw_retry(state.pin_state.puk_retries_remaining))
             }
         }
-        Err(crate::security::pin::PinError::InvalidLength) |
-        Err(crate::security::pin::PinError::NewPinInvalidLength) => {
-            ApduResponse::err(0x6700)
-        }
-        Err(_) => {
-            ApduResponse::err(0x6985)
-        }
+        Err(crate::security::pin::PinError::InvalidLength)
+        | Err(crate::security::pin::PinError::NewPinInvalidLength) => ApduResponse::err(0x6700),
+        Err(_) => ApduResponse::err(0x6985),
     }
 }
 

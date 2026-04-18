@@ -47,7 +47,10 @@ pub const HEADER_SIZE: usize = 50;
 ///
 /// Fields are stored little-endian as required by the on-disk format.
 pub fn write_header(buf: &mut [u8], header: &ObjectHeader) {
-    assert!(buf.len() >= HEADER_SIZE, "buffer too small for ObjectHeader");
+    assert!(
+        buf.len() >= HEADER_SIZE,
+        "buffer too small for ObjectHeader"
+    );
     buf[0..4].copy_from_slice(&header.magic);
     buf[4..8].copy_from_slice(&header.key_id.to_le_bytes());
     buf[8] = header.key_type;
@@ -103,10 +106,7 @@ pub fn read_header(buf: &[u8]) -> Result<ObjectHeader, StorageError> {
 ///   * ciphertext                               — the full encrypted blob
 ///
 /// Returns `Err(StorageError::IntegrityFailure)` on mismatch.
-pub fn verify_header_crc32(
-    header_bytes: &[u8],
-    ciphertext: &[u8],
-) -> Result<(), StorageError> {
+pub fn verify_header_crc32(header_bytes: &[u8], ciphertext: &[u8]) -> Result<(), StorageError> {
     if header_bytes.len() < HEADER_SIZE {
         return Err(StorageError::IntegrityFailure);
     }
@@ -155,10 +155,7 @@ pub fn compute_object_crc32(header_bytes: &[u8], ciphertext: &[u8]) -> u32 {
 /// `plaintext` is the decrypted key material.
 ///
 /// Returns `Err(StorageError::IntegrityFailure)` on mismatch.
-pub fn verify_plaintext_blake2s(
-    expected: &[u8; 32],
-    plaintext: &[u8],
-) -> Result<(), StorageError> {
+pub fn verify_plaintext_blake2s(expected: &[u8; 32], plaintext: &[u8]) -> Result<(), StorageError> {
     let computed = compute_plaintext_blake2s(plaintext);
     // Constant-time comparison to avoid timing side-channels.
     use subtle::ConstantTimeEq;

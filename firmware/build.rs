@@ -44,8 +44,8 @@ fn main() {
     };
 
     // Locate the boards/ directory (sibling of the firmware/ crate).
-    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR")
-        .expect("CARGO_MANIFEST_DIR set by cargo");
+    let manifest_dir =
+        std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR set by cargo");
     let boards_dir = PathBuf::from(&manifest_dir)
         .parent()
         .expect("firmware/ has a parent")
@@ -57,8 +57,7 @@ fn main() {
     // it via `INCLUDE memory.x`.
     let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR set by cargo");
     let dst = PathBuf::from(&out_dir).join("memory.x");
-    fs::copy(&src, &dst)
-        .unwrap_or_else(|e| panic!("failed to copy {}: {e}", src.display()));
+    fs::copy(&src, &dst).unwrap_or_else(|e| panic!("failed to copy {}: {e}", src.display()));
 
     // Add $OUT_DIR to the linker search path so `memory.x` is found by link.x.
     println!("cargo:rustc-link-search={out_dir}");

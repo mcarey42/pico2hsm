@@ -45,17 +45,11 @@ fn find_tlv<'a>(data: &'a [u8], tag: u8) -> Option<&'a [u8]> {
 pub fn handle(state: &mut ScHsmState, cmd: &ApduCommand<'_>) -> ApduResponse {
     match (cmd.p1, cmd.p2) {
         // SET for Computation (sign)
-        (0x41, 0xA4) => {
-            parse_and_set_se(state, cmd.data, SeOperation::Computation)
-        }
+        (0x41, 0xA4) => parse_and_set_se(state, cmd.data, SeOperation::Computation),
         // SET for Decipherment
-        (0x41, 0xB8) => {
-            parse_and_set_se(state, cmd.data, SeOperation::Decipherment)
-        }
+        (0x41, 0xB8) => parse_and_set_se(state, cmd.data, SeOperation::Decipherment),
         // SET for Confidentiality / SM
-        (0x41, 0xB4) => {
-            parse_and_set_se(state, cmd.data, SeOperation::Confidentiality)
-        }
+        (0x41, 0xB4) => parse_and_set_se(state, cmd.data, SeOperation::Confidentiality),
         // RESTORE SE#3 — reset to default state
         (0xF3, 0x03) => {
             state.current_key_id = None;

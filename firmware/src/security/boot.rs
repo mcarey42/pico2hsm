@@ -265,7 +265,9 @@ pub fn disable_jtag_permanent() {
     match otp::write_raw_word(OTP_BOOT_FLAGS_ROW, new_flags) {
         Ok(()) => {
             defmt::warn!("boot: JTAG disable bookkeeping flag set in OTP row 0x110 — IRREVERSIBLE");
-            defmt::warn!("boot: hardware JTAG disable (CRIT1.DEBUG_DISABLE) must be set via picotool");
+            defmt::warn!(
+                "boot: hardware JTAG disable (CRIT1.DEBUG_DISABLE) must be set via picotool"
+            );
         }
         Err(_) => {
             defmt::error!("boot: failed to set JTAG disable OTP flag");

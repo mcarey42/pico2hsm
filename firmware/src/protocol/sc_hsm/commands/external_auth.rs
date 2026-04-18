@@ -64,7 +64,9 @@ pub fn handle(state: &mut ScHsmState, cmd: &ApduCommand<'_>) -> ApduResponse {
     // Constant-time comparison to prevent timing attacks.
     let ok1 = expected.ct_eq(cmd.data).into();
     // Double-check evaluation for fault injection resistance (P1-2).
-    let ok2 = crate::crypto::kdf::hmac_sha256(&so_pin_hash, &challenge_bytes).ct_eq(cmd.data).into();
+    let ok2 = crate::crypto::kdf::hmac_sha256(&so_pin_hash, &challenge_bytes)
+        .ct_eq(cmd.data)
+        .into();
     if double_check(ok1, ok2) == DoubleCheckResult::Mismatch {
         // Possible fault injection — decrement counter and refuse.
         state.ext_auth_retry_count = state.ext_auth_retry_count.saturating_sub(1);

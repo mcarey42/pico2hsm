@@ -8,8 +8,8 @@
 //! Requires active PIN session. Keys marked with NO-EXPORT flag are rejected.
 
 use pico2hsm_core::apdu::{
-    ApduCommand, ApduResponse, SW_CONDITIONS_NOT_SATISFIED, SW_FILE_NOT_FOUND,
-    SW_SECURITY_STATUS, SW_WRONG_DATA,
+    ApduCommand, ApduResponse, SW_CONDITIONS_NOT_SATISFIED, SW_FILE_NOT_FOUND, SW_SECURITY_STATUS,
+    SW_WRONG_DATA,
 };
 use pico2hsm_core::key::KeyId;
 
@@ -29,7 +29,11 @@ pub const INS_EXPORT_KEY: u8 = 0x72;
 pub const NO_EXPORT_BIT: u8 = 0x08;
 
 /// Handle an EXPORT KEY APDU command.
-pub fn handle(state: &mut ScHsmState, store: &mut dyn KeyStore, cmd: &ApduCommand<'_>) -> ApduResponse {
+pub fn handle(
+    state: &mut ScHsmState,
+    store: &mut dyn KeyStore,
+    cmd: &ApduCommand<'_>,
+) -> ApduResponse {
     // Require PIN authentication
     if !state.pin_verified {
         return ApduResponse::err(SW_SECURITY_STATUS);
@@ -69,13 +73,19 @@ pub fn handle(state: &mut ScHsmState, store: &mut dyn KeyStore, cmd: &ApduComman
     // Enforce NO_EXPORT flag: reject wrapping if the key was generated with
     // the NO_EXPORT bit set in its key access conditions (TLV tag 0xD4).
     if key_flags & NO_EXPORT_BIT != 0 {
-        crate::cdc_log!("SC-HSM EXPORT KEY rejected: NO_EXPORT flag set (flags=0x{:02x})", key_flags);
+        crate::cdc_log!(
+            "SC-HSM EXPORT KEY rejected: NO_EXPORT flag set (flags=0x{:02x})",
+            key_flags
+        );
         return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED);
     }
 
     // Wrap key under DKEK.
     let mut rng = FwRng;
-    match state.dkek.wrap(&private_key_bytes, algo_byte, key_flags, &mut rng) {
+    match state
+        .dkek
+        .wrap(&private_key_bytes, algo_byte, key_flags, &mut rng)
+    {
         Ok(wrapped) => ApduResponse::ok(&wrapped),
         Err(_) => ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
     }
@@ -84,18 +94,22 @@ pub fn handle(state: &mut ScHsmState, store: &mut dyn KeyStore, cmd: &ApduComman
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pico2hsm_core::apdu::{ApduCommand, SW_OK};
-    use pico2hsm_core::key::{AppletId, KeyId, KeyType as CoreKeyType};
     use crate::protocol::sc_hsm::{KeyMeta, ScHsmState};
-    use crate::storage::KeyStore;
     use crate::security::key_management::{AlgorithmId, KeyObject, KeyType as KmType};
+    use crate::storage::KeyStore;
+    use pico2hsm_core::apdu::{ApduCommand, SW_OK};
     use pico2hsm_core::error::HsmError;
+    use pico2hsm_core::key::{AppletId, KeyId, KeyType as CoreKeyType};
 
     struct TestStore {
         keys: heapless::Vec<KeyObject, 4>,
     }
     impl TestStore {
-        fn new() -> Self { TestStore { keys: heapless::Vec::new() } }
+        fn new() -> Self {
+            TestStore {
+                keys: heapless::Vec::new(),
+            }
+        }
         fn add_key(&mut self, key_id: u32, algo: AlgorithmId, key_flags: u8, private_key: &[u8]) {
             let mut obj = KeyObject::new(KmType::Ec, key_id, AppletId::ScHsm, algo);
             obj.key_flags = key_flags;
@@ -127,9 +141,16 @@ mod tests {
             self.keys.retain(|k| k.key_id != key_id.0);
             Ok(())
         }
-        fn wipe_all(&mut self) -> Result<(), HsmError> { self.keys.clear(); Ok(()) }
-        fn wipe_by_owner(&mut self, _: AppletId) -> Result<(), HsmError> { Ok(()) }
-        fn enumerate_keys(&self) -> heapless::Vec<KeyId, 64> { heapless::Vec::new() }
+        fn wipe_all(&mut self) -> Result<(), HsmError> {
+            self.keys.clear();
+            Ok(())
+        }
+        fn wipe_by_owner(&mut self, _: AppletId) -> Result<(), HsmError> {
+            Ok(())
+        }
+        fn enumerate_keys(&self) -> heapless::Vec<KeyId, 64> {
+            heapless::Vec::new()
+        }
         fn for_each_key(&self, _f: &mut dyn FnMut(KeyId)) {}
     }
 
@@ -145,7 +166,14 @@ mod tests {
     }
 
     fn make_cmd<'a>(p1: u8, p2: u8, data: &'a [u8]) -> ApduCommand<'a> {
-        ApduCommand { cla: 0x80, ins: INS_EXPORT_KEY, p1, p2, data, le: None }
+        ApduCommand {
+            cla: 0x80,
+            ins: INS_EXPORT_KEY,
+            p1,
+            p2,
+            data,
+            le: None,
+        }
     }
 
     #[test]
@@ -157,7 +185,7 @@ mod tests {
         let _ = state.key_index.push(KeyMeta {
             key_id: key_id.0,
             key_type: CoreKeyType::EcPrivateP256 as u8,
-            algo: 0x13, // ECDSA P-256
+            algo: 0x13,      // ECDSA P-256
             key_flags: 0x00, // exportable
         });
         let mut store = TestStore::new();
@@ -168,7 +196,11 @@ mod tests {
 
         assert_eq!(resp.sw, SW_OK, "expected SW_OK for valid export");
         // Wrapped blob: KCV(8) + IV(16) + ciphertext (>= 16 bytes).
-        assert!(resp.data.len() >= 40, "wrapped blob too short: {}", resp.data.len());
+        assert!(
+            resp.data.len() >= 40,
+            "wrapped blob too short: {}",
+            resp.data.len()
+        );
     }
 
     #[test]
@@ -215,17 +247,24 @@ mod tests {
         let _ = state.key_index.push(KeyMeta {
             key_id: key_id.0,
             key_type: CoreKeyType::EcPrivateP256 as u8,
-            algo: 0x13, // ECDSA P-256
+            algo: 0x13,               // ECDSA P-256
             key_flags: NO_EXPORT_BIT, // 0x08 = NO_EXPORT
         });
         let mut store = TestStore::new();
-        store.add_key(key_id.0, AlgorithmId::EcdsaP256, NO_EXPORT_BIT, &[0x42u8; 32]);
+        store.add_key(
+            key_id.0,
+            AlgorithmId::EcdsaP256,
+            NO_EXPORT_BIT,
+            &[0x42u8; 32],
+        );
 
         let cmd = make_cmd(0x02, 0x92, &[]);
         let resp = handle(&mut state, &mut store, &cmd);
 
-        assert_eq!(resp.sw, SW_CONDITIONS_NOT_SATISFIED,
-            "EXPORT KEY must reject keys with NO_EXPORT flag");
+        assert_eq!(
+            resp.sw, SW_CONDITIONS_NOT_SATISFIED,
+            "EXPORT KEY must reject keys with NO_EXPORT flag"
+        );
     }
 
     #[test]
@@ -246,7 +285,9 @@ mod tests {
         let cmd = make_cmd(0x03, 0x92, &[]);
         let resp = handle(&mut state, &mut store, &cmd);
 
-        assert_eq!(resp.sw, SW_OK,
-            "EXPORT KEY must allow keys without NO_EXPORT flag");
+        assert_eq!(
+            resp.sw, SW_OK,
+            "EXPORT KEY must allow keys without NO_EXPORT flag"
+        );
     }
 }

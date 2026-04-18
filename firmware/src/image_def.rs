@@ -15,8 +15,7 @@
 //! FLASH ORIGIN = 0x10000100, so the address is the same for every target.
 
 use embassy_rp::block::{
-    item_image_type_exe, item_vector_table, Architecture, Block, Security,
-    ITEM_1BS_VECTOR_TABLE,
+    item_image_type_exe, item_vector_table, Architecture, Block, Security, ITEM_1BS_VECTOR_TABLE,
 };
 
 /// The vector table address as set by every board linker script.

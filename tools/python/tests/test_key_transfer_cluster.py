@@ -11,7 +11,7 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -72,9 +72,10 @@ class TestExportKeyFromDevice:
         assert result == VALID_BLOB_40
         assert len(hsm.transmitted) == 1
         apdu = hsm.transmitted[0]
-        # INS_EXPORT_KEY = 0x72, P2 = key_ref
+        # sc-hsm EXPORT KEY: CLA=80 INS=72 P1=<key_ref> P2=92
         assert apdu[1] == 0x72
-        assert apdu[3] == 0x01
+        assert apdu[2] == 0x01
+        assert apdu[3] == 0x92
 
     def test_export_key_validates_key_ref_low(self):
         """key_ref=0 should raise ValueError."""
@@ -142,9 +143,10 @@ class TestImportKeyToDevice:
 
         assert len(hsm.transmitted) == 1
         apdu = hsm.transmitted[0]
-        # INS_IMPORT_KEY = 0x74, P2 = key_ref
+        # sc-hsm IMPORT KEY: CLA=80 INS=74 P1=<key_ref> P2=93
         assert apdu[1] == 0x74
-        assert apdu[3] == 0x05
+        assert apdu[2] == 0x05
+        assert apdu[3] == 0x93
 
     def test_import_key_apdu_error(self):
         """Non-9000 SW should raise Pico2HSMError."""
@@ -186,8 +188,13 @@ class TestDeleteKeyFromDevice:
 
 class TestTransferKeys:
 
-    def test_transfer_keys_missing(self):
-        """Plan with missing=[1]: verify export+import called."""
+    @patch("pico2hsm.key_transfer.read_ef", return_value=None)
+    def test_transfer_keys_missing(self, _mock_read_ef):
+        """Plan with missing=[1]: verify export+import called.
+
+        read_ef is patched to return None so PRKD/CVC sync calls are no-ops;
+        this test is about the orchestration layer, not EF propagation.
+        """
         primary = MockPico2HSM()
         secondary = MockPico2HSM()
         plan = SyncPlan(missing_on_secondary=[1], conflicts=[], tombstone_on_secondary=[], orphans=[])
@@ -204,7 +211,8 @@ class TestTransferKeys:
         assert len(primary.transmitted) == 1   # export
         assert len(secondary.transmitted) == 1  # import
 
-    def test_transfer_keys_conflict_overwrites(self):
+    @patch("pico2hsm.key_transfer.read_ef", return_value=None)
+    def test_transfer_keys_conflict_overwrites(self, _mock_read_ef):
         """Plan with conflicts=[2]: verify export+import called for secondary."""
         primary = MockPico2HSM()
         secondary = MockPico2HSM()
@@ -254,7 +262,8 @@ class TestTransferKeys:
         assert len(primary.transmitted) == 0
         assert len(secondary.transmitted) == 0
 
-    def test_transfer_keys_partial_failure(self):
+    @patch("pico2hsm.key_transfer.read_ef", return_value=None)
+    def test_transfer_keys_partial_failure(self, _mock_read_ef):
         """If one key fails, continue with the rest and return success=False."""
         primary = MockPico2HSM()
         secondary = MockPico2HSM()

@@ -16,7 +16,9 @@
 //! must return SW=6285 (selected file in termination state). This is enforced in the
 //! dispatch table in `openpgp/mod.rs`.
 
-use pico2hsm_core::apdu::{ApduCommand, ApduResponse, SW_CONDITIONS_NOT_SATISFIED, SW_SECURITY_STATUS};
+use pico2hsm_core::apdu::{
+    ApduCommand, ApduResponse, SW_CONDITIONS_NOT_SATISFIED, SW_SECURITY_STATUS,
+};
 
 use crate::protocol::openpgp::OpenPgpState;
 

@@ -27,11 +27,11 @@ pub mod image_def;
 // required by protocol/sc_hsm/mod.rs on all targets. ARM-specific sub-modules
 // (board_chips, flash_chip, filesystem, StorageManager) are gated inside
 // storage/mod.rs via #[cfg(target_arch = "arm")].
+#[cfg(target_arch = "arm")]
+pub mod display;
 pub mod storage;
 #[cfg(target_arch = "arm")]
 pub mod transport;
-#[cfg(target_arch = "arm")]
-pub mod display;
 
 // No-op stubs for crate::cdc_log!/cdc_warn!/cdc_error! on non-ARM (host test) builds.
 // On ARM, the real implementations live in transport::cdc_serial and are exported via
@@ -51,7 +51,8 @@ pub static CORE1_PROGRESS: core::sync::atomic::AtomicU8 = core::sync::atomic::At
 ///
 /// `Relaxed` ordering is sufficient: RP2350 is cache-coherent across cores and
 /// we only need eventual visibility, not ordering with other memory operations.
-pub static WATCHDOG_HEARTBEAT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+pub static WATCHDOG_HEARTBEAT: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
 
 /// Consecutive time-extension intervals (1.5 s each) without a heartbeat change
 /// before Core0 declares Core1 stuck and aborts the APDU.  20 intervals = 30 s.
@@ -64,14 +65,21 @@ pub const WATCHDOG_STALL_LIMIT: u32 = 20;
 /// When `true`, Core0 skips stall detection and never aborts — it just sends
 /// time-extensions.  Core1 sets this before RSA keygen and clears it after.
 /// `Relaxed` ordering is fine (same rationale as `WATCHDOG_HEARTBEAT`).
-pub static WATCHDOG_SUPPRESS: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+pub static WATCHDOG_SUPPRESS: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
 
 #[cfg(not(target_arch = "arm"))]
 #[macro_export]
-macro_rules! cdc_log   { ($($arg:tt)*) => {{}} }
+macro_rules! cdc_log {
+    ($($arg:tt)*) => {{}};
+}
 #[cfg(not(target_arch = "arm"))]
 #[macro_export]
-macro_rules! cdc_warn  { ($($arg:tt)*) => {{}} }
+macro_rules! cdc_warn {
+    ($($arg:tt)*) => {{}};
+}
 #[cfg(not(target_arch = "arm"))]
 #[macro_export]
-macro_rules! cdc_error { ($($arg:tt)*) => {{}} }
+macro_rules! cdc_error {
+    ($($arg:tt)*) => {{}};
+}

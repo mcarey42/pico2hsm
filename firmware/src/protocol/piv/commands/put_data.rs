@@ -12,7 +12,7 @@
 
 use pico2hsm_core::apdu::{ApduCommand, ApduResponse};
 
-use crate::protocol::piv::{PivState, PivDataObject, MAX_PIV_DATA_SIZE};
+use crate::protocol::piv::{PivDataObject, PivState, MAX_PIV_DATA_SIZE};
 
 /// INS byte for PUT DATA.
 pub const INS_PUT_DATA: u8 = 0xDB;

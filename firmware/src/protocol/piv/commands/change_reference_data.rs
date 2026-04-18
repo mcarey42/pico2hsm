@@ -77,21 +77,18 @@ fn handle_change_pin(state: &mut PivState, cmd: &ApduCommand<'_>) -> ApduRespons
     let mut new_salt = [0u8; 16];
     fill_random_bytes(&mut new_salt);
 
-    match state.pin_state.change_pin(old_pin, new_pin, &state.device_id, new_salt) {
+    match state
+        .pin_state
+        .change_pin(old_pin, new_pin, &state.device_id, new_salt)
+    {
         Ok(()) => ApduResponse::ok(&[]),
-        Err(crate::security::pin::PinError::Locked) => {
-            ApduResponse::err(0x6983)
-        }
+        Err(crate::security::pin::PinError::Locked) => ApduResponse::err(0x6983),
         Err(crate::security::pin::PinError::WrongCurrentPin) => {
             ApduResponse::err(sw_retry(state.pin_state.pin_retries_remaining))
         }
-        Err(crate::security::pin::PinError::InvalidLength) |
-        Err(crate::security::pin::PinError::NewPinInvalidLength) => {
-            ApduResponse::err(0x6700)
-        }
-        Err(_) => {
-            ApduResponse::err(0x6985)
-        }
+        Err(crate::security::pin::PinError::InvalidLength)
+        | Err(crate::security::pin::PinError::NewPinInvalidLength) => ApduResponse::err(0x6700),
+        Err(_) => ApduResponse::err(0x6985),
     }
 }
 
@@ -111,7 +108,9 @@ fn handle_change_puk(state: &mut PivState, cmd: &ApduCommand<'_>) -> ApduRespons
     // PUK change: verify old PUK, then update PUK hash
     // Use the PUK hash verification directly
     let old_puk_hash = crate::security::pin::PinState::hash_puk(
-        old_puk, &state.device_id, &state.pin_state.puk_salt
+        old_puk,
+        &state.device_id,
+        &state.pin_state.puk_salt,
     );
 
     use subtle::ConstantTimeEq;
@@ -130,9 +129,8 @@ fn handle_change_puk(state: &mut PivState, cmd: &ApduCommand<'_>) -> ApduRespons
     fill_random_bytes(&mut new_salt);
 
     state.pin_state.puk_salt = new_salt;
-    state.pin_state.puk_hash = crate::security::pin::PinState::hash_puk(
-        new_puk, &state.device_id, &new_salt
-    );
+    state.pin_state.puk_hash =
+        crate::security::pin::PinState::hash_puk(new_puk, &state.device_id, &new_salt);
     state.pin_state.puk_retries_remaining = crate::security::pin::MAX_PUK_RETRIES;
     state.pin_state.puk_blocked = false;
 

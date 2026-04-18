@@ -18,6 +18,11 @@ This script:
   - Signed output → `dist/pico2hsm-<feat>-debug-signed.elf`
   - OTP configuration → `dist/pico2hsm-<feat>-debug-otp.json`
   - If no key is present, flashes unsigned (warns but continues)
+  - **About `ec_firmware_signing_key.pem`**: each user of this project generates
+    and holds their own secp256k1 key. It is the root of trust for that user's
+    HSM fleet — **not** a project-wide test key. The filename is gitignored;
+    the `dist/` signed artifacts are gitignored; no key material is ever
+    committed. See `docs/PROVISIONING.md` Option A / Option B for generation.
 - Flashes via `probe-rs run --chip RP235x` (uses signed ELF if signing occurred)
 - Streams RTT output to the terminal until Ctrl+C
 

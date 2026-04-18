@@ -37,10 +37,7 @@ type HmacSha512 = Hmac<Sha512>;
 /// `salt` may be empty (uses zero-filled salt per RFC 5869 §2.2).
 /// Returns the 32-byte pseudorandom key (PRK).
 pub fn hkdf_extract(salt: &[u8], ikm: &[u8]) -> [u8; 32] {
-    let (prk, _) = Hkdf::<Sha256>::extract(
-        if salt.is_empty() { None } else { Some(salt) },
-        ikm,
-    );
+    let (prk, _) = Hkdf::<Sha256>::extract(if salt.is_empty() { None } else { Some(salt) }, ikm);
     prk.into()
 }
 
@@ -81,11 +78,9 @@ pub fn hkdf_sha256(
     info: &[u8],
     output: &mut [u8],
 ) -> Result<(), CryptoError> {
-    let hkdf = Hkdf::<Sha256>::new(
-        if salt.is_empty() { None } else { Some(salt) },
-        ikm,
-    );
-    hkdf.expand(info, output).map_err(|_| CryptoError::KdfFailure)
+    let hkdf = Hkdf::<Sha256>::new(if salt.is_empty() { None } else { Some(salt) }, ikm);
+    hkdf.expand(info, output)
+        .map_err(|_| CryptoError::KdfFailure)
 }
 
 // -------------------------------------------------------------------------
@@ -167,11 +162,7 @@ pub fn x963_kdf(
 
 /// X9.63 KDF: SHA-256(Z || counter || SharedInfo)
 /// where Z is the shared secret and counter starts at 1.
-pub fn x963_kdf_sha256(
-    z: &[u8],
-    shared_info: &[u8],
-    output: &mut [u8],
-) -> Result<(), CryptoError> {
+pub fn x963_kdf_sha256(z: &[u8], shared_info: &[u8], output: &mut [u8]) -> Result<(), CryptoError> {
     // Each SHA-256 call produces 32 bytes. Maximum output = 32 * 0xFFFF_FFFF
     // For our purposes we restrict to 256 bytes (8 blocks).
     const MAX_OUT: usize = 256;
@@ -272,19 +263,15 @@ impl Slip10Curve {
 /// secp256k1 curve order n (big-endian).
 /// n = FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
 const SECP256K1_ORDER: [u8; 32] = [
-    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
-    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFE,
-    0xBA, 0xAE, 0xDC, 0xE6, 0xAF, 0x48, 0xA0, 0x3B,
-    0xBF, 0xD2, 0x5E, 0x8C, 0xD0, 0x36, 0x41, 0x41,
+    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFE,
+    0xBA, 0xAE, 0xDC, 0xE6, 0xAF, 0x48, 0xA0, 0x3B, 0xBF, 0xD2, 0x5E, 0x8C, 0xD0, 0x36, 0x41, 0x41,
 ];
 
 /// NIST P-256 curve order n (big-endian).
 /// n = FFFFFFFF00000000FFFFFFFFFFFFFFFFBCE6FAADA7179E84F3B9CAC2FC632551
 const NIST256P1_ORDER: [u8; 32] = [
-    0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00,
-    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
-    0xBC, 0xE6, 0xFA, 0xAD, 0xA7, 0x17, 0x9E, 0x84,
-    0xF3, 0xB9, 0xCA, 0xC2, 0xFC, 0x63, 0x25, 0x51,
+    0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+    0xBC, 0xE6, 0xFA, 0xAD, 0xA7, 0x17, 0x9E, 0x84, 0xF3, 0xB9, 0xCA, 0xC2, 0xFC, 0x63, 0x25, 0x51,
 ];
 
 /// Check if a 32-byte big-endian integer is zero.
@@ -360,8 +347,8 @@ pub fn slip10_master_key(
     }
 
     let seed_key = curve.seed_key();
-    let mut mac = <HmacSha512 as HmacMac>::new_from_slice(seed_key)
-        .map_err(|_| CryptoError::KdfFailure)?;
+    let mut mac =
+        <HmacSha512 as HmacMac>::new_from_slice(seed_key).map_err(|_| CryptoError::KdfFailure)?;
     mac.update(seed);
     let result: [u8; 64] = mac.finalize().into_bytes().into();
 
@@ -432,28 +419,27 @@ pub fn slip10_child_key(
     let mut child_chain = [0u8; 32];
     child_chain.copy_from_slice(&result[32..]);
 
-    let child_key = match curve {
-        Slip10Curve::Ed25519 => {
-            // Ed25519: child key = IL (no scalar addition with parent key)
-            if is_zero(&il) {
-                child_chain.zeroize();
-                return Err(CryptoError::KdfFailure);
+    let child_key =
+        match curve {
+            Slip10Curve::Ed25519 => {
+                // Ed25519: child key = IL (no scalar addition with parent key)
+                if is_zero(&il) {
+                    child_chain.zeroize();
+                    return Err(CryptoError::KdfFailure);
+                }
+                il
             }
-            il
-        }
-        Slip10Curve::Secp256k1 => {
-            scalar_add_mod(&il, parent_key, &SECP256K1_ORDER).ok_or_else(|| {
-                child_chain.zeroize();
-                CryptoError::KdfFailure
-            })?
-        }
-        Slip10Curve::Nist256p1 => {
-            scalar_add_mod(&il, parent_key, &NIST256P1_ORDER).ok_or_else(|| {
-                child_chain.zeroize();
-                CryptoError::KdfFailure
-            })?
-        }
-    };
+            Slip10Curve::Secp256k1 => scalar_add_mod(&il, parent_key, &SECP256K1_ORDER)
+                .ok_or_else(|| {
+                    child_chain.zeroize();
+                    CryptoError::KdfFailure
+                })?,
+            Slip10Curve::Nist256p1 => scalar_add_mod(&il, parent_key, &NIST256P1_ORDER)
+                .ok_or_else(|| {
+                    child_chain.zeroize();
+                    CryptoError::KdfFailure
+                })?,
+        };
 
     // Validate child key (not zero, < order) for non-Ed25519
     match curve {
@@ -475,10 +461,7 @@ pub fn slip10_child_key(
 ///
 /// Uses the `k256` or `p256` crate depending on the curve.
 /// Returns 33-byte compressed point (0x02/0x03 || X).
-fn compressed_pubkey(
-    private_key: &[u8; 32],
-    curve: Slip10Curve,
-) -> Result<[u8; 33], CryptoError> {
+fn compressed_pubkey(private_key: &[u8; 32], curve: Slip10Curve) -> Result<[u8; 33], CryptoError> {
     use elliptic_curve::sec1::ToEncodedPoint;
 
     match curve {
@@ -555,10 +538,7 @@ pub fn bip44_derive(
 ///
 /// `path` is a slice of 4-byte indices (MSB = hardened flag).
 /// Returns the derived private `KeyMaterial`.
-pub fn bip32_derive(
-    master: &KeyMaterial,
-    path: &[u32],
-) -> Result<KeyMaterial, CryptoError> {
+pub fn bip32_derive(master: &KeyMaterial, path: &[u32]) -> Result<KeyMaterial, CryptoError> {
     if master.raw.len() != 64 {
         return Err(CryptoError::WrongKeyLength);
     }
@@ -567,8 +547,7 @@ pub fn bip32_derive(
     let mut chain: [u8; 32] = master.raw[32..].try_into().unwrap();
 
     for &index in path {
-        let (next_key, next_chain) =
-            slip10_child_key(&key, &chain, index, Slip10Curve::Secp256k1)?;
+        let (next_key, next_chain) = slip10_child_key(&key, &chain, index, Slip10Curve::Secp256k1)?;
         key.zeroize();
         chain.zeroize();
         key = next_key;
@@ -577,8 +556,10 @@ pub fn bip32_derive(
 
     // Pack key || chain_code into a Bip32Master KeyMaterial
     let mut raw: heapless::Vec<u8, { pico2hsm_core::key::MAX_KEY_BYTES }> = heapless::Vec::new();
-    raw.extend_from_slice(&key).map_err(|_| CryptoError::BufferTooSmall)?;
-    raw.extend_from_slice(&chain).map_err(|_| CryptoError::BufferTooSmall)?;
+    raw.extend_from_slice(&key)
+        .map_err(|_| CryptoError::BufferTooSmall)?;
+    raw.extend_from_slice(&chain)
+        .map_err(|_| CryptoError::BufferTooSmall)?;
 
     key.zeroize();
     chain.zeroize();
@@ -594,10 +575,7 @@ pub fn bip32_derive(
 ///
 /// `path` is a slice of 4-byte indices (MSB = hardened flag).
 /// Returns the derived private `KeyMaterial`.
-pub fn slip10_derive(
-    master: &KeyMaterial,
-    path: &[u32],
-) -> Result<KeyMaterial, CryptoError> {
+pub fn slip10_derive(master: &KeyMaterial, path: &[u32]) -> Result<KeyMaterial, CryptoError> {
     if master.raw.len() != 64 {
         return Err(CryptoError::WrongKeyLength);
     }
@@ -622,8 +600,10 @@ pub fn slip10_derive(
     }
 
     let mut raw: heapless::Vec<u8, { pico2hsm_core::key::MAX_KEY_BYTES }> = heapless::Vec::new();
-    raw.extend_from_slice(&key).map_err(|_| CryptoError::BufferTooSmall)?;
-    raw.extend_from_slice(&chain).map_err(|_| CryptoError::BufferTooSmall)?;
+    raw.extend_from_slice(&key)
+        .map_err(|_| CryptoError::BufferTooSmall)?;
+    raw.extend_from_slice(&chain)
+        .map_err(|_| CryptoError::BufferTooSmall)?;
 
     key.zeroize();
     chain.zeroize();
@@ -671,9 +651,10 @@ mod tests {
                 .try_into()
                 .unwrap();
         let info = hex::decode("f0f1f2f3f4f5f6f7f8f9").unwrap();
-        let expected =
-            hex::decode("3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865")
-                .unwrap();
+        let expected = hex::decode(
+            "3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865",
+        )
+        .unwrap();
 
         let mut out: heapless::Vec<u8, 256> = heapless::Vec::new();
         // Pre-fill to desired length (42 bytes)
@@ -689,9 +670,10 @@ mod tests {
         let ikm = [0x0bu8; 22];
         let salt = hex::decode("000102030405060708090a0b0c").unwrap();
         let info = hex::decode("f0f1f2f3f4f5f6f7f8f9").unwrap();
-        let expected =
-            hex::decode("3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865")
-                .unwrap();
+        let expected = hex::decode(
+            "3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865",
+        )
+        .unwrap();
 
         let mut out = [0u8; 42];
         hkdf_sha256(&salt, &ikm, &info, &mut out).unwrap();
@@ -841,8 +823,7 @@ mod tests {
     #[test]
     fn test_slip10_secp256k1_child_hardened() {
         let seed = hex::decode("000102030405060708090a0b0c0d0e0f").unwrap();
-        let (master_key, master_chain) =
-            slip10_master_key(&seed, Slip10Curve::Secp256k1).unwrap();
+        let (master_key, master_chain) = slip10_master_key(&seed, Slip10Curve::Secp256k1).unwrap();
 
         // m/0' — SLIP-0010 test vector 1
         let (child_key, child_chain) = slip10_child_key(
@@ -868,8 +849,7 @@ mod tests {
     fn test_slip10_secp256k1_child_normal() {
         // SLIP-0010 test vector 1: m/0'/1 (normal child of hardened)
         let seed = hex::decode("000102030405060708090a0b0c0d0e0f").unwrap();
-        let (master_key, master_chain) =
-            slip10_master_key(&seed, Slip10Curve::Secp256k1).unwrap();
+        let (master_key, master_chain) = slip10_master_key(&seed, Slip10Curve::Secp256k1).unwrap();
 
         // Derive m/0'
         let (key_0h, chain_0h) = slip10_child_key(
@@ -881,13 +861,8 @@ mod tests {
         .unwrap();
 
         // Derive m/0'/1 (normal, index = 1)
-        let (child_key, child_chain) = slip10_child_key(
-            &key_0h,
-            &chain_0h,
-            1,
-            Slip10Curve::Secp256k1,
-        )
-        .unwrap();
+        let (child_key, child_chain) =
+            slip10_child_key(&key_0h, &chain_0h, 1, Slip10Curve::Secp256k1).unwrap();
 
         let expected_key =
             hex::decode("3c6cb8d0f6a264c91ea8b5030fadaa8e538b020f0a387421a12de9319dc93368")
@@ -904,8 +879,7 @@ mod tests {
     fn test_slip10_secp256k1_child_hardened_depth2() {
         // SLIP-0010 test vector 1: m/0'/1/2' (hardened child at depth 2)
         let seed = hex::decode("000102030405060708090a0b0c0d0e0f").unwrap();
-        let (master_key, master_chain) =
-            slip10_master_key(&seed, Slip10Curve::Secp256k1).unwrap();
+        let (master_key, master_chain) = slip10_master_key(&seed, Slip10Curve::Secp256k1).unwrap();
 
         // Derive m/0'
         let (key_0h, chain_0h) = slip10_child_key(
@@ -917,22 +891,12 @@ mod tests {
         .unwrap();
 
         // Derive m/0'/1
-        let (key_0h_1, chain_0h_1) = slip10_child_key(
-            &key_0h,
-            &chain_0h,
-            1,
-            Slip10Curve::Secp256k1,
-        )
-        .unwrap();
+        let (key_0h_1, chain_0h_1) =
+            slip10_child_key(&key_0h, &chain_0h, 1, Slip10Curve::Secp256k1).unwrap();
 
         // Derive m/0'/1/2' (hardened, index = 0x80000002)
-        let (child_key, child_chain) = slip10_child_key(
-            &key_0h_1,
-            &chain_0h_1,
-            0x8000_0002,
-            Slip10Curve::Secp256k1,
-        )
-        .unwrap();
+        let (child_key, child_chain) =
+            slip10_child_key(&key_0h_1, &chain_0h_1, 0x8000_0002, Slip10Curve::Secp256k1).unwrap();
 
         let expected_key =
             hex::decode("cbce0d719ecf7431d88e6a89fa1483e02e35092af60c042b1df2ff59fa424dca")
@@ -970,12 +934,19 @@ mod tests {
     fn test_bip44_derive_secp256k1() {
         // Just verify it runs without error and produces non-zero output
         let seed = hex::decode("000102030405060708090a0b0c0d0e0f").unwrap();
-        let (master_key, master_chain) =
-            slip10_master_key(&seed, Slip10Curve::Secp256k1).unwrap();
+        let (master_key, master_chain) = slip10_master_key(&seed, Slip10Curve::Secp256k1).unwrap();
 
         // m/44'/0'/0'/0/0  (Bitcoin mainnet, account 0, external chain, address 0)
-        let (key, _chain) =
-            bip44_derive(&master_key, &master_chain, 0, 0, 0, 0, Slip10Curve::Secp256k1).unwrap();
+        let (key, _chain) = bip44_derive(
+            &master_key,
+            &master_chain,
+            0,
+            0,
+            0,
+            0,
+            Slip10Curve::Secp256k1,
+        )
+        .unwrap();
 
         assert_ne!(key, [0u8; 32]);
     }

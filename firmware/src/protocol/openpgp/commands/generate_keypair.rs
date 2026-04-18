@@ -8,8 +8,7 @@
 
 use pico2hsm_core::{
     apdu::{
-        ApduCommand, ApduResponse, SW_CONDITIONS_NOT_SATISFIED, SW_SECURITY_STATUS,
-        SW_WRONG_DATA,
+        ApduCommand, ApduResponse, SW_CONDITIONS_NOT_SATISFIED, SW_SECURITY_STATUS, SW_WRONG_DATA,
     },
     key::KeyType,
 };
@@ -197,9 +196,24 @@ pub fn handle_with_store(
     use pico2hsm_core::key::{AppletId, KeyId, KeyType as CoreKeyType};
 
     let (slot, priv_opt, pub_opt, key_type_opt) = match crt_tag {
-        0xB6 => (SLOT_SIG, &state.sig_private, &state.sig_public, &state.sig_key_type),
-        0xB8 => (SLOT_DEC, &state.dec_private, &state.dec_public, &state.dec_key_type),
-        0xA4 => (SLOT_AUTH, &state.auth_private, &state.auth_public, &state.auth_key_type),
+        0xB6 => (
+            SLOT_SIG,
+            &state.sig_private,
+            &state.sig_public,
+            &state.sig_key_type,
+        ),
+        0xB8 => (
+            SLOT_DEC,
+            &state.dec_private,
+            &state.dec_public,
+            &state.dec_key_type,
+        ),
+        0xA4 => (
+            SLOT_AUTH,
+            &state.auth_private,
+            &state.auth_public,
+            &state.auth_key_type,
+        ),
         _ => return resp,
     };
 

@@ -12,7 +12,10 @@
 //!   - 0x84: AES-256 (32 bytes)
 
 use pico2hsm_core::{
-    apdu::{ApduCommand, ApduResponse, SW_CONDITIONS_NOT_SATISFIED, SW_OK, SW_SECURITY_STATUS, SW_WRONG_DATA},
+    apdu::{
+        ApduCommand, ApduResponse, SW_CONDITIONS_NOT_SATISFIED, SW_OK, SW_SECURITY_STATUS,
+        SW_WRONG_DATA,
+    },
     key::{AppletId, KeyId},
 };
 
@@ -114,9 +117,9 @@ pub fn handle(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pico2hsm_core::apdu::ApduCommand;
     use crate::protocol::sc_hsm::ScHsmState;
     use crate::storage::NullKeyStore;
+    use pico2hsm_core::apdu::ApduCommand;
 
     fn make_state_authed() -> ScHsmState {
         let mut s = ScHsmState::new();
@@ -158,7 +161,11 @@ mod tests {
         let resp = handle(&mut state, &mut store, &cmd);
         assert_eq!(resp.sw, pico2hsm_core::apdu::SW_OK);
         let full_id = KeyId::sc_hsm(0, 0x01).0;
-        let meta = state.key_index.iter().find(|m| m.key_id == full_id).unwrap();
+        let meta = state
+            .key_index
+            .iter()
+            .find(|m| m.key_id == full_id)
+            .unwrap();
         assert_eq!(meta.key_type, pico2hsm_core::key::KeyType::Aes128 as u8);
     }
 
@@ -171,7 +178,11 @@ mod tests {
         let resp = handle(&mut state, &mut store, &cmd);
         assert_eq!(resp.sw, pico2hsm_core::apdu::SW_OK);
         let full_id = KeyId::sc_hsm(0, 0x05).0;
-        let meta = state.key_index.iter().find(|m| m.key_id == full_id).unwrap();
+        let meta = state
+            .key_index
+            .iter()
+            .find(|m| m.key_id == full_id)
+            .unwrap();
         assert_eq!(meta.key_type, pico2hsm_core::key::KeyType::Aes256 as u8);
     }
 
@@ -183,12 +194,26 @@ mod tests {
         let cmd = ApduCommand::parse(&raw).unwrap();
         handle(&mut state, &mut store, &cmd);
         let full_id = KeyId::sc_hsm(0, 0x02).0;
-        assert_eq!(state.key_index.iter().filter(|m| m.key_id == full_id).count(), 1);
+        assert_eq!(
+            state
+                .key_index
+                .iter()
+                .filter(|m| m.key_id == full_id)
+                .count(),
+            1
+        );
 
         // Generate again — should replace, not duplicate
         let cmd2 = ApduCommand::parse(&raw).unwrap();
         handle(&mut state, &mut store, &cmd2);
-        assert_eq!(state.key_index.iter().filter(|m| m.key_id == full_id).count(), 1);
+        assert_eq!(
+            state
+                .key_index
+                .iter()
+                .filter(|m| m.key_id == full_id)
+                .count(),
+            1
+        );
     }
 
     #[test]

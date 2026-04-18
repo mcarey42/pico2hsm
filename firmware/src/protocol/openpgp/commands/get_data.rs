@@ -107,9 +107,21 @@ pub fn handle(state: &mut OpenPgpState, cmd: &ApduCommand<'_>) -> ApduResponse {
         // 00DE — Key Information (v3.4+): 6 bytes, each pair = (key_ref, status)
         // status: 0x00 = not present, 0x01 = generated on card
         0x00DE => {
-            let sig_status = if state.sig_private.is_some() { 0x01 } else { 0x00 };
-            let dec_status = if state.dec_private.is_some() { 0x01 } else { 0x00 };
-            let auth_status = if state.auth_private.is_some() { 0x01 } else { 0x00 };
+            let sig_status = if state.sig_private.is_some() {
+                0x01
+            } else {
+                0x00
+            };
+            let dec_status = if state.dec_private.is_some() {
+                0x01
+            } else {
+                0x00
+            };
+            let auth_status = if state.auth_private.is_some() {
+                0x01
+            } else {
+                0x00
+            };
             ApduResponse::ok(&[0x01, sig_status, 0x02, dec_status, 0x03, auth_status])
         }
 
@@ -141,7 +153,7 @@ fn extended_capabilities() -> [u8; 10] {
     //   bit 6 (0x40) = GET CHALLENGE supported — YES
     //   bit 7 (0x80) = Secure Messaging using AES — NO
     let byte0: u8 = 0x54; // ALG_ATTR_CHANGEABLE (0x04) | KEY_IMPORT (0x10) | GET_CHALLENGE (0x40)
-    // Byte 1: 0x00 (no SM, no MSE, no PIN block 2)
+                          // Byte 1: 0x00 (no SM, no MSE, no PIN block 2)
     let byte1: u8 = 0x00;
     // Bytes 2-3: max GET CHALLENGE length = 0x00FF (255 bytes)
     // Bytes 4-5: max certificate length = 0x0400 (1024 bytes, per cardholder_cert field size)
@@ -153,13 +165,13 @@ fn extended_capabilities() -> [u8; 10] {
 /// PW Status Bytes (DO C4) — 7 bytes.
 fn pw_status_bytes(state: &OpenPgpState) -> [u8; 7] {
     [
-        0x00,                // format: UTF-8 PINs
-        0x7F,                // max PW1 length (127)
-        0x7F,                // max Reset Code length (127)
-        0x7F,                // max PW3 length (127)
-        state.pw1_retries,   // PW1 retry counter
-        0x00,                // RC retry counter (no reset code set)
-        state.pw3_retries,   // PW3 retry counter
+        0x00,              // format: UTF-8 PINs
+        0x7F,              // max PW1 length (127)
+        0x7F,              // max Reset Code length (127)
+        0x7F,              // max PW3 length (127)
+        state.pw1_retries, // PW1 retry counter
+        0x00,              // RC retry counter (no reset code set)
+        state.pw3_retries, // PW3 retry counter
     ]
 }
 
@@ -271,9 +283,7 @@ fn build_application_related(state: &OpenPgpState) -> ApduResponse {
     // 5F52 — Historical Bytes (minimal compact-TLV for card capabilities)
     // This is a minimal set: category indicator (0x00), then compact-TLV
     // 73 = card capabilities, C0 = card service data, 01 = status indicator
-    let hist_bytes: &[u8] = &[
-        0x00, 0x31, 0xC5, 0x73, 0xC0, 0x01, 0x80, 0x00, 0x90, 0x00,
-    ];
+    let hist_bytes: &[u8] = &[0x00, 0x31, 0xC5, 0x73, 0xC0, 0x01, 0x80, 0x00, 0x90, 0x00];
     let _ = content.push(0x5F);
     let _ = content.push(0x52);
     let _ = content.push(hist_bytes.len() as u8);

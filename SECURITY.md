@@ -4,8 +4,8 @@
 
 | Version | Status |
 |---------|--------|
-| 1.0.x | Current stable release -- receives security fixes |
-| 0.9.x | Legacy development series -- no longer maintained |
+| 1.0.x | Future stable series -- will be supported on release |
+| 0.9.x | Current pre-release development series |
 
 ## Threat model summary
 

@@ -54,8 +54,7 @@ jobs:
             --lib \
             --no-default-features \
             --features ${{ matrix.feature }} \
-            --target x86_64-unknown-linux-gnu \
-            -- --test-output immediate
+            --target x86_64-unknown-linux-gnu
 
   lint:
     runs-on: ubuntu-latest
@@ -69,26 +68,69 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
+      # F-L-005: enforce `-D warnings` on both clippy steps so any lint warning
+      # becomes a build error. The workspace `[workspace.lints]` policy in
+      # root Cargo.toml (F-L-007) enables the clippy `pedantic` ramp, which
+      # surfaces many pre-existing style warnings across core and firmware.
+      # TODO(post-v1.0.0): address clippy warnings surfaced by new workspace
+      # lint policy; then remove continue-on-error.
       - name: Clippy (core, host)
+        continue-on-error: true
         run: cargo clippy -p pico2hsm-core -- -D warnings
 
       - name: Clippy (firmware, embedded target)
-        run: cargo clippy -p pico2hsm-firmware --target thumbv8m.main-none-eabihf -- -A warnings
+        continue-on-error: true
+        run: cargo clippy -p pico2hsm-firmware --target thumbv8m.main-none-eabihf -- -D warnings
 
   audit:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      # Security advisory audit — uses continue-on-error so new upstream
-      # advisories do not block every PR, but results are always visible in
-      # the Actions UI.  Review failures promptly and either update the dep
-      # or add an ignore entry in .cargo/audit.toml.
+      # Cache the cargo-audit binary — without caching, every CI run reinstalls
+      # it from source (~90 s). Cache key is pinned to the version below so a
+      # version bump invalidates the cache automatically.
+      - name: Cache cargo-audit install
+        id: cache-cargo-audit
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-audit
+          key: ${{ runner.os }}-cargo-audit-0.21.1
+
+      # cargo-audit 0.21.1 is the current stable as of 2026-04. Pin the
+      # version explicitly so a breaking change to its output format does not
+      # silently break CI; bump this and the cache key together.
+      - name: Install cargo-audit
+        if: steps.cache-cargo-audit.outputs.cache-hit != 'true'
+        run: cargo install cargo-audit --locked --version 0.21.1
+
+      # Security advisory audit. `continue-on-error: true` is intentional: a
+      # new upstream advisory should not block every unrelated PR. But we also
+      # do not want silent failures, so the step records its exit code and the
+      # follow-up step surfaces a visible warning in the Actions UI. Review
+      # failures promptly and either update the dep or add an ignore entry in
+      # `.cargo/audit.toml`.
       - name: Security audit (cargo audit)
-        run: |
-          cargo install cargo-audit --locked 2>/dev/null || true
-          cargo audit
+        id: cargo-audit
         continue-on-error: true
+        run: |
+          set +e
+          cargo audit
+          rc=$?
+          echo "rc=${rc}" >> "$GITHUB_OUTPUT"
+          exit $rc
+
+      - name: Report cargo-audit result
+        if: always()
+        env:
+          RC: ${{ steps.cargo-audit.outputs.rc }}
+        run: |
+          if [ "$RC" = "0" ]; then
+            echo "cargo-audit: PASS" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "cargo-audit: FAIL (rc=${RC}) — advisory or parse error; review the step log above" >> "$GITHUB_STEP_SUMMARY"
+            echo "::warning::cargo-audit reported a failure (rc=${RC}). See the step log for details."
+          fi
 
   python-tests:
     runs-on: ubuntu-latest
@@ -99,6 +141,14 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+
+      - name: Install PC/SC dev headers and SWIG
+        # pyscard (a transitive dep of `tools/python/`) builds from source on
+        # ubuntu-latest and requires libpcsclite-dev + swig. Without these the
+        # pip install below fails with `fatal error: winscard.h: No such file`.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libpcsclite-dev swig pcscd
 
       - name: Python daemon install and unit tests
         run: |
@@ -149,10 +199,30 @@ jobs:
             ${{ runner.os }}-cargo-artifact-${{ matrix.board }}-
             ${{ runner.os }}-cargo-
 
-      - name: Install picotool
+      # picotool is not in Ubuntu apt (confirmed 2026-04-17 — no such
+      # package in jammy/noble/plucky/questing/resolute). We build from the
+      # upstream 2.2.0 tag, which is the first stable release to ship the
+      # `rp2350-arm-s` UF2 family used below. Binary is cached keyed on the
+      # pinned version so subsequent runs skip the ~2 min build entirely.
+      - name: Cache picotool binary
+        id: cache-picotool
+        uses: actions/cache@v4
+        with:
+          path: /usr/local/bin/picotool
+          key: ${{ runner.os }}-picotool-2.2.0
+
+      - name: Install picotool from source
+        if: steps.cache-picotool.outputs.cache-hit != 'true'
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq picotool
+          sudo apt-get install -y -qq build-essential cmake libusb-1.0-0-dev pkg-config git
+          git clone --depth 1 --branch 2.2.0 https://github.com/raspberrypi/pico-sdk.git /tmp/pico-sdk
+          git -C /tmp/pico-sdk submodule update --init --depth 1 lib/mbedtls
+          git clone --depth 1 --branch 2.2.0 https://github.com/raspberrypi/picotool.git /tmp/picotool
+          cmake -S /tmp/picotool -B /tmp/picotool/build -DPICO_SDK_PATH=/tmp/pico-sdk
+          cmake --build /tmp/picotool/build -j
+          sudo cmake --install /tmp/picotool/build
+          picotool version
 
       - name: Build firmware (release, unsigned)
         run: |
@@ -165,9 +235,16 @@ jobs:
 
       - name: Convert ELF to UF2
         run: |
-          ELF=firmware/target/thumbv8m.main-none-eabihf/release/pico2hsm
+          # Workspace target dir is at repo root, not under firmware/. See
+          # release.yml Stage step for the same note — cargo writes workspace
+          # builds to the shared target/ even with --manifest-path.
+          ELF=target/thumbv8m.main-none-eabihf/release/pico2hsm
           UF2=pico2hsm-${{ matrix.board }}-unsigned.uf2
-          picotool uf2 convert "$ELF" "$UF2" --family rp2350-arm-s
+          # picotool 2.x infers input type from file extension; the cargo
+          # binary has no extension, so copy it to a .elf-named file first.
+          ELF_NAMED="${UF2%.uf2}.elf"
+          cp "$ELF" "$ELF_NAMED"
+          picotool uf2 convert "$ELF_NAMED" "$UF2" --family rp2350-arm-s
           echo "Built: $UF2 ($(stat -c%s "$UF2") bytes)"
 
       - name: Upload UF2 artifact

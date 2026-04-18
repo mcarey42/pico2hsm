@@ -85,7 +85,11 @@ fn parse_write_tlv(data: &[u8]) -> Option<(usize, &[u8])> {
 }
 
 /// Handle a WRITE DATA APDU command.
-pub fn handle(state: &mut ScHsmState, store: &mut dyn KeyStore, cmd: &ApduCommand<'_>) -> ApduResponse {
+pub fn handle(
+    state: &mut ScHsmState,
+    store: &mut dyn KeyStore,
+    cmd: &ApduCommand<'_>,
+) -> ApduResponse {
     // Security requirement: reject if no PIN session is active.
     if !state.pin_verified && !state.so_pin_verified {
         return ApduResponse::err(SW_SECURITY_STATUS);
@@ -130,7 +134,10 @@ fn write_at_offset(
     let key_id = KeyId::sc_hsm_ef(0, file_id_hi, file_id_lo);
 
     // Check if this EF already exists in key_index.
-    let exists = state.key_index.iter().any(|m| m.key_type == 16 && m.key_id == key_id.0);
+    let exists = state
+        .key_index
+        .iter()
+        .any(|m| m.key_type == 16 && m.key_id == key_id.0);
 
     // Build the complete data buffer by combining existing data with
     // the new payload at the given offset.
@@ -160,7 +167,12 @@ fn write_at_offset(
         let _ = store.erase_key(key_id);
     }
 
-    let mut key_obj = KeyObject::new(KmType::Generic, key_id.0, AppletId::ScHsm, AlgorithmId::AesGcm);
+    let mut key_obj = KeyObject::new(
+        KmType::Generic,
+        key_id.0,
+        AppletId::ScHsm,
+        AlgorithmId::AesGcm,
+    );
     let _ = key_obj.private_key.extend_from_slice(&data_buf);
     match store.save_key(&key_obj) {
         Ok(()) => {
@@ -171,7 +183,7 @@ fn write_at_offset(
             if !exists {
                 let meta = KeyMeta {
                     key_id: key_id.0,
-                    key_type: 16, // EfFile
+                    key_type: 16,     // EfFile
                     algo: file_id_hi, // high byte of file_id, used by list_keys to filter CE entries
                     key_flags: 0,
                 };

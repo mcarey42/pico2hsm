@@ -51,16 +51,16 @@ use pico2hsm_core::{
 
 // ---- Re-used curve crate imports ----------------------------------------
 
+use ecdsa::{
+    der::Signature as DerSignature,
+    // PrehashSigner / PrehashVerifier live in the `signature` crate which
+    // ecdsa re-exports as `ecdsa::signature`.
+    signature::hazmat::{PrehashSigner, PrehashVerifier},
+};
 use elliptic_curve::{
     ecdh::diffie_hellman,
     sec1::{EncodedPoint, FromEncodedPoint, ToEncodedPoint},
     PublicKey, SecretKey,
-};
-use ecdsa::{
-    // PrehashSigner / PrehashVerifier live in the `signature` crate which
-    // ecdsa re-exports as `ecdsa::signature`.
-    signature::hazmat::{PrehashSigner, PrehashVerifier},
-    der::Signature as DerSignature,
 };
 
 // ---------------------------------------------------------------------------
@@ -274,10 +274,7 @@ pub fn ed25519_sign(
 ///
 /// Returns the 32-byte shared secret.
 #[cfg(feature = "applet-openpgp-curve25519")]
-pub fn x25519_ecdh(
-    private_key: &[u8],
-    peer_public_key: &[u8],
-) -> Result<[u8; 32], CryptoError> {
+pub fn x25519_ecdh(private_key: &[u8], peer_public_key: &[u8]) -> Result<[u8; 32], CryptoError> {
     use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
 
     if private_key.len() != 32 || peer_public_key.len() != 32 {
@@ -315,9 +312,9 @@ pub fn generate_rsa_keypair(
     key_type: KeyType,
     rng: &mut (impl RngCore + rand_core::CryptoRng),
 ) -> Result<RsaKeyPair, CryptoError> {
-    use ::rsa::RsaPrivateKey;
     use ::rsa::pkcs1::EncodeRsaPrivateKey;
     use ::rsa::traits::PublicKeyParts;
+    use ::rsa::RsaPrivateKey;
 
     let bits: usize = match key_type {
         KeyType::RsaPrivate2048 => 2048,
@@ -326,17 +323,17 @@ pub fn generate_rsa_keypair(
         _ => return Err(CryptoError::UnsupportedAlgorithm),
     };
 
-    let priv_key = RsaPrivateKey::new(rng, bits)
-        .map_err(|_| CryptoError::RngFailure)?;
+    let priv_key = RsaPrivateKey::new(rng, bits).map_err(|_| CryptoError::RngFailure)?;
 
     // Encode private key as PKCS#1 DER
-    let priv_der_doc = priv_key.to_pkcs1_der()
+    let priv_der_doc = priv_key
+        .to_pkcs1_der()
         .map_err(|_| CryptoError::RngFailure)?;
     let priv_der_bytes = priv_der_doc.as_bytes();
 
     // Extract raw modulus and exponent for building CVC responses
     let pub_key = priv_key.to_public_key();
-    let modulus_bytes = pub_key.n().to_bytes_be();  // alloc::vec::Vec<u8>
+    let modulus_bytes = pub_key.n().to_bytes_be(); // alloc::vec::Vec<u8>
     let exponent_bytes = pub_key.e().to_bytes_be(); // alloc::vec::Vec<u8>
 
     let mut pair = RsaKeyPair {
@@ -405,13 +402,17 @@ fn build_pkcs1_pub_der<const N: usize>(
     // INTEGER modulus
     let _ = out.push(0x02);
     push_der_len_rsa(out, int_n_content_len);
-    if needs_pad_n { let _ = out.push(0x00); }
+    if needs_pad_n {
+        let _ = out.push(0x00);
+    }
     let _ = out.extend_from_slice(modulus);
 
     // INTEGER exponent
     let _ = out.push(0x02);
     push_der_len_rsa(out, int_e_content_len);
-    if needs_pad_e { let _ = out.push(0x00); }
+    if needs_pad_e {
+        let _ = out.push(0x00);
+    }
     let _ = out.extend_from_slice(exponent);
 
     Ok(())
@@ -419,7 +420,13 @@ fn build_pkcs1_pub_der<const N: usize>(
 
 #[cfg(feature = "rsa")]
 fn der_int_len_size(len: usize) -> usize {
-    if len < 0x80 { 1 } else if len <= 0xFF { 2 } else { 3 }
+    if len < 0x80 {
+        1
+    } else if len <= 0xFF {
+        2
+    } else {
+        3
+    }
 }
 
 #[cfg(feature = "rsa")]
@@ -484,20 +491,14 @@ pub fn ecdsa_sign(
     };
 
     match key_type {
-        KeyType::EcPrivateP256 => {
-            ecdsa_sign_curve::<p256::NistP256>(private_key_raw, hash)
-        }
-        KeyType::EcPrivateP384 => {
-            ecdsa_sign_curve::<p384::NistP384>(private_key_raw, hash)
-        }
+        KeyType::EcPrivateP256 => ecdsa_sign_curve::<p256::NistP256>(private_key_raw, hash),
+        KeyType::EcPrivateP384 => ecdsa_sign_curve::<p384::NistP384>(private_key_raw, hash),
         KeyType::EcPrivateP521 => {
             // P-521 does not implement DigestPrimitive (no hash matches 66-byte field size).
             // Use randomized k from hardware TRNG — equivalent security to RFC 6979.
             ecdsa_sign_p521(private_key_raw, hash, rng)
         }
-        KeyType::EcPrivateK256 => {
-            ecdsa_sign_curve::<k256::Secp256k1>(private_key_raw, hash)
-        }
+        KeyType::EcPrivateK256 => ecdsa_sign_curve::<k256::Secp256k1>(private_key_raw, hash),
         KeyType::EcPrivateBrainpoolP256
         | KeyType::EcPrivateBrainpoolP384
         | KeyType::EcPrivateBrainpoolP512 => {
@@ -514,23 +515,23 @@ fn ecdsa_sign_curve<C>(
     hash_data: &[u8],
 ) -> Result<EcdsaSignature, CryptoError>
 where
-    C: elliptic_curve::PrimeCurve + elliptic_curve::CurveArithmetic + ecdsa::hazmat::DigestPrimitive,
-    C::Scalar: elliptic_curve::ops::Invert<
-            Output = elliptic_curve::subtle::CtOption<C::Scalar>,
-        > + ecdsa::hazmat::SignPrimitive<C>,
+    C: elliptic_curve::PrimeCurve
+        + elliptic_curve::CurveArithmetic
+        + ecdsa::hazmat::DigestPrimitive,
+    C::Scalar: elliptic_curve::ops::Invert<Output = elliptic_curve::subtle::CtOption<C::Scalar>>
+        + ecdsa::hazmat::SignPrimitive<C>,
     elliptic_curve::FieldBytesSize<C>: elliptic_curve::sec1::ModulusSize,
-    elliptic_curve::AffinePoint<C>: elliptic_curve::sec1::FromEncodedPoint<C>
-        + elliptic_curve::sec1::ToEncodedPoint<C>,
+    elliptic_curve::AffinePoint<C>:
+        elliptic_curve::sec1::FromEncodedPoint<C> + elliptic_curve::sec1::ToEncodedPoint<C>,
     ecdsa::SignatureSize<C>: elliptic_curve::generic_array::ArrayLength<u8>,
     ecdsa::der::MaxSize<C>: elliptic_curve::generic_array::ArrayLength<u8>,
     <elliptic_curve::FieldBytesSize<C> as core::ops::Add>::Output:
-        core::ops::Add<ecdsa::der::MaxOverhead>
-        + elliptic_curve::generic_array::ArrayLength<u8>,
+        core::ops::Add<ecdsa::der::MaxOverhead> + elliptic_curve::generic_array::ArrayLength<u8>,
 {
     use ecdsa::SigningKey;
 
-    let secret = SecretKey::<C>::from_slice(private_key_raw)
-        .map_err(|_| CryptoError::WrongKeyLength)?;
+    let secret =
+        SecretKey::<C>::from_slice(private_key_raw).map_err(|_| CryptoError::WrongKeyLength)?;
     let signing_key = SigningKey::<C>::from(&secret);
 
     // sign_prehash signs the raw hash bytes deterministically (RFC 6979).
@@ -563,8 +564,7 @@ fn ecdsa_sign_p521(
     // Deref with explicit type annotation to avoid Rust resolving to the NonZeroScalar copy.
     let nz = secret.to_nonzero_scalar();
     let scalar: p521::Scalar = *nz;
-    let z = bits2field::<p521::NistP521>(hash_data)
-        .map_err(|_| CryptoError::SignFailure)?;
+    let z = bits2field::<p521::NistP521>(hash_data).map_err(|_| CryptoError::SignFailure)?;
     // Generate a random k from the hardware TRNG, convert to Scalar for Invert bound.
     let k_nz = NonZeroScalar::<p521::NistP521>::random(rng);
     let k: p521::Scalar = *k_nz;
@@ -592,9 +592,9 @@ fn ecdsa_verify_p521(
         .map_err(|_| CryptoError::VerifyFailure)?;
     let sig = EcdsaSig::<p521::NistP521>::from_der(signature_der)
         .map_err(|_| CryptoError::VerifyFailure)?;
-    let z = bits2field::<p521::NistP521>(hash_data)
-        .map_err(|_| CryptoError::VerifyFailure)?;
-    match public_key.as_affine().verify_prehashed(&z, &sig) {  // z by reference
+    let z = bits2field::<p521::NistP521>(hash_data).map_err(|_| CryptoError::VerifyFailure)?;
+    match public_key.as_affine().verify_prehashed(&z, &sig) {
+        // z by reference
         Ok(()) => Ok(true),
         Err(_) => Ok(false),
     }
@@ -640,9 +640,7 @@ pub fn ecdsa_verify(
         KeyType::EcPrivateP384 => {
             ecdsa_verify_curve::<p384::NistP384>(public_key_raw, hash, signature_der)
         }
-        KeyType::EcPrivateP521 => {
-            ecdsa_verify_p521(public_key_raw, hash, signature_der)
-        }
+        KeyType::EcPrivateP521 => ecdsa_verify_p521(public_key_raw, hash, signature_der),
         KeyType::EcPrivateK256 => {
             ecdsa_verify_curve::<k256::Secp256k1>(public_key_raw, hash, signature_der)
         }
@@ -663,7 +661,9 @@ fn ecdsa_verify_curve<C>(
     signature_der: &[u8],
 ) -> Result<bool, CryptoError>
 where
-    C: elliptic_curve::PrimeCurve + elliptic_curve::CurveArithmetic + ecdsa::hazmat::DigestPrimitive,
+    C: elliptic_curve::PrimeCurve
+        + elliptic_curve::CurveArithmetic
+        + ecdsa::hazmat::DigestPrimitive,
     elliptic_curve::AffinePoint<C>: ecdsa::hazmat::VerifyPrimitive<C>
         + elliptic_curve::sec1::FromEncodedPoint<C>
         + elliptic_curve::sec1::ToEncodedPoint<C>,
@@ -671,17 +671,16 @@ where
     ecdsa::SignatureSize<C>: elliptic_curve::generic_array::ArrayLength<u8>,
     ecdsa::der::MaxSize<C>: elliptic_curve::generic_array::ArrayLength<u8>,
     <elliptic_curve::FieldBytesSize<C> as core::ops::Add>::Output:
-        core::ops::Add<ecdsa::der::MaxOverhead>
-        + elliptic_curve::generic_array::ArrayLength<u8>,
+        core::ops::Add<ecdsa::der::MaxOverhead> + elliptic_curve::generic_array::ArrayLength<u8>,
 {
     use ecdsa::VerifyingKey;
 
-    let public_key = PublicKey::<C>::from_sec1_bytes(public_key_raw)
-        .map_err(|_| CryptoError::VerifyFailure)?;
+    let public_key =
+        PublicKey::<C>::from_sec1_bytes(public_key_raw).map_err(|_| CryptoError::VerifyFailure)?;
     let verifying_key = VerifyingKey::<C>::from(&public_key);
 
-    let der_sig = DerSignature::<C>::try_from(signature_der)
-        .map_err(|_| CryptoError::VerifyFailure)?;
+    let der_sig =
+        DerSignature::<C>::try_from(signature_der).map_err(|_| CryptoError::VerifyFailure)?;
 
     match verifying_key.verify_prehash(hash_data, &der_sig) {
         Ok(()) => Ok(true),
@@ -742,19 +741,16 @@ fn ecdh_agree_curve<C>(
 ) -> Result<Vec<u8, 66>, CryptoError>
 where
     C: elliptic_curve::CurveArithmetic,
-    elliptic_curve::AffinePoint<C>: elliptic_curve::sec1::FromEncodedPoint<C>
-        + elliptic_curve::sec1::ToEncodedPoint<C>,
+    elliptic_curve::AffinePoint<C>:
+        elliptic_curve::sec1::FromEncodedPoint<C> + elliptic_curve::sec1::ToEncodedPoint<C>,
     elliptic_curve::FieldBytesSize<C>: elliptic_curve::sec1::ModulusSize,
 {
-    let secret = SecretKey::<C>::from_slice(private_key_raw)
-        .map_err(|_| CryptoError::WrongKeyLength)?;
+    let secret =
+        SecretKey::<C>::from_slice(private_key_raw).map_err(|_| CryptoError::WrongKeyLength)?;
     let peer_pk = PublicKey::<C>::from_sec1_bytes(peer_public_key_raw)
         .map_err(|_| CryptoError::EcdhFailure)?;
 
-    let shared = diffie_hellman(
-        secret.to_nonzero_scalar(),
-        peer_pk.as_affine(),
-    );
+    let shared = diffie_hellman(secret.to_nonzero_scalar(), peer_pk.as_affine());
 
     let raw = shared.raw_secret_bytes();
     let mut out: Vec<u8, 66> = Vec::new();
@@ -834,53 +830,64 @@ pub fn rsa_sign_pkcs1v15(
     hash_algo: HashAlgorithm,
     _rng: &mut impl RngCore,
 ) -> Result<heapless::Vec<u8, 512>, CryptoError> {
-    use ::rsa::RsaPrivateKey;
     use ::rsa::pkcs1::DecodeRsaPrivateKey;
     use ::rsa::pkcs1v15::SigningKey;
     use ::rsa::signature::hazmat::PrehashSigner;
+    use ::rsa::RsaPrivateKey;
     use sha1::Sha1;
     use sha2::{Sha256, Sha384, Sha512};
 
-    let priv_key = RsaPrivateKey::from_pkcs1_der(private_key_der)
-        .map_err(|_| CryptoError::WrongKeyLength)?;
+    let priv_key =
+        RsaPrivateKey::from_pkcs1_der(private_key_der).map_err(|_| CryptoError::WrongKeyLength)?;
 
     // Each arm produces the raw signature bytes (heap-allocated by rsa crate).
     let sig_bytes: alloc::vec::Vec<u8> = match hash_algo {
         HashAlgorithm::Sha1 => {
             let key: SigningKey<Sha1> = SigningKey::new(priv_key);
-            let sig = key.sign_prehash(hash_data).map_err(|_| CryptoError::SignFailure)?;
+            let sig = key
+                .sign_prehash(hash_data)
+                .map_err(|_| CryptoError::SignFailure)?;
             use ::rsa::signature::SignatureEncoding;
             sig.to_bytes().to_vec()
         }
         HashAlgorithm::Sha224 => {
             use sha2::Sha224;
             let key: SigningKey<Sha224> = SigningKey::new(priv_key);
-            let sig = key.sign_prehash(hash_data).map_err(|_| CryptoError::SignFailure)?;
+            let sig = key
+                .sign_prehash(hash_data)
+                .map_err(|_| CryptoError::SignFailure)?;
             use ::rsa::signature::SignatureEncoding;
             sig.to_bytes().to_vec()
         }
         HashAlgorithm::Sha256 => {
             let key: SigningKey<Sha256> = SigningKey::new(priv_key);
-            let sig = key.sign_prehash(hash_data).map_err(|_| CryptoError::SignFailure)?;
+            let sig = key
+                .sign_prehash(hash_data)
+                .map_err(|_| CryptoError::SignFailure)?;
             use ::rsa::signature::SignatureEncoding;
             sig.to_bytes().to_vec()
         }
         HashAlgorithm::Sha384 => {
             let key: SigningKey<Sha384> = SigningKey::new(priv_key);
-            let sig = key.sign_prehash(hash_data).map_err(|_| CryptoError::SignFailure)?;
+            let sig = key
+                .sign_prehash(hash_data)
+                .map_err(|_| CryptoError::SignFailure)?;
             use ::rsa::signature::SignatureEncoding;
             sig.to_bytes().to_vec()
         }
         HashAlgorithm::Sha512 => {
             let key: SigningKey<sha2::Sha512> = SigningKey::new(priv_key);
-            let sig = key.sign_prehash(hash_data).map_err(|_| CryptoError::SignFailure)?;
+            let sig = key
+                .sign_prehash(hash_data)
+                .map_err(|_| CryptoError::SignFailure)?;
             use ::rsa::signature::SignatureEncoding;
             sig.to_bytes().to_vec()
         }
     };
 
     let mut out: heapless::Vec<u8, 512> = heapless::Vec::new();
-    out.extend_from_slice(&sig_bytes).map_err(|_| CryptoError::BufferTooSmall)?;
+    out.extend_from_slice(&sig_bytes)
+        .map_err(|_| CryptoError::BufferTooSmall)?;
     Ok(out)
 }
 
@@ -900,14 +907,14 @@ pub fn rsa_sign_pss(
     _salt_len: usize,
     rng: &mut (impl RngCore + rand_core::CryptoRng),
 ) -> Result<heapless::Vec<u8, 512>, CryptoError> {
-    use ::rsa::RsaPrivateKey;
     use ::rsa::pkcs1::DecodeRsaPrivateKey;
     use ::rsa::pss::BlindedSigningKey;
     use ::rsa::signature::hazmat::RandomizedPrehashSigner;
+    use ::rsa::RsaPrivateKey;
     use sha2::Sha256;
 
-    let priv_key = RsaPrivateKey::from_pkcs1_der(private_key_der)
-        .map_err(|_| CryptoError::WrongKeyLength)?;
+    let priv_key =
+        RsaPrivateKey::from_pkcs1_der(private_key_der).map_err(|_| CryptoError::WrongKeyLength)?;
 
     // BlindedSigningKey uses randomized blinding against timing attacks.
     let key: BlindedSigningKey<Sha256> = BlindedSigningKey::new(priv_key);
@@ -919,7 +926,8 @@ pub fn rsa_sign_pss(
     let sig_bytes = sig.to_bytes();
 
     let mut out: heapless::Vec<u8, 512> = heapless::Vec::new();
-    out.extend_from_slice(sig_bytes.as_ref()).map_err(|_| CryptoError::BufferTooSmall)?;
+    out.extend_from_slice(sig_bytes.as_ref())
+        .map_err(|_| CryptoError::BufferTooSmall)?;
     Ok(out)
 }
 
@@ -935,19 +943,20 @@ pub fn rsa_decrypt_pkcs1v15(
     private_key_der: &[u8],
     ciphertext: &[u8],
 ) -> Result<heapless::Vec<u8, 512>, CryptoError> {
-    use ::rsa::RsaPrivateKey;
     use ::rsa::pkcs1::DecodeRsaPrivateKey;
     use ::rsa::Pkcs1v15Encrypt;
+    use ::rsa::RsaPrivateKey;
 
-    let priv_key = RsaPrivateKey::from_pkcs1_der(private_key_der)
-        .map_err(|_| CryptoError::WrongKeyLength)?;
+    let priv_key =
+        RsaPrivateKey::from_pkcs1_der(private_key_der).map_err(|_| CryptoError::WrongKeyLength)?;
 
     let plaintext = priv_key
         .decrypt(Pkcs1v15Encrypt, ciphertext)
         .map_err(|_| CryptoError::DecryptFailure)?;
 
     let mut out: heapless::Vec<u8, 512> = heapless::Vec::new();
-    out.extend_from_slice(&plaintext).map_err(|_| CryptoError::BufferTooSmall)?;
+    out.extend_from_slice(&plaintext)
+        .map_err(|_| CryptoError::BufferTooSmall)?;
     Ok(out)
 }
 
@@ -965,13 +974,13 @@ pub fn rsa_decrypt_oaep(
     _hash_algo: HashAlgorithm,
     _rng: &mut impl RngCore,
 ) -> Result<heapless::Vec<u8, 512>, CryptoError> {
-    use ::rsa::RsaPrivateKey;
     use ::rsa::pkcs1::DecodeRsaPrivateKey;
     use ::rsa::Oaep;
+    use ::rsa::RsaPrivateKey;
     use sha2::Sha256;
 
-    let priv_key = RsaPrivateKey::from_pkcs1_der(private_key_der)
-        .map_err(|_| CryptoError::WrongKeyLength)?;
+    let priv_key =
+        RsaPrivateKey::from_pkcs1_der(private_key_der).map_err(|_| CryptoError::WrongKeyLength)?;
 
     let scheme = Oaep::new::<Sha256>();
     let plaintext = priv_key
@@ -979,7 +988,8 @@ pub fn rsa_decrypt_oaep(
         .map_err(|_| CryptoError::DecryptFailure)?;
 
     let mut out: heapless::Vec<u8, 512> = heapless::Vec::new();
-    out.extend_from_slice(&plaintext).map_err(|_| CryptoError::BufferTooSmall)?;
+    out.extend_from_slice(&plaintext)
+        .map_err(|_| CryptoError::BufferTooSmall)?;
     Ok(out)
 }
 
@@ -996,12 +1006,12 @@ pub fn rsa_private_raw(
     private_key_der: &[u8],
     data: &[u8],
 ) -> Result<heapless::Vec<u8, 512>, CryptoError> {
-    use ::rsa::RsaPrivateKey;
     use ::rsa::pkcs1::DecodeRsaPrivateKey;
     use ::rsa::traits::PublicKeyParts;
+    use ::rsa::RsaPrivateKey;
 
-    let priv_key = RsaPrivateKey::from_pkcs1_der(private_key_der)
-        .map_err(|_| CryptoError::WrongKeyLength)?;
+    let priv_key =
+        RsaPrivateKey::from_pkcs1_der(private_key_der).map_err(|_| CryptoError::WrongKeyLength)?;
 
     let n = priv_key.n();
     let key_len = (n.bits() + 7) / 8; // modulus length in bytes
@@ -1014,18 +1024,20 @@ pub fn rsa_private_raw(
     // We pass None for the blinding RNG; a local phantom type satisfies the generic bound.
     struct NoRng;
     impl ::rsa::rand_core::RngCore for NoRng {
-        fn next_u32(&mut self) -> u32 { 0 }
-        fn next_u64(&mut self) -> u64 { 0 }
+        fn next_u32(&mut self) -> u32 {
+            0
+        }
+        fn next_u64(&mut self) -> u64 {
+            0
+        }
         fn fill_bytes(&mut self, _: &mut [u8]) {}
-        fn try_fill_bytes(&mut self, _: &mut [u8]) -> Result<(), ::rsa::rand_core::Error> { Ok(()) }
+        fn try_fill_bytes(&mut self, _: &mut [u8]) -> Result<(), ::rsa::rand_core::Error> {
+            Ok(())
+        }
     }
     impl ::rsa::rand_core::CryptoRng for NoRng {}
-    let m = ::rsa::hazmat::rsa_decrypt(
-        None::<&mut NoRng>,
-        &priv_key,
-        &c,
-    )
-    .map_err(|_| CryptoError::DecryptFailure)?;
+    let m = ::rsa::hazmat::rsa_decrypt(None::<&mut NoRng>, &priv_key, &c)
+        .map_err(|_| CryptoError::DecryptFailure)?;
 
     // Convert result to big-endian, zero-padded to key_len bytes
     let m_bytes = m.to_bytes_be();
@@ -1033,7 +1045,8 @@ pub fn rsa_private_raw(
     for _ in 0..key_len.saturating_sub(m_bytes.len()) {
         let _ = out.push(0x00);
     }
-    out.extend_from_slice(&m_bytes).map_err(|_| CryptoError::BufferTooSmall)?;
+    out.extend_from_slice(&m_bytes)
+        .map_err(|_| CryptoError::BufferTooSmall)?;
     Ok(out)
 }
 
@@ -1045,12 +1058,24 @@ pub fn rsa_sign(
 ) -> Result<heapless::Vec<u8, 512>, CryptoError> {
     struct DummyRng;
     impl RngCore for DummyRng {
-        fn next_u32(&mut self) -> u32 { 0 }
-        fn next_u64(&mut self) -> u64 { 0 }
+        fn next_u32(&mut self) -> u32 {
+            0
+        }
+        fn next_u64(&mut self) -> u64 {
+            0
+        }
         fn fill_bytes(&mut self, _dest: &mut [u8]) {}
-        fn try_fill_bytes(&mut self, _dest: &mut [u8]) -> Result<(), rand_core::Error> { Ok(()) }
+        fn try_fill_bytes(&mut self, _dest: &mut [u8]) -> Result<(), rand_core::Error> {
+            Ok(())
+        }
     }
-    rsa_sign_pkcs1v15(key.key_type, &key.raw, hash_data, HashAlgorithm::Sha256, &mut DummyRng)
+    rsa_sign_pkcs1v15(
+        key.key_type,
+        &key.raw,
+        hash_data,
+        HashAlgorithm::Sha256,
+        &mut DummyRng,
+    )
 }
 
 /// Legacy RSA PKCS#1v1.5 decrypt — operates on `KeyMaterial`.
@@ -1083,7 +1108,11 @@ pub fn ec_private_to_key_material(
     raw.extend_from_slice(private_key_raw)
         .map_err(|_| CryptoError::BufferTooSmall)?;
 
-    Ok(KeyMaterial { key_type, key_id, raw })
+    Ok(KeyMaterial {
+        key_type,
+        key_id,
+        raw,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1135,21 +1164,9 @@ mod tests {
         assert_eq!(pair.public_key[0], 0x04);
 
         let hash = [0x42u8; 32];
-        let sig = ecdsa_sign(
-            KeyType::EcPrivateP256,
-            &pair.private_key,
-            &hash,
-            &mut rng,
-        )
-        .unwrap();
+        let sig = ecdsa_sign(KeyType::EcPrivateP256, &pair.private_key, &hash, &mut rng).unwrap();
 
-        let ok = ecdsa_verify(
-            KeyType::EcPrivateP256,
-            &pair.public_key,
-            &hash,
-            &sig,
-        )
-        .unwrap();
+        let ok = ecdsa_verify(KeyType::EcPrivateP256, &pair.public_key, &hash, &sig).unwrap();
         assert!(ok, "P-256 signature verification failed");
     }
 
@@ -1161,20 +1178,8 @@ mod tests {
         assert_eq!(pair.public_key.len(), 97);
 
         let hash = [0x55u8; 48];
-        let sig = ecdsa_sign(
-            KeyType::EcPrivateP384,
-            &pair.private_key,
-            &hash,
-            &mut rng,
-        )
-        .unwrap();
-        let ok = ecdsa_verify(
-            KeyType::EcPrivateP384,
-            &pair.public_key,
-            &hash,
-            &sig,
-        )
-        .unwrap();
+        let sig = ecdsa_sign(KeyType::EcPrivateP384, &pair.private_key, &hash, &mut rng).unwrap();
+        let ok = ecdsa_verify(KeyType::EcPrivateP384, &pair.public_key, &hash, &sig).unwrap();
         assert!(ok);
     }
 
@@ -1186,20 +1191,8 @@ mod tests {
         assert_eq!(pair.public_key.len(), 133);
 
         let hash = [0x77u8; 64];
-        let sig = ecdsa_sign(
-            KeyType::EcPrivateP521,
-            &pair.private_key,
-            &hash,
-            &mut rng,
-        )
-        .unwrap();
-        let ok = ecdsa_verify(
-            KeyType::EcPrivateP521,
-            &pair.public_key,
-            &hash,
-            &sig,
-        )
-        .unwrap();
+        let sig = ecdsa_sign(KeyType::EcPrivateP521, &pair.private_key, &hash, &mut rng).unwrap();
+        let ok = ecdsa_verify(KeyType::EcPrivateP521, &pair.public_key, &hash, &sig).unwrap();
         assert!(ok);
     }
 
@@ -1211,20 +1204,8 @@ mod tests {
         assert_eq!(pair.public_key.len(), 65);
 
         let hash = [0x11u8; 32];
-        let sig = ecdsa_sign(
-            KeyType::EcPrivateK256,
-            &pair.private_key,
-            &hash,
-            &mut rng,
-        )
-        .unwrap();
-        let ok = ecdsa_verify(
-            KeyType::EcPrivateK256,
-            &pair.public_key,
-            &hash,
-            &sig,
-        )
-        .unwrap();
+        let sig = ecdsa_sign(KeyType::EcPrivateK256, &pair.private_key, &hash, &mut rng).unwrap();
+        let ok = ecdsa_verify(KeyType::EcPrivateK256, &pair.public_key, &hash, &sig).unwrap();
         assert!(ok);
     }
 
@@ -1234,18 +1215,10 @@ mod tests {
         let alice = generate_ec_keypair(KeyType::EcPrivateP256, &mut rng).unwrap();
         let bob = generate_ec_keypair(KeyType::EcPrivateP256, &mut rng).unwrap();
 
-        let alice_shared = ecdh_agree(
-            KeyType::EcPrivateP256,
-            &alice.private_key,
-            &bob.public_key,
-        )
-        .unwrap();
-        let bob_shared = ecdh_agree(
-            KeyType::EcPrivateP256,
-            &bob.private_key,
-            &alice.public_key,
-        )
-        .unwrap();
+        let alice_shared =
+            ecdh_agree(KeyType::EcPrivateP256, &alice.private_key, &bob.public_key).unwrap();
+        let bob_shared =
+            ecdh_agree(KeyType::EcPrivateP256, &bob.private_key, &alice.public_key).unwrap();
 
         assert_eq!(alice_shared.as_slice(), bob_shared.as_slice());
         assert_eq!(alice_shared.len(), 32);
@@ -1257,18 +1230,10 @@ mod tests {
         let alice = generate_ec_keypair(KeyType::EcPrivateP384, &mut rng).unwrap();
         let bob = generate_ec_keypair(KeyType::EcPrivateP384, &mut rng).unwrap();
 
-        let alice_shared = ecdh_agree(
-            KeyType::EcPrivateP384,
-            &alice.private_key,
-            &bob.public_key,
-        )
-        .unwrap();
-        let bob_shared = ecdh_agree(
-            KeyType::EcPrivateP384,
-            &bob.private_key,
-            &alice.public_key,
-        )
-        .unwrap();
+        let alice_shared =
+            ecdh_agree(KeyType::EcPrivateP384, &alice.private_key, &bob.public_key).unwrap();
+        let bob_shared =
+            ecdh_agree(KeyType::EcPrivateP384, &bob.private_key, &alice.public_key).unwrap();
 
         assert_eq!(alice_shared.as_slice(), bob_shared.as_slice());
         assert_eq!(alice_shared.len(), 48);
@@ -1280,18 +1245,10 @@ mod tests {
         let alice = generate_ec_keypair(KeyType::EcPrivateK256, &mut rng).unwrap();
         let bob = generate_ec_keypair(KeyType::EcPrivateK256, &mut rng).unwrap();
 
-        let alice_shared = ecdh_agree(
-            KeyType::EcPrivateK256,
-            &alice.private_key,
-            &bob.public_key,
-        )
-        .unwrap();
-        let bob_shared = ecdh_agree(
-            KeyType::EcPrivateK256,
-            &bob.private_key,
-            &alice.public_key,
-        )
-        .unwrap();
+        let alice_shared =
+            ecdh_agree(KeyType::EcPrivateK256, &alice.private_key, &bob.public_key).unwrap();
+        let bob_shared =
+            ecdh_agree(KeyType::EcPrivateK256, &bob.private_key, &alice.public_key).unwrap();
 
         assert_eq!(alice_shared.as_slice(), bob_shared.as_slice());
     }
@@ -1301,25 +1258,15 @@ mod tests {
         let mut rng = CounterRng(0xfeed);
         let pair = generate_ec_keypair(KeyType::EcPrivateP256, &mut rng).unwrap();
         let hash = [0x01u8; 32];
-        let mut sig = ecdsa_sign(
-            KeyType::EcPrivateP256,
-            &pair.private_key,
-            &hash,
-            &mut rng,
-        )
-        .unwrap();
+        let mut sig =
+            ecdsa_sign(KeyType::EcPrivateP256, &pair.private_key, &hash, &mut rng).unwrap();
 
         // Corrupt the last byte of the DER signature.
         let last = sig.len() - 1;
         sig[last] ^= 0xff;
 
-        let ok = ecdsa_verify(
-            KeyType::EcPrivateP256,
-            &pair.public_key,
-            &hash,
-            &sig,
-        )
-        .unwrap_or(false);
+        let ok =
+            ecdsa_verify(KeyType::EcPrivateP256, &pair.public_key, &hash, &sig).unwrap_or(false);
         assert!(!ok, "corrupted signature should not verify");
     }
 
@@ -1330,21 +1277,10 @@ mod tests {
         let hash = [0x01u8; 32];
         let wrong_hash = [0x02u8; 32];
 
-        let sig = ecdsa_sign(
-            KeyType::EcPrivateP256,
-            &pair.private_key,
-            &hash,
-            &mut rng,
-        )
-        .unwrap();
+        let sig = ecdsa_sign(KeyType::EcPrivateP256, &pair.private_key, &hash, &mut rng).unwrap();
 
-        let ok = ecdsa_verify(
-            KeyType::EcPrivateP256,
-            &pair.public_key,
-            &wrong_hash,
-            &sig,
-        )
-        .unwrap_or(false);
+        let ok = ecdsa_verify(KeyType::EcPrivateP256, &pair.public_key, &wrong_hash, &sig)
+            .unwrap_or(false);
         assert!(!ok, "signature over different hash should not verify");
     }
 
@@ -1354,12 +1290,8 @@ mod tests {
         let pair = generate_ec_keypair(KeyType::EcPrivateP256, &mut rng).unwrap();
         let key_id = KeyId(0x0001);
 
-        let material = ec_private_to_key_material(
-            KeyType::EcPrivateP256,
-            key_id,
-            &pair.private_key,
-        )
-        .unwrap();
+        let material =
+            ec_private_to_key_material(KeyType::EcPrivateP256, key_id, &pair.private_key).unwrap();
 
         assert_eq!(material.key_type, KeyType::EcPrivateP256);
         assert_eq!(material.key_id, key_id);

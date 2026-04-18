@@ -1,0 +1,361 @@
+name: Release
+
+# Tag-triggered release workflow.
+#
+# Builds UF2 firmware for every supported board, emits per-crate CycloneDX
+# SBOMs, collects SHA256SUMS across all boards, extracts the matching
+# CHANGELOG.md section for the release body, and publishes a GitHub Release
+# with all assets attached.
+#
+# IMPORTANT: The UF2 artifacts attached to the release are UNSIGNED. Production
+# signing is performed offline using a per-project firmware signing key and
+# `picotool seal --hash --sign`. See docs/SECURE_PROVISIONING_PLAN.md for the
+# full secure boot procedure.
+#
+# Dry-run mode: push a tag with a `-ci-test` suffix (e.g. `v1.0.0-ci-test`) to
+# exercise the workflow. The workflow still publishes a GitHub Release — you
+# must delete it (and the tag) manually afterwards. See docs/RELEASE_PROCESS.md.
+#
+# Security note: tag names are GitHub-validated git refs (not free-form user
+# text) and are read via `github.ref` only. Where a tag value is used inside a
+# `run:` step, it is passed via `env:` and quoted, never interpolated directly.
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Job 1: build UF2 for every board in the matrix.
+  # Produces <board>.uf2, <board>.elf, and <board>.uf2.sha256 per board.
+  # Modelled on the build-artifacts job in build.yml:118-191.
+  # ---------------------------------------------------------------------------
+  build-uf2:
+    name: Build UF2 (${{ matrix.board }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        board:
+          - pico2_4m
+          - rp2350_one_4m
+          - rp2350_geek_16m
+          - rp2350_geek_sdcard
+          - waveshare_rp2350_lcd_16m
+          - waveshare_rp2350_lcd_sdcard
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: thumbv8m.main-none-eabihf
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-release-${{ matrix.board }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-release-${{ matrix.board }}-
+            ${{ runner.os }}-cargo-artifact-${{ matrix.board }}-
+            ${{ runner.os }}-cargo-
+
+      # picotool is not in Ubuntu apt (confirmed 2026-04-17 — no such
+      # package in jammy/noble/plucky/questing/resolute). We build from the
+      # upstream 2.2.0 tag, which is the first stable release to ship the
+      # `rp2350-arm-s` UF2 family used below. Binary is cached keyed on the
+      # pinned version so subsequent runs skip the ~2 min build entirely.
+      - name: Cache picotool binary
+        id: cache-picotool
+        uses: actions/cache@v4
+        with:
+          path: /usr/local/bin/picotool
+          key: ${{ runner.os }}-picotool-2.2.0
+
+      - name: Install picotool from source
+        if: steps.cache-picotool.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq build-essential cmake libusb-1.0-0-dev pkg-config git
+          git clone --depth 1 --branch 2.2.0 https://github.com/raspberrypi/pico-sdk.git /tmp/pico-sdk
+          git -C /tmp/pico-sdk submodule update --init --depth 1 lib/mbedtls
+          git clone --depth 1 --branch 2.2.0 https://github.com/raspberrypi/picotool.git /tmp/picotool
+          cmake -S /tmp/picotool -B /tmp/picotool/build -DPICO_SDK_PATH=/tmp/pico-sdk
+          cmake --build /tmp/picotool/build -j
+          sudo cmake --install /tmp/picotool/build
+          picotool version
+
+      - name: Build firmware (release, unsigned)
+        env:
+          BOARD: ${{ matrix.board }}
+        run: |
+          cargo build \
+            --manifest-path firmware/Cargo.toml \
+            --release \
+            --no-default-features \
+            --features "${BOARD},applet-piv,applet-openpgp-curve25519" \
+            --target thumbv8m.main-none-eabihf
+
+      - name: Stage ELF + UF2
+        env:
+          BOARD: ${{ matrix.board }}
+        run: |
+          set -euo pipefail
+          mkdir -p release-assets
+          # Workspace target dir is at repo root, not under firmware/. When
+          # `cargo build --manifest-path firmware/Cargo.toml` runs inside a
+          # Cargo workspace, cargo writes to the workspace's shared target/.
+          ELF_SRC=target/thumbv8m.main-none-eabihf/release/pico2hsm
+          BASE="pico2hsm-${BOARD}-unsigned"
+          ELF_DST="release-assets/${BASE}.elf"
+          UF2_DST="release-assets/${BASE}.uf2"
+          # picotool 2.x infers input type from file extension; the cargo
+          # binary has no extension (`[[bin]] name = "pico2hsm"`), so pass
+          # the already-staged .elf copy instead of the raw ELF_SRC.
+          cp "$ELF_SRC" "$ELF_DST"
+          picotool uf2 convert "$ELF_DST" "$UF2_DST" --family rp2350-arm-s
+          ( cd release-assets && sha256sum "${BASE}.uf2" > "${BASE}.uf2.sha256" )
+          ls -la release-assets
+
+      - name: Upload per-board artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: uf2-${{ matrix.board }}
+          path: release-assets/*
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # Job 2: emit CycloneDX SBOMs for each workspace member.
+  # cargo-sbom outputs CycloneDX JSON. One SBOM per workspace member.
+  # ---------------------------------------------------------------------------
+  sbom:
+    name: Generate SBOMs
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: thumbv8m.main-none-eabihf
+
+      - name: Cache cargo-sbom install
+        id: cache-sbom
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-sbom
+          # Pin version in the cache key so a version bump invalidates it.
+          key: ${{ runner.os }}-cargo-sbom-0.9.1
+
+      - name: Install cargo-sbom
+        if: steps.cache-sbom.outputs.cache-hit != 'true'
+        # cargo-sbom 0.9.1 produces CycloneDX JSON; pinning the version keeps
+        # the SBOM schema stable across releases.
+        run: cargo install cargo-sbom --locked --version 0.9.1
+
+      - name: Generate SBOMs per workspace member
+        run: |
+          set -euo pipefail
+          mkdir -p sbom-output
+          for crate in pico2hsm-core firmware pico2hsm-integration-tests; do
+            echo "=== SBOM for $crate ==="
+            cargo sbom \
+              --cargo-package "$crate" \
+              --output-format cyclone_dx_json_1_4 \
+              > "sbom-output/${crate}.cdx.json"
+            ls -la "sbom-output/${crate}.cdx.json"
+          done
+
+      - name: Fallback — always emit cargo tree dump
+        if: always()
+        run: |
+          mkdir -p sbom-output
+          cargo tree \
+            --manifest-path firmware/Cargo.toml \
+            --no-default-features \
+            --features pico2_4m,applet-piv,applet-openpgp-curve25519 \
+            --target thumbv8m.main-none-eabihf \
+            --prefix none \
+            --format "{p} {l}" \
+            > sbom-output/cargo-tree-firmware-pico2_4m.txt || true
+
+      - name: Upload SBOM artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: sbom-output/*
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # Job 3: assemble release assets, extract CHANGELOG section, publish release.
+  # ---------------------------------------------------------------------------
+  release:
+    name: Publish GitHub Release
+    runs-on: ubuntu-latest
+    needs: [build-uf2, sbom]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all UF2 artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: uf2-*
+          path: downloaded-artifacts/
+          merge-multiple: true
+
+      - name: Download SBOM artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: sbom
+          path: downloaded-artifacts/
+
+      - name: Assemble release directory
+        id: assemble
+        env:
+          REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          # Copy every asset to the release directory.
+          find downloaded-artifacts -maxdepth 2 -type f -exec cp {} release/ \;
+          ls -la release
+
+          # Combine per-board SHA256 files into a single SHA256SUMS file.
+          ( cd release && cat ./*.uf2.sha256 > SHA256SUMS )
+          echo "=== SHA256SUMS ==="
+          cat release/SHA256SUMS
+
+          # Verify every expected board is represented — fail loudly otherwise.
+          EXPECTED_BOARDS=(pico2_4m rp2350_one_4m rp2350_geek_16m rp2350_geek_sdcard waveshare_rp2350_lcd_16m waveshare_rp2350_lcd_sdcard)
+          MISSING=()
+          for b in "${EXPECTED_BOARDS[@]}"; do
+            if ! ls "release/pico2hsm-${b}-unsigned.uf2" >/dev/null 2>&1; then
+              MISSING+=("$b")
+            fi
+          done
+          if [ ${#MISSING[@]} -gt 0 ]; then
+            echo "ERROR: missing UF2 artifacts for boards: ${MISSING[*]}" >&2
+            exit 1
+          fi
+
+          # Tag comes from github.ref (validated git ref). Strip prefix.
+          TAG="${REF#refs/tags/}"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          VERSION="${TAG#v}"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          if [[ "$TAG" == *-ci-test ]]; then
+            echo "dry_run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "dry_run=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Extract CHANGELOG section for this tag
+        id: changelog
+        env:
+          VERSION: ${{ steps.assemble.outputs.version }}
+        # Extract the `## [VERSION]` section from CHANGELOG.md. If CHANGELOG.md
+        # does not exist or the section is missing, emit a placeholder rather
+        # than failing — the release body falls back to the UNSIGNED warning
+        # + SHA256SUMS excerpt.
+        run: |
+          set -euo pipefail
+          OUTFILE=release-notes-body.md
+          if [ ! -f CHANGELOG.md ]; then
+            echo "_(CHANGELOG.md not present in the repo; release notes body was not populated.)_" > "$OUTFILE"
+          else
+            # Match `## [VERSION]` (optionally followed by ` - DATE`) and emit
+            # lines until the next `## [` header.
+            awk -v ver="$VERSION" '
+              BEGIN { in_section = 0; found = 0 }
+              /^## \[/ {
+                if (in_section) { exit }
+                header = $0
+                sub(/^## \[/, "", header)
+                sub(/\].*$/, "", header)
+                if (header == ver) { in_section = 1; found = 1; next }
+              }
+              in_section { print }
+              END { if (!found) { exit 3 } }
+            ' CHANGELOG.md > "$OUTFILE" || {
+              echo "_(No CHANGELOG.md section found for version ${VERSION}.)_" > "$OUTFILE"
+            }
+          fi
+          echo "=== release-notes-body.md ==="
+          cat "$OUTFILE"
+          echo "path=${OUTFILE}" >> "$GITHUB_OUTPUT"
+
+      - name: Compose release body
+        id: body
+        env:
+          TAG: ${{ steps.assemble.outputs.tag }}
+          DRY: ${{ steps.assemble.outputs.dry_run }}
+          CHANGELOG_BODY: ${{ steps.changelog.outputs.path }}
+        run: |
+          set -euo pipefail
+          OUT=release-body.md
+
+          {
+            if [ "$DRY" = "true" ]; then
+              echo "> **DRY-RUN BUILD** — this release was produced by a \`-ci-test\` tag and should be deleted before consumers see it."
+              echo ""
+            fi
+            echo "## :warning: UNSIGNED FIRMWARE"
+            echo ""
+            echo "The UF2 files attached to this release are **unsigned**. They are suitable for"
+            echo "evaluation, development, and reproducing CI builds locally. For production"
+            echo "deployment you must generate your own firmware signing key, sign the ELF with"
+            echo "\`picotool seal --hash --sign\`, and lock the OTP fuses."
+            echo ""
+            echo "See [docs/SECURE_PROVISIONING_PLAN.md](docs/SECURE_PROVISIONING_PLAN.md) for the full"
+            echo "secure boot procedure. Unsigned firmware will not run on devices that have secure"
+            echo "boot enabled."
+            echo ""
+            echo "## Changes"
+            echo ""
+            cat "$CHANGELOG_BODY"
+            echo ""
+            echo "## SHA256SUMS"
+            echo ""
+            echo '```'
+            cat release/SHA256SUMS
+            echo '```'
+            echo ""
+            echo "## Assets"
+            echo ""
+            echo "- \`<board>.uf2\` — flashable firmware image (UF2, RP2350 family \`rp2350-arm-s\`)."
+            echo "- \`<board>.elf\` — original ELF (for debugging with probe-rs / picotool)."
+            echo "- \`<board>.uf2.sha256\` — per-file SHA256 (also aggregated in SHA256SUMS)."
+            echo "- \`*.cdx.json\` — CycloneDX 1.4 SBOM, one per workspace crate."
+            echo ""
+            echo "Verify downloads with:"
+            echo ""
+            echo '```sh'
+            echo "sha256sum -c SHA256SUMS"
+            echo '```'
+          } > "$OUT"
+
+          echo "path=${OUT}" >> "$GITHUB_OUTPUT"
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.assemble.outputs.tag }}
+          name: ${{ steps.assemble.outputs.tag }}
+          body_path: ${{ steps.body.outputs.path }}
+          prerelease: ${{ contains(steps.assemble.outputs.tag, '-') }}
+          files: |
+            release/*.uf2
+            release/*.elf
+            release/*.uf2.sha256
+            release/SHA256SUMS
+            release/*.cdx.json
+            release/cargo-tree-*.txt
+          fail_on_unmatched_files: false

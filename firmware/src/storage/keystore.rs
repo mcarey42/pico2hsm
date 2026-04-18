@@ -25,20 +25,20 @@ use crate::security::key_management::KeyObject;
 
 // ARM-only imports used by FlashKeyStore.
 #[cfg(target_arch = "arm")]
+use crate::security::key_management::AlgorithmId;
+#[cfg(target_arch = "arm")]
+use crate::storage::integrity::compute_plaintext_blake2s;
+#[cfg(target_arch = "arm")]
+use crate::storage::StorageManager;
+#[cfg(target_arch = "arm")]
+use pico2hsm_core::flash::FlashChip;
+#[cfg(target_arch = "arm")]
 use pico2hsm_core::{
     error::{CryptoError, StorageError},
     key::KeyType as CoreKeyType,
 };
 #[cfg(target_arch = "arm")]
 use zeroize::Zeroizing;
-#[cfg(target_arch = "arm")]
-use pico2hsm_core::flash::FlashChip;
-#[cfg(target_arch = "arm")]
-use crate::security::key_management::AlgorithmId;
-#[cfg(target_arch = "arm")]
-use crate::storage::StorageManager;
-#[cfg(target_arch = "arm")]
-use crate::storage::integrity::compute_plaintext_blake2s;
 
 // ─── KeyStore trait ───────────────────────────────────────────────────────────
 
@@ -114,15 +114,18 @@ impl<Chip: FlashChip> KeyStore for FlashKeyStore<Chip> {
         obj_copy.use_count = obj.use_count;
         obj_copy.generation = obj.generation.saturating_add(1);
         obj_copy.key_flags = obj.key_flags;
-        obj_copy.private_key.extend_from_slice(&obj.private_key)
+        obj_copy
+            .private_key
+            .extend_from_slice(&obj.private_key)
             .map_err(|_| HsmError::Crypto(CryptoError::EncryptFailure))?;
-        obj_copy.public_key.extend_from_slice(&obj.public_key)
+        obj_copy
+            .public_key
+            .extend_from_slice(&obj.public_key)
             .map_err(|_| HsmError::Crypto(CryptoError::EncryptFailure))?;
 
         // --- 1. Generate a fresh 12-byte nonce from the hardware TRNG. ---
         let mut nonce = [0u8; 12];
-        crate::crypto::rng::fill_random(&mut nonce)
-            .map_err(HsmError::Crypto)?;
+        crate::crypto::rng::fill_random(&mut nonce).map_err(HsmError::Crypto)?;
 
         // --- 2. Encrypt the key object (with bumped generation). ---
         let blob = obj_copy
@@ -139,7 +142,8 @@ impl<Chip: FlashChip> KeyStore for FlashKeyStore<Chip> {
         let core_key_type = algo_to_core_key_type(obj_copy.algorithm);
 
         // --- 5. Write to flash. ---
-        let result = self.storage
+        let result = self
+            .storage
             .write_key(KeyId(obj_copy.key_id), core_key_type, &blob, &hash)
             .map_err(HsmError::Storage);
         if result.is_ok() {
@@ -155,10 +159,7 @@ impl<Chip: FlashChip> KeyStore for FlashKeyStore<Chip> {
             return Ok(None);
         }
 
-        let blob = self
-            .storage
-            .read_key(key_id)
-            .map_err(HsmError::Storage)?;
+        let blob = self.storage.read_key(key_id).map_err(HsmError::Storage)?;
 
         // Pass the u32 key_id to decrypt — decrypt uses the low byte for KEK derivation.
         let obj = KeyObject::decrypt(&blob, key_id.0, &self.smk)
@@ -168,9 +169,7 @@ impl<Chip: FlashChip> KeyStore for FlashKeyStore<Chip> {
     }
 
     fn erase_key(&mut self, key_id: KeyId) -> Result<(), HsmError> {
-        let result = self.storage
-            .delete_key(key_id)
-            .map_err(HsmError::Storage);
+        let result = self.storage.delete_key(key_id).map_err(HsmError::Storage);
         if result.is_ok() {
             crate::cdc_log!("FLASH erase key=0x{:08x} ok", key_id.0);
         }
@@ -196,7 +195,9 @@ impl<Chip: FlashChip> KeyStore for FlashKeyStore<Chip> {
 
     fn enumerate_keys(&self) -> Vec<KeyId, 64> {
         let mut out = Vec::new();
-        self.storage.for_each_key(&mut |kid| { let _ = out.push(kid); });
+        self.storage.for_each_key(&mut |kid| {
+            let _ = out.push(kid);
+        });
         out
     }
 
@@ -315,7 +316,10 @@ impl<P: KeyStore, S: KeyStore> HybridKeyStore<P, S> {
                 }
                 Err(_) => {
                     #[cfg(target_arch = "arm")]
-                    defmt::warn!("HybridKeyStore: resync read failed for key 0x{:08x}", key_id.0);
+                    defmt::warn!(
+                        "HybridKeyStore: resync read failed for key 0x{:08x}",
+                        key_id.0
+                    );
                     self.flash_error = true;
                     any_failed = true;
                 }
@@ -324,7 +328,9 @@ impl<P: KeyStore, S: KeyStore> HybridKeyStore<P, S> {
 
         if any_failed {
             crate::cdc_warn!("HYBRID resync partial fail");
-            Err(HsmError::Storage(pico2hsm_core::error::StorageError::WriteError))
+            Err(HsmError::Storage(
+                pico2hsm_core::error::StorageError::WriteError,
+            ))
         } else {
             self.degraded = false;
             self.flash_error = false;
@@ -391,7 +397,10 @@ impl<P: KeyStore, S: KeyStore> KeyStore for HybridKeyStore<P, S> {
         if let Err(_e) = self.secondary.save_key(obj) {
             #[cfg(target_arch = "arm")]
             defmt::warn!("HybridKeyStore: secondary write failed — marking degraded");
-            crate::cdc_warn!("HYBRID secondary write failed key=0x{:08x} — degraded", obj.key_id);
+            crate::cdc_warn!(
+                "HYBRID secondary write failed key=0x{:08x} — degraded",
+                obj.key_id
+            );
             self.degraded = true;
         } else if self.degraded {
             // Secondary write succeeded while degraded — trigger full resync.
@@ -416,7 +425,10 @@ impl<P: KeyStore, S: KeyStore> KeyStore for HybridKeyStore<P, S> {
                 self.flash_error = true;
                 #[cfg(target_arch = "arm")]
                 defmt::warn!("HybridKeyStore: primary read error for key 0x{:08x}, falling back to secondary", key_id.0);
-                crate::cdc_warn!("HYBRID primary miss key=0x{:08x}, trying secondary", key_id.0);
+                crate::cdc_warn!(
+                    "HYBRID primary miss key=0x{:08x}, trying secondary",
+                    key_id.0
+                );
             }
         }
 
@@ -426,7 +438,10 @@ impl<P: KeyStore, S: KeyStore> KeyStore for HybridKeyStore<P, S> {
                 // Resync: best-effort write-back to primary.
                 if let Err(_e) = self.primary.save_key(&obj) {
                     #[cfg(target_arch = "arm")]
-                    defmt::warn!("HybridKeyStore: write-back to primary failed for key 0x{:08x}", key_id.0);
+                    defmt::warn!(
+                        "HybridKeyStore: write-back to primary failed for key 0x{:08x}",
+                        key_id.0
+                    );
                     // Don't propagate — we have the key from secondary.
                 }
                 Ok(Some(obj))
@@ -434,7 +449,10 @@ impl<P: KeyStore, S: KeyStore> KeyStore for HybridKeyStore<P, S> {
             Ok(None) => Ok(None),
             Err(_) => {
                 #[cfg(target_arch = "arm")]
-                defmt::warn!("HybridKeyStore: secondary read also failed for key 0x{:08x}", key_id.0);
+                defmt::warn!(
+                    "HybridKeyStore: secondary read also failed for key 0x{:08x}",
+                    key_id.0
+                );
                 // Both stores failed — key is gone.
                 Ok(None)
             }
@@ -451,7 +469,10 @@ impl<P: KeyStore, S: KeyStore> KeyStore for HybridKeyStore<P, S> {
         // Erase from secondary — failure is non-fatal.
         if let Err(_e) = self.secondary.erase_key(key_id) {
             #[cfg(target_arch = "arm")]
-            defmt::warn!("HybridKeyStore: secondary erase failed for key 0x{:08x}", key_id.0);
+            defmt::warn!(
+                "HybridKeyStore: secondary erase failed for key 0x{:08x}",
+                key_id.0
+            );
             self.degraded = true;
         }
 
@@ -532,10 +553,9 @@ fn algo_to_core_key_type(algo: AlgorithmId) -> CoreKeyType {
         | AlgorithmId::RsaPss
         | AlgorithmId::RsaDecrypt => CoreKeyType::RsaPrivate2048,
         // AES / symmetric
-        AlgorithmId::AesEcb
-        | AlgorithmId::AesCbc
-        | AlgorithmId::AesCtr
-        | AlgorithmId::AesGcm => CoreKeyType::Aes256,
+        AlgorithmId::AesEcb | AlgorithmId::AesCbc | AlgorithmId::AesCtr | AlgorithmId::AesGcm => {
+            CoreKeyType::Aes256
+        }
         // Curve25519
         AlgorithmId::Ed25519 => CoreKeyType::Ed25519,
         AlgorithmId::X25519 => CoreKeyType::X25519,

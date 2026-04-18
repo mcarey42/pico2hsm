@@ -6,22 +6,27 @@
 //! No embassy-rp / embassy-executor imports — all tests run on x86_64.
 
 use pico2hsm_firmware::security::dkek::{
-    DkekError, DkekImportResult, DkekManager,
-    encrypt_share_blob, SHARE_BLOB_SIZE,
+    encrypt_share_blob, DkekError, DkekImportResult, DkekManager, SHARE_BLOB_SIZE,
 };
 
 // ---------------------------------------------------------------------------
 // Deterministic RNG (same as in crypto_tests.rs)
 // ---------------------------------------------------------------------------
 
-struct DeterministicRng { state: u64 }
+struct DeterministicRng {
+    state: u64,
+}
 
 impl DeterministicRng {
-    fn seeded(seed: u64) -> Self { DeterministicRng { state: seed | 1 } }
+    fn seeded(seed: u64) -> Self {
+        DeterministicRng { state: seed | 1 }
+    }
 }
 
 impl rand_core::RngCore for DeterministicRng {
-    fn next_u32(&mut self) -> u32 { self.next_u64() as u32 }
+    fn next_u32(&mut self) -> u32 {
+        self.next_u64() as u32
+    }
 
     fn next_u64(&mut self) -> u64 {
         self.state = self.state.wrapping_add(0x9e3779b97f4a7c15);
@@ -55,17 +60,13 @@ const DEVICE_ID: [u8; 16] = [0x01; 16];
 
 /// A fixed 32-byte share value for deterministic tests.
 const SHARE_VALUE_A: [u8; 32] = [
-    0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
-    0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x00,
-    0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80,
-    0x90, 0xA0, 0xB0, 0xC0, 0xD0, 0xE0, 0xF0, 0x01,
+    0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x00,
+    0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80, 0x90, 0xA0, 0xB0, 0xC0, 0xD0, 0xE0, 0xF0, 0x01,
 ];
 
 const SHARE_VALUE_B: [u8; 32] = [
-    0xFE, 0xDC, 0xBA, 0x98, 0x76, 0x54, 0x32, 0x10,
-    0x0F, 0x1E, 0x2D, 0x3C, 0x4B, 0x5A, 0x69, 0x78,
-    0x87, 0x96, 0xA5, 0xB4, 0xC3, 0xD2, 0xE1, 0xF0,
-    0x09, 0x18, 0x27, 0x36, 0x45, 0x54, 0x63, 0x72,
+    0xFE, 0xDC, 0xBA, 0x98, 0x76, 0x54, 0x32, 0x10, 0x0F, 0x1E, 0x2D, 0x3C, 0x4B, 0x5A, 0x69, 0x78,
+    0x87, 0x96, 0xA5, 0xB4, 0xC3, 0xD2, 0xE1, 0xF0, 0x09, 0x18, 0x27, 0x36, 0x45, 0x54, 0x63, 0x72,
 ];
 
 const TEST_PASSWORD_A: &[u8] = b"password-for-share-A";
@@ -93,7 +94,10 @@ fn test_dkek_not_initialized_state() {
     assert!(!mgr.is_ready(), "Fresh DkekManager must not be ready");
     assert_eq!(mgr.shares_received(), 0);
     assert_eq!(mgr.shares_total(), 0);
-    assert!(mgr.get_dkek().is_none(), "get_dkek must return None when not initialized");
+    assert!(
+        mgr.get_dkek().is_none(),
+        "get_dkek must return None when not initialized"
+    );
 }
 
 #[test]
@@ -113,7 +117,11 @@ fn test_dkek_single_share_completes() {
     let blob = make_blob(&SHARE_VALUE_A, TEST_PASSWORD_A);
     let result = mgr.import_share(&blob, TEST_PASSWORD_A).unwrap();
 
-    assert_eq!(result, DkekImportResult::Complete, "n=1: single share must complete the DKEK");
+    assert_eq!(
+        result,
+        DkekImportResult::Complete,
+        "n=1: single share must complete the DKEK"
+    );
     assert!(mgr.is_ready(), "Manager must be Ready after n=1 share");
     assert_eq!(mgr.shares_received(), 1);
     assert_eq!(mgr.shares_total(), 1);
@@ -129,7 +137,10 @@ fn test_dkek_single_share_value_is_the_share() {
     mgr.import_share(&blob, TEST_PASSWORD_A).unwrap();
 
     let dkek = mgr.get_dkek().unwrap();
-    assert_eq!(dkek, &SHARE_VALUE_A, "n=1: DKEK must equal the single share value");
+    assert_eq!(
+        dkek, &SHARE_VALUE_A,
+        "n=1: DKEK must equal the single share value"
+    );
 }
 
 #[test]
@@ -144,13 +155,23 @@ fn test_dkek_two_shares_xor_accumulation() {
     let r1 = mgr.import_share(&blob_a, TEST_PASSWORD_A).unwrap();
     assert_eq!(
         r1,
-        DkekImportResult::MoreSharesNeeded { received: 1, total: 2 },
+        DkekImportResult::MoreSharesNeeded {
+            received: 1,
+            total: 2
+        },
         "After first of two shares, manager must report MoreSharesNeeded"
     );
-    assert!(!mgr.is_ready(), "Manager must not be ready after only one of two shares");
+    assert!(
+        !mgr.is_ready(),
+        "Manager must not be ready after only one of two shares"
+    );
 
     let r2 = mgr.import_share(&blob_b, TEST_PASSWORD_B).unwrap();
-    assert_eq!(r2, DkekImportResult::Complete, "After second share, manager must complete");
+    assert_eq!(
+        r2,
+        DkekImportResult::Complete,
+        "After second share, manager must complete"
+    );
     assert!(mgr.is_ready());
 
     let expected_dkek: [u8; 32] = core::array::from_fn(|i| SHARE_VALUE_A[i] ^ SHARE_VALUE_B[i]);
@@ -219,7 +240,10 @@ fn test_dkek_clear_resets_to_not_initialized() {
     mgr.clear();
 
     assert!(!mgr.is_ready(), "After clear(), manager must not be ready");
-    assert!(mgr.get_dkek().is_none(), "After clear(), get_dkek must return None");
+    assert!(
+        mgr.get_dkek().is_none(),
+        "After clear(), get_dkek must return None"
+    );
     assert_eq!(mgr.shares_total(), 0);
 }
 
@@ -234,7 +258,11 @@ fn test_dkek_reinit_resets_accumulated_shares() {
 
     // Re-init with n=1 — should clear the partial accumulation
     mgr.init_shares(1);
-    assert_eq!(mgr.shares_received(), 0, "Re-init must reset received count");
+    assert_eq!(
+        mgr.shares_received(),
+        0,
+        "Re-init must reset received count"
+    );
 
     // Fresh single share should complete
     let blob2 = make_blob(&SHARE_VALUE_B, TEST_PASSWORD_B);
@@ -311,14 +339,25 @@ fn test_dkek_invalid_blob_length_fails() {
 #[test]
 fn test_share_blob_size() {
     let blob = encrypt_share_blob(&SHARE_VALUE_A, TEST_PASSWORD_A, &TEST_IV).unwrap();
-    assert_eq!(blob.len(), SHARE_BLOB_SIZE, "Share blob must be exactly SHARE_BLOB_SIZE bytes");
-    assert_eq!(SHARE_BLOB_SIZE, 80, "SHARE_BLOB_SIZE must be 80 (IV=16 + ciphertext=64)");
+    assert_eq!(
+        blob.len(),
+        SHARE_BLOB_SIZE,
+        "Share blob must be exactly SHARE_BLOB_SIZE bytes"
+    );
+    assert_eq!(
+        SHARE_BLOB_SIZE, 80,
+        "SHARE_BLOB_SIZE must be 80 (IV=16 + ciphertext=64)"
+    );
 }
 
 #[test]
 fn test_share_blob_iv_at_start() {
     let blob = encrypt_share_blob(&SHARE_VALUE_A, TEST_PASSWORD_A, &TEST_IV).unwrap();
-    assert_eq!(&blob[..16], &TEST_IV, "First 16 bytes of share blob must be the IV");
+    assert_eq!(
+        &blob[..16],
+        &TEST_IV,
+        "First 16 bytes of share blob must be the IV"
+    );
 }
 
 #[test]
@@ -363,8 +402,8 @@ fn test_share_blob_roundtrip_via_import() {
 
 #[test]
 fn test_noise_exchange_roundtrip() {
-    use pico2hsm_firmware::crypto::asymmetric::generate_ec_keypair;
     use pico2hsm_core::key::KeyType as CryptoKeyType;
+    use pico2hsm_firmware::crypto::asymmetric::generate_ec_keypair;
 
     let mut rng = DeterministicRng::seeded(0xDEAD_CAFE);
 
@@ -377,13 +416,13 @@ fn test_noise_exchange_roundtrip() {
 
     // Generate ephemeral P-256 keypairs for both sides
     let alice_pair = generate_ec_keypair(CryptoKeyType::EcPrivateP256, &mut rng).unwrap();
-    let bob_pair   = generate_ec_keypair(CryptoKeyType::EcPrivateP256, &mut rng).unwrap();
+    let bob_pair = generate_ec_keypair(CryptoKeyType::EcPrivateP256, &mut rng).unwrap();
 
     let alice_priv: [u8; 32] = alice_pair.private_key.as_slice().try_into().unwrap();
-    let bob_priv:   [u8; 32] = bob_pair.private_key.as_slice().try_into().unwrap();
+    let bob_priv: [u8; 32] = bob_pair.private_key.as_slice().try_into().unwrap();
 
     let alice_pub: [u8; 65] = alice_pair.public_key.as_slice().try_into().unwrap();
-    let bob_pub:   [u8; 65] = bob_pair.public_key.as_slice().try_into().unwrap();
+    let bob_pub: [u8; 65] = bob_pair.public_key.as_slice().try_into().unwrap();
 
     // Sender (Alice) encrypts the DKEK for Bob using Bob's ephemeral public key
     let encrypted_dkek = sender
@@ -401,7 +440,10 @@ fn test_noise_exchange_roundtrip() {
         )
         .unwrap();
 
-    assert!(receiver.is_ready(), "Receiver must be ready after noise exchange");
+    assert!(
+        receiver.is_ready(),
+        "Receiver must be ready after noise exchange"
+    );
     assert_eq!(
         receiver.get_dkek().unwrap(),
         sender.get_dkek().unwrap(),
@@ -411,24 +453,26 @@ fn test_noise_exchange_roundtrip() {
 
 #[test]
 fn test_noise_recv_wrong_key_fails() {
-    use pico2hsm_firmware::crypto::asymmetric::generate_ec_keypair;
     use pico2hsm_core::key::KeyType as CryptoKeyType;
+    use pico2hsm_firmware::crypto::asymmetric::generate_ec_keypair;
 
     let mut rng = DeterministicRng::seeded(0x9999_CAFE);
 
     let mut sender = DkekManager::new(DEVICE_ID);
     sender.init_shares(1);
-    sender.import_share(&make_blob(&SHARE_VALUE_A, TEST_PASSWORD_A), TEST_PASSWORD_A).unwrap();
+    sender
+        .import_share(&make_blob(&SHARE_VALUE_A, TEST_PASSWORD_A), TEST_PASSWORD_A)
+        .unwrap();
 
-    let alice_pair  = generate_ec_keypair(CryptoKeyType::EcPrivateP256, &mut rng).unwrap();
-    let bob_pair    = generate_ec_keypair(CryptoKeyType::EcPrivateP256, &mut rng).unwrap();
+    let alice_pair = generate_ec_keypair(CryptoKeyType::EcPrivateP256, &mut rng).unwrap();
+    let bob_pair = generate_ec_keypair(CryptoKeyType::EcPrivateP256, &mut rng).unwrap();
     let mallory_pair = generate_ec_keypair(CryptoKeyType::EcPrivateP256, &mut rng).unwrap();
 
     let alice_priv: [u8; 32] = alice_pair.private_key.as_slice().try_into().unwrap();
-    let bob_pub:   [u8; 65]  = bob_pair.public_key.as_slice().try_into().unwrap();
+    let bob_pub: [u8; 65] = bob_pair.public_key.as_slice().try_into().unwrap();
 
-    let alice_pub: [u8; 65]     = alice_pair.public_key.as_slice().try_into().unwrap();
-    let mallory_priv: [u8; 32]  = mallory_pair.private_key.as_slice().try_into().unwrap();
+    let alice_pub: [u8; 65] = alice_pair.public_key.as_slice().try_into().unwrap();
+    let mallory_priv: [u8; 32] = mallory_pair.private_key.as_slice().try_into().unwrap();
 
     // Sender encrypts for Bob
     let encrypted_dkek = sender
@@ -437,12 +481,8 @@ fn test_noise_recv_wrong_key_fails() {
 
     // Mallory tries to decrypt — wrong private key → AES-GCM tag failure
     let mut receiver = DkekManager::new(DEVICE_ID);
-    let result = receiver.noise_recv_dkek_data(
-        &alice_pub,
-        &mallory_priv,
-        &encrypted_dkek,
-        &DEVICE_ID,
-    );
+    let result =
+        receiver.noise_recv_dkek_data(&alice_pub, &mallory_priv, &encrypted_dkek, &DEVICE_ID);
 
     assert!(
         matches!(result, Err(DkekError::DecryptFailure)),
@@ -453,8 +493,8 @@ fn test_noise_recv_wrong_key_fails() {
 #[test]
 fn test_noise_send_without_dkek_fails() {
     let mut rng = DeterministicRng::seeded(0x1234);
-    use pico2hsm_firmware::crypto::asymmetric::generate_ec_keypair;
     use pico2hsm_core::key::KeyType as CryptoKeyType;
+    use pico2hsm_firmware::crypto::asymmetric::generate_ec_keypair;
 
     let sender = DkekManager::new(DEVICE_ID); // Not initialized
     let bob_pair = generate_ec_keypair(CryptoKeyType::EcPrivateP256, &mut rng).unwrap();
@@ -487,7 +527,10 @@ fn test_derive_static_private_key_different_otp_differs() {
     let otp2 = [0x02u8; 32];
     let sk1 = DkekManager::derive_static_private_key(&otp1);
     let sk2 = DkekManager::derive_static_private_key(&otp2);
-    assert_ne!(*sk1, *sk2, "Different OTP keys must produce different static keys");
+    assert_ne!(
+        *sk1, *sk2,
+        "Different OTP keys must produce different static keys"
+    );
 }
 
 #[test]
@@ -515,7 +558,10 @@ fn test_generate_share_two_calls_differ() {
     let mut rng = DeterministicRng::seeded(0xBEEF);
     let share1 = *mgr.generate_share(&mut rng);
     let share2 = *mgr.generate_share(&mut rng);
-    assert_ne!(share1, share2, "Two consecutive share generations must differ");
+    assert_ne!(
+        share1, share2,
+        "Two consecutive share generations must differ"
+    );
 }
 
 // Use core:: for no_std compat

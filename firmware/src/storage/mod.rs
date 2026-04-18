@@ -38,8 +38,8 @@
 //! flash) use the `AnyChip` enum or a board-specific concrete type.
 
 pub mod keystore;
-pub use keystore::KeyStore;
 pub use keystore::HybridKeyStore;
+pub use keystore::KeyStore;
 
 pub use keystore::NullKeyStore;
 
@@ -60,16 +60,18 @@ pub mod sdcard;
 #[cfg(target_arch = "arm")]
 pub mod sdcard_spi;
 #[cfg(target_arch = "arm")]
-pub use sdcard::{SdCardCheckResult, compute_device_fingerprint, check_sd_signature, write_sd_signature};
+pub use sdcard::{
+    check_sd_signature, compute_device_fingerprint, write_sd_signature, SdCardCheckResult,
+};
 #[cfg(target_arch = "arm")]
 pub mod wal;
 
 #[cfg(target_arch = "arm")]
-pub use keystore::FlashKeyStore;
-#[cfg(target_arch = "arm")]
 pub use board_chips::BoardChip;
 #[cfg(target_arch = "arm")]
 pub use board_chips::BoardKeyStore;
+#[cfg(target_arch = "arm")]
+pub use keystore::FlashKeyStore;
 
 #[cfg(target_arch = "arm")]
 use filesystem::{Directory, KeyFilesystem, ScrubReport};
@@ -78,7 +80,7 @@ use pico2hsm_core::{
     error::{HsmError, StorageError},
     flash::{FlashChip, SECTOR_SIZE},
     key::{KeyId, KeyMaterial, KeyRecord, KeyType},
-    storage::{ChipState, DATA_START_SECTOR, MirrorPair, MirrorState, WAL_SECTOR_0, WAL_SECTOR_1},
+    storage::{ChipState, MirrorPair, MirrorState, DATA_START_SECTOR, WAL_SECTOR_0, WAL_SECTOR_1},
 };
 
 // ─── AnyChip — erased chip type for static dispatch ──────────────────────────
@@ -225,10 +227,26 @@ impl<Chip: FlashChip> StorageManager<Chip> {
             filesystem,
             chip_states: [ChipState::NotPresent; 8],
             mirror_pairs: [
-                MirrorPair { primary: 0, mirror: 4, state: MirrorState::Degraded { failed_member: 4 } },
-                MirrorPair { primary: 1, mirror: 5, state: MirrorState::Degraded { failed_member: 5 } },
-                MirrorPair { primary: 2, mirror: 6, state: MirrorState::Degraded { failed_member: 6 } },
-                MirrorPair { primary: 3, mirror: 7, state: MirrorState::Degraded { failed_member: 7 } },
+                MirrorPair {
+                    primary: 0,
+                    mirror: 4,
+                    state: MirrorState::Degraded { failed_member: 4 },
+                },
+                MirrorPair {
+                    primary: 1,
+                    mirror: 5,
+                    state: MirrorState::Degraded { failed_member: 5 },
+                },
+                MirrorPair {
+                    primary: 2,
+                    mirror: 6,
+                    state: MirrorState::Degraded { failed_member: 6 },
+                },
+                MirrorPair {
+                    primary: 3,
+                    mirror: 7,
+                    state: MirrorState::Degraded { failed_member: 7 },
+                },
             ],
         }
     }
@@ -270,9 +288,15 @@ impl<Chip: FlashChip> StorageManager<Chip> {
             let mirror_state = self.chip_states[pair.mirror as usize];
             pair.state = match (primary_state, mirror_state) {
                 (ChipState::Healthy, ChipState::Healthy) => MirrorState::InSync,
-                (ChipState::Healthy, _) => MirrorState::Degraded { failed_member: pair.mirror },
-                (_, ChipState::Healthy) => MirrorState::Degraded { failed_member: pair.primary },
-                _ => MirrorState::Degraded { failed_member: pair.mirror },
+                (ChipState::Healthy, _) => MirrorState::Degraded {
+                    failed_member: pair.mirror,
+                },
+                (_, ChipState::Healthy) => MirrorState::Degraded {
+                    failed_member: pair.primary,
+                },
+                _ => MirrorState::Degraded {
+                    failed_member: pair.mirror,
+                },
             };
         }
 
@@ -290,7 +314,8 @@ impl<Chip: FlashChip> StorageManager<Chip> {
     pub fn read_key(
         &mut self,
         key_id: KeyId,
-    ) -> Result<heapless::Vec<u8, { crate::security::key_management::MAX_BLOB_SIZE }>, StorageError> {
+    ) -> Result<heapless::Vec<u8, { crate::security::key_management::MAX_BLOB_SIZE }>, StorageError>
+    {
         self.filesystem.read_key(key_id)
     }
 
@@ -311,8 +336,13 @@ impl<Chip: FlashChip> StorageManager<Chip> {
         } else {
             1
         };
-        self.filesystem
-            .write_key(key_id, key_type, encrypted_blob, plaintext_hash, sector_count)
+        self.filesystem.write_key(
+            key_id,
+            key_type,
+            encrypted_blob,
+            plaintext_hash,
+            sector_count,
+        )
     }
 
     /// Delete a key.
@@ -439,8 +469,7 @@ impl<Chip: FlashChip> StorageManager<Chip> {
 
         // Mark recovering chip as resyncing.
         self.chip_states[recovering_idx] = ChipState::Resyncing { progress_sector: 0 };
-        self.mirror_pairs[pair_idx].state =
-            MirrorState::Resyncing { progress_sector: 0 };
+        self.mirror_pairs[pair_idx].state = MirrorState::Resyncing { progress_sector: 0 };
 
         // Copy all sectors from healthy to recovering chip.
         let capacity = self.filesystem.chips[healthy_idx].capacity();
@@ -469,10 +498,12 @@ impl<Chip: FlashChip> StorageManager<Chip> {
                     .map_err(|_| HsmError::Storage(StorageError::WriteError))?;
             }
 
-            self.chip_states[recovering_idx] =
-                ChipState::Resyncing { progress_sector: sector };
-            self.mirror_pairs[pair_idx].state =
-                MirrorState::Resyncing { progress_sector: sector };
+            self.chip_states[recovering_idx] = ChipState::Resyncing {
+                progress_sector: sector,
+            };
+            self.mirror_pairs[pair_idx].state = MirrorState::Resyncing {
+                progress_sector: sector,
+            };
 
             // Yield to allow other embassy tasks to run.
             embassy_time::Timer::after_micros(0).await;
@@ -588,4 +619,3 @@ impl<Chip: FlashChip> StorageManager<Chip> {
         self.resync_chip(degraded_chip).await
     }
 }
-

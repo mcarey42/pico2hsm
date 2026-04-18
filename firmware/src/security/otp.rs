@@ -126,14 +126,12 @@ impl Otp {
     /// Each pair of bytes is stored as one ECC-protected 16-bit word.
     /// Returns `Err` if any row yields an ECC error or is read-locked.
     pub fn read_storage_key_material(&self) -> Result<[u8; 64], HsmError> {
-        read_ecc_bytes_64(OTP_STORAGE_KEY_ROW_START as usize)
-            .map_err(otp_err_to_hsm)
+        read_ecc_bytes_64(OTP_STORAGE_KEY_ROW_START as usize).map_err(otp_err_to_hsm)
     }
 
     /// Read 32 bytes of device identity key material from OTP rows 0x120–0x127.
     pub fn read_device_identity_material(&self) -> Result<[u8; 32], HsmError> {
-        read_ecc_bytes_32(OTP_DEVICE_ID_KEY_ROW_START as usize)
-            .map_err(otp_err_to_hsm)
+        read_ecc_bytes_32(OTP_DEVICE_ID_KEY_ROW_START as usize).map_err(otp_err_to_hsm)
     }
 
     /// Read the boot flags word from OTP row 0x110.
@@ -141,8 +139,7 @@ impl Otp {
     /// Returns the lower 24 bits (raw read, not ECC) since flags are packed
     /// as individual bits and do not benefit from ECC.
     pub fn read_boot_flags(&self) -> Result<u32, HsmError> {
-        otp::read_raw_word(OTP_BOOT_FLAGS_ROW as usize)
-            .map_err(otp_err_to_hsm)
+        otp::read_raw_word(OTP_BOOT_FLAGS_ROW as usize).map_err(otp_err_to_hsm)
     }
 
     /// Write 64 bytes of storage key material (one-time operation).
@@ -155,14 +152,12 @@ impl Otp {
             defmt::error!("OTP: write_storage_key_material called on provisioned device");
             return Err(HsmError::NotSupported);
         }
-        write_ecc_bytes(OTP_STORAGE_KEY_ROW_START as usize, key.as_ref())
-            .map_err(otp_err_to_hsm)
+        write_ecc_bytes(OTP_STORAGE_KEY_ROW_START as usize, key.as_ref()).map_err(otp_err_to_hsm)
     }
 
     /// Write 32 bytes of device identity key material (one-time operation).
     pub fn write_device_identity_material(&mut self, key: &[u8; 32]) -> Result<(), HsmError> {
-        write_ecc_bytes(OTP_DEVICE_ID_KEY_ROW_START as usize, key.as_ref())
-            .map_err(otp_err_to_hsm)
+        write_ecc_bytes(OTP_DEVICE_ID_KEY_ROW_START as usize, key.as_ref()).map_err(otp_err_to_hsm)
     }
 
     /// Check if the device has been provisioned.
@@ -203,11 +198,9 @@ impl Otp {
     ///
     /// Writes bit 1 of OTP row 0x110.  Once set, this bit cannot be cleared.
     pub fn set_production_mode(&mut self) -> Result<(), HsmError> {
-        let current = otp::read_raw_word(OTP_BOOT_FLAGS_ROW as usize)
-            .map_err(otp_err_to_hsm)?;
+        let current = otp::read_raw_word(OTP_BOOT_FLAGS_ROW as usize).map_err(otp_err_to_hsm)?;
         let new_flags = current | BOOT_FLAG_PRODUCTION_MODE | BOOT_FLAG_PROVISIONED;
-        otp::write_raw_word(OTP_BOOT_FLAGS_ROW as usize, new_flags)
-            .map_err(otp_err_to_hsm)?;
+        otp::write_raw_word(OTP_BOOT_FLAGS_ROW as usize, new_flags).map_err(otp_err_to_hsm)?;
         defmt::warn!("OTP: production mode flag set — IRREVERSIBLE");
         Ok(())
     }
@@ -229,11 +222,9 @@ impl Otp {
             defmt::error!("OTP: JTAG disable attempted outside production mode");
             return Err(HsmError::NotSupported);
         }
-        let current = otp::read_raw_word(OTP_BOOT_FLAGS_ROW as usize)
-            .map_err(otp_err_to_hsm)?;
+        let current = otp::read_raw_word(OTP_BOOT_FLAGS_ROW as usize).map_err(otp_err_to_hsm)?;
         let new_flags = current | BOOT_FLAG_JTAG_DISABLED;
-        otp::write_raw_word(OTP_BOOT_FLAGS_ROW as usize, new_flags)
-            .map_err(otp_err_to_hsm)?;
+        otp::write_raw_word(OTP_BOOT_FLAGS_ROW as usize, new_flags).map_err(otp_err_to_hsm)?;
         defmt::warn!("OTP: JTAG disable fuse set — IRREVERSIBLE");
         Ok(())
     }
@@ -248,7 +239,7 @@ fn read_ecc_bytes_32(row_start: usize) -> Result<[u8; 32], otp::Error> {
     let mut out = [0u8; 32];
     for i in 0..16 {
         let word = otp::read_ecc_word(row_start + i)?;
-        out[i * 2]     = (word >> 8) as u8;
+        out[i * 2] = (word >> 8) as u8;
         out[i * 2 + 1] = (word & 0xFF) as u8;
     }
     Ok(out)
@@ -261,7 +252,7 @@ fn read_ecc_bytes_64(row_start: usize) -> Result<[u8; 64], otp::Error> {
     let mut out = [0u8; 64];
     for i in 0..32 {
         let word = otp::read_ecc_word(row_start + i)?;
-        out[i * 2]     = (word >> 8) as u8;
+        out[i * 2] = (word >> 8) as u8;
         out[i * 2 + 1] = (word & 0xFF) as u8;
     }
     Ok(out)
@@ -276,7 +267,11 @@ fn write_ecc_bytes(row_start: usize, data: &[u8]) -> Result<(), otp::Error> {
     let num_rows = (len + 1) / 2;
     for i in 0..num_rows {
         let high = data[i * 2] as u16;
-        let low = if i * 2 + 1 < len { data[i * 2 + 1] as u16 } else { 0 };
+        let low = if i * 2 + 1 < len {
+            data[i * 2 + 1] as u16
+        } else {
+            0
+        };
         let word = (high << 8) | low;
         otp::write_ecc_word(row_start + i, word)?;
     }
@@ -289,13 +284,8 @@ fn write_ecc_bytes(row_start: usize, data: &[u8]) -> Result<(), otp::Error> {
 ///
 /// Returns `Err` if the row is read-locked or the index is out of range.
 pub fn read_row(row: u8) -> Result<[u8; 3], StorageError> {
-    let val = otp::read_raw_word(row as usize)
-        .map_err(otp_err_to_storage)?;
-    Ok([
-        (val >> 16) as u8,
-        (val >> 8) as u8,
-        val as u8,
-    ])
+    let val = otp::read_raw_word(row as usize).map_err(otp_err_to_storage)?;
+    Ok([(val >> 16) as u8, (val >> 8) as u8, val as u8])
 }
 
 /// Write one OTP row (burns fuses — irreversible).
@@ -303,8 +293,7 @@ pub fn read_row(row: u8) -> Result<[u8; 3], StorageError> {
 /// `data` is 3 bytes big-endian representing a 24-bit OTP value.
 pub fn write_row(row: u8, data: [u8; 3]) -> Result<(), StorageError> {
     let val: u32 = ((data[0] as u32) << 16) | ((data[1] as u32) << 8) | (data[2] as u32);
-    otp::write_raw_word(row as usize, val)
-        .map_err(otp_err_to_storage)
+    otp::write_raw_word(row as usize, val).map_err(otp_err_to_storage)
 }
 
 /// Permanently lock a range of OTP rows for reading via the RP2350 SW_LOCK
@@ -342,8 +331,8 @@ pub fn write_row(row: u8, data: [u8; 3]) -> Result<(), StorageError> {
 /// Single-caller assumption: this is called once at provisioning time.
 #[cfg(target_arch = "arm")]
 pub fn lock_read(row_start: u8, row_count: u8) -> Result<(), StorageError> {
-    use embassy_rp::pac::OTP;
     use embassy_rp::pac::otp::vals::{SwLockNsec, SwLockSec};
+    use embassy_rp::pac::OTP;
 
     if row_count == 0 {
         return Ok(());
@@ -351,13 +340,18 @@ pub fn lock_read(row_start: u8, row_count: u8) -> Result<(), StorageError> {
 
     // Compute the range of OTP pages covered by [row_start, row_start + row_count).
     let first_page = (row_start as usize) / 64;
-    let last_row = (row_start as usize).saturating_add(row_count as usize).saturating_sub(1);
+    let last_row = (row_start as usize)
+        .saturating_add(row_count as usize)
+        .saturating_sub(1);
     let last_page = last_row / 64;
 
     // Validate page indices — OTP has 64 pages (0..63).
     if last_page >= 64 {
-        defmt::error!("OTP: lock_read — row range 0x{:02X}+{} exceeds OTP page count",
-            row_start, row_count);
+        defmt::error!(
+            "OTP: lock_read — row range 0x{:02X}+{} exceeds OTP page count",
+            row_start,
+            row_count
+        );
         return Err(StorageError::WriteError);
     }
 
@@ -373,8 +367,12 @@ pub fn lock_read(row_start: u8, row_count: u8) -> Result<(), StorageError> {
                 w.set_nsec(SwLockNsec::INACCESSIBLE);
             });
         }
-        defmt::warn!("OTP: page {} read-locked (rows 0x{:02X}–0x{:02X}) — reset required to unlock",
-            page, page * 64, page * 64 + 63);
+        defmt::warn!(
+            "OTP: page {} read-locked (rows 0x{:02X}–0x{:02X}) — reset required to unlock",
+            page,
+            page * 64,
+            page * 64 + 63
+        );
     }
 
     Ok(())
@@ -394,20 +392,25 @@ pub fn lock_read(_row_start: u8, _row_count: u8) -> Result<(), StorageError> {
 /// See `lock_read()` for page mapping and register layout details.
 #[cfg(target_arch = "arm")]
 pub fn lock_write(row_start: u8, row_count: u8) -> Result<(), StorageError> {
-    use embassy_rp::pac::OTP;
     use embassy_rp::pac::otp::vals::{SwLockNsec, SwLockSec};
+    use embassy_rp::pac::OTP;
 
     if row_count == 0 {
         return Ok(());
     }
 
     let first_page = (row_start as usize) / 64;
-    let last_row = (row_start as usize).saturating_add(row_count as usize).saturating_sub(1);
+    let last_row = (row_start as usize)
+        .saturating_add(row_count as usize)
+        .saturating_sub(1);
     let last_page = last_row / 64;
 
     if last_page >= 64 {
-        defmt::error!("OTP: lock_write — row range 0x{:02X}+{} exceeds OTP page count",
-            row_start, row_count);
+        defmt::error!(
+            "OTP: lock_write — row range 0x{:02X}+{} exceeds OTP page count",
+            row_start,
+            row_count
+        );
         return Err(StorageError::WriteError);
     }
 
@@ -419,8 +422,12 @@ pub fn lock_write(row_start: u8, row_count: u8) -> Result<(), StorageError> {
                 w.set_nsec(SwLockNsec::READ_ONLY);
             });
         }
-        defmt::warn!("OTP: page {} write-locked (rows 0x{:02X}–0x{:02X})",
-            page, page * 64, page * 64 + 63);
+        defmt::warn!(
+            "OTP: page {} write-locked (rows 0x{:02X}–0x{:02X})",
+            page,
+            page * 64,
+            page * 64 + 63
+        );
     }
 
     Ok(())
@@ -443,8 +450,7 @@ pub fn read_root_secret() -> Result<[u8; 32], StorageError> {
         if byte_idx >= 32 {
             break;
         }
-        let raw = otp::read_raw_word(row)
-            .map_err(otp_err_to_storage)?;
+        let raw = otp::read_raw_word(row).map_err(otp_err_to_storage)?;
         let bytes = [(raw >> 16) as u8, (raw >> 8) as u8, raw as u8];
         for &b in &bytes {
             if byte_idx < 32 {
@@ -473,8 +479,7 @@ pub fn derive_smk() -> Result<[u8; 32], StorageError> {
     use hkdf::Hkdf;
     use sha2::Sha256;
 
-    let ikm = read_ecc_bytes_64(OTP_STORAGE_KEY_ROW_START as usize)
-        .map_err(otp_err_to_storage)?;
+    let ikm = read_ecc_bytes_64(OTP_STORAGE_KEY_ROW_START as usize).map_err(otp_err_to_storage)?;
     let salt = b"pico2hsm-smk";
 
     let hk = Hkdf::<Sha256>::new(Some(salt), &ikm);

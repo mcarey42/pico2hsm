@@ -21,10 +21,7 @@ pub mod pkcs15_objects;
 
 use heapless::{String, Vec};
 use pico2hsm_core::{
-    apdu::{
-        ApduCommand, ApduResponse, SW_CLASS_NOT_SUPPORTED, SW_INS_NOT_SUPPORTED,
-        SW_OK,
-    },
+    apdu::{ApduCommand, ApduResponse, SW_CLASS_NOT_SUPPORTED, SW_INS_NOT_SUPPORTED, SW_OK},
     error::HsmError,
     key::{AppletId, KeyId, KeyType as CoreKeyType},
     protocol::HsmProtocol,
@@ -46,7 +43,10 @@ impl crate::storage::KeyStore for LocalNullStore {
     fn save_key(&mut self, _: &crate::security::key_management::KeyObject) -> Result<(), HsmError> {
         Ok(())
     }
-    fn fetch_key(&mut self, _: KeyId) -> Result<Option<crate::security::key_management::KeyObject>, HsmError> {
+    fn fetch_key(
+        &mut self,
+        _: KeyId,
+    ) -> Result<Option<crate::security::key_management::KeyObject>, HsmError> {
         Ok(None)
     }
     fn erase_key(&mut self, _: KeyId) -> Result<(), HsmError> {
@@ -65,8 +65,9 @@ impl crate::storage::KeyStore for LocalNullStore {
 }
 
 /// AID for SmartCard-HSM (pico2hsm variant).
-pub const SC_HSM_AID: &[u8] =
-    &[0xE8, 0x2B, 0x06, 0x01, 0x04, 0x01, 0x81, 0xC3, 0x1F, 0x02, 0x01];
+pub const SC_HSM_AID: &[u8] = &[
+    0xE8, 0x2B, 0x06, 0x01, 0x04, 0x01, 0x81, 0xC3, 0x1F, 0x02, 0x01,
+];
 
 /// Maximum PIN length in bytes.
 pub const MAX_PIN_LEN: usize = 16;
@@ -473,7 +474,8 @@ impl ScHsmState {
             addr_of_mut!((*dest).exchange_ephem_pub).write(None);
             addr_of_mut!((*dest).exchange_challenge).write(None);
             addr_of_mut!((*dest).exchange_peer_ephem_pub).write(None);
-            addr_of_mut!((*dest).exchange_challenge_cache).write([[0u8; 32]; MAX_EXCHANGE_CHALLENGE_CACHE]);
+            addr_of_mut!((*dest).exchange_challenge_cache)
+                .write([[0u8; 32]; MAX_EXCHANGE_CHALLENGE_CACHE]);
             addr_of_mut!((*dest).exchange_challenge_cache_count).write(0);
             addr_of_mut!((*dest).exchange_challenge_cache_write_idx).write(0);
             addr_of_mut!((*dest).generation).write(0);
@@ -525,7 +527,9 @@ pub struct ScHsm {
 impl ScHsm {
     /// Create a new SC-HSM protocol instance.
     pub fn new() -> Self {
-        ScHsm { state: ScHsmState::new() }
+        ScHsm {
+            state: ScHsmState::new(),
+        }
     }
 
     /// Initialise an `ScHsm` directly into a destination pointer, avoiding
@@ -583,12 +587,18 @@ impl ScHsm {
             // SW=9000 from LIST KEYS instead of import behaviour — this is a known
             // limitation.  Custom tooling should continue to use INS=0x74.
             import_key::INS_IMPORT_KEY => import_key::handle(&mut self.state, store, cmd),
-            change_pin::INS_CHANGE_PIN => change_pin::handle_with_store(&mut self.state, store, cmd),
-            reset_retry::INS_RESET_RETRY => reset_retry::handle_with_store(&mut self.state, store, cmd),
+            change_pin::INS_CHANGE_PIN => {
+                change_pin::handle_with_store(&mut self.state, store, cmd)
+            }
+            reset_retry::INS_RESET_RETRY => {
+                reset_retry::handle_with_store(&mut self.state, store, cmd)
+            }
             extras::INS_EXTRAS => extras::handle(&mut self.state, store, cmd),
             // File commands that need flash access.
             read_binary::INS_READ_BINARY => read_binary::handle(&mut self.state, store, cmd),
-            read_binary::INS_READ_BINARY_ODD => read_binary::handle_odd(&mut self.state, store, cmd),
+            read_binary::INS_READ_BINARY_ODD => {
+                read_binary::handle_odd(&mut self.state, store, cmd)
+            }
             update_binary::INS_UPDATE_BINARY => update_binary::handle(&mut self.state, store, cmd),
             write_data::INS_WRITE_DATA => write_data::handle(&mut self.state, store, cmd),
             // Crypto operations that now load keys from flash on-demand.
@@ -620,21 +630,45 @@ impl ScHsm {
             // Commands that need flash access — use LocalNullStore in the
             // stateless dispatch path (host-side tests).  On firmware the
             // dispatch_with_store() route is taken instead.
-            initialize::INS_INITIALIZE => initialize::handle(&mut self.state, &mut LocalNullStore, cmd),
-            generate_keypair::INS_GENERATE_KEYPAIR => generate_keypair::handle(&mut self.state, &mut LocalNullStore, cmd),
-            generate_key::INS_GENERATE_KEY => generate_key::handle(&mut self.state, &mut LocalNullStore, cmd),
-            export_key::INS_EXPORT_KEY | 0x34 => export_key::handle(&mut self.state, &mut LocalNullStore, cmd),
-            import_key::INS_IMPORT_KEY => import_key::handle(&mut self.state, &mut LocalNullStore, cmd),
-            delete_file::INS_DELETE_FILE => delete_file::handle(&mut self.state, &mut LocalNullStore, cmd),
+            initialize::INS_INITIALIZE => {
+                initialize::handle(&mut self.state, &mut LocalNullStore, cmd)
+            }
+            generate_keypair::INS_GENERATE_KEYPAIR => {
+                generate_keypair::handle(&mut self.state, &mut LocalNullStore, cmd)
+            }
+            generate_key::INS_GENERATE_KEY => {
+                generate_key::handle(&mut self.state, &mut LocalNullStore, cmd)
+            }
+            export_key::INS_EXPORT_KEY | 0x34 => {
+                export_key::handle(&mut self.state, &mut LocalNullStore, cmd)
+            }
+            import_key::INS_IMPORT_KEY => {
+                import_key::handle(&mut self.state, &mut LocalNullStore, cmd)
+            }
+            delete_file::INS_DELETE_FILE => {
+                delete_file::handle(&mut self.state, &mut LocalNullStore, cmd)
+            }
             extras::INS_EXTRAS => extras::handle(&mut self.state, &mut LocalNullStore, cmd),
-            read_binary::INS_READ_BINARY => read_binary::handle(&mut self.state, &mut LocalNullStore, cmd),
-            read_binary::INS_READ_BINARY_ODD => read_binary::handle_odd(&mut self.state, &mut LocalNullStore, cmd),
-            update_binary::INS_UPDATE_BINARY => update_binary::handle(&mut self.state, &mut LocalNullStore, cmd),
-            write_data::INS_WRITE_DATA => write_data::handle(&mut self.state, &mut LocalNullStore, cmd),
+            read_binary::INS_READ_BINARY => {
+                read_binary::handle(&mut self.state, &mut LocalNullStore, cmd)
+            }
+            read_binary::INS_READ_BINARY_ODD => {
+                read_binary::handle_odd(&mut self.state, &mut LocalNullStore, cmd)
+            }
+            update_binary::INS_UPDATE_BINARY => {
+                update_binary::handle(&mut self.state, &mut LocalNullStore, cmd)
+            }
+            write_data::INS_WRITE_DATA => {
+                write_data::handle(&mut self.state, &mut LocalNullStore, cmd)
+            }
             sign::INS_SIGN => sign::handle(&mut self.state, &mut LocalNullStore, cmd),
-            general_auth::INS_GENERAL_AUTH => general_auth::handle(&mut self.state, &mut LocalNullStore, cmd),
+            general_auth::INS_GENERAL_AUTH => {
+                general_auth::handle(&mut self.state, &mut LocalNullStore, cmd)
+            }
             pso::INS_PSO => pso::handle(&mut self.state, &mut LocalNullStore, cmd),
-            cipher_sym::INS_CIPHER_SYM => cipher_sym::handle(&mut self.state, &mut LocalNullStore, cmd),
+            cipher_sym::INS_CIPHER_SYM => {
+                cipher_sym::handle(&mut self.state, &mut LocalNullStore, cmd)
+            }
             bip_slip::INS_BIP_SLIP => bip_slip::handle(&mut self.state, &mut LocalNullStore, cmd),
             decrypt::INS_DECRYPT => {
                 if cmd.p1 == derive_asym::P1_DERIVE {
@@ -643,8 +677,12 @@ impl ScHsm {
                     decrypt::handle(&mut self.state, &mut LocalNullStore, cmd)
                 }
             }
-            change_pin::INS_CHANGE_PIN => change_pin::handle_with_store(&mut self.state, &mut LocalNullStore, cmd),
-            reset_retry::INS_RESET_RETRY => reset_retry::handle_with_store(&mut self.state, &mut LocalNullStore, cmd),
+            change_pin::INS_CHANGE_PIN => {
+                change_pin::handle_with_store(&mut self.state, &mut LocalNullStore, cmd)
+            }
+            reset_retry::INS_RESET_RETRY => {
+                reset_retry::handle_with_store(&mut self.state, &mut LocalNullStore, cmd)
+            }
             // Commands that don't need flash access (stateless dispatch).
             verify::INS_VERIFY => verify::handle(&mut self.state, cmd),
             mse::INS_MSE => mse::handle(&mut self.state, cmd),
@@ -656,10 +694,18 @@ impl ScHsm {
             session_pin::INS_SESSION_PIN => session_pin::handle(&mut self.state, cmd),
             puk_auth::INS_PUK_AUTH => puk_auth::handle(&mut self.state, cmd),
             select::INS_SELECT => select::handle(&mut self.state, cmd),
-            provisioning::INS_PROV_GET_STATUS => provisioning::handle_get_status(&mut self.state, cmd),
-            provisioning::INS_PROV_SET_PRODUCTION => provisioning::handle_set_production_mode(&mut self.state, cmd),
-            provisioning::INS_PROV_LOCK_OTP_ROWS => provisioning::handle_lock_otp_rows(&mut self.state, cmd),
-            provisioning::INS_PROV_WRITE_CRIT1 => provisioning::handle_write_crit1(&mut self.state, cmd),
+            provisioning::INS_PROV_GET_STATUS => {
+                provisioning::handle_get_status(&mut self.state, cmd)
+            }
+            provisioning::INS_PROV_SET_PRODUCTION => {
+                provisioning::handle_set_production_mode(&mut self.state, cmd)
+            }
+            provisioning::INS_PROV_LOCK_OTP_ROWS => {
+                provisioning::handle_lock_otp_rows(&mut self.state, cmd)
+            }
+            provisioning::INS_PROV_WRITE_CRIT1 => {
+                provisioning::handle_write_crit1(&mut self.state, cmd)
+            }
             #[cfg(feature = "debug")]
             debug_dump::INS_DEBUG_DUMP => debug_dump::handle(cmd),
             _ => ApduResponse::err(SW_INS_NOT_SUPPORTED),
@@ -716,7 +762,12 @@ impl ScHsm {
 
         crate::CORE1_PROGRESS.store(35, core::sync::atomic::Ordering::Relaxed);
         let kid = Self::sc_hsm_pin_key_id();
-        let mut obj = KeyObject::new(KmKeyType::Generic, kid.0, AppletId::ScHsm, AlgorithmId::AesGcm);
+        let mut obj = KeyObject::new(
+            KmKeyType::Generic,
+            kid.0,
+            AppletId::ScHsm,
+            AlgorithmId::AesGcm,
+        );
         crate::CORE1_PROGRESS.store(36, core::sync::atomic::Ordering::Relaxed);
         let _ = obj.private_key.extend_from_slice(&buf);
         crate::CORE1_PROGRESS.store(37, core::sync::atomic::Ordering::Relaxed);
@@ -725,7 +776,10 @@ impl ScHsm {
     }
 
     /// Load PIN/SO-PIN/PUK state from flash into `state`.
-    pub fn load_pin_state_from_store(state: &mut ScHsmState, store: &mut dyn crate::storage::KeyStore) {
+    pub fn load_pin_state_from_store(
+        state: &mut ScHsmState,
+        store: &mut dyn crate::storage::KeyStore,
+    ) {
         let kid = Self::sc_hsm_pin_key_id();
         if let Ok(Some(obj)) = store.fetch_key(kid) {
             let b = &obj.private_key;
@@ -734,15 +788,27 @@ impl ScHsm {
             // requiring re-INITIALIZE (acceptable on pre-production devices).
             if b.len() >= 149 {
                 let user_hash: [u8; 32] = b[0..32].try_into().unwrap_or([0u8; 32]);
-                state.user_pin_hash = if user_hash == [0u8; 32] { None } else { Some(user_hash) };
+                state.user_pin_hash = if user_hash == [0u8; 32] {
+                    None
+                } else {
+                    Some(user_hash)
+                };
                 state.user_pin_salt = b[32..48].try_into().unwrap_or([0u8; 16]);
                 state.pin_retry_count = b[48];
                 let so_hash: [u8; 32] = b[49..81].try_into().unwrap_or([0u8; 32]);
-                state.so_pin_hash = if so_hash == [0u8; 32] { None } else { Some(so_hash) };
+                state.so_pin_hash = if so_hash == [0u8; 32] {
+                    None
+                } else {
+                    Some(so_hash)
+                };
                 state.so_pin_salt = b[81..97].try_into().unwrap_or([0u8; 16]);
                 state.so_pin_retry_count = b[97];
                 let puk_hash: [u8; 32] = b[98..130].try_into().unwrap_or([0u8; 32]);
-                state.puk_hash = if puk_hash == [0u8; 32] { None } else { Some(puk_hash) };
+                state.puk_hash = if puk_hash == [0u8; 32] {
+                    None
+                } else {
+                    Some(puk_hash)
+                };
                 state.puk_salt = b[130..146].try_into().unwrap_or([0u8; 16]);
                 state.puk_retry_count = b[146];
                 state.initialized = b[147] != 0;
@@ -772,7 +838,12 @@ impl ScHsm {
             let _ = buf.extend_from_slice(pubkey);
             let _ = buf.push(state.dkek_unauthenticated_allowed as u8);
 
-            let mut obj = KeyObject::new(KmKeyType::Generic, kid.0, AppletId::ScHsm, AlgorithmId::AesGcm);
+            let mut obj = KeyObject::new(
+                KmKeyType::Generic,
+                kid.0,
+                AppletId::ScHsm,
+                AlgorithmId::AesGcm,
+            );
             let _ = obj.private_key.extend_from_slice(&buf);
             let _ = store.save_key(&obj);
         } else {
@@ -782,7 +853,10 @@ impl ScHsm {
     }
 
     /// Load the enrolled peer public key from flash into `state`.
-    pub fn load_peer_pubkey_from_store(state: &mut ScHsmState, store: &mut dyn crate::storage::KeyStore) {
+    pub fn load_peer_pubkey_from_store(
+        state: &mut ScHsmState,
+        store: &mut dyn crate::storage::KeyStore,
+    ) {
         let kid = Self::sc_hsm_peer_pubkey_key_id();
         if let Ok(Some(obj)) = store.fetch_key(kid) {
             let b = &obj.private_key;

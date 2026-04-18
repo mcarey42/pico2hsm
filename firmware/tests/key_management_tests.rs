@@ -6,7 +6,7 @@
 
 use pico2hsm_core::key::AppletId;
 use pico2hsm_firmware::security::key_management::{
-    AlgorithmId, KeyError, KeyObject, KeyType, derive_key_encryption_key,
+    derive_key_encryption_key, AlgorithmId, KeyError, KeyObject, KeyType,
 };
 
 // ---------------------------------------------------------------------------
@@ -20,7 +20,9 @@ const TEST_SMK: [u8; 32] = [0xAA; 32];
 const TEST_DEVICE_ID: [u8; 16] = [0x42; 16];
 
 /// Fixed 12-byte nonce used for deterministic encrypt/decrypt tests.
-const TEST_NONCE: [u8; 12] = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC];
+const TEST_NONCE: [u8; 12] = [
+    0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC,
+];
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -54,7 +56,10 @@ fn aes_key(id: u8) -> KeyObject {
 fn test_kek_derivation_deterministic() {
     let kek1 = derive_key_encryption_key(&TEST_SMK, 0x01).unwrap();
     let kek2 = derive_key_encryption_key(&TEST_SMK, 0x01).unwrap();
-    assert_eq!(*kek1, *kek2, "KEK derivation must be deterministic for the same key_id");
+    assert_eq!(
+        *kek1, *kek2,
+        "KEK derivation must be deterministic for the same key_id"
+    );
 }
 
 #[test]
@@ -124,7 +129,10 @@ fn test_key_object_encrypt_decrypt_roundtrip_aes() {
     assert_eq!(recovered.key_id, kid);
     assert_eq!(recovered.algorithm, AlgorithmId::AesGcm);
     assert_eq!(recovered.private_key.as_slice(), &[0x55u8; 32]);
-    assert!(recovered.public_key.is_empty(), "AES keys have no public component");
+    assert!(
+        recovered.public_key.is_empty(),
+        "AES keys have no public component"
+    );
 }
 
 #[test]
@@ -166,7 +174,10 @@ fn test_key_object_wrong_key_id_fails() {
     let result = KeyObject::decrypt(&blob, kid, &TEST_SMK);
 
     assert!(
-        matches!(result, Err(KeyError::DecryptFailure | KeyError::InvalidFormat)),
+        matches!(
+            result,
+            Err(KeyError::DecryptFailure | KeyError::InvalidFormat)
+        ),
         "Decrypt with wrong key_id must fail"
     );
 }
@@ -244,18 +255,24 @@ fn test_key_object_with_use_count_preserved() {
     let kid = pico2hsm_core::key::KeyId::sc_hsm(0, 0x08).0;
     let recovered = KeyObject::decrypt(&blob, kid, &TEST_SMK).unwrap();
 
-    assert_eq!(recovered.use_count, 1234, "use_count must be preserved through encrypt/decrypt");
-    assert_eq!(recovered.generation, 99, "generation must be preserved through encrypt/decrypt");
+    assert_eq!(
+        recovered.use_count, 1234,
+        "use_count must be preserved through encrypt/decrypt"
+    );
+    assert_eq!(
+        recovered.generation, 99,
+        "generation must be preserved through encrypt/decrypt"
+    );
 }
 
 // ---------------------------------------------------------------------------
 // DKEK wrap / unwrap roundtrip
 // ---------------------------------------------------------------------------
 
-const TEST_DKEK: [u8; 32] = [0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE,
-                               0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
-                               0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x11, 0x22,
-                               0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0x00];
+const TEST_DKEK: [u8; 32] = [
+    0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+    0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0x00,
+];
 
 #[test]
 fn test_dkek_wrap_unwrap_roundtrip_ec() {
@@ -270,7 +287,8 @@ fn test_dkek_wrap_unwrap_roundtrip_ec() {
         &TEST_DEVICE_ID,
         0x20, // new key_id on importing HSM
         AlgorithmId::EcdsaP256,
-    ).unwrap();
+    )
+    .unwrap();
 
     // Private key material must match
     assert_eq!(
@@ -295,7 +313,8 @@ fn test_dkek_wrap_unwrap_roundtrip_aes() {
         &TEST_DEVICE_ID,
         0x21,
         AlgorithmId::AesGcm,
-    ).unwrap();
+    )
+    .unwrap();
 
     assert_eq!(
         recovered.private_key.as_slice(),
@@ -307,7 +326,9 @@ fn test_dkek_wrap_unwrap_roundtrip_aes() {
 #[test]
 fn test_dkek_wrap_wrong_dkek_fails() {
     let obj = ec_key(0x12);
-    let blob = obj.wrap_dkek(&TEST_DKEK, &TEST_DEVICE_ID, &TEST_NONCE).unwrap();
+    let blob = obj
+        .wrap_dkek(&TEST_DKEK, &TEST_DEVICE_ID, &TEST_NONCE)
+        .unwrap();
 
     let wrong_dkek = [0xFFu8; 32];
     let result = KeyObject::unwrap_dkek(
@@ -327,7 +348,9 @@ fn test_dkek_wrap_wrong_dkek_fails() {
 #[test]
 fn test_dkek_wrap_wrong_device_id_fails() {
     let obj = ec_key(0x13);
-    let blob = obj.wrap_dkek(&TEST_DKEK, &TEST_DEVICE_ID, &TEST_NONCE).unwrap();
+    let blob = obj
+        .wrap_dkek(&TEST_DKEK, &TEST_DEVICE_ID, &TEST_NONCE)
+        .unwrap();
 
     let wrong_device_id = [0x99u8; 16];
     let result = KeyObject::unwrap_dkek(
@@ -347,7 +370,9 @@ fn test_dkek_wrap_wrong_device_id_fails() {
 #[test]
 fn test_dkek_blob_tamper_fails() {
     let obj = ec_key(0x14);
-    let mut blob = obj.wrap_dkek(&TEST_DKEK, &TEST_DEVICE_ID, &TEST_NONCE).unwrap();
+    let mut blob = obj
+        .wrap_dkek(&TEST_DKEK, &TEST_DEVICE_ID, &TEST_NONCE)
+        .unwrap();
 
     // Flip a byte in the ciphertext (between nonce [0..12] and tag [len-16..])
     blob[15] ^= 0x55;
@@ -372,7 +397,9 @@ fn test_dkek_wrap_blob_format() {
     // For a 32-byte private key with no padding (already block-aligned: 1+2+32=35 → pad 5 → 40),
     // ciphertext is 40 bytes, so total = 12 + 40 + 16 = 68 bytes.
     let obj = ec_key(0x15);
-    let blob = obj.wrap_dkek(&TEST_DKEK, &TEST_DEVICE_ID, &TEST_NONCE).unwrap();
+    let blob = obj
+        .wrap_dkek(&TEST_DKEK, &TEST_DEVICE_ID, &TEST_NONCE)
+        .unwrap();
 
     assert!(
         blob.len() >= 12 + 16,

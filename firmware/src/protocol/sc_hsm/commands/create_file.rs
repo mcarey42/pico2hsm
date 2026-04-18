@@ -6,9 +6,7 @@
 //! OpenSC sends: `00 E0 00 00 02 <fid_hi> <fid_lo>`
 //! The 2-byte data field is the new file identifier.
 
-use pico2hsm_core::apdu::{
-    ApduCommand, ApduResponse, SW_SECURITY_STATUS, SW_WRONG_DATA,
-};
+use pico2hsm_core::apdu::{ApduCommand, ApduResponse, SW_SECURITY_STATUS, SW_WRONG_DATA};
 
 use crate::protocol::sc_hsm::ScHsmState;
 

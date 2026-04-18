@@ -111,13 +111,13 @@ where
         let jedec24 = ((id[0] as u32) << 16) | ((id[1] as u32) << 8) | (id[2] as u32);
 
         let (capacity, needs_4b) = match jedec24 {
-            0xEF4015 => (2 * 1024 * 1024, false),   // W25Q16  — 2 MB
-            0xEF4016 => (4 * 1024 * 1024, false),   // W25Q32  — 4 MB
-            0xEF4017 => (8 * 1024 * 1024, false),   // W25Q64  — 8 MB
-            0xEF4018 => (16 * 1024 * 1024, false),  // W25Q128 — 16 MB
-            0xEF4019 => (32 * 1024 * 1024, true),   // W25Q256 — 32 MB
-            0xEF4020 => (64 * 1024 * 1024, true),   // W25Q512 — 64 MB
-            0xEF4022 => (256 * 1024 * 1024, true),  // W25Q02  — 256 MB
+            0xEF4015 => (2 * 1024 * 1024, false),  // W25Q16  — 2 MB
+            0xEF4016 => (4 * 1024 * 1024, false),  // W25Q32  — 4 MB
+            0xEF4017 => (8 * 1024 * 1024, false),  // W25Q64  — 8 MB
+            0xEF4018 => (16 * 1024 * 1024, false), // W25Q128 — 16 MB
+            0xEF4019 => (32 * 1024 * 1024, true),  // W25Q256 — 32 MB
+            0xEF4020 => (64 * 1024 * 1024, true),  // W25Q512 — 64 MB
+            0xEF4022 => (256 * 1024 * 1024, true), // W25Q02  — 256 MB
             _ => {
                 defmt::error!(
                     "SpiFlash: unknown JEDEC ID 0x{:06X} — chip not present or unsupported",
@@ -168,7 +168,9 @@ where
     }
 
     fn spi_transfer(&mut self, read: &mut [u8], write: &[u8]) -> Result<(), StorageError> {
-        self.spi.transfer(read, write).map_err(|_| StorageError::ReadError)
+        self.spi
+            .transfer(read, write)
+            .map_err(|_| StorageError::ReadError)
     }
 
     // ── Address encoding ────────────────────────────────────────────────────
@@ -390,7 +392,11 @@ where
         self.bad_block_table
             .push(sector)
             .map_err(|_| StorageError::WriteError)?;
-        defmt::warn!("SpiFlash: sector {} marked bad (total bad: {})", sector, self.bad_block_table.len());
+        defmt::warn!(
+            "SpiFlash: sector {} marked bad (total bad: {})",
+            sector,
+            self.bad_block_table.len()
+        );
         Ok(())
     }
 }
@@ -544,7 +550,10 @@ pub struct SpiFlashLegacy {
 impl SpiFlashLegacy {
     #[allow(dead_code)]
     pub fn new(_capacity: u64) -> Self {
-        SpiFlashLegacy { capacity: _capacity, degraded: false }
+        SpiFlashLegacy {
+            capacity: _capacity,
+            degraded: false,
+        }
     }
 }
 

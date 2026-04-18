@@ -38,8 +38,7 @@ use pico2hsm_core::{
     flash::{FlashChip, PAGE_SIZE, SECTOR_SIZE},
     key::{KeyId, KeyRecord, KeyType},
     storage::{
-        ChipState, DATA_START_SECTOR, DIRECTORY_SECTOR, SECTOR_MAGIC,
-        WAL_SECTOR_0, WAL_SECTOR_1,
+        ChipState, DATA_START_SECTOR, DIRECTORY_SECTOR, SECTOR_MAGIC, WAL_SECTOR_0, WAL_SECTOR_1,
     },
     storage::{DirectoryEntry, ObjectHeader},
 };
@@ -101,7 +100,9 @@ impl Directory {
             return Ok(());
         }
         // Append new entry.
-        self.entries.push(entry).map_err(|_| StorageError::KeystoreFull)?;
+        self.entries
+            .push(entry)
+            .map_err(|_| StorageError::KeystoreFull)?;
         self.dirty = true;
         Ok(())
     }
@@ -225,12 +226,18 @@ impl Directory {
                 flags,
                 _pad: [pad],
             };
-            self.entries.push(entry).map_err(|_| StorageError::KeystoreFull)?;
+            self.entries
+                .push(entry)
+                .map_err(|_| StorageError::KeystoreFull)?;
             offset += DIR_ENTRY_SIZE;
         }
 
         if crc_accum != stored_crc {
-            defmt::warn!("Directory: CRC mismatch — stored {:04X}, computed {:04X}", stored_crc, crc_accum);
+            defmt::warn!(
+                "Directory: CRC mismatch — stored {:04X}, computed {:04X}",
+                stored_crc,
+                crc_accum
+            );
             return Err(StorageError::IntegrityFailure);
         }
 
@@ -290,7 +297,9 @@ impl<Chip: FlashChip> KeyFilesystem<Chip> {
 
     /// Add a chip to the filesystem (call before `mount()`).
     pub fn add_chip(&mut self, chip: Chip) -> Result<(), StorageError> {
-        self.chips.push(chip).map_err(|_| StorageError::KeystoreFull)?;
+        self.chips
+            .push(chip)
+            .map_err(|_| StorageError::KeystoreFull)?;
         Ok(())
     }
 
@@ -348,9 +357,15 @@ impl<Chip: FlashChip> KeyFilesystem<Chip> {
                     }
                 }
             } else if IntegrityChecker::is_blank(sector0) {
-                defmt::info!("KeyFilesystem: chip {} sector 0 is blank — needs format", chip_index);
+                defmt::info!(
+                    "KeyFilesystem: chip {} sector 0 is blank — needs format",
+                    chip_index
+                );
             } else {
-                defmt::warn!("KeyFilesystem: chip {} sector 0 has unexpected content", chip_index);
+                defmt::warn!(
+                    "KeyFilesystem: chip {} sector 0 has unexpected content",
+                    chip_index
+                );
             }
         }
 
@@ -396,11 +411,17 @@ impl<Chip: FlashChip> KeyFilesystem<Chip> {
         for chip in self.chips.iter_mut() {
             let addr = DIRECTORY_SECTOR * SECTOR_SIZE as u32;
             if let Err(e) = chip.erase_sector(addr) {
-                defmt::warn!("KeyFilesystem: erase directory sector failed: {:?}", defmt::Debug2Format(&e));
+                defmt::warn!(
+                    "KeyFilesystem: erase directory sector failed: {:?}",
+                    defmt::Debug2Format(&e)
+                );
                 continue;
             }
             if let Err(e) = write_sector(chip, addr, &buf) {
-                defmt::warn!("KeyFilesystem: write directory sector failed: {:?}", defmt::Debug2Format(&e));
+                defmt::warn!(
+                    "KeyFilesystem: write directory sector failed: {:?}",
+                    defmt::Debug2Format(&e)
+                );
             }
         }
         self.directory.dirty = false;
@@ -412,11 +433,12 @@ impl<Chip: FlashChip> KeyFilesystem<Chip> {
     /// Read a key object's encrypted blob from flash.
     ///
     /// Returns the ciphertext bytes (the caller decrypts and verifies BLAKE2s).
-    pub fn read_key(&mut self, key_id: KeyId) -> Result<heapless::Vec<u8, { crate::security::key_management::MAX_BLOB_SIZE }>, StorageError> {
-        let entry = self
-            .directory
-            .find(key_id)
-            .ok_or(StorageError::ReadError)?;
+    pub fn read_key(
+        &mut self,
+        key_id: KeyId,
+    ) -> Result<heapless::Vec<u8, { crate::security::key_management::MAX_BLOB_SIZE }>, StorageError>
+    {
+        let entry = self.directory.find(key_id).ok_or(StorageError::ReadError)?;
 
         let chip_index = entry.chip_index as usize;
         let sector_index = entry.sector_index;
@@ -426,7 +448,8 @@ impl<Chip: FlashChip> KeyFilesystem<Chip> {
             return Err(StorageError::ReadError);
         }
 
-        let mut out: heapless::Vec<u8, { crate::security::key_management::MAX_BLOB_SIZE }> = heapless::Vec::new();
+        let mut out: heapless::Vec<u8, { crate::security::key_management::MAX_BLOB_SIZE }> =
+            heapless::Vec::new();
         // The total plaintext length is stored in the header; read it from the
         // first sector and use it to truncate the output (sector data is padded
         // to 256-byte alignment for CRC, but the caller needs the exact blob).
@@ -525,7 +548,7 @@ impl<Chip: FlashChip> KeyFilesystem<Chip> {
             plaintext_len,
             sector_count,
             seq_no,
-            crc32: 0,    // computed below
+            crc32: 0, // computed below
             blake2s: *plaintext_hash,
         };
 
@@ -592,11 +615,12 @@ impl<Chip: FlashChip> KeyFilesystem<Chip> {
     pub fn delete_key(&mut self, key_id: KeyId) -> Result<(), StorageError> {
         // Look up entry before removing from directory.
         let (chip_index, sector_index, sector_count) = {
-            let entry = self
-                .directory
-                .find(key_id)
-                .ok_or(StorageError::ReadError)?;
-            (entry.chip_index as usize, entry.sector_index, entry.sector_count as u32)
+            let entry = self.directory.find(key_id).ok_or(StorageError::ReadError)?;
+            (
+                entry.chip_index as usize,
+                entry.sector_index,
+                entry.sector_count as u32,
+            )
         };
 
         if chip_index >= self.chips.len() {
@@ -607,7 +631,11 @@ impl<Chip: FlashChip> KeyFilesystem<Chip> {
         for s in 0..sector_count {
             let addr = (sector_index + s) * SECTOR_SIZE as u32;
             if let Err(e) = self.chips[chip_index].erase_sector(addr) {
-                defmt::warn!("KeyFilesystem: erase sector {} failed: {:?}", sector_index + s, defmt::Debug2Format(&e));
+                defmt::warn!(
+                    "KeyFilesystem: erase sector {} failed: {:?}",
+                    sector_index + s,
+                    defmt::Debug2Format(&e)
+                );
             }
         }
 
@@ -672,11 +700,7 @@ impl<Chip: FlashChip> KeyFilesystem<Chip> {
                 if IntegrityChecker::verify_magic(&buf)
                     && IntegrityChecker::verify_crc32(&buf).is_err()
                 {
-                    defmt::warn!(
-                        "scrub: CRC32 failure chip {} sector {}",
-                        chip_idx,
-                        sector
-                    );
+                    defmt::warn!("scrub: CRC32 failure chip {} sector {}", chip_idx, sector);
                     report.errors_found += 1;
                 }
             }
@@ -697,7 +721,9 @@ impl<Chip: FlashChip> KeyFilesystem<Chip> {
             }
             let cap_sectors = (chip.capacity() / SECTOR_SIZE as u64) as u32;
             // Find `needed_sectors` consecutive free sectors.
-            if let Some(start) = self.find_consecutive_free(chip_idx as u8, cap_sectors, needed_sectors) {
+            if let Some(start) =
+                self.find_consecutive_free(chip_idx as u8, cap_sectors, needed_sectors)
+            {
                 return Ok((chip_idx, start));
             }
         }
@@ -740,7 +766,11 @@ impl<Chip: FlashChip> KeyFilesystem<Chip> {
 // ─── Free functions ───────────────────────────────────────────────────────────
 
 /// Write a full 4096-byte sector to a chip using 16 × 256-byte page writes.
-pub fn write_sector<C: FlashChip>(chip: &mut C, addr: u32, data: &[u8; SECTOR_SIZE]) -> Result<(), StorageError> {
+pub fn write_sector<C: FlashChip>(
+    chip: &mut C,
+    addr: u32,
+    data: &[u8; SECTOR_SIZE],
+) -> Result<(), StorageError> {
     for p in 0..16usize {
         let page_addr = addr + (p * PAGE_SIZE) as u32;
         chip.write_page(page_addr, &data[p * PAGE_SIZE..(p + 1) * PAGE_SIZE])?;

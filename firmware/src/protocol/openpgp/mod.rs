@@ -40,25 +40,17 @@ pub const OPENPGP_AID_PREFIX: &[u8] = &[0xD2, 0x76, 0x00, 0x01, 0x24, 0x01];
 /// 00 00 00 01 = serial number (placeholder)
 /// 00 00 = RFU
 pub const OPENPGP_AID: [u8; 16] = [
-    0xD2, 0x76, 0x00, 0x01, 0x24, 0x01,
-    0x03, 0x04,
-    0xFF, 0xFF,
-    0x00, 0x00, 0x00, 0x01,
-    0x00, 0x00,
+    0xD2, 0x76, 0x00, 0x01, 0x24, 0x01, 0x03, 0x04, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00,
 ];
 
 /// P-256 OID bytes (1.2.840.10045.3.1.7) — used in algorithm attributes.
 pub const P256_OID: &[u8] = &[0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07];
 
 /// Default algorithm attributes for ECDSA (SIG/AUTH): `13` + P-256 OID.
-pub const DEFAULT_ECDSA_ALGO_ATTRS: &[u8] = &[
-    0x13, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07,
-];
+pub const DEFAULT_ECDSA_ALGO_ATTRS: &[u8] = &[0x13, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07];
 
 /// Default algorithm attributes for ECDH (DEC): `12` + P-256 OID.
-pub const DEFAULT_ECDH_ALGO_ATTRS: &[u8] = &[
-    0x12, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07,
-];
+pub const DEFAULT_ECDH_ALGO_ATTRS: &[u8] = &[0x12, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07];
 
 /// Ed25519 OID: 1.3.6.1.4.1.11591.15.1
 #[cfg(feature = "applet-openpgp-curve25519")]
@@ -70,9 +62,8 @@ pub const X25519_OID: &[u8] = &[0x2B, 0x06, 0x01, 0x04, 0x01, 0x97, 0x55, 0x01, 
 
 /// Default algorithm attributes for EdDSA (SIG/AUTH): `16` + Ed25519 OID.
 #[cfg(feature = "applet-openpgp-curve25519")]
-pub const DEFAULT_EDDSA_ALGO_ATTRS: &[u8] = &[
-    0x16, 0x2B, 0x06, 0x01, 0x04, 0x01, 0xDA, 0x47, 0x0F, 0x01,
-];
+pub const DEFAULT_EDDSA_ALGO_ATTRS: &[u8] =
+    &[0x16, 0x2B, 0x06, 0x01, 0x04, 0x01, 0xDA, 0x47, 0x0F, 0x01];
 
 /// Default algorithm attributes for X25519 (DEC): `12` + X25519 OID.
 #[cfg(feature = "applet-openpgp-curve25519")]
@@ -174,7 +165,6 @@ pub struct OpenPgpState {
 
     // --- Termination flag (set by TERMINATE DF, cleared by ACTIVATE FILE) ---
     pub terminated: bool,
-
 }
 
 impl OpenPgpState {
@@ -333,9 +323,7 @@ impl OpenPgp {
             generate_keypair::INS_GENERATE_KEYPAIR => {
                 generate_keypair::handle_with_store(&mut self.state, store, cmd)
             }
-            verify::INS_VERIFY => {
-                verify::handle_with_store(&mut self.state, store, cmd)
-            }
+            verify::INS_VERIFY => verify::handle_with_store(&mut self.state, store, cmd),
             change_pin::INS_CHANGE_PIN => {
                 change_pin::handle_with_store(&mut self.state, store, cmd)
             }

@@ -39,28 +39,29 @@ const CCID_DESCRIPTOR_TYPE: u8 = 0x21;
 /// - dwFeatures: auto params + T=1 + extended APDUs (0x000400FE)
 /// - dwMaxCCIDMessageLength: 4096 (0x00001000)
 const CCID_CLASS_DESCRIPTOR: [u8; 54] = [
-    54,         // bLength
-    0x21,       // bDescriptorType (CCID)
+    54,   // bLength
+    0x21, // bDescriptorType (CCID)
     0x10, 0x01, // bcdCCID (1.10)
-    0x00,       // bMaxSlotIndex (0 = 1 slot)
-    0x03,       // bVoltageSupport (5V and 3.3V)
-    0x02, 0x00, 0x00, 0x00,  // dwProtocols: T=1
-    0xA0, 0x0F, 0x00, 0x00,  // dwDefaultClock (4000 kHz)
-    0xA0, 0x0F, 0x00, 0x00,  // dwMaximumClock
-    0x00,       // bNumClockSupported
-    0x00, 0x2A, 0x00, 0x00,  // dwDataRate (10752 bps default)
-    0x00, 0x2A, 0x00, 0x00,  // dwMaxDataRate
-    0x00,       // bNumDataRatesSupported
-    0xFE, 0x00, 0x00, 0x00,  // dwMaxIFSD (254)
-    0x00, 0x00, 0x00, 0x00,  // dwSynchProtocols
-    0x00, 0x00, 0x00, 0x00,  // dwMechanical
-    0xFE, 0x00, 0x04, 0x00,  // dwFeatures: 0x000400FE — auto-params + Short&Extended APDU exchange
-    0x00, 0x10, 0x00, 0x00,  // dwMaxCCIDMessageLength (4096)
-    0xFF,       // bClassGetResponse
-    0xFF,       // bClassEnvelope
+    0x00, // bMaxSlotIndex (0 = 1 slot)
+    0x03, // bVoltageSupport (5V and 3.3V)
+    0x02, 0x00, 0x00, 0x00, // dwProtocols: T=1
+    0xA0, 0x0F, 0x00, 0x00, // dwDefaultClock (4000 kHz)
+    0xA0, 0x0F, 0x00, 0x00, // dwMaximumClock
+    0x00, // bNumClockSupported
+    0x00, 0x2A, 0x00, 0x00, // dwDataRate (10752 bps default)
+    0x00, 0x2A, 0x00, 0x00, // dwMaxDataRate
+    0x00, // bNumDataRatesSupported
+    0xFE, 0x00, 0x00, 0x00, // dwMaxIFSD (254)
+    0x00, 0x00, 0x00, 0x00, // dwSynchProtocols
+    0x00, 0x00, 0x00, 0x00, // dwMechanical
+    0xFE, 0x00, 0x04,
+    0x00, // dwFeatures: 0x000400FE — auto-params + Short&Extended APDU exchange
+    0x00, 0x10, 0x00, 0x00, // dwMaxCCIDMessageLength (4096)
+    0xFF, // bClassGetResponse
+    0xFF, // bClassEnvelope
     0x00, 0x00, // wLcdLayout (no LCD)
-    0x00,       // bPINSupport
-    0x01,       // bMaxCCIDBusySlots
+    0x00, // bPINSupport
+    0x01, // bMaxCCIDBusySlots
 ];
 
 // ─── PC_to_RDR message type codes ─────────────────────────────────────────
@@ -159,7 +160,10 @@ impl CcidHeader {
         let len = self.length.to_le_bytes();
         [
             self.msg_type,
-            len[0], len[1], len[2], len[3],
+            len[0],
+            len[1],
+            len[2],
+            len[3],
             self.slot,
             self.seq,
             self.status,
@@ -283,7 +287,8 @@ impl<'d, D: Driver<'d>> CcidTransport<'d, D> {
         let _ = embassy_time::with_timeout(
             embassy_time::Duration::from_millis(250),
             self.intr_ep.write(&[0x50, 0x03]),
-        ).await;
+        )
+        .await;
     }
 
     /// Wait for a complete APDU from the host.
@@ -329,10 +334,19 @@ impl<'d, D: Driver<'d>> CcidTransport<'d, D> {
                 }
                 PC_TO_RDR_ESCAPE => {
                     // Not supported — return command-not-supported
-                    self.send_slot_status(RDR_TO_PC_ESCAPE, header.seq, STATUS_CMD_NOT_SUPPORTED, 0x00).await?;
+                    self.send_slot_status(
+                        RDR_TO_PC_ESCAPE,
+                        header.seq,
+                        STATUS_CMD_NOT_SUPPORTED,
+                        0x00,
+                    )
+                    .await?;
                 }
-                PC_TO_RDR_ICCCLOCK | PC_TO_RDR_T0APDU | PC_TO_RDR_MECHANICAL
-                | PC_TO_RDR_ABORT | PC_TO_RDR_SETDATARATE => {
+                PC_TO_RDR_ICCCLOCK
+                | PC_TO_RDR_T0APDU
+                | PC_TO_RDR_MECHANICAL
+                | PC_TO_RDR_ABORT
+                | PC_TO_RDR_SETDATARATE => {
                     // Not supported — return slot status with command-not-supported
                     let resp = self.build_slot_status(header.seq, STATUS_CMD_NOT_SUPPORTED, 0x00);
                     self.write_response(&resp).await?;
@@ -375,12 +389,15 @@ impl<'d, D: Driver<'d>> CcidTransport<'d, D> {
     pub async fn send_time_extension(&mut self) -> Result<(), CcidError> {
         let msg = [
             RDR_TO_PC_DATABLOCK,
-            0x00, 0x00, 0x00, 0x00, // dwLength = 0 (no APDU data yet)
-            0x00,                    // bSlot
+            0x00,
+            0x00,
+            0x00,
+            0x00, // dwLength = 0 (no APDU data yet)
+            0x00, // bSlot
             self.pending_seq,
-            0x80,                    // bStatus: bmCommandStatus = 10 (time extension)
-            0x01,                    // bError: 1 BWI unit extension
-            0x00,                    // bChainParameter
+            0x80, // bStatus: bmCommandStatus = 10 (time extension)
+            0x01, // bError: 1 BWI unit extension
+            0x00, // bChainParameter
         ];
         self.write_response(&msg).await
     }
@@ -396,8 +413,10 @@ impl<'d, D: Driver<'d>> CcidTransport<'d, D> {
         // 10-byte header alone creates a short packet that terminates the transfer
         // before the APDU data arrives, leaving libccid with no response data.
         let mut msg: Vec<u8, 4106> = Vec::new(); // 10 header + up to 4096 payload
-        msg.extend_from_slice(&hdr).map_err(|_| CcidError::BufferOverflow)?;
-        msg.extend_from_slice(apdu_response).map_err(|_| CcidError::BufferOverflow)?;
+        msg.extend_from_slice(&hdr)
+            .map_err(|_| CcidError::BufferOverflow)?;
+        msg.extend_from_slice(apdu_response)
+            .map_err(|_| CcidError::BufferOverflow)?;
         let total = msg.len();
         self.write_response(&msg).await?;
         // Zero-length packet if total is an exact multiple of the bulk packet size.
@@ -500,7 +519,10 @@ impl<'d, D: Driver<'d>> CcidTransport<'d, D> {
         let len_le = (T1_PARAMS.len() as u32).to_le_bytes();
         let hdr = [
             RDR_TO_PC_PARAMETERS,
-            len_le[0], len_le[1], len_le[2], len_le[3],
+            len_le[0],
+            len_le[1],
+            len_le[2],
+            len_le[3],
             0x00, // bSlot
             seq,
             STATUS_OK,
@@ -530,13 +552,9 @@ impl<'d, D: Driver<'d>> CcidTransport<'d, D> {
         error: u8,
     ) -> Result<(), CcidError> {
         let resp = [
-            msg_type,
-            0x00, 0x00, 0x00, 0x00, // dwLength = 0
+            msg_type, 0x00, 0x00, 0x00, 0x00, // dwLength = 0
             0x00, // bSlot
-            seq,
-            status,
-            error,
-            0x00, // bSpecific
+            seq, status, error, 0x00, // bSpecific
         ];
         self.write_response(&resp).await
     }
@@ -546,12 +564,15 @@ impl<'d, D: Driver<'d>> CcidTransport<'d, D> {
         let len = payload_len.to_le_bytes();
         [
             RDR_TO_PC_DATABLOCK,
-            len[0], len[1], len[2], len[3],
+            len[0],
+            len[1],
+            len[2],
+            len[3],
             0x00, // bSlot
             seq,
-            STATUS_OK,  // bStatus
-            ERROR_OK,   // bError
-            0x00,       // bChainParameter (no chaining on our side)
+            STATUS_OK, // bStatus
+            ERROR_OK,  // bError
+            0x00,      // bChainParameter (no chaining on our side)
         ]
     }
 
@@ -559,7 +580,10 @@ impl<'d, D: Driver<'d>> CcidTransport<'d, D> {
     fn build_slot_status(&self, seq: u8, status: u8, error: u8) -> [u8; 10] {
         [
             RDR_TO_PC_SLOTSTATUS,
-            0x00, 0x00, 0x00, 0x00, // dwLength = 0
+            0x00,
+            0x00,
+            0x00,
+            0x00, // dwLength = 0
             0x00, // bSlot
             seq,
             status,
@@ -567,7 +591,6 @@ impl<'d, D: Driver<'d>> CcidTransport<'d, D> {
             0x00, // bClockStatus (card clock running)
         ]
     }
-
 }
 
 // ─── Legacy types kept for compatibility with the existing scaffold ───────────
@@ -627,11 +650,7 @@ impl CcidHandler {
     /// Process one incoming CCID bulk message.
     ///
     /// Returns the response bytes to be sent on the bulk IN endpoint.
-    pub async fn process_message<'a>(
-        &mut self,
-        _msg: &'a [u8],
-        _out: &mut Vec<u8, 512>,
-    ) {
+    pub async fn process_message<'a>(&mut self, _msg: &'a [u8], _out: &mut Vec<u8, 512>) {
         // TODO: implement
     }
 }

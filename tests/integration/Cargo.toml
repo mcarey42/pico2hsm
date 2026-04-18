@@ -1,9 +1,17 @@
 [package]
 name = "pico2hsm-integration-tests"
-version = "0.1.0"
-edition = "2021"
-description = "Integration test harness for pico2hsm"
-license = "MIT"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+description = "Integration test harness for the pico2hsm USB HSM firmware"
+readme = "../../README.md"
+keywords = ["hsm", "smartcard", "testing", "rp2350"]
+categories = ["development-tools::testing", "embedded"]
+publish = false
 
 [dependencies]
 pico2hsm-core = { path = "../../pico2hsm-core" }
@@ -15,3 +23,6 @@ path = "tests/apdu_parsing.rs"
 [[test]]
 name = "key_types"
 path = "tests/key_types.rs"
+
+[lints]
+workspace = true

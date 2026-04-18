@@ -44,10 +44,7 @@
 // Always import shared types — St7789StatusDisplay implements LedController unconditionally.
 use super::{LedController, LedStatus};
 // Board is only needed inside the feature-gated impl block.
-#[cfg(any(
-    feature = "rp2350_geek_16m",
-    feature = "rp2350_geek_sdcard",
-))]
+#[cfg(any(feature = "rp2350_geek_16m", feature = "rp2350_geek_sdcard",))]
 use super::Board;
 
 // ─── GPIO pin assignments ─────────────────────────────────────────────────────
@@ -92,21 +89,21 @@ pub const LCD_SPI_FREQ_HZ: u32 = 30_000_000;
 // ─── ST7789 register constants ────────────────────────────────────────────────
 
 const ST7789_SWRESET: u8 = 0x01;
-const ST7789_SLPOUT: u8  = 0x11;
-const ST7789_NORON: u8   = 0x13;
-const ST7789_INVON: u8   = 0x21;
-const ST7789_DISPON: u8  = 0x29;
-const ST7789_CASET: u8   = 0x2A;
-const ST7789_RASET: u8   = 0x2B;
-const ST7789_RAMWR: u8   = 0x2C;
-const ST7789_MADCTL: u8  = 0x36;
-const ST7789_COLMOD: u8  = 0x3A;
+const ST7789_SLPOUT: u8 = 0x11;
+const ST7789_NORON: u8 = 0x13;
+const ST7789_INVON: u8 = 0x21;
+const ST7789_DISPON: u8 = 0x29;
+const ST7789_CASET: u8 = 0x2A;
+const ST7789_RASET: u8 = 0x2B;
+const ST7789_RAMWR: u8 = 0x2C;
+const ST7789_MADCTL: u8 = 0x36;
+const ST7789_COLMOD: u8 = 0x3A;
 
 /// Display physical dimensions (landscape orientation after MADCTL rotation).
 /// The ST7789 in the RP2350-Geek is a 240×135 panel mounted landscape.
 /// CASET range: 52..(52+240-1) = 52..291
 /// RASET range: 40..(40+135-1) = 40..174
-pub const LCD_WIDTH: u16  = 240;
+pub const LCD_WIDTH: u16 = 240;
 pub const LCD_HEIGHT: u16 = 135;
 const LCD_COL_OFFSET: u16 = 52;
 const LCD_ROW_OFFSET: u16 = 40;
@@ -195,10 +192,10 @@ impl St7789StatusDisplay {
 
         // Safety: these four GPIOs are exclusively wired to the ST7789 LCD on
         // the RP2350-Geek and are not claimed anywhere else in the firmware.
-        let dc  = Output::new(unsafe { AnyPin::steal(LCD_DC_PIN) },  Level::Low);
-        let cs  = Output::new(unsafe { AnyPin::steal(LCD_CS_PIN) },  Level::High); // deasserted
+        let dc = Output::new(unsafe { AnyPin::steal(LCD_DC_PIN) }, Level::Low);
+        let cs = Output::new(unsafe { AnyPin::steal(LCD_CS_PIN) }, Level::High); // deasserted
         let rst = Output::new(unsafe { AnyPin::steal(LCD_RST_PIN) }, Level::High); // not in reset
-        let bl  = Output::new(unsafe { AnyPin::steal(LCD_BL_PIN) },  Level::Low);  // backlight off
+        let bl = Output::new(unsafe { AnyPin::steal(LCD_BL_PIN) }, Level::Low); // backlight off
 
         let mut display = Self {
             spi,
@@ -237,17 +234,27 @@ impl St7789StatusDisplay {
     pub async fn flush(&mut self) {
         // Re-assert the visible window before RAMWR.
         let col_start = LCD_COL_OFFSET;
-        let col_end   = LCD_COL_OFFSET + LCD_WIDTH - 1;
+        let col_end = LCD_COL_OFFSET + LCD_WIDTH - 1;
         let row_start = LCD_ROW_OFFSET;
-        let row_end   = LCD_ROW_OFFSET + LCD_HEIGHT - 1;
-        self.write_command_data(ST7789_CASET, &[
-            (col_start >> 8) as u8, (col_start & 0xFF) as u8,
-            (col_end   >> 8) as u8, (col_end   & 0xFF) as u8,
-        ]);
-        self.write_command_data(ST7789_RASET, &[
-            (row_start >> 8) as u8, (row_start & 0xFF) as u8,
-            (row_end   >> 8) as u8, (row_end   & 0xFF) as u8,
-        ]);
+        let row_end = LCD_ROW_OFFSET + LCD_HEIGHT - 1;
+        self.write_command_data(
+            ST7789_CASET,
+            &[
+                (col_start >> 8) as u8,
+                (col_start & 0xFF) as u8,
+                (col_end >> 8) as u8,
+                (col_end & 0xFF) as u8,
+            ],
+        );
+        self.write_command_data(
+            ST7789_RASET,
+            &[
+                (row_start >> 8) as u8,
+                (row_start & 0xFF) as u8,
+                (row_end >> 8) as u8,
+                (row_end & 0xFF) as u8,
+            ],
+        );
 
         self.dc.set_low();
         self.cs_assert();
@@ -386,25 +393,31 @@ impl St7789StatusDisplay {
 
         // Column address set: 52 to 291 (52 + 240 - 1)
         let col_start = LCD_COL_OFFSET;
-        let col_end   = LCD_COL_OFFSET + LCD_WIDTH - 1;
+        let col_end = LCD_COL_OFFSET + LCD_WIDTH - 1;
         defmt::info!("ST7789: CASET {}..{}...", col_start, col_end);
-        self.write_command_data(ST7789_CASET, &[
-            (col_start >> 8) as u8,
-            (col_start & 0xFF) as u8,
-            (col_end   >> 8) as u8,
-            (col_end   & 0xFF) as u8,
-        ]);
+        self.write_command_data(
+            ST7789_CASET,
+            &[
+                (col_start >> 8) as u8,
+                (col_start & 0xFF) as u8,
+                (col_end >> 8) as u8,
+                (col_end & 0xFF) as u8,
+            ],
+        );
 
         // Row address set: 40 to 174 (40 + 135 - 1)
         let row_start = LCD_ROW_OFFSET;
-        let row_end   = LCD_ROW_OFFSET + LCD_HEIGHT - 1;
+        let row_end = LCD_ROW_OFFSET + LCD_HEIGHT - 1;
         defmt::info!("ST7789: RASET {}..{}...", row_start, row_end);
-        self.write_command_data(ST7789_RASET, &[
-            (row_start >> 8) as u8,
-            (row_start & 0xFF) as u8,
-            (row_end   >> 8) as u8,
-            (row_end   & 0xFF) as u8,
-        ]);
+        self.write_command_data(
+            ST7789_RASET,
+            &[
+                (row_start >> 8) as u8,
+                (row_start & 0xFF) as u8,
+                (row_end >> 8) as u8,
+                (row_end & 0xFF) as u8,
+            ],
+        );
 
         // Inversion on — ST7789 requires INVON for correct (non-inverted) colours
         defmt::info!("ST7789: INVON...");
@@ -440,22 +453,28 @@ impl St7789StatusDisplay {
         // Re-assert the column and row windows before RAMWR in case they were
         // disturbed by a previous partial write.
         let col_start = LCD_COL_OFFSET;
-        let col_end   = LCD_COL_OFFSET + LCD_WIDTH - 1;
+        let col_end = LCD_COL_OFFSET + LCD_WIDTH - 1;
         let row_start = LCD_ROW_OFFSET;
-        let row_end   = LCD_ROW_OFFSET + LCD_HEIGHT - 1;
+        let row_end = LCD_ROW_OFFSET + LCD_HEIGHT - 1;
 
-        self.write_command_data(ST7789_CASET, &[
-            (col_start >> 8) as u8,
-            (col_start & 0xFF) as u8,
-            (col_end   >> 8) as u8,
-            (col_end   & 0xFF) as u8,
-        ]);
-        self.write_command_data(ST7789_RASET, &[
-            (row_start >> 8) as u8,
-            (row_start & 0xFF) as u8,
-            (row_end   >> 8) as u8,
-            (row_end   & 0xFF) as u8,
-        ]);
+        self.write_command_data(
+            ST7789_CASET,
+            &[
+                (col_start >> 8) as u8,
+                (col_start & 0xFF) as u8,
+                (col_end >> 8) as u8,
+                (col_end & 0xFF) as u8,
+            ],
+        );
+        self.write_command_data(
+            ST7789_RASET,
+            &[
+                (row_start >> 8) as u8,
+                (row_start & 0xFF) as u8,
+                (row_end >> 8) as u8,
+                (row_end & 0xFF) as u8,
+            ],
+        );
 
         // Begin RAM write
         self.dc.set_low();
@@ -465,8 +484,8 @@ impl St7789StatusDisplay {
 
         // Convert RGB565 to RGB444: extract top 4 bits of each channel.
         let r = ((color >> 12) & 0x0F) as u8;
-        let g = ((color >> 7)  & 0x0F) as u8;
-        let b = ((color >> 1)  & 0x0F) as u8;
+        let g = ((color >> 7) & 0x0F) as u8;
+        let b = ((color >> 1) & 0x0F) as u8;
 
         // Pack two identical pixels into 3 bytes (RGB444 Interface II):
         //   Byte 0: R1G1, Byte 1: B1R2, Byte 2: G2B2
@@ -477,7 +496,7 @@ impl St7789StatusDisplay {
         // Write rows one at a time — 360 bytes per row (240 pixels × 3/2 bytes).
         let mut row_buf = [0u8; (LCD_WIDTH as usize) * 3 / 2]; // 360 bytes
         for i in 0..(LCD_WIDTH as usize / 2) {
-            row_buf[i * 3]     = byte0;
+            row_buf[i * 3] = byte0;
             row_buf[i * 3 + 1] = byte1;
             row_buf[i * 3 + 2] = byte2;
         }
@@ -491,13 +510,13 @@ impl St7789StatusDisplay {
     /// Map a `LedStatus` to an RGB565 colour for the status screen.
     fn status_color(status: LedStatus) -> u16 {
         match status {
-            LedStatus::Off          => 0x0000, // black
-            LedStatus::Ready        => 0x07E0, // green
-            LedStatus::Busy         => 0x001F, // blue
-            LedStatus::Error        => 0xF800, // red
-            LedStatus::Degraded     => 0xFFE0, // yellow
-            LedStatus::Resyncing    => 0x07FF, // cyan
-            LedStatus::WaitingForPin=> 0x031F, // bright blue (slightly lighter)
+            LedStatus::Off => 0x0000,           // black
+            LedStatus::Ready => 0x07E0,         // green
+            LedStatus::Busy => 0x001F,          // blue
+            LedStatus::Error => 0xF800,         // red
+            LedStatus::Degraded => 0xFFE0,      // yellow
+            LedStatus::Resyncing => 0x07FF,     // cyan
+            LedStatus::WaitingForPin => 0x031F, // bright blue (slightly lighter)
         }
     }
 }
@@ -521,7 +540,10 @@ impl LedController for St7789StatusDisplay {
 use embedded_graphics::{
     draw_target::DrawTarget,
     geometry::{OriginDimensions, Size},
-    pixelcolor::{Rgb565, raw::{RawData, RawU16}},
+    pixelcolor::{
+        raw::{RawData, RawU16},
+        Rgb565,
+    },
     primitives::Rectangle,
     Pixel,
 };
@@ -600,7 +622,10 @@ impl DrawTarget for St7789StatusDisplay {
         I: IntoIterator<Item = Self::Color>,
     {
         use embedded_graphics::geometry::Point;
-        let disp = Rectangle::new(Point::zero(), Size::new(LCD_WIDTH as u32, LCD_HEIGHT as u32));
+        let disp = Rectangle::new(
+            Point::zero(),
+            Size::new(LCD_WIDTH as u32, LCD_HEIGHT as u32),
+        );
         let area = area.intersection(&disp);
         if area.size.width == 0 || area.size.height == 0 {
             return Ok(());
@@ -610,24 +635,32 @@ impl DrawTarget for St7789StatusDisplay {
         let fb = unsafe { &mut *(&raw mut FRAMEBUF) };
         let x0 = area.top_left.x as usize;
         let y0 = area.top_left.y as usize;
-        let w  = area.size.width as usize;
+        let w = area.size.width as usize;
 
         let mut col = 0usize;
         let mut row = 0usize;
         for color in colors {
-            if row >= area.size.height as usize { break; }
+            if row >= area.size.height as usize {
+                break;
+            }
             let (r, g, b) = rgb565_to_rgb444(color);
             let linear = (y0 + row) * LCD_WIDTH as usize + (x0 + col);
             pack_pixel_444(fb, linear, r, g, b);
             col += 1;
-            if col >= w { col = 0; row += 1; }
+            if col >= w {
+                col = 0;
+                row += 1;
+            }
         }
         Ok(())
     }
 
     fn fill_solid(&mut self, area: &Rectangle, color: Self::Color) -> Result<(), Self::Error> {
         use embedded_graphics::geometry::Point;
-        let disp = Rectangle::new(Point::zero(), Size::new(LCD_WIDTH as u32, LCD_HEIGHT as u32));
+        let disp = Rectangle::new(
+            Point::zero(),
+            Size::new(LCD_WIDTH as u32, LCD_HEIGHT as u32),
+        );
         let area = area.intersection(&disp);
         if area.size.width == 0 || area.size.height == 0 {
             return Ok(());
@@ -639,8 +672,8 @@ impl DrawTarget for St7789StatusDisplay {
         let fb = unsafe { &mut *(&raw mut FRAMEBUF) };
         let x0 = area.top_left.x as usize;
         let y0 = area.top_left.y as usize;
-        let w  = area.size.width as usize;
-        let h  = area.size.height as usize;
+        let w = area.size.width as usize;
+        let h = area.size.height as usize;
         for row in y0..(y0 + h) {
             for col in 0..w {
                 let linear = row * LCD_WIDTH as usize + (x0 + col);
@@ -656,7 +689,9 @@ impl DrawTarget for St7789StatusDisplay {
 #[cfg(not(target_arch = "arm"))]
 impl St7789StatusDisplay {
     fn new_stub() -> Self {
-        Self { current_status: LedStatus::Off }
+        Self {
+            current_status: LedStatus::Off,
+        }
     }
 }
 
@@ -715,14 +750,13 @@ impl Rp2350GeekBoard {
 impl Rp2350GeekBoard {
     #[allow(dead_code)]
     fn _new_stub() -> Self {
-        Self { display: St7789StatusDisplay::new_stub() }
+        Self {
+            display: St7789StatusDisplay::new_stub(),
+        }
     }
 }
 
-#[cfg(any(
-    feature = "rp2350_geek_16m",
-    feature = "rp2350_geek_sdcard",
-))]
+#[cfg(any(feature = "rp2350_geek_16m", feature = "rp2350_geek_sdcard",))]
 impl Board for Rp2350GeekBoard {
     type Led = St7789StatusDisplay;
     type Spi0 = Rp2350GeekSpi0;
@@ -743,6 +777,10 @@ impl Board for Rp2350GeekBoard {
         unimplemented!("spi1 not available on non-ARM test build")
     }
 
-    fn spi0_cs_pins(&self) -> &[u8] { &[] }
-    fn spi1_cs_pins(&self) -> &[u8] { &[] }
+    fn spi0_cs_pins(&self) -> &[u8] {
+        &[]
+    }
+    fn spi1_cs_pins(&self) -> &[u8] {
+        &[]
+    }
 }

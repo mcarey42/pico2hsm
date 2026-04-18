@@ -22,7 +22,11 @@ use crate::protocol::sc_hsm::ScHsmState;
 pub const INS_DELETE_FILE: u8 = 0xE4;
 
 /// Handle a DELETE FILE APDU command.
-pub fn handle(state: &mut ScHsmState, store: &mut dyn crate::storage::KeyStore, cmd: &ApduCommand<'_>) -> ApduResponse {
+pub fn handle(
+    state: &mut ScHsmState,
+    store: &mut dyn crate::storage::KeyStore,
+    cmd: &ApduCommand<'_>,
+) -> ApduResponse {
     if !state.pin_verified && !state.so_pin_verified {
         return ApduResponse::err(SW_SECURITY_STATUS);
     }
@@ -51,7 +55,9 @@ pub fn handle(state: &mut ScHsmState, store: &mut dyn crate::storage::KeyStore, 
     if hi == 0xCE {
         // CE xx EF files: look up by EfFile KeyId encoding.
         let ef_key_id = pico2hsm_core::key::KeyId::sc_hsm_ef(0, hi as u8, key_id_proto).0;
-        state.key_index.retain(|m| !(m.key_type == 16 && m.key_id == ef_key_id));
+        state
+            .key_index
+            .retain(|m| !(m.key_type == 16 && m.key_id == ef_key_id));
         // Erase from flash and clear cache.
         if state.key_index.len() < before_idx {
             let _ = store.erase_key(pico2hsm_core::key::KeyId(ef_key_id));

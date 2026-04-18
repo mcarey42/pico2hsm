@@ -6,7 +6,11 @@ tests/hw/__pycache__/
 tests/hw/helpers/__pycache__/
 tools/python/**/__pycache__/
 **/__pycache__/
+*.egg-info/
+tools/python/build/
 *.orig
 .claude/
+!.claude/agents/
+!.claude/agents/**
 ec_firmware_signing_key.pem
 ec_firmware_signing_key.pub

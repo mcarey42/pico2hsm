@@ -20,8 +20,8 @@
 use heapless::Vec;
 use pico2hsm_core::{
     apdu::{
-        ApduCommand, ApduResponse, SW_CLASS_NOT_SUPPORTED, SW_FILE_NOT_FOUND,
-        SW_INS_NOT_SUPPORTED, SW_OK,
+        ApduCommand, ApduResponse, SW_CLASS_NOT_SUPPORTED, SW_FILE_NOT_FOUND, SW_INS_NOT_SUPPORTED,
+        SW_OK,
     },
     protocol::HsmProtocol,
 };
@@ -115,9 +115,8 @@ impl Dispatcher {
                 core::ptr::addr_of_mut!((*sb).data).write_bytes(0u8, 1);
                 core::ptr::addr_of_mut!((*sb).len).write(0);
                 core::ptr::addr_of_mut!((*sb).offset).write(0);
-                core::ptr::addr_of_mut!((*sb).state).write(
-                    crate::apdu::shared_buffer::SharedBufState::Empty,
-                );
+                core::ptr::addr_of_mut!((*sb).state)
+                    .write(crate::apdu::shared_buffer::SharedBufState::Empty);
             }
             &mut *ptr
         }
@@ -291,7 +290,7 @@ impl Dispatcher {
     /// Handle GET RESPONSE (INS=0xC0): serve the next chunk from `shared_buf`.
     fn handle_get_response(&mut self, le: Option<u16>) -> ApduResponse {
         let max_len = match le {
-            None => 4096, // no Le — return all remaining
+            None => 4096,   // no Le — return all remaining
             Some(0) => 256, // short APDU Le=0x00 → 256
             Some(n) => n as usize,
         };
@@ -435,10 +434,9 @@ fn km_algo_to_core_key_type(
         | AlgorithmId::RsaPkcs1Sha512
         | AlgorithmId::RsaPss
         | AlgorithmId::RsaDecrypt => CoreKeyType::RsaPrivate2048,
-        AlgorithmId::AesEcb
-        | AlgorithmId::AesCbc
-        | AlgorithmId::AesCtr
-        | AlgorithmId::AesGcm => CoreKeyType::Aes256,
+        AlgorithmId::AesEcb | AlgorithmId::AesCbc | AlgorithmId::AesCtr | AlgorithmId::AesGcm => {
+            CoreKeyType::Aes256
+        }
         AlgorithmId::Ed25519 => CoreKeyType::Ed25519,
         AlgorithmId::X25519 => CoreKeyType::X25519,
     }
@@ -509,12 +507,12 @@ fn push_ef_to_state(
 /// ```
 fn build_sc_hsm_fci() -> ApduResponse {
     let aid: &[u8] = SC_HSM_AID; // 11 bytes
-    // 4 version bytes: [cwa_major, cwa_minor, hw_major, hw_minor]
+                                 // 4 version bytes: [cwa_major, cwa_minor, hw_major, hw_minor]
     let version: &[u8] = &[0x20, 0x00, 0x00, 0x00];
 
     // A5 inner: 9F 6E 04 + 4 bytes = 7 bytes
     let a5_inner_len: u8 = 2 + 1 + version.len() as u8; // tag(2) + len(1) + data(4) = 7
-    // 6F inner: 84 TLV (13 bytes) + A5 TLV (2+7 = 9 bytes) = 22 bytes
+                                                        // 6F inner: 84 TLV (13 bytes) + A5 TLV (2+7 = 9 bytes) = 22 bytes
     let outer_len: u8 = (2 + aid.len() as u8) + (2 + a5_inner_len);
 
     let mut fci: Vec<u8, 32> = Vec::new();

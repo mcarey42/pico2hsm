@@ -11,8 +11,8 @@
 use subtle::ConstantTimeEq;
 
 use pico2hsm_core::apdu::{
-    ApduCommand, ApduResponse, SW_AUTH_BLOCKED, SW_CONDITIONS_NOT_SATISFIED,
-    SW_SECURITY_STATUS, SW_WRONG_DATA, SW_WRONG_LENGTH, SW_OK,
+    ApduCommand, ApduResponse, SW_AUTH_BLOCKED, SW_CONDITIONS_NOT_SATISFIED, SW_OK,
+    SW_SECURITY_STATUS, SW_WRONG_DATA, SW_WRONG_LENGTH,
 };
 
 use crate::protocol::sc_hsm::ScHsmState;
@@ -197,8 +197,10 @@ pub fn handle(state: &mut ScHsmState, cmd: &ApduCommand<'_>) -> ApduResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pico2hsm_core::apdu::{SW_CONDITIONS_NOT_SATISFIED, SW_OK, SW_SECURITY_STATUS, SW_WRONG_LENGTH};
     use crate::protocol::sc_hsm::ScHsmState;
+    use pico2hsm_core::apdu::{
+        SW_CONDITIONS_NOT_SATISFIED, SW_OK, SW_SECURITY_STATUS, SW_WRONG_LENGTH,
+    };
 
     /// Build a VERIFY APDU with P2=0x82 and a given data payload.
     fn make_session_verify(data: &[u8]) -> heapless::Vec<u8, 32> {

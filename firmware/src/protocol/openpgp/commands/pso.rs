@@ -12,8 +12,7 @@
 
 use pico2hsm_core::{
     apdu::{
-        ApduCommand, ApduResponse, SW_CONDITIONS_NOT_SATISFIED, SW_SECURITY_STATUS,
-        SW_WRONG_DATA,
+        ApduCommand, ApduResponse, SW_CONDITIONS_NOT_SATISFIED, SW_SECURITY_STATUS, SW_WRONG_DATA,
     },
     key::KeyType,
 };
@@ -66,10 +65,8 @@ fn handle_cds(state: &mut OpenPgpState, cmd: &ApduCommand<'_>) -> ApduResponse {
     // Ed25519 path: sign directly with ed25519-dalek (returns raw 64-byte r||s)
     #[cfg(feature = "applet-openpgp-curve25519")]
     if key_type == KeyType::Ed25519 {
-        let raw_sig = match crate::crypto::asymmetric::ed25519_sign(
-            &priv_buf[..priv_len],
-            cmd.data,
-        ) {
+        let raw_sig = match crate::crypto::asymmetric::ed25519_sign(&priv_buf[..priv_len], cmd.data)
+        {
             Ok(s) => s,
             Err(_) => return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
         };
@@ -143,13 +140,11 @@ fn handle_decipher(state: &mut OpenPgpState, cmd: &ApduCommand<'_>) -> ApduRespo
         if peer_pubkey.len() != 32 {
             return ApduResponse::err(SW_WRONG_DATA);
         }
-        let shared = match crate::crypto::asymmetric::x25519_ecdh(
-            &priv_buf[..priv_len],
-            peer_pubkey,
-        ) {
-            Ok(s) => s,
-            Err(_) => return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
-        };
+        let shared =
+            match crate::crypto::asymmetric::x25519_ecdh(&priv_buf[..priv_len], peer_pubkey) {
+                Ok(s) => s,
+                Err(_) => return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
+            };
         return ApduResponse::ok(&shared);
     }
 
@@ -161,14 +156,11 @@ fn handle_decipher(state: &mut OpenPgpState, cmd: &ApduCommand<'_>) -> ApduRespo
     };
 
     // Perform ECDH
-    let shared_secret = match crate::crypto::asymmetric::ecdh_agree(
-        key_type,
-        &priv_buf[..priv_len],
-        peer_pubkey,
-    ) {
-        Ok(s) => s,
-        Err(_) => return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
-    };
+    let shared_secret =
+        match crate::crypto::asymmetric::ecdh_agree(key_type, &priv_buf[..priv_len], peer_pubkey) {
+            Ok(s) => s,
+            Err(_) => return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
+        };
 
     ApduResponse::ok(&shared_secret)
 }

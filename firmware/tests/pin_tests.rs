@@ -4,8 +4,8 @@
 //! x86_64. No embassy-rp / embassy-executor imports.
 
 use pico2hsm_firmware::security::pin::{
-    PinError, PinState, PinVerifyResult, MAX_PIN_RETRIES, MAX_PUK_RETRIES,
-    MIN_PIN_LENGTH, MAX_PIN_LENGTH,
+    PinError, PinState, PinVerifyResult, MAX_PIN_LENGTH, MAX_PIN_RETRIES, MAX_PUK_RETRIES,
+    MIN_PIN_LENGTH,
 };
 
 // ---------------------------------------------------------------------------
@@ -13,10 +13,10 @@ use pico2hsm_firmware::security::pin::{
 // ---------------------------------------------------------------------------
 
 const DEVICE_ID: &[u8] = b"pico2hsm-test-dev-01";
-const TEST_PIN:  &[u8] = b"123456";
-const TEST_PUK:  &[u8] = b"12345678";
-const PIN_SALT:  [u8; 16] = [0xAAu8; 16];
-const PUK_SALT:  [u8; 16] = [0xBBu8; 16];
+const TEST_PIN: &[u8] = b"123456";
+const TEST_PUK: &[u8] = b"12345678";
+const PIN_SALT: [u8; 16] = [0xAAu8; 16];
+const PUK_SALT: [u8; 16] = [0xBBu8; 16];
 
 // ---------------------------------------------------------------------------
 // Helper
@@ -24,10 +24,15 @@ const PUK_SALT:  [u8; 16] = [0xBBu8; 16];
 
 fn make_state() -> PinState {
     PinState::new(
-        TEST_PIN, TEST_PUK, DEVICE_ID,
-        PIN_SALT, PUK_SALT,
-        MAX_PIN_RETRIES, MAX_PUK_RETRIES,
-    ).unwrap()
+        TEST_PIN,
+        TEST_PUK,
+        DEVICE_ID,
+        PIN_SALT,
+        PUK_SALT,
+        MAX_PIN_RETRIES,
+        MAX_PUK_RETRIES,
+    )
+    .unwrap()
 }
 
 // ---------------------------------------------------------------------------
@@ -38,7 +43,10 @@ fn make_state() -> PinState {
 fn test_pin_hash_deterministic() {
     let h1 = PinState::hash_pin(TEST_PIN, DEVICE_ID, &PIN_SALT);
     let h2 = PinState::hash_pin(TEST_PIN, DEVICE_ID, &PIN_SALT);
-    assert_eq!(h1, h2, "PIN hash must be deterministic for identical inputs");
+    assert_eq!(
+        h1, h2,
+        "PIN hash must be deterministic for identical inputs"
+    );
 }
 
 #[test]
@@ -77,8 +85,15 @@ fn test_pin_verify_correct() {
     let mut state = make_state();
     let result = state.verify_pin(TEST_PIN, DEVICE_ID, None).unwrap();
 
-    assert_eq!(result, PinVerifyResult::Success, "Correct PIN must return Success");
-    assert!(state.session_authenticated, "Session must be authenticated after success");
+    assert_eq!(
+        result,
+        PinVerifyResult::Success,
+        "Correct PIN must return Success"
+    );
+    assert!(
+        state.session_authenticated,
+        "Session must be authenticated after success"
+    );
     assert_eq!(
         state.pin_retries_remaining, MAX_PIN_RETRIES,
         "Retry count must be restored after correct PIN"
@@ -91,10 +106,18 @@ fn test_pin_verify_wrong() {
     let result = state.verify_pin(b"wrong1", DEVICE_ID, None).unwrap();
 
     assert!(
-        matches!(result, PinVerifyResult::WrongPin { retries_remaining: 2 }),
+        matches!(
+            result,
+            PinVerifyResult::WrongPin {
+                retries_remaining: 2
+            }
+        ),
         "First wrong PIN must return WrongPin with 2 retries remaining"
     );
-    assert!(!state.session_authenticated, "Session must not be authenticated after wrong PIN");
+    assert!(
+        !state.session_authenticated,
+        "Session must not be authenticated after wrong PIN"
+    );
     assert_eq!(state.pin_retries_remaining, 2);
 }
 
@@ -105,7 +128,12 @@ fn test_pin_verify_wrong_second_attempt() {
     let result = state.verify_pin(b"wrong2", DEVICE_ID, None).unwrap();
 
     assert!(
-        matches!(result, PinVerifyResult::WrongPin { retries_remaining: 1 }),
+        matches!(
+            result,
+            PinVerifyResult::WrongPin {
+                retries_remaining: 1
+            }
+        ),
         "Second wrong PIN must return WrongPin with 1 retry remaining"
     );
 }
@@ -176,8 +204,15 @@ fn test_verify_with_smk_derives_session_key() {
 
     state.verify_pin(TEST_PIN, DEVICE_ID, Some(&smk)).unwrap();
 
-    assert!(state.session_key.is_some(), "Session key must be derived on success");
-    assert_eq!(state.session_key.as_ref().unwrap().len(), 32, "Session key must be 32 bytes");
+    assert!(
+        state.session_key.is_some(),
+        "Session key must be derived on success"
+    );
+    assert_eq!(
+        state.session_key.as_ref().unwrap().len(),
+        32,
+        "Session key must be 32 bytes"
+    );
 }
 
 #[test]
@@ -192,7 +227,10 @@ fn test_verify_session_key_is_deterministic() {
     state2.verify_pin(TEST_PIN, DEVICE_ID, Some(&smk)).unwrap();
     let sk2: [u8; 32] = **state2.session_key.as_ref().unwrap();
 
-    assert_eq!(sk1, sk2, "Session key must be deterministic for same SMK + PIN");
+    assert_eq!(
+        sk1, sk2,
+        "Session key must be deterministic for same SMK + PIN"
+    );
 }
 
 #[test]
@@ -208,7 +246,10 @@ fn test_verify_different_smk_different_session_key() {
     state2.verify_pin(TEST_PIN, DEVICE_ID, Some(&smk2)).unwrap();
     let sk2: [u8; 32] = **state2.session_key.as_ref().unwrap();
 
-    assert_ne!(sk1, sk2, "Different SMKs must produce different session keys");
+    assert_ne!(
+        sk1, sk2,
+        "Different SMKs must produce different session keys"
+    );
 }
 
 #[test]
@@ -222,8 +263,14 @@ fn test_reset_session_clears_session_key() {
 
     state.reset_session();
 
-    assert!(!state.session_authenticated, "session_authenticated must be false after reset");
-    assert!(state.session_key.is_none(), "session_key must be None after reset");
+    assert!(
+        !state.session_authenticated,
+        "session_authenticated must be false after reset"
+    );
+    assert!(
+        state.session_key.is_none(),
+        "session_key must be None after reset"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -236,7 +283,9 @@ fn test_pin_change_correct_old_pin() {
     let new_salt = [0xCCu8; 16];
     let new_pin = b"newpin1!";
 
-    state.change_pin(TEST_PIN, new_pin, DEVICE_ID, new_salt).unwrap();
+    state
+        .change_pin(TEST_PIN, new_pin, DEVICE_ID, new_salt)
+        .unwrap();
 
     // Old PIN must no longer work
     let r_old = state.verify_pin(TEST_PIN, DEVICE_ID, None).unwrap();
@@ -247,7 +296,11 @@ fn test_pin_change_correct_old_pin() {
 
     // New PIN must work
     let r_new = state.verify_pin(new_pin, DEVICE_ID, None).unwrap();
-    assert_eq!(r_new, PinVerifyResult::Success, "New PIN must work after change");
+    assert_eq!(
+        r_new,
+        PinVerifyResult::Success,
+        "New PIN must work after change"
+    );
 }
 
 #[test]
@@ -296,7 +349,9 @@ fn test_pin_change_resets_retry_counter() {
     assert_eq!(state.pin_retries_remaining, 2);
 
     // Change PIN — should reset counter
-    state.change_pin(TEST_PIN, b"newpin99", DEVICE_ID, [0xDDu8; 16]).unwrap();
+    state
+        .change_pin(TEST_PIN, b"newpin99", DEVICE_ID, [0xDDu8; 16])
+        .unwrap();
     assert_eq!(
         state.pin_retries_remaining, MAX_PIN_RETRIES,
         "Retry counter must reset after PIN change"
@@ -329,11 +384,20 @@ fn test_puk_unblock_correct_puk() {
     assert!(state.pin_blocked);
 
     let new_salt = [0xEEu8; 16];
-    state.unblock_pin(TEST_PUK, b"newpin11", DEVICE_ID, new_salt).unwrap();
+    state
+        .unblock_pin(TEST_PUK, b"newpin11", DEVICE_ID, new_salt)
+        .unwrap();
 
-    assert!(!state.pin_blocked, "PIN must be unblocked after PUK unblock");
+    assert!(
+        !state.pin_blocked,
+        "PIN must be unblocked after PUK unblock"
+    );
     let r = state.verify_pin(b"newpin11", DEVICE_ID, None).unwrap();
-    assert_eq!(r, PinVerifyResult::Success, "New PIN must work after PUK unblock");
+    assert_eq!(
+        r,
+        PinVerifyResult::Success,
+        "New PIN must work after PUK unblock"
+    );
 }
 
 #[test]
@@ -372,7 +436,9 @@ fn test_puk_correct_resets_puk_counter() {
     assert_eq!(state.puk_retries_remaining, MAX_PUK_RETRIES - 1);
 
     // Correct PUK — should restore PUK counter
-    state.unblock_pin(TEST_PUK, b"newpin11", DEVICE_ID, [0xFFu8; 16]).unwrap();
+    state
+        .unblock_pin(TEST_PUK, b"newpin11", DEVICE_ID, [0xFFu8; 16])
+        .unwrap();
     assert_eq!(
         state.puk_retries_remaining, MAX_PUK_RETRIES,
         "PUK counter must reset after successful unblock"
@@ -389,7 +455,11 @@ fn test_lockout_immediately_blocks() {
     state.lock_out();
 
     let result = state.verify_pin(TEST_PIN, DEVICE_ID, None).unwrap();
-    assert_eq!(result, PinVerifyResult::Blocked, "lock_out must immediately block the PIN");
+    assert_eq!(
+        result,
+        PinVerifyResult::Blocked,
+        "lock_out must immediately block the PIN"
+    );
 }
 
 #[test]
@@ -402,8 +472,14 @@ fn test_lockout_clears_session() {
 
     state.lock_out();
 
-    assert!(!state.session_authenticated, "lock_out must clear the session");
-    assert!(state.session_key.is_none(), "lock_out must clear session key");
+    assert!(
+        !state.session_authenticated,
+        "lock_out must clear the session"
+    );
+    assert!(
+        state.session_key.is_none(),
+        "lock_out must clear session key"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -414,16 +490,32 @@ fn test_lockout_clears_session() {
 fn test_pin_length_minimum_accepted() {
     let min_pin = vec![b'1'; MIN_PIN_LENGTH];
     let result = PinState::new(
-        &min_pin, TEST_PUK, DEVICE_ID, PIN_SALT, PUK_SALT, MAX_PIN_RETRIES, MAX_PUK_RETRIES,
+        &min_pin,
+        TEST_PUK,
+        DEVICE_ID,
+        PIN_SALT,
+        PUK_SALT,
+        MAX_PIN_RETRIES,
+        MAX_PUK_RETRIES,
     );
-    assert!(result.is_ok(), "PIN of minimum length ({}) must be accepted", MIN_PIN_LENGTH);
+    assert!(
+        result.is_ok(),
+        "PIN of minimum length ({}) must be accepted",
+        MIN_PIN_LENGTH
+    );
 }
 
 #[test]
 fn test_pin_length_too_short_rejected() {
     let short_pin = vec![b'1'; MIN_PIN_LENGTH - 1];
     let result = PinState::new(
-        &short_pin, TEST_PUK, DEVICE_ID, PIN_SALT, PUK_SALT, MAX_PIN_RETRIES, MAX_PUK_RETRIES,
+        &short_pin,
+        TEST_PUK,
+        DEVICE_ID,
+        PIN_SALT,
+        PUK_SALT,
+        MAX_PIN_RETRIES,
+        MAX_PUK_RETRIES,
     );
     assert!(
         matches!(result, Err(PinError::InvalidLength)),
@@ -436,16 +528,32 @@ fn test_pin_length_too_short_rejected() {
 fn test_pin_length_maximum_accepted() {
     let max_pin = vec![b'A'; MAX_PIN_LENGTH];
     let result = PinState::new(
-        &max_pin, TEST_PUK, DEVICE_ID, PIN_SALT, PUK_SALT, MAX_PIN_RETRIES, MAX_PUK_RETRIES,
+        &max_pin,
+        TEST_PUK,
+        DEVICE_ID,
+        PIN_SALT,
+        PUK_SALT,
+        MAX_PIN_RETRIES,
+        MAX_PUK_RETRIES,
     );
-    assert!(result.is_ok(), "PIN of maximum length ({}) must be accepted", MAX_PIN_LENGTH);
+    assert!(
+        result.is_ok(),
+        "PIN of maximum length ({}) must be accepted",
+        MAX_PIN_LENGTH
+    );
 }
 
 #[test]
 fn test_pin_length_too_long_rejected() {
     let long_pin = vec![b'Z'; MAX_PIN_LENGTH + 1];
     let result = PinState::new(
-        &long_pin, TEST_PUK, DEVICE_ID, PIN_SALT, PUK_SALT, MAX_PIN_RETRIES, MAX_PUK_RETRIES,
+        &long_pin,
+        TEST_PUK,
+        DEVICE_ID,
+        PIN_SALT,
+        PUK_SALT,
+        MAX_PIN_RETRIES,
+        MAX_PUK_RETRIES,
     );
     assert!(
         matches!(result, Err(PinError::InvalidLength)),
@@ -465,7 +573,10 @@ fn test_pin_manager_always_returns_wrong_pin() {
     let mut mgr = PinManager::new(3);
     let result = mgr.verify(b"anypinvalue");
     // PinManager is a stub that always returns WrongPin until wired to storage
-    assert!(result.is_err(), "PinManager stub must return Err for any PIN");
+    assert!(
+        result.is_err(),
+        "PinManager stub must return Err for any PIN"
+    );
 }
 
 #[test]
@@ -490,7 +601,10 @@ fn test_pin_manager_retries_remaining() {
 #[test]
 fn test_pin_manager_is_locked_when_zero() {
     let mgr = PinManager::new(0);
-    assert!(mgr.is_locked(), "PinManager with 0 retries must report locked");
+    assert!(
+        mgr.is_locked(),
+        "PinManager with 0 retries must report locked"
+    );
 }
 
 #[test]
@@ -498,6 +612,9 @@ fn test_pin_manager_reset_retry() {
     let mut mgr = PinManager::new(3);
     // Decrement manually (no public method, so just check reset works)
     mgr.reset_retry();
-    assert!(!mgr.is_locked(), "After reset_retry, manager must not be locked");
+    assert!(
+        !mgr.is_locked(),
+        "After reset_retry, manager must not be locked"
+    );
     assert_eq!(mgr.retries_remaining(), 3);
 }

@@ -30,11 +30,18 @@ pub fn handle(state: &mut ScHsmState, cmd: &ApduCommand<'_>) -> ApduResponse {
             return ApduResponse::err(SW_WRONG_DATA);
         }
         let raw: &[u8; 32] = cmd.data.try_into().unwrap();
-        crate::cdc_log!("KEY_DOMAIN import_share_raw: required={} imported={}", state.dkek_shares_required, state.dkek_shares_imported);
+        crate::cdc_log!(
+            "KEY_DOMAIN import_share_raw: required={} imported={}",
+            state.dkek_shares_required,
+            state.dkek_shares_imported
+        );
         match state.dkek.import_share_raw(raw) {
             Ok(DkekImportResult::Complete) => {
                 state.dkek_shares_imported = state.dkek.shares_total();
-                crate::cdc_log!("KEY_DOMAIN DKEK Complete: is_ready={}", state.dkek.is_ready());
+                crate::cdc_log!(
+                    "KEY_DOMAIN DKEK Complete: is_ready={}",
+                    state.dkek.is_ready()
+                );
                 // sc-hsm-tool asserts apdu.resplen >= sizeof(key_check_value) + 2.
                 // key_check_value is 8 bytes, so we must return at least 10 bytes:
                 //   [remaining(1), total(1), kcv(8)]
@@ -88,7 +95,9 @@ pub fn handle(state: &mut ScHsmState, cmd: &ApduCommand<'_>) -> ApduResponse {
                     state.dkek_shares_imported = state.dkek.shares_total();
                     ApduResponse::ok(&[])
                 }
-                Ok(crate::security::dkek::DkekImportResult::MoreSharesNeeded { received, .. }) => {
+                Ok(crate::security::dkek::DkekImportResult::MoreSharesNeeded {
+                    received, ..
+                }) => {
                     state.dkek_shares_imported = received;
                     // SW_6985 = conditions not satisfied (more shares needed)
                     ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED)
@@ -151,7 +160,10 @@ mod tests {
         let resp = handle(&mut state, &cmd);
 
         // Should succeed (SW_OK = 0x9000), not SW_SECURITY_STATUS
-        assert_eq!(resp.sw, SW_OK, "P1=0x00 raw share import must not require SO-PIN");
+        assert_eq!(
+            resp.sw, SW_OK,
+            "P1=0x00 raw share import must not require SO-PIN"
+        );
     }
 
     #[test]
@@ -164,7 +176,10 @@ mod tests {
         let cmd = ApduCommand::parse(&apdu).unwrap();
         let resp = handle(&mut state, &cmd);
 
-        assert_eq!(resp.sw, SW_WRONG_DATA, "wrong-length share must be rejected");
+        assert_eq!(
+            resp.sw, SW_WRONG_DATA,
+            "wrong-length share must be rejected"
+        );
     }
 
     #[test]
@@ -179,11 +194,19 @@ mod tests {
         assert_eq!(resp.sw, SW_OK);
         // Response: [remaining(1), total(1), kcv(8)] = 10 bytes minimum
         // sc-hsm-tool asserts apdu.resplen >= sizeof(key_check_value) + 2 (8+2=10)
-        assert_eq!(resp.data.len(), 10, "response must be 10 bytes for sc-hsm-tool compatibility");
+        assert_eq!(
+            resp.data.len(),
+            10,
+            "response must be 10 bytes for sc-hsm-tool compatibility"
+        );
         assert_eq!(resp.data[0], 0x00, "remaining shares should be 0");
         assert_eq!(resp.data[1], 0x01, "total shares should be 1");
         // KCV bytes [2..10] must be non-zero (real DKEK was loaded)
-        assert_ne!(&resp.data[2..10], &[0u8; 8], "KCV must not be all zeros when DKEK is ready");
+        assert_ne!(
+            &resp.data[2..10],
+            &[0u8; 8],
+            "KCV must not be all zeros when DKEK is ready"
+        );
         // DKEK should now be ready
         assert!(state.dkek.is_ready());
         assert_eq!(state.dkek_shares_imported, 1);

@@ -47,9 +47,7 @@ use pico2hsm_core::key::AppletId;
 
 use aes_gcm::{
     aead::{AeadInPlace, KeyInit as GcmKeyInit},
-    Aes256Gcm,
-    Nonce as GcmNonce,
-    Tag as GcmTag,
+    Aes256Gcm, Nonce as GcmNonce, Tag as GcmTag,
 };
 
 // ---------------------------------------------------------------------------
@@ -134,9 +132,9 @@ pub const MAX_PUBLIC_KEY_SIZE: usize = 520;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum KeyType {
-    Rsa     = 0x01,
-    Ec      = 0x02,
-    Aes     = 0x03,
+    Rsa = 0x01,
+    Ec = 0x02,
+    Aes = 0x03,
     Generic = 0x04,
 }
 
@@ -163,31 +161,31 @@ impl KeyType {
 #[repr(u8)]
 pub enum AlgorithmId {
     // EC signatures
-    EcdsaP256            = 0x13,
-    EcdsaP384            = 0x15,
-    EcdsaP521            = 0x17,
-    EcdsaK256            = 0x19,
-    EcdsaBrainpool256    = 0x53,
-    EcdsaBrainpool384    = 0x54,
-    EcdsaBrainpool512    = 0x55,
+    EcdsaP256 = 0x13,
+    EcdsaP384 = 0x15,
+    EcdsaP521 = 0x17,
+    EcdsaK256 = 0x19,
+    EcdsaBrainpool256 = 0x53,
+    EcdsaBrainpool384 = 0x54,
+    EcdsaBrainpool512 = 0x55,
     // EC key agreement
-    EcdhP256             = 0x23,
-    EcdhP384             = 0x25,
-    EcdhP521             = 0x27,
+    EcdhP256 = 0x23,
+    EcdhP384 = 0x25,
+    EcdhP521 = 0x27,
     // RSA signatures
-    RsaPkcs1Sha256       = 0x31,
-    RsaPkcs1Sha384       = 0x32,
-    RsaPkcs1Sha512       = 0x33,
-    RsaPss               = 0x34,
-    RsaDecrypt           = 0x41,
+    RsaPkcs1Sha256 = 0x31,
+    RsaPkcs1Sha384 = 0x32,
+    RsaPkcs1Sha512 = 0x33,
+    RsaPss = 0x34,
+    RsaDecrypt = 0x41,
     // Symmetric
-    AesEcb               = 0x60,
-    AesCbc               = 0x61,
-    AesCtr               = 0x62,
-    AesGcm               = 0x63,
+    AesEcb = 0x60,
+    AesCbc = 0x61,
+    AesCtr = 0x62,
+    AesGcm = 0x63,
     // Curve25519
-    Ed25519              = 0x20,
-    X25519               = 0x21,
+    Ed25519 = 0x20,
+    X25519 = 0x21,
 }
 
 impl AlgorithmId {
@@ -258,33 +256,33 @@ pub enum KeyError {
 /// All fields containing secret material implement `Zeroize` and the struct
 /// is wrapped in `Zeroizing` at call sites where it leaves a function.
 pub struct KeyObject {
-    pub key_type:    KeyType,
+    pub key_type: KeyType,
     /// Full u32 internal key ID (structured: partition | applet | reserved | proto_ref).
-    pub key_id:      u32,
+    pub key_id: u32,
     /// Owning applet.
-    pub owner:       AppletId,
-    pub algorithm:   AlgorithmId,
-    pub key_domain:  u8,
-    pub use_count:   u32,
+    pub owner: AppletId,
+    pub algorithm: AlgorithmId,
+    pub key_domain: u8,
+    pub use_count: u32,
     /// Monotonically increasing generation counter.
     ///
     /// Incremented on every `save_key` call. Starts at 1 on first write.
     /// Used by the DKEK sync protocol to detect stale replicas.
     /// Blobs written with the old `P2K2` magic will deserialize with
     /// `generation = 0`.
-    pub generation:  u32,
+    pub generation: u32,
     /// Key access conditions byte (SC-HSM TLV tag 0xD4).
     ///
     /// Bit layout: 0=ALLOW_SIGN, 1=ALLOW_DECRYPT, 2=ALLOW_DERIVE, 3=NO_EXPORT.
     /// Default 0x00 = all operations allowed, exportable.
     /// Persisted in flash since P2K4; older blobs (P2K2/P2K3) default to 0.
-    pub key_flags:   u8,
+    pub key_flags: u8,
     /// Daemon-assigned HLC timestamp (ms since epoch), 0 for legacy/locally-generated keys.
     pub timestamp_ms: u64,
     /// Raw private key scalar or symmetric key bytes (zeroized on drop).
     pub private_key: heapless::Vec<u8, MAX_PRIVATE_KEY_SIZE>,
     /// Optional raw public key (uncompressed EC point, or RSA public key DER).
-    pub public_key:  heapless::Vec<u8, MAX_PUBLIC_KEY_SIZE>,
+    pub public_key: heapless::Vec<u8, MAX_PUBLIC_KEY_SIZE>,
 }
 
 impl Zeroize for KeyObject {
@@ -309,12 +307,7 @@ impl Drop for KeyObject {
 
 impl KeyObject {
     /// Create a new `KeyObject` with empty key material.
-    pub fn new(
-        key_type:  KeyType,
-        key_id:    u32,
-        owner:     AppletId,
-        algorithm: AlgorithmId,
-    ) -> Self {
+    pub fn new(key_type: KeyType, key_id: u32, owner: AppletId, algorithm: AlgorithmId) -> Self {
         KeyObject {
             key_type,
             key_id,
@@ -347,7 +340,11 @@ impl KeyObject {
         // For EC keys (≤255 bytes) store the exact length.
         // For RSA keys (>255 bytes) store 0 as a sentinel; the actual
         // length is prepended as a 2-byte LE value in the plaintext.
-        buf[10] = if self.private_key.len() > 255 { 0 } else { self.private_key.len() as u8 };
+        buf[10] = if self.private_key.len() > 255 {
+            0
+        } else {
+            self.private_key.len() as u8
+        };
         buf[11] = self.key_domain;
         buf[12..16].copy_from_slice(&self.use_count.to_be_bytes());
         buf[16..20].copy_from_slice(&self.generation.to_be_bytes());
@@ -381,7 +378,7 @@ impl KeyObject {
         //   EC  keys (priv ≤ 255): priv_key || pub_len(2) || pub_key
         //   RSA keys (priv > 255): priv_len_le16(2) || priv_key || pub_len(2) || pub_key
         let priv_len = self.private_key.len();
-        let pub_len  = self.public_key.len();
+        let pub_len = self.public_key.len();
         let inline_len = priv_len > 255;
         let prefix_len = if inline_len { 2 } else { 0 };
         let pt_len = prefix_len + priv_len + 2 + pub_len;
@@ -392,28 +389,45 @@ impl KeyObject {
         // GCM payload buffer (plaintext -> ciphertext in-place)
         let mut ct_buf: heapless::Vec<u8, MAX_BLOB_SIZE> = heapless::Vec::new();
         // Start with the header (included in blob, used as GCM AAD)
-        ct_buf.extend_from_slice(&header).map_err(|_| KeyError::BufferTooSmall)?;
+        ct_buf
+            .extend_from_slice(&header)
+            .map_err(|_| KeyError::BufferTooSmall)?;
         // For RSA: prepend 2-byte LE private key length
         if inline_len {
-            ct_buf.extend_from_slice(&(priv_len as u16).to_le_bytes()).map_err(|_| KeyError::BufferTooSmall)?;
+            ct_buf
+                .extend_from_slice(&(priv_len as u16).to_le_bytes())
+                .map_err(|_| KeyError::BufferTooSmall)?;
         }
-        ct_buf.extend_from_slice(&self.private_key).map_err(|_| KeyError::BufferTooSmall)?;
+        ct_buf
+            .extend_from_slice(&self.private_key)
+            .map_err(|_| KeyError::BufferTooSmall)?;
         let pub_len_bytes = (pub_len as u16).to_be_bytes();
-        ct_buf.extend_from_slice(&pub_len_bytes).map_err(|_| KeyError::BufferTooSmall)?;
-        ct_buf.extend_from_slice(&self.public_key).map_err(|_| KeyError::BufferTooSmall)?;
+        ct_buf
+            .extend_from_slice(&pub_len_bytes)
+            .map_err(|_| KeyError::BufferTooSmall)?;
+        ct_buf
+            .extend_from_slice(&self.public_key)
+            .map_err(|_| KeyError::BufferTooSmall)?;
 
         // Encrypt the payload portion (everything after the header) in-place.
-        let cipher = Aes256Gcm::new_from_slice(&*kek)
-            .map_err(|_| KeyError::EncryptFailure)?;
+        let cipher = Aes256Gcm::new_from_slice(&*kek).map_err(|_| KeyError::EncryptFailure)?;
         let nonce_arr = GcmNonce::from_slice(nonce);
 
         let tag = cipher
-            .encrypt_in_place_detached(nonce_arr, &header, &mut ct_buf.as_mut_slice()[P2K4_HEADER_SIZE..])
+            .encrypt_in_place_detached(
+                nonce_arr,
+                &header,
+                &mut ct_buf.as_mut_slice()[P2K4_HEADER_SIZE..],
+            )
             .map_err(|_| KeyError::EncryptFailure)?;
 
         // Append tag then nonce.
-        ct_buf.extend_from_slice(tag.as_slice()).map_err(|_| KeyError::BufferTooSmall)?;
-        ct_buf.extend_from_slice(nonce).map_err(|_| KeyError::BufferTooSmall)?;
+        ct_buf
+            .extend_from_slice(tag.as_slice())
+            .map_err(|_| KeyError::BufferTooSmall)?;
+        ct_buf
+            .extend_from_slice(nonce)
+            .map_err(|_| KeyError::BufferTooSmall)?;
 
         Ok(ct_buf)
     }
@@ -444,7 +458,13 @@ impl KeyObject {
         if !is_v4 && !is_v3 && !is_v2 {
             return Err(KeyError::BadMagic);
         }
-        let header_size: usize = if is_v4 { 21 } else if is_v3 { 20 } else { 16 };
+        let header_size: usize = if is_v4 {
+            21
+        } else if is_v3 {
+            20
+        } else {
+            16
+        };
 
         if blob.len() < header_size + TAG_SIZE + NONCE_SIZE {
             return Err(KeyError::InvalidFormat);
@@ -453,22 +473,24 @@ impl KeyObject {
         // Extract nonce and tag from the end.
         let blob_len = blob.len();
         let nonce_start = blob_len - NONCE_SIZE;
-        let tag_start   = nonce_start - TAG_SIZE;
+        let tag_start = nonce_start - TAG_SIZE;
 
-        let nonce: &[u8; 12] = blob[nonce_start..].try_into()
+        let nonce: &[u8; 12] = blob[nonce_start..]
+            .try_into()
             .map_err(|_| KeyError::InvalidFormat)?;
-        let tag_bytes: &[u8; 16] = blob[tag_start..nonce_start].try_into()
+        let tag_bytes: &[u8; 16] = blob[tag_start..nonce_start]
+            .try_into()
             .map_err(|_| KeyError::InvalidFormat)?;
 
         // The header is the first `header_size` bytes (also AAD).
         let header = &blob[..header_size];
 
         // Parse common header fields (same layout for bytes 0..16).
-        let kt   = KeyType::from_u8(header[4]).ok_or(KeyError::UnknownKeyType)?;
+        let kt = KeyType::from_u8(header[4]).ok_or(KeyError::UnknownKeyType)?;
         let stored_key_id = u32::from_le_bytes(header[5..9].try_into().unwrap());
         let algo = AlgorithmId::from_u8(header[9]).ok_or(KeyError::UnknownAlgorithm)?;
         let priv_size = header[10] as usize;
-        let domain    = header[11];
+        let domain = header[11];
         let use_count = u32::from_be_bytes(header[12..16].try_into().unwrap());
 
         // Parse generation (P2K3/P2K4; defaults to 0 for P2K2 blobs).
@@ -499,18 +521,12 @@ impl KeyObject {
         }
         pt_buf[..ct_payload.len()].copy_from_slice(ct_payload);
 
-        let cipher = Aes256Gcm::new_from_slice(&*kek)
-            .map_err(|_| KeyError::DecryptFailure)?;
+        let cipher = Aes256Gcm::new_from_slice(&*kek).map_err(|_| KeyError::DecryptFailure)?;
         let nonce_arr = GcmNonce::from_slice(nonce);
-        let tag_val   = GcmTag::clone_from_slice(tag_bytes);
+        let tag_val = GcmTag::clone_from_slice(tag_bytes);
 
         cipher
-            .decrypt_in_place_detached(
-                nonce_arr,
-                header,
-                &mut pt_buf[..ct_payload.len()],
-                &tag_val,
-            )
+            .decrypt_in_place_detached(nonce_arr, header, &mut pt_buf[..ct_payload.len()], &tag_val)
             .map_err(|_| KeyError::DecryptFailure)?;
 
         // Parse plaintext.  Two layouts depending on priv_size sentinel:
@@ -531,7 +547,9 @@ impl KeyObject {
             return Err(KeyError::InvalidFormat);
         }
         let pub_len = u16::from_be_bytes(
-            pt_buf[priv_offset + priv_size..priv_offset + priv_size + 2].try_into().unwrap()
+            pt_buf[priv_offset + priv_size..priv_offset + priv_size + 2]
+                .try_into()
+                .unwrap(),
         ) as usize;
         let total_needed = priv_offset + priv_size + 2 + pub_len;
         if ct_payload.len() < total_needed {
@@ -563,7 +581,9 @@ impl KeyObject {
             .extend_from_slice(&pt_buf[priv_offset..priv_offset + priv_size])
             .map_err(|_| KeyError::KeyTooLarge)?;
         obj.public_key
-            .extend_from_slice(&pt_buf[priv_offset + priv_size + 2..priv_offset + priv_size + 2 + pub_len])
+            .extend_from_slice(
+                &pt_buf[priv_offset + priv_size + 2..priv_offset + priv_size + 2 + pub_len],
+            )
             .map_err(|_| KeyError::KeyTooLarge)?;
 
         Ok(obj)
@@ -579,9 +599,9 @@ impl KeyObject {
     /// AAD: `SHA-256(device_id)`
     pub fn wrap_dkek(
         &self,
-        dkek:      &[u8; 32],
+        dkek: &[u8; 32],
         device_id: &[u8],
-        nonce:     &[u8; NONCE_SIZE],
+        nonce: &[u8; NONCE_SIZE],
     ) -> Result<heapless::Vec<u8, DKEK_MAX_BLOB>, KeyError> {
         // Compute AAD = SHA-256(device_id)
         let aad: [u8; 32] = Sha256::digest(device_id).into();
@@ -608,14 +628,15 @@ impl KeyObject {
         pt[3..3 + priv_len].copy_from_slice(&self.private_key);
         // Padding bytes are already 0 (zero-filled).
 
-        let cipher = Aes256Gcm::new_from_slice(dkek)
-            .map_err(|_| KeyError::EncryptFailure)?;
+        let cipher = Aes256Gcm::new_from_slice(dkek).map_err(|_| KeyError::EncryptFailure)?;
         let nonce_arr = GcmNonce::from_slice(nonce);
 
         // Copy plaintext into output buffer (nonce first)
         let mut out: heapless::Vec<u8, DKEK_MAX_BLOB> = heapless::Vec::new();
-        out.extend_from_slice(nonce).map_err(|_| KeyError::BufferTooSmall)?;
-        out.extend_from_slice(&pt[..payload_len]).map_err(|_| KeyError::BufferTooSmall)?;
+        out.extend_from_slice(nonce)
+            .map_err(|_| KeyError::BufferTooSmall)?;
+        out.extend_from_slice(&pt[..payload_len])
+            .map_err(|_| KeyError::BufferTooSmall)?;
 
         let tag = cipher
             .encrypt_in_place_detached(
@@ -625,7 +646,8 @@ impl KeyObject {
             )
             .map_err(|_| KeyError::EncryptFailure)?;
 
-        out.extend_from_slice(tag.as_slice()).map_err(|_| KeyError::BufferTooSmall)?;
+        out.extend_from_slice(tag.as_slice())
+            .map_err(|_| KeyError::BufferTooSmall)?;
 
         Ok(out)
     }
@@ -641,10 +663,10 @@ impl KeyObject {
     /// after this call since they are not encoded in the DKEK payload by design
     /// (the importing HSM assigns a new key_id).
     pub fn unwrap_dkek(
-        blob:      &[u8],
-        dkek:      &[u8; 32],
+        blob: &[u8],
+        dkek: &[u8; 32],
         device_id: &[u8],
-        key_id:    u32,
+        key_id: u32,
         algorithm: AlgorithmId,
     ) -> Result<Self, KeyError> {
         // blob = nonce(12) || ciphertext || tag(16)
@@ -652,10 +674,12 @@ impl KeyObject {
             return Err(KeyError::InvalidFormat);
         }
 
-        let nonce: &[u8; 12] = blob[..NONCE_SIZE].try_into()
+        let nonce: &[u8; 12] = blob[..NONCE_SIZE]
+            .try_into()
             .map_err(|_| KeyError::InvalidFormat)?;
         let ct_end = blob.len() - TAG_SIZE;
-        let tag_bytes: &[u8; 16] = blob[ct_end..].try_into()
+        let tag_bytes: &[u8; 16] = blob[ct_end..]
+            .try_into()
             .map_err(|_| KeyError::InvalidFormat)?;
         let ct = &blob[NONCE_SIZE..ct_end];
 
@@ -668,18 +692,17 @@ impl KeyObject {
         let mut pt = Zeroizing::new([0u8; DKEK_MAX_PAYLOAD]);
         pt[..ct.len()].copy_from_slice(ct);
 
-        let cipher = Aes256Gcm::new_from_slice(dkek)
-            .map_err(|_| KeyError::DecryptFailure)?;
+        let cipher = Aes256Gcm::new_from_slice(dkek).map_err(|_| KeyError::DecryptFailure)?;
         let nonce_arr = GcmNonce::from_slice(nonce);
-        let tag_val   = GcmTag::clone_from_slice(tag_bytes);
+        let tag_val = GcmTag::clone_from_slice(tag_bytes);
 
         cipher
             .decrypt_in_place_detached(nonce_arr, &aad, &mut pt[..ct.len()], &tag_val)
             .map_err(|_| KeyError::DecryptFailure)?;
 
         // Parse payload: key_type(1) || key_size_be(2) || private_key || padding
-        let raw_kt  = KeyType::from_u8(pt[0]).ok_or(KeyError::UnknownKeyType)?;
-        let key_sz  = u16::from_be_bytes([pt[1], pt[2]]) as usize;
+        let raw_kt = KeyType::from_u8(pt[0]).ok_or(KeyError::UnknownKeyType)?;
+        let key_sz = u16::from_be_bytes([pt[1], pt[2]]) as usize;
         if 3 + key_sz > ct.len() {
             return Err(KeyError::InvalidFormat);
         }
@@ -692,14 +715,14 @@ impl KeyObject {
         };
 
         let mut obj = KeyObject {
-            key_type:   raw_kt,
+            key_type: raw_kt,
             key_id,
             owner,
             algorithm,
             key_domain: 0,
-            use_count:  0,
+            use_count: 0,
             generation: 0,
-            key_flags:  0,
+            key_flags: 0,
             timestamp_ms: 0,
             private_key: heapless::Vec::new(),
             public_key: heapless::Vec::new(),
@@ -724,7 +747,7 @@ impl KeyObject {
 /// The returned key is wrapped in `Zeroizing` to ensure it is cleared from
 /// memory when it goes out of scope.
 pub fn derive_key_encryption_key(
-    smk:    &[u8; 32],
+    smk: &[u8; 32],
     key_id: u8,
 ) -> Result<Zeroizing<[u8; 32]>, KeyError> {
     // Build info = KEK_INFO_PREFIX || key_id
@@ -802,7 +825,9 @@ mod tests {
 
     /// Produce a deterministic fake nonce for testing.
     fn test_nonce() -> [u8; 12] {
-        [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x00, 0x11, 0x22, 0x33, 0x44, 0x55]
+        [
+            0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x00, 0x11, 0x22, 0x33, 0x44, 0x55,
+        ]
     }
 
     #[test]
@@ -818,7 +843,10 @@ mod tests {
         let smk = test_smk();
         let kek1 = derive_key_encryption_key(&smk, 0x01).unwrap();
         let kek2 = derive_key_encryption_key(&smk, 0x02).unwrap();
-        assert_ne!(*kek1, *kek2, "Different key_ids must produce different KEKs");
+        assert_ne!(
+            *kek1, *kek2,
+            "Different key_ids must produce different KEKs"
+        );
     }
 
     #[test]
@@ -827,7 +855,12 @@ mod tests {
         let smk = test_smk();
         let nonce = test_nonce();
 
-        let mut obj = KeyObject::new(KeyType::Ec, 0x00000001u32, AppletId::ScHsm, AlgorithmId::EcdsaP256);
+        let mut obj = KeyObject::new(
+            KeyType::Ec,
+            0x00000001u32,
+            AppletId::ScHsm,
+            AlgorithmId::EcdsaP256,
+        );
         obj.generation = 42;
         // Fake 32-byte P-256 private key scalar.
         obj.private_key.extend_from_slice(&[0x42u8; 32]).unwrap();
@@ -851,7 +884,12 @@ mod tests {
         let smk = test_smk();
         let nonce = test_nonce();
 
-        let mut obj = KeyObject::new(KeyType::Aes, 0x00000010u32, AppletId::ScHsm, AlgorithmId::AesGcm);
+        let mut obj = KeyObject::new(
+            KeyType::Aes,
+            0x00000010u32,
+            AppletId::ScHsm,
+            AlgorithmId::AesGcm,
+        );
         obj.private_key.extend_from_slice(&[0xBEu8; 32]).unwrap();
 
         let blob = obj.encrypt(&smk, &nonce).unwrap();
@@ -868,7 +906,12 @@ mod tests {
         let smk = test_smk();
         let nonce = test_nonce();
 
-        let mut obj = KeyObject::new(KeyType::Aes, 0x00000005u32, AppletId::ScHsm, AlgorithmId::AesCbc);
+        let mut obj = KeyObject::new(
+            KeyType::Aes,
+            0x00000005u32,
+            AppletId::ScHsm,
+            AlgorithmId::AesCbc,
+        );
         obj.private_key.extend_from_slice(&[0x11u8; 16]).unwrap();
 
         let blob = obj.encrypt(&smk, &nonce).unwrap();
@@ -883,7 +926,12 @@ mod tests {
         let smk = test_smk();
         let nonce = test_nonce();
 
-        let mut obj = KeyObject::new(KeyType::Ec, 0x00000002u32, AppletId::ScHsm, AlgorithmId::EcdsaP384);
+        let mut obj = KeyObject::new(
+            KeyType::Ec,
+            0x00000002u32,
+            AppletId::ScHsm,
+            AlgorithmId::EcdsaP384,
+        );
         obj.private_key.extend_from_slice(&[0xFFu8; 48]).unwrap();
 
         let mut blob = obj.encrypt(&smk, &nonce).unwrap();
@@ -900,13 +948,23 @@ mod tests {
         let device_id = b"pico2hsm-test-device-id";
         let nonce = test_nonce();
 
-        let mut obj = KeyObject::new(KeyType::Ec, 0x00000003u32, AppletId::ScHsm, AlgorithmId::EcdhP256);
+        let mut obj = KeyObject::new(
+            KeyType::Ec,
+            0x00000003u32,
+            AppletId::ScHsm,
+            AlgorithmId::EcdhP256,
+        );
         obj.private_key.extend_from_slice(&[0xABu8; 32]).unwrap();
 
         let wrapped = obj.wrap_dkek(&dkek, device_id, &nonce).unwrap();
         let recovered = KeyObject::unwrap_dkek(
-            &wrapped, &dkek, device_id, 0x00000007u32, AlgorithmId::EcdhP256,
-        ).unwrap();
+            &wrapped,
+            &dkek,
+            device_id,
+            0x00000007u32,
+            AlgorithmId::EcdhP256,
+        )
+        .unwrap();
 
         assert_eq!(recovered.private_key.as_slice(), &[0xABu8; 32]);
         assert_eq!(recovered.key_id, 0x00000007u32);
@@ -918,11 +976,22 @@ mod tests {
         let dkek = [0xDEu8; 32];
         let nonce = test_nonce();
 
-        let mut obj = KeyObject::new(KeyType::Aes, 0x00000001u32, AppletId::ScHsm, AlgorithmId::AesGcm);
+        let mut obj = KeyObject::new(
+            KeyType::Aes,
+            0x00000001u32,
+            AppletId::ScHsm,
+            AlgorithmId::AesGcm,
+        );
         obj.private_key.extend_from_slice(&[0x99u8; 32]).unwrap();
 
         let wrapped = obj.wrap_dkek(&dkek, b"device-A", &nonce).unwrap();
-        let result = KeyObject::unwrap_dkek(&wrapped, &dkek, b"device-B", 0x00000001u32, AlgorithmId::AesGcm);
+        let result = KeyObject::unwrap_dkek(
+            &wrapped,
+            &dkek,
+            b"device-B",
+            0x00000001u32,
+            AlgorithmId::AesGcm,
+        );
         assert!(matches!(result, Err(KeyError::DecryptFailure)));
     }
 
