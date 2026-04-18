@@ -3,7 +3,7 @@
 Items identified during development, mechanism audits, and pre-release security review.
 Each item carries a severity and a target milestone.
 
-Last updated: 2026-04-16 (v1.0.0-rc4: synchronous core1 dispatch loop with WFE/SEV, CLA validation, fuzz tests, Geek board UI boot, ECDH fix, CRIT1 row correction)
+Last updated: 2026-04-18 (v1.0.0: first stable release — see CHANGELOG.md)
 
 ---
 
