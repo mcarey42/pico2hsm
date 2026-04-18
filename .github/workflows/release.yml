@@ -110,7 +110,10 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p release-assets
-          ELF_SRC=firmware/target/thumbv8m.main-none-eabihf/release/pico2hsm
+          # Workspace target dir is at repo root, not under firmware/. When
+          # `cargo build --manifest-path firmware/Cargo.toml` runs inside a
+          # Cargo workspace, cargo writes to the workspace's shared target/.
+          ELF_SRC=target/thumbv8m.main-none-eabihf/release/pico2hsm
           BASE="pico2hsm-${BOARD}-unsigned"
           ELF_DST="release-assets/${BASE}.elf"
           UF2_DST="release-assets/${BASE}.uf2"
