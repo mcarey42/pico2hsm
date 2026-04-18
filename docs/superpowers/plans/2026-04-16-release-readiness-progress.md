@@ -19,7 +19,7 @@ This document is the **source of truth** for where the release-prep effort is. T
 | 3 — Parallel execution | completed | 2026-04-16 | 2026-04-17 | all 30 findings resolved + 2 supplemental CI fixes; post-v1.0.0 follow-ups tracked |
 | 4 — Firmware items | skipped | — | 2026-04-17 | gate #2 — no firmware-source findings surfaced; skipping per plan |
 | 5 — Verification sweep | completed | 2026-04-17 | 2026-04-17 | sweep-2 audit 30/30 + 2/2 closed; verdict READY |
-| 6 — Finalize | in progress | 2026-04-17 | — | dry-run passed (attempt #4); 3 CI infra fixes landed; PR open pending |
+| 6 — Finalize | awaiting gate #3 | 2026-04-17 | — | dry-run #4 green; 3 CI infra fixes landed; PR #1 open for user review |
 
 ---
 
