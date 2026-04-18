@@ -276,9 +276,17 @@ These have been red since at least `v1.0.0-rc2`. Not in audit scope (auditor did
 **Fix:** commit `cbf5bf3` — "ci: fix ELF_SRC path — workspace target is at root, not under firmware/". Drops `firmware/` prefix in both workflows; adds a comment explaining the workspace-target-dir rule.
 **Status:** fix committed; tag `v1.0.0-ci-test` deleted; dry-run #3 will follow.
 
-### [2026-04-17] Phase 6 dry-run #3 — ELF path fix validation
+### [2026-04-17] Phase 6 dry-run #3 — picotool extension regression (caught by dry-run)
 
-**Status:** pending — re-running after commits `fe182bd` (picotool) + `cbf5bf3` (ELF path).
+**Source:** dry-run #3 (run 24591993960)
+**Symptom:** picotool install from source passed ✓ (cached from run #2 as designed); cargo build passed ✓; Stage ELF + UF2 failed across all 6 matrix jobs with: `ERROR: filename 'target/.../release/pico2hsm' does not have a recognized file type (extension)` (exit 157).
+**Root cause:** picotool 2.x infers input file type from extension. `firmware/Cargo.toml` declares `[[bin]] name = "pico2hsm"` (no `.elf` extension), so cargo's output has no extension. `release.yml` was already `cp`-ing to an `.elf`-named staging file for the release asset but then handed the raw extensionless path to picotool; `build.yml` had no staging copy at all.
+**Fix:** commit `aca68a1`. `release.yml`: pass `$ELF_DST` (already ends in `.elf`) to picotool. `build.yml`: add a cp step to produce an `.elf`-extension filename before invoking picotool.
+**Status:** fix committed; `v1.0.0-ci-test` tag deleted; dry-run #4 will follow.
+
+### [2026-04-17] Phase 6 dry-run #4 — picotool extension fix validation
+
+**Status:** pending — re-running after commit `aca68a1` (picotool extension).
 
 ---
 
