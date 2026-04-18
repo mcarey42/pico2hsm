@@ -1,12 +1,12 @@
 [build-system]
-requires = ["setuptools>=68", "wheel"]
+requires = ["setuptools>=77", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "pico2hsm"
 version = "1.0.0"
 description = "Python daemon and CLI for the pico2hsm USB HSM"
-license = { text = "MIT" }
+license = "MIT"
 authors = [
     { name = "Mark Carey", email = "mcarey@solcore.net" },
 ]
@@ -14,7 +14,6 @@ requires-python = ">=3.10"
 keywords = ["hsm", "pico2hsm", "smartcard", "sc-hsm", "piv", "openpgp"]
 classifiers = [
     "Development Status :: 5 - Production/Stable",
-    "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
@@ -35,10 +34,10 @@ Homepage = "https://github.com/mcarey42/pico2hsm"
 Repository = "https://github.com/mcarey42/pico2hsm"
 
 # NOTE: console entry points deliberately omitted.
-# `setup.py` declares `hsm-tool=pico2hsm.__main__:main`, but no `pico2hsm/__main__.py`
-# exists in the package. The standalone scripts `hsm-tool.py` and `hsm_daemon.py` live
-# at the top of tools/python/ and are not importable package modules. Add [project.scripts]
-# once the package exposes proper entry-point functions.
+# No `pico2hsm/__main__.py` exists in the package; the standalone scripts
+# `hsm-tool.py` and `hsm_daemon.py` live at the top of tools/python/ and are
+# not importable package modules. Add [project.scripts] once the package
+# exposes proper entry-point functions.
 # [project.scripts]
 
 [tool.setuptools.packages.find]

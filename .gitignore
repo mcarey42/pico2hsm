@@ -6,6 +6,8 @@ tests/hw/__pycache__/
 tests/hw/helpers/__pycache__/
 tools/python/**/__pycache__/
 **/__pycache__/
+*.egg-info/
+tools/python/build/
 *.orig
 .claude/
 !.claude/agents/
