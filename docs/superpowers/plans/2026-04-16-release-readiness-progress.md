@@ -258,6 +258,19 @@ These have been red since at least `v1.0.0-rc2`. Not in audit scope (auditor did
 - No `.pem/.key/.crt/.env` files tracked; `ec_firmware_signing_key.pem` correctly gitignored
 **No blockers.** Phase 6 may proceed on admin/user signal.
 
+### [2026-04-17] Phase 6 dry-run — picotool apt regression (caught by dry-run)
+
+**Source:** Phase 6 release dry-run via `v1.0.0-ci-test` tag (run 24591645253)
+**Symptom:** All 6 `Build UF2` matrix jobs failed at `Install picotool` with `E: Unable to locate package picotool` (exit 100). Release workflow aborted before reaching sbom / release jobs; no GitHub Release was published.
+**Root cause:** `picotool` is not in any Ubuntu apt suite (confirmed against `packages.ubuntu.com` — no match in jammy/noble/plucky/questing/resolute). The apt install line had existed since release.yml was written but was never actually exercised end-to-end, because `build.yml`'s `build-artifacts` job (which had the same line) was gated behind `needs: [build]` and `build` had been failing on every run since v0.9.0.
+**Fix:** commit `fe182bd` — "ci: build picotool from source — apt package no longer exists". Replaces the apt install in both `build.yml` and `release.yml` with a cached source build pinned to `picotool 2.2.0` + `pico-sdk 2.2.0`. 2.2.0 is the first stable release shipping UF2 family `rp2350-arm-s`. `/usr/local/bin/picotool` is cached keyed on the pinned version; version bump invalidates cache automatically.
+**Status:** Fix committed. Dry-run will be re-run from `release-prep/v1.0.0` HEAD (which now includes `fe182bd`) to confirm green release workflow before PR open.
+**Audit status:** this is a supplemental finding surfaced AFTER Phase 5 auditor's READY verdict. The auditor's scope was static code review — a live CI run was out of scope. Closing this finding in-flight (same pattern as the two earlier supplemental CI fixes).
+
+### [2026-04-17] Phase 6 dry-run #2 — picotool fix validation
+
+**Status:** in progress — waiting on live CI run.
+
 ---
 
 ## Phase 3 summary (2026-04-17)
