@@ -19,7 +19,7 @@ This document is the **source of truth** for where the release-prep effort is. T
 | 3 — Parallel execution | completed | 2026-04-16 | 2026-04-17 | all 30 findings resolved + 2 supplemental CI fixes; post-v1.0.0 follow-ups tracked |
 | 4 — Firmware items | skipped | — | 2026-04-17 | gate #2 — no firmware-source findings surfaced; skipping per plan |
 | 5 — Verification sweep | completed | 2026-04-17 | 2026-04-17 | sweep-2 audit 30/30 + 2/2 closed; verdict READY |
-| 6 — Finalize | pending | — | — | gate #3, CHANGELOG date + PR |
+| 6 — Finalize | in progress | 2026-04-17 | — | dry-run passed (attempt #4); 3 CI infra fixes landed; PR open pending |
 
 ---
 
@@ -284,9 +284,25 @@ These have been red since at least `v1.0.0-rc2`. Not in audit scope (auditor did
 **Fix:** commit `aca68a1`. `release.yml`: pass `$ELF_DST` (already ends in `.elf`) to picotool. `build.yml`: add a cp step to produce an `.elf`-extension filename before invoking picotool.
 **Status:** fix committed; `v1.0.0-ci-test` tag deleted; dry-run #4 will follow.
 
-### [2026-04-17] Phase 6 dry-run #4 — picotool extension fix validation
+### [2026-04-17] Phase 6 dry-run #4 — GREEN
 
-**Status:** pending — re-running after commit `aca68a1` (picotool extension).
+**Source:** dry-run #4 (run 24592071751)
+**Result:** all 6 matrix jobs success; SBOMs success; Publish GitHub Release success. Draft release `v1.0.0-ci-test` published with: 6 UF2s + 6 per-file SHA256s + 6 ELFs + 3 CycloneDX SBOMs (firmware, core, integration-tests) + aggregate `SHA256SUMS` + `cargo-tree` fallback. DRY-RUN and UNSIGNED FIRMWARE banners both present in the release body. "No CHANGELOG.md section found for 1.0.0-ci-test" is expected — the extractor strips a leading `v` and looks for `## [1.0.0-ci-test]`; for the real `v1.0.0` tag it will resolve to `## [1.0.0]` as designed (and fills the date at tag time per RELEASE_PROCESS.md §2.3).
+**Cleanup:** `gh release delete v1.0.0-ci-test --yes` + `git push --delete origin v1.0.0-ci-test` + `git tag -d v1.0.0-ci-test` — all succeeded; release confirmed 404 on API, tag confirmed absent from remote.
+**Verdict:** release.yml pipeline validated end-to-end against `release-prep/v1.0.0` HEAD (`3f2f2b2`). Safe to tag v1.0.0 once PR merges.
+
+### Phase 6 — dry-run summary
+
+Four attempts; three latent regressions caught and fixed. Each fix was a surface-level issue masked by an upstream gating failure that had kept the step dark until release-prep fixed the gate.
+
+| # | Outcome | Cause | Fix commit |
+|---|---|---|---|
+| 1 | fail | `apt install picotool` — package not in any Ubuntu suite | `fe182bd` |
+| 2 | fail | `cargo build --manifest-path firmware/…` uses workspace `target/`, not `firmware/target/` | `cbf5bf3` |
+| 3 | fail | picotool 2.x infers type from extension; cargo output has no extension | `aca68a1` |
+| 4 | **pass** | — | — |
+
+Total CI infra fixes landed in Phase 6: 3 commits on top of `release-prep/v1.0.0`.
 
 ---
 
