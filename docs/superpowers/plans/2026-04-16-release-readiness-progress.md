@@ -267,9 +267,18 @@ These have been red since at least `v1.0.0-rc2`. Not in audit scope (auditor did
 **Status:** Fix committed. Dry-run will be re-run from `release-prep/v1.0.0` HEAD (which now includes `fe182bd`) to confirm green release workflow before PR open.
 **Audit status:** this is a supplemental finding surfaced AFTER Phase 5 auditor's READY verdict. The auditor's scope was static code review — a live CI run was out of scope. Closing this finding in-flight (same pattern as the two earlier supplemental CI fixes).
 
-### [2026-04-17] Phase 6 dry-run #2 — picotool fix validation
+### [2026-04-17] Phase 6 dry-run #2 — ELF path regression (caught by dry-run)
 
-**Status:** in progress — waiting on live CI run.
+**Source:** dry-run #2 (run 24591897445)
+**Symptom:** picotool install from source passed ✓; `cargo build` passed ✓; Stage ELF + UF2 failed across all 6 matrix jobs with `cp: cannot stat 'firmware/target/thumbv8m.main-none-eabihf/release/pico2hsm': No such file or directory`.
+**Root cause:** `cargo build --manifest-path firmware/Cargo.toml` in a Cargo workspace writes to the WORKSPACE target directory (`target/` at repo root), not to `firmware/target/`. Both `release.yml` (Stage ELF + UF2 step) and `build.yml` (Convert ELF to UF2 step) had the wrong path baked in. Same latent-regression class as the picotool apt issue — `build.yml`'s equivalent step had been behind `needs: [build]` and was never exercised.
+**Verification of cargo behaviour:** local repo `/home/mcarey/pico2hsm/target/thumbv8m.main-none-eabihf/release/pico2hsm` exists; no such file under `firmware/target/`.
+**Fix:** commit `cbf5bf3` — "ci: fix ELF_SRC path — workspace target is at root, not under firmware/". Drops `firmware/` prefix in both workflows; adds a comment explaining the workspace-target-dir rule.
+**Status:** fix committed; tag `v1.0.0-ci-test` deleted; dry-run #3 will follow.
+
+### [2026-04-17] Phase 6 dry-run #3 — ELF path fix validation
+
+**Status:** pending — re-running after commits `fe182bd` (picotool) + `cbf5bf3` (ELF path).
 
 ---
 
