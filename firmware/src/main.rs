@@ -461,6 +461,19 @@ const USB_PID: u16 = 0x27C0;
 #[embassy_executor::main]
 async fn main(_spawner: Spawner) {
     // ── 1. Initialise RP2350 clocks and peripherals ─────────────────────────
+    #[cfg(feature = "experiment-overclock-400")]
+    let p = {
+        // Experimental 400 MHz overclock at stock V1_10 core voltage.
+        // See `firmware/Cargo.toml` for caveats; only validated on
+        // rp2350_one_4m with a passive heatsink.
+        use embassy_rp::clocks::ClockConfig;
+        let clocks = ClockConfig::system_freq(400_000_000)
+            .expect("system_freq(400_000_000) — no valid PLL params");
+        let mut cfg = embassy_rp::config::Config::default();
+        cfg.clocks = clocks;
+        embassy_rp::init(cfg)
+    };
+    #[cfg(not(feature = "experiment-overclock-400"))]
     let p = embassy_rp::init(Default::default());
 
     // ── RTT probe-rs connect window (debug builds only) ──────────────────────
