@@ -21,6 +21,18 @@
 #   - #[cfg(debug_assertions)] blocks are compiled in (delay loop, sentinels)
 #   - defmt RTT output is visible via probe-rs
 #   - Optimisation is off (easier to correlate addresses with source)
+#
+# Optional environment variables (experimental):
+#   OVERCLOCK_200=1   Add the experiment-overclock-200 feature (200 MHz @ V1_10).
+#   OVERCLOCK_300=1   Add the experiment-overclock-300 feature (300 MHz @ V1_15).
+#   OVERCLOCK_400=1   Add the experiment-overclock-400 feature (400 MHz @ V1_30).
+#                     At most one OVERCLOCK_* may be set; firmware compile_error
+#                     enforces this if multiple are passed.
+#   BOOTSEL=1         Skip probe-rs / RTT and flash via picotool over USB
+#                     instead.  Use this when the board is in BOOTSEL mode
+#                     (no Debugprobe, just the USB cable).  The unsigned ELF
+#                     is loaded with `picotool load -x` so the device reboots
+#                     into the application immediately after flash.
 
 set -euo pipefail
 
@@ -59,15 +71,30 @@ ELF="target/thumbv8m.main-none-eabihf/debug/pico2hsm"
 CHIP="RP235x"
 KEY_FILE="ec_firmware_signing_key.pem"
 
+# ── Optional experimental features ────────────────────────────────────────────
+EXTRA_FEATS=""
+if [[ "${OVERCLOCK_200:-0}" == "1" ]]; then
+    EXTRA_FEATS=",experiment-overclock-200"
+    warn "OVERCLOCK_200=1 — adding experiment-overclock-200 (clk_sys=200 MHz, V1_10)"
+fi
+if [[ "${OVERCLOCK_300:-0}" == "1" ]]; then
+    EXTRA_FEATS="${EXTRA_FEATS},experiment-overclock-300"
+    warn "OVERCLOCK_300=1 — adding experiment-overclock-300 (clk_sys=300 MHz, V1_15)"
+fi
+if [[ "${OVERCLOCK_400:-0}" == "1" ]]; then
+    EXTRA_FEATS="${EXTRA_FEATS},experiment-overclock-400"
+    warn "OVERCLOCK_400=1 — adding experiment-overclock-400 (clk_sys=400 MHz, V1_30)"
+fi
+
 # ── Build (debug profile) ─────────────────────────────────────────────────────
 section "Debug build: $FEAT"
-info "cargo build --no-default-features --features $FEAT,rsa,applet-piv,applet-openpgp-curve25519"
+info "cargo build --no-default-features --features ${FEAT},rsa,applet-piv,applet-openpgp-curve25519${EXTRA_FEATS}"
 
 DEFMT_LOG=trace \
 cargo build \
     --manifest-path firmware/Cargo.toml \
     --no-default-features \
-    --features "$FEAT,rsa,applet-piv,applet-openpgp-curve25519"
+    --features "${FEAT},rsa,applet-piv,applet-openpgp-curve25519${EXTRA_FEATS}"
 
 [[ -f "$ELF" ]] || die "ELF not found at $ELF"
 ok "Build complete: $ELF"
@@ -114,6 +141,18 @@ else
 fi
 
 # ── Flash + run ───────────────────────────────────────────────────────────────
+if [[ "${BOOTSEL:-0}" == "1" ]]; then
+    section "Flash via picotool (BOOTSEL mode): $FEAT"
+    command -v picotool >/dev/null 2>&1 || die "picotool not installed"
+    info "picotool load -x $FLASH_ELF"
+    # -t elf  : input format
+    # -x      : execute (reboot to application) immediately after load
+    picotool load "$FLASH_ELF" -t elf -x
+    ok "Flashed via picotool — device should be re-enumerating on USB"
+    info "Wait ~5 s for USB CCID re-enumeration before invoking ./run_tests.sh"
+    exit 0
+fi
+
 section "Flash + RTT monitor: $FEAT"
 info "Flashing with probe-rs run --chip $CHIP ..."
 info "RTT output will appear below.  Press Ctrl+C to stop monitoring."

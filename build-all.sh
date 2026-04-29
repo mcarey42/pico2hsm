@@ -100,6 +100,24 @@ fi
 # from Cargo.toml defaults, so we re-add them explicitly here.
 COMMON_FEATURES="rsa,applet-piv,applet-openpgp-curve25519"
 
+# ── Optional experimental overclock feature ───────────────────────────────────
+# OVERCLOCK_200=1 / OVERCLOCK_300=1 / OVERCLOCK_400=1 — append the matching
+# experiment-overclock-* feature to all variants.  See firmware/Cargo.toml
+# for caveats; only 200 and 300 MHz have been validated against the full
+# integration suite.  At most one OVERCLOCK_* may be set.
+if [[ "${OVERCLOCK_200:-0}" == "1" ]]; then
+    COMMON_FEATURES="${COMMON_FEATURES},experiment-overclock-200"
+    warn "OVERCLOCK_200=1 — appending experiment-overclock-200 (200 MHz @ V1_10)"
+fi
+if [[ "${OVERCLOCK_300:-0}" == "1" ]]; then
+    COMMON_FEATURES="${COMMON_FEATURES},experiment-overclock-300"
+    warn "OVERCLOCK_300=1 — appending experiment-overclock-300 (300 MHz @ V1_15)"
+fi
+if [[ "${OVERCLOCK_400:-0}" == "1" ]]; then
+    COMMON_FEATURES="${COMMON_FEATURES},experiment-overclock-400"
+    warn "OVERCLOCK_400=1 — appending experiment-overclock-400 (400 MHz @ V1_30)"
+fi
+
 # ── Board variant table ───────────────────────────────────────────────────────
 # (feature flag, human name, probe-rs chip id)
 declare -a VARIANTS=(

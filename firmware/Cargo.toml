@@ -39,18 +39,16 @@ applet-openpgp = []                      # OpenPGP Card 3.4 applet (RSA + NIST E
 applet-openpgp-curve25519 = ["applet-openpgp", "dep:ed25519-dalek", "dep:x25519-dalek"]  # Adds Ed25519/X25519 (~50 KB)
 
 # ── Experimental — DO NOT enable in production ────────────────────────────────
-# Overclock the RP2350 system clock from 150 MHz (stock) to 400 MHz at the
-# default V1_10 core voltage.  Multiple community reports confirm 400–500 MHz
-# is reliable on RP2350 silicon at stock voltage; pico2hsm has only been
-# validated on this branch with a 1 cm² passive heatsink on the rp2350_one_4m
-# board.  Enabling this changes timing assumptions throughout the firmware:
-# PIO dividers (rp2350_one.rs) recompute correctly via `clk_sys_freq()`, but
-# any constants hard-coded to 150 MHz (e.g. `CYCLES_PER_MS` on the geek board,
-# the PBKDF2 iteration count) shift proportionally and have NOT been
-# re-calibrated.  This feature gates only the clock-init call; it must be
-# combined with a board feature, e.g.
-#     --no-default-features --features rp2350_one_4m,experiment-overclock-400
-experiment-overclock-400 = []
+# Overclock features for the RP2350 system clock.  Each writes the QMI flash
+# divider explicitly (M0_TIMING.CLKDIV=4) before the PLL_SYS retune, then
+# raises clk_sys via embassy-rp's ClockConfig::system_freq(), with a
+# proportional bump to core voltage (system_freq alone hardcodes V1_10).
+# Combine with a board feature, e.g.
+#     --no-default-features --features pico2_4m,experiment-overclock-300
+# At most one of the experiment-overclock-* features may be enabled at a time.
+experiment-overclock-200 = []   # 200 MHz @ V1_10 — diagnostic/PAC-validation
+experiment-overclock-300 = []   # 300 MHz @ V1_15 — Phase B
+experiment-overclock-400 = []   # 400 MHz @ V1_30 — Phase C / target
 
 # ─── Platform-agnostic dependencies ──────────────────────────────────────────
 # All of these compile on both x86_64 (for tests) and thumbv8m.main-none-eabihf

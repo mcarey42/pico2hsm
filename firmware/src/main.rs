@@ -461,20 +461,73 @@ const USB_PID: u16 = 0x27C0;
 #[embassy_executor::main]
 async fn main(_spawner: Spawner) {
     // ── 1. Initialise RP2350 clocks and peripherals ─────────────────────────
-    #[cfg(feature = "experiment-overclock-400")]
+    //
+    // Phase A/B/C/... of the 400 MHz overclock roadmap.  Each variant writes
+    // QMI M0_TIMING explicitly (CLKDIV=4) before reprogramming PLL_SYS, with
+    // a dummy XIP read + DSB/ISB barrier in between (RP2350 datasheet §12.14.6).
+    // Voltage is bumped above embassy-rp's hardcoded V1_10 in lockstep with
+    // frequency — 200 MHz holds at V1_10, 300 MHz at V1_15, 400 MHz will use
+    // V1_25 or V1_30.
+    #[cfg(any(
+        feature = "experiment-overclock-200",
+        feature = "experiment-overclock-300",
+        feature = "experiment-overclock-400",
+    ))]
     let p = {
-        // Experimental 400 MHz overclock at stock V1_10 core voltage.
-        // See `firmware/Cargo.toml` for caveats; only validated on
-        // rp2350_one_4m with a passive heatsink.
-        use embassy_rp::clocks::ClockConfig;
-        let clocks = ClockConfig::system_freq(400_000_000)
-            .expect("system_freq(400_000_000) — no valid PLL params");
+        unsafe {
+            use embassy_rp::pac;
+            pac::QMI.mem(0).timing().modify(|w| {
+                // CLKDIV=4 keeps QSPI ≤ clk_sys/4 — 50 MHz @ 200 MHz, 75 MHz @
+                // 300 MHz, 100 MHz @ 400 MHz.  All comfortably under W25Q32's
+                // 133 MHz QSPI spec.  RXDELAY=2 is the bootrom default and
+                // is documented as known-good at 100 MHz QSPI.
+                w.set_clkdiv(4);
+                w.set_rxdelay(2);
+                w.set_cooldown(1);
+            });
+            // Force the new divider through QMI before the PLL retunes.
+            let _ = core::ptr::read_volatile(0x10000000 as *const u32);
+            cortex_m::asm::dsb();
+            cortex_m::asm::isb();
+        }
+
+        use embassy_rp::clocks::{ClockConfig, CoreVoltage, PeriClkSrc};
+
+        #[cfg(feature = "experiment-overclock-200")]
+        let (target_hz, voltage) = (200_000_000u32, CoreVoltage::V1_10);
+        #[cfg(feature = "experiment-overclock-300")]
+        let (target_hz, voltage) = (300_000_000u32, CoreVoltage::V1_15);
+        #[cfg(feature = "experiment-overclock-400")]
+        let (target_hz, voltage) = (400_000_000u32, CoreVoltage::V1_30);
+
+        let mut clocks = ClockConfig::system_freq(target_hz)
+            .expect("system_freq(target_hz) — no valid PLL params");
+        // system_freq() hardcodes V1_10 for all RP235x targets; override.
+        clocks.core_voltage = voltage;
+        // Decouple clk_peri from clk_sys — at 400 MHz clk_sys, leaving
+        // peri_clk_src = PllSys would put clk_peri at 400 MHz too, well
+        // over the 150 MHz peripheral spec.  pico-sdk's set_sys_clock_pll
+        // does the same thing on every clk_sys change.  This keeps every
+        // clk_peri-derived peripheral (UART/SPI/I2C) at a constant 48 MHz
+        // regardless of the overclock target.
+        clocks.peri_clk_src = Some(PeriClkSrc::PllUsb);
         let mut cfg = embassy_rp::config::Config::default();
         cfg.clocks = clocks;
         embassy_rp::init(cfg)
     };
-    #[cfg(not(feature = "experiment-overclock-400"))]
+    #[cfg(not(any(
+        feature = "experiment-overclock-200",
+        feature = "experiment-overclock-300",
+        feature = "experiment-overclock-400",
+    )))]
     let p = embassy_rp::init(Default::default());
+
+    #[cfg(any(
+        all(feature = "experiment-overclock-200", feature = "experiment-overclock-300"),
+        all(feature = "experiment-overclock-200", feature = "experiment-overclock-400"),
+        all(feature = "experiment-overclock-300", feature = "experiment-overclock-400"),
+    ))]
+    compile_error!("at most one experiment-overclock-* feature may be enabled");
 
     // ── RTT probe-rs connect window (debug builds only) ──────────────────────
     // probe-rs sets RTT flags=BLOCK_IF_FULL after the chip resets post-flash.
