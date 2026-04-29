@@ -266,7 +266,7 @@ static KEY_COUNT: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::n
 #[cfg(target_arch = "arm")]
 use pico2hsm_firmware::CORE1_PROGRESS;
 #[cfg(target_arch = "arm")]
-use pico2hsm_firmware::{WATCHDOG_HEARTBEAT, WATCHDOG_STALL_LIMIT};
+use pico2hsm_firmware::{WATCHDOG_HEARTBEAT, WATCHDOG_STALL_LIMIT, WATCHDOG_SUPPRESS};
 
 /// Dispatcher — stored in BSS outside the async task state machine so that
 /// the `dispatcher_task` pool does not need to hold the full 50 KB Dispatcher
@@ -379,7 +379,15 @@ fn dispatcher_loop(ptr_wrapper: DispatcherPtr) -> ! {
         if apdu_bytes.is_empty() {
             // Empty APDU = reset signal issued by core0 on USB disconnect.
             // Reset in-memory state and reload keys from store.
-            *dispatcher = pico2hsm_firmware::apdu::dispatcher::Dispatcher::new();
+            //
+            // NOTE: must use `reset_in_place` (writes fields through a raw
+            // pointer) rather than `*dispatcher = Dispatcher::new()`.  The
+            // Dispatcher struct is ~82 KB; in debug builds `Dispatcher::new()`
+            // would place the full struct on the Core1 stack before copying
+            // it into BSS, risking silent stack overflow on the second USB
+            // reconnect in a test session.  See
+            // .claude/projects/-home-mcarey-pico2hsm/memory/dispatcher_stack_overflow.md
+            dispatcher.reset_in_place();
             if FlashQueueKeyStore::is_direct_write() {
                 // SD card: reload directly on core1.
                 use pico2hsm_firmware::storage::KeyStore;
@@ -819,7 +827,17 @@ async fn run_one_board(p: embassy_rp::Peripherals) {
                                             .load(core::sync::atomic::Ordering::Relaxed);
                                         let heartbeat = WATCHDOG_HEARTBEAT
                                             .load(core::sync::atomic::Ordering::Relaxed);
-                                        if heartbeat == last_heartbeat {
+                                        let suppress = WATCHDOG_SUPPRESS
+                                            .load(core::sync::atomic::Ordering::Relaxed);
+                                        if suppress {
+                                            // RSA keygen (or similar long pure-compute op)
+                                            // disarms the stall detector; heartbeat stops
+                                            // bumping because no RNG calls happen during
+                                            // Miller–Rabin. Reset counter and keep sending
+                                            // time extensions until keygen completes.
+                                            stall_count = 0;
+                                            last_heartbeat = heartbeat;
+                                        } else if heartbeat == last_heartbeat {
                                             stall_count += 1;
                                             defmt::warn!("time ext: core1 progress={} heartbeat={} STALL {}/{}", progress, heartbeat, stall_count, WATCHDOG_STALL_LIMIT);
                                             if stall_count >= WATCHDOG_STALL_LIMIT {
@@ -1243,7 +1261,17 @@ async fn run_geek_board(p: embassy_rp::Peripherals) {
                                             .load(core::sync::atomic::Ordering::Relaxed);
                                         let heartbeat = WATCHDOG_HEARTBEAT
                                             .load(core::sync::atomic::Ordering::Relaxed);
-                                        if heartbeat == last_heartbeat {
+                                        let suppress = WATCHDOG_SUPPRESS
+                                            .load(core::sync::atomic::Ordering::Relaxed);
+                                        if suppress {
+                                            // RSA keygen (or similar long pure-compute op)
+                                            // disarms the stall detector; heartbeat stops
+                                            // bumping because no RNG calls happen during
+                                            // Miller–Rabin. Reset counter and keep sending
+                                            // time extensions until keygen completes.
+                                            stall_count = 0;
+                                            last_heartbeat = heartbeat;
+                                        } else if heartbeat == last_heartbeat {
                                             stall_count += 1;
                                             defmt::warn!("time ext: core1 progress={} heartbeat={} STALL {}/{}", progress, heartbeat, stall_count, WATCHDOG_STALL_LIMIT);
                                             if stall_count >= WATCHDOG_STALL_LIMIT {
@@ -1568,7 +1596,17 @@ async fn run_pico2_board(p: embassy_rp::Peripherals) {
                                             .load(core::sync::atomic::Ordering::Relaxed);
                                         let heartbeat = WATCHDOG_HEARTBEAT
                                             .load(core::sync::atomic::Ordering::Relaxed);
-                                        if heartbeat == last_heartbeat {
+                                        let suppress = WATCHDOG_SUPPRESS
+                                            .load(core::sync::atomic::Ordering::Relaxed);
+                                        if suppress {
+                                            // RSA keygen (or similar long pure-compute op)
+                                            // disarms the stall detector; heartbeat stops
+                                            // bumping because no RNG calls happen during
+                                            // Miller–Rabin. Reset counter and keep sending
+                                            // time extensions until keygen completes.
+                                            stall_count = 0;
+                                            last_heartbeat = heartbeat;
+                                        } else if heartbeat == last_heartbeat {
                                             stall_count += 1;
                                             defmt::warn!("time ext: core1 progress={} heartbeat={} STALL {}/{}", progress, heartbeat, stall_count, WATCHDOG_STALL_LIMIT);
                                             if stall_count >= WATCHDOG_STALL_LIMIT {
@@ -2072,7 +2110,17 @@ async fn run_waveshare_lcd_board(p: embassy_rp::Peripherals) {
                                             .load(core::sync::atomic::Ordering::Relaxed);
                                         let heartbeat = WATCHDOG_HEARTBEAT
                                             .load(core::sync::atomic::Ordering::Relaxed);
-                                        if heartbeat == last_heartbeat {
+                                        let suppress = WATCHDOG_SUPPRESS
+                                            .load(core::sync::atomic::Ordering::Relaxed);
+                                        if suppress {
+                                            // RSA keygen (or similar long pure-compute op)
+                                            // disarms the stall detector; heartbeat stops
+                                            // bumping because no RNG calls happen during
+                                            // Miller–Rabin. Reset counter and keep sending
+                                            // time extensions until keygen completes.
+                                            stall_count = 0;
+                                            last_heartbeat = heartbeat;
+                                        } else if heartbeat == last_heartbeat {
                                             stall_count += 1;
                                             defmt::warn!("time ext: core1 progress={} heartbeat={} STALL {}/{}", progress, heartbeat, stall_count, WATCHDOG_STALL_LIMIT);
                                             if stall_count >= WATCHDOG_STALL_LIMIT {

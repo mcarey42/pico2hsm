@@ -607,10 +607,16 @@ impl ScHsm {
             pso::INS_PSO => pso::handle(&mut self.state, store, cmd),
             cipher_sym::INS_CIPHER_SYM => cipher_sym::handle(&mut self.state, store, cmd),
             bip_slip::INS_BIP_SLIP => bip_slip::handle(&mut self.state, store, cmd),
-            // INS 0x62: shared between DECIPHER (P1 = key_reference) and
-            // DERIVE_ASYM (P1 = 0x01). Route by P1.
+            // INS 0x62: shared between DECIPHER (P1 = key_reference, P2 = algo)
+            // and the proprietary DERIVE_ASYM (P1=0x01, P2=0x00).  P1 alone is
+            // not a safe discriminator — SC-HSM uses P1 as the key reference,
+            // and OpenSC assigns key_ref=0x01 to the first generated key, so a
+            // legitimate DECIPHER on slot 1 (e.g. P-256 ECDH) would otherwise
+            // be mis-routed to derive_asym.  Require P2=0x00 as well: DECIPHER
+            // always sets P2 to an algo code (0x21/0x22/0x23/0x25/0x27/0x29/0x80),
+            // never 0x00, so this cleanly separates the two.
             decrypt::INS_DECRYPT => {
-                if cmd.p1 == derive_asym::P1_DERIVE {
+                if cmd.p1 == derive_asym::P1_DERIVE && cmd.p2 == 0x00 {
                     derive_asym::handle(&mut self.state, store, cmd)
                 } else {
                     decrypt::handle(&mut self.state, store, cmd)
@@ -670,8 +676,9 @@ impl ScHsm {
                 cipher_sym::handle(&mut self.state, &mut LocalNullStore, cmd)
             }
             bip_slip::INS_BIP_SLIP => bip_slip::handle(&mut self.state, &mut LocalNullStore, cmd),
+            // See dispatch_with_store() above for the P1+P2 discrimination rationale.
             decrypt::INS_DECRYPT => {
-                if cmd.p1 == derive_asym::P1_DERIVE {
+                if cmd.p1 == derive_asym::P1_DERIVE && cmd.p2 == 0x00 {
                     derive_asym::handle(&mut self.state, &mut LocalNullStore, cmd)
                 } else {
                     decrypt::handle(&mut self.state, &mut LocalNullStore, cmd)

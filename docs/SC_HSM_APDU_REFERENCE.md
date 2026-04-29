@@ -876,7 +876,7 @@ INS `0x62` is shared between two operations, disambiguated by P1:
 
 **Response notes:** For `P2 = 0x80`, pico2hsm prepends `0x04` to the X-coordinate. OpenSC's `sc_hsm_decipher` strips this prefix to recover the field-size X bytes. For explicit ECDH codes (`0x23/0x25/0x27/0x29`), the raw X-coordinate is returned without the prefix.
 
-**Note — ECDH1-COFACTOR-DERIVE vs ECDH1-DERIVE:** For all supported curves (P-256/P-384/P-521/K-256) the cofactor h=1, so `ECDH1-COFACTOR-DERIVE` (0x1051) and `ECDH1-DERIVE` (0x1050) are mathematically identical. Tests use `ECDH1-DERIVE` because OpenSC 0.25's SC-HSM driver rejects `ECDH1-COFACTOR-DERIVE` for P-256 keys at the PKCS#11 layer (before sending any APDU).
+**Note — ECDH1-COFACTOR-DERIVE vs ECDH1-DERIVE:** For all supported curves (P-256/P-384/P-521/K-256) the cofactor h=1, so `ECDH1-COFACTOR-DERIVE` (0x1051) and `ECDH1-DERIVE` (0x1050) are mathematically identical. Tests use `ECDH1-DERIVE` uniformly because the `OpenSC 0.25 sc-hsm driver + pico2hsm firmware` combination rejects `ECDH1-COFACTOR-DERIVE` for P-256 keys: the driver translates the mechanism into a `80 62 01 80 …` DECIPHER APDU that the device answers with `SW=6985` ("conditions of use not satisfied"), which OpenSC surfaces as `CKR_GENERAL_ERROR`. Plain `ECDH1-DERIVE` works for all four curves.
 
 **Status words:**
 
