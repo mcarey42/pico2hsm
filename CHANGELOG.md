@@ -6,6 +6,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.1] - 2026-04-29
+
+First maintenance release of the v1.0 line.  Three coupled SC-HSM bug fixes
+plus the test/doc updates that exercise them.  No behaviour change for code
+paths that were already passing on v1.0.0.
+
+### Fixed
+- **SC-HSM INS=0x62 routing.** `DECIPHER` (P1 = key reference, P2 = algo)
+  and the proprietary `DERIVE_ASYM` (P1 = 0x01, P2 = 0x00) were previously
+  disambiguated by `P1` alone, which mis-routed a legitimate P-256 ECDH
+  `DECIPHER` on slot 1 to `derive_asym` because OpenSC assigns
+  `key_ref = 0x01` to the first generated key.  Routing now requires both
+  `P1 = 0x01` AND `P2 = 0x00` (DECIPHER's P2 is always a non-zero algo
+  code), restoring P-256 ECDH on slot 1.
+- **Core1 reset stack overflow risk.** The Core1 dispatcher loop's
+  USB-reconnect path used `*dispatcher = Dispatcher::new()`, which
+  materialises the ~82 KB `Dispatcher` struct on the Core1 stack before
+  copying it into BSS — risking a silent stack overflow on the second
+  reconnect in a long test session.  Replaced with a new
+  `Dispatcher::reset_in_place()` that rewrites fields through
+  `addr_of_mut!`, keeping peak added stack usage to a few hundred bytes.
+- **RSA keygen disarms the time-extension stall detector.** Miller-Rabin
+  prime-search makes no RNG calls, so `WATCHDOG_HEARTBEAT` stops bumping
+  during a long keygen and the stall detector previously tripped.  All
+  four board run loops (`pico2_4m`, `rp2350_one_4m`, `rp2350_geek_*`,
+  `waveshare_rp2350_lcd_*`) now honour a `WATCHDOG_SUPPRESS` flag — while
+  set, `stall_count` resets and CCID time extensions keep flowing until
+  keygen completes.
+
+### Changed
+- `tests/hw/test_03_ecdh.py` uses `ECDH1-DERIVE` uniformly across all four
+  curves now that the firmware INS=0x62 routing fix lets P-256 derivations
+  reach the device through plain DERIVE.  Removes the per-curve mechanism
+  switch.
+- `tests/hw/test_11_dkek_roundtrip.py` `LIST_KEYS` APDU now sends
+  `80 58 00 00 00` (Le=0) instead of `80 58 00 FF 00` (Lc=0xFF, malformed
+  for this command).  Adds diagnostic logging when no `0xCC` slot is found
+  so future regressions surface in the test log instead of returning
+  `None` silently.
+
+### Documentation
+- `docs/SC_HSM_APDU_REFERENCE.md` documents the OpenSC 0.25 sc-hsm-driver
+  rejection of `ECDH1-COFACTOR-DERIVE` for P-256 (returns SW=6985 →
+  `CKR_GENERAL_ERROR`) so future developers don't waste time chasing the
+  symptom.
+
 ## [1.0.0] - 2026-04-18
 
 First stable release of the pico2hsm firmware.
