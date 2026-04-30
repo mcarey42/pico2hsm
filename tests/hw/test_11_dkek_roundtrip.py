@@ -123,7 +123,7 @@ def _get_first_key_slot(reader: int = 0) -> int | None:
     This is NOT the same as the PKCS#15 CKA_ID passed to pkcs11-tool --id.
     """
     SELECT_SC_HSM_HEX = "00A404000BE82B0601040181C31F020100"
-    LIST_KEYS_HEX = "805800FF00"
+    LIST_KEYS_HEX = "8058000000"
     result = subprocess.run(
         ["opensc-tool", f"-r{reader}", "-s", SELECT_SC_HSM_HEX, "-s", LIST_KEYS_HEX],
         capture_output=True, timeout=10,
@@ -159,6 +159,13 @@ def _get_first_key_slot(reader: int = 0) -> int | None:
         if hi == 0xCC and lo != 0x00 and lo < 0xF0:
             return lo
         i += 2
+    # Diagnostic: no usable 0xCC slot found.  Log the raw opensc-tool output
+    # and the parsed block list so firmware-side reset/reconnect bugs are
+    # visible in the test log instead of just returning None silently.
+    log.warning("_get_first_key_slot returning None; stdout=%r stderr=%r",
+                output, result.stderr.decode(errors="replace"))
+    log.warning("parsed blocks (%d): %s",
+                len(blocks), [bytes(b).hex() for b in blocks])
     return None
 
 

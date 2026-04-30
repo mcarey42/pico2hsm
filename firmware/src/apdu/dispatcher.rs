@@ -132,6 +132,43 @@ impl Dispatcher {
         }
     }
 
+    /// Reset a live Dispatcher back to post-boot state **without** allocating
+    /// a full ~82 KB Dispatcher on the stack.
+    ///
+    /// Used by the Core1 dispatcher loop on USB-reconnect reset signals.
+    /// In debug builds `Dispatcher::new()` (and therefore `*self = Self::new()`)
+    /// materialises the entire struct on the Core1 stack before `memcpy`ing
+    /// into place; on the 128 KB Core1 stack this risks silent overflow when
+    /// combined with the existing dispatch-chain temporaries.  See
+    /// `.claude/projects/-home-mcarey-pico2hsm/memory/dispatcher_stack_overflow.md`.
+    ///
+    /// This method rewrites each field directly through `addr_of_mut!` —
+    /// peak added stack usage is a few hundred bytes.  The caller is
+    /// responsible for reloading flash-backed keys afterwards via
+    /// `load_keys_from_store`; this method only resets in-memory state.
+    ///
+    /// All fields are trivially-droppable (enums, `heapless::Vec` with inline
+    /// storage, fixed arrays), so overwriting them with `ptr::write` does
+    /// not leak anything.
+    #[inline(never)]
+    pub fn reset_in_place(&mut self) {
+        let ptr: *mut Self = self;
+        unsafe {
+            core::ptr::addr_of_mut!((*ptr).active).write(ActiveProtocol::None);
+            ScHsm::init_in_place(core::ptr::addr_of_mut!((*ptr).sc_hsm));
+            Piv::init_in_place(core::ptr::addr_of_mut!((*ptr).piv));
+            Self::init_openpgp_in_place(core::ptr::addr_of_mut!((*ptr).openpgp));
+            {
+                let sb = core::ptr::addr_of_mut!((*ptr).shared_buf);
+                core::ptr::addr_of_mut!((*sb).data).write_bytes(0u8, 1);
+                core::ptr::addr_of_mut!((*sb).len).write(0);
+                core::ptr::addr_of_mut!((*sb).offset).write(0);
+                core::ptr::addr_of_mut!((*sb).state)
+                    .write(crate::apdu::shared_buffer::SharedBufState::Empty);
+            }
+        }
+    }
+
     /// Return the total number of keys in the key_index, clamped to u8.
     ///
     /// Used by core1 to update the `KEY_COUNT` atomic without needing access
