@@ -762,15 +762,11 @@ pub fn handle(
         // Suppress the watchdog during RSA keygen — modular exponentiation
         // runs for minutes without RNG calls, which would trip the heartbeat
         // stall detector and crash the device.
-        crate::WATCHDOG_SUPPRESS.store(true, core::sync::atomic::Ordering::Relaxed);
-        let pair = match crate::crypto::asymmetric::generate_rsa_keypair(key_type, &mut FwRng) {
-            Ok(p) => {
-                crate::WATCHDOG_SUPPRESS.store(false, core::sync::atomic::Ordering::Relaxed);
-                p
-            }
-            Err(_) => {
-                crate::WATCHDOG_SUPPRESS.store(false, core::sync::atomic::Ordering::Relaxed);
-                return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED);
+        let pair = {
+            let _suppress = crate::WatchdogSuppressGuard::new();
+            match crate::crypto::asymmetric::generate_rsa_keypair(key_type, &mut FwRng) {
+                Ok(p) => p,
+                Err(_) => return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
             }
         };
 

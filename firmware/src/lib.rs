@@ -68,6 +68,25 @@ pub const WATCHDOG_STALL_LIMIT: u32 = 20;
 pub static WATCHDOG_SUPPRESS: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
+/// Holds [`WATCHDOG_SUPPRESS`] set for its lifetime and clears it on drop,
+/// so every return path (including `?` and early returns) re-arms the
+/// stall detector.
+pub struct WatchdogSuppressGuard(());
+
+impl WatchdogSuppressGuard {
+    /// Disarm the core1 stall detector until the guard is dropped.
+    pub fn new() -> Self {
+        WATCHDOG_SUPPRESS.store(true, core::sync::atomic::Ordering::Relaxed);
+        WatchdogSuppressGuard(())
+    }
+}
+
+impl Drop for WatchdogSuppressGuard {
+    fn drop(&mut self) {
+        WATCHDOG_SUPPRESS.store(false, core::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 #[cfg(not(target_arch = "arm"))]
 #[macro_export]
 macro_rules! cdc_log {

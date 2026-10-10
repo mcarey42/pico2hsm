@@ -94,12 +94,17 @@ static FLASH_RESP: Channel<SpinlockRawMutex<26>, Result<(), pico2hsm_core::error
 /// Flash operation request — sent from core1 to core0 for flash persistence.
 ///
 /// Core1 cannot call `embassy_rp::flash` directly (the `in_ram()` function
-/// asserts `core_id == 0`).  Instead, the dispatcher queues flash ops and
-/// sends them to core0 via `FLASH_REQ` after each APDU dispatch completes.
+/// asserts `core_id == 0`).  Instead, `Core1KeyStore` sends each op to core0
+/// via `FLASH_REQ` and blocks on `FLASH_RESP` until it completes.
 #[cfg(target_arch = "arm")]
 enum FlashOp {
     /// Encrypt and persist a key object to flash.
-    SaveKey(pico2hsm_firmware::security::key_management::KeyObject),
+    ///
+    /// Points at core1's `KeyObject` rather than carrying a copy: core1 stays
+    /// blocked on `FLASH_RESP` until core0 has finished with it, so the
+    /// pointee outlives every use, and no plaintext copy of the key is left
+    /// behind in the channel slot.
+    SaveKey(*const pico2hsm_firmware::security::key_management::KeyObject),
     /// Delete a key from persistent storage.
     EraseKey(pico2hsm_core::key::KeyId),
     /// Wipe ALL keys. Called by INITIALIZE only.
@@ -112,6 +117,11 @@ enum FlashOp {
     ReloadKeys,
 }
 
+// SAFETY: the only non-Send field is `SaveKey`'s pointer, which core0
+// dereferences only while core1 is blocked waiting for `FLASH_RESP`.
+#[cfg(target_arch = "arm")]
+unsafe impl Send for FlashOp {}
+
 /// A `KeyStore` implementation used by the core1 dispatcher during APDU
 /// processing.
 ///
@@ -123,32 +133,21 @@ enum FlashOp {
 ///
 /// **QMI flash boards** (all others):
 /// Reads go through `store_ptr` (XIP memory-mapped, safe from any core).
-/// Writes are queued as `FlashOp`s and drained to core0 after dispatch,
-/// because `embassy_rp::flash` asserts `core_id == 0` for erase/write.
+/// Writes are sent to core0 one at a time and complete before the call
+/// returns, because `embassy_rp::flash` asserts `core_id == 0`.  Being
+/// synchronous means callers see real write errors, later reads in the same
+/// APDU see earlier writes, and a PIN retry counter is on flash before the
+/// PIN is compared.
 #[cfg(target_arch = "arm")]
-struct FlashQueueKeyStore {
-    /// Queued flash ops — only used by QMI flash boards.
-    /// SD card boards leave this empty (writes go direct).
-    ops: heapless::Vec<FlashOp, 8>,
+struct Core1KeyStore {
     /// Raw pointer to the BoardKeyStore.
     store_ptr: *mut pico2hsm_firmware::storage::BoardKeyStore,
 }
 
-// SAFETY: FlashQueueKeyStore is only used by Core1's single dispatcher task.
 #[cfg(target_arch = "arm")]
-unsafe impl Send for FlashQueueKeyStore {}
-
-#[cfg(target_arch = "arm")]
-impl FlashQueueKeyStore {
+impl Core1KeyStore {
     fn new(store_ptr: *mut pico2hsm_firmware::storage::BoardKeyStore) -> Self {
-        FlashQueueKeyStore {
-            ops: heapless::Vec::new(),
-            store_ptr,
-        }
-    }
-
-    fn drain(&mut self) -> heapless::Vec<FlashOp, 8> {
-        core::mem::replace(&mut self.ops, heapless::Vec::new())
+        Core1KeyStore { store_ptr }
     }
 
     /// Whether this board uses direct SD card writes (no core0 channel needed).
@@ -158,42 +157,30 @@ impl FlashQueueKeyStore {
             feature = "waveshare_rp2350_lcd_sdcard",
         ))
     }
+
+    /// Run `op` on core0 and block until it reports the result.
+    fn on_core0(op: FlashOp) -> Result<(), pico2hsm_core::error::HsmError> {
+        blocking_send(&FLASH_REQ, op);
+        blocking_receive(&FLASH_RESP)
+    }
+
+    fn direct(&mut self) -> &mut pico2hsm_firmware::storage::BoardKeyStore {
+        // SAFETY: core0 touches the store only while core1 is blocked in
+        // `on_core0`, so this reference is never aliased by a live access.
+        unsafe { &mut *self.store_ptr }
+    }
 }
 
 #[cfg(target_arch = "arm")]
-impl pico2hsm_firmware::storage::KeyStore for FlashQueueKeyStore {
+impl pico2hsm_firmware::storage::KeyStore for Core1KeyStore {
     fn save_key(
         &mut self,
         obj: &pico2hsm_firmware::security::key_management::KeyObject,
     ) -> Result<(), pico2hsm_core::error::HsmError> {
-        CORE1_PROGRESS.store(70, core::sync::atomic::Ordering::Relaxed);
         if Self::is_direct_write() {
-            // SD card: write directly from core1 — no XIP involvement.
-            use pico2hsm_firmware::storage::KeyStore;
-            let store = unsafe { &mut *self.store_ptr };
-            let result = store.save_key(obj);
-            CORE1_PROGRESS.store(73, core::sync::atomic::Ordering::Relaxed);
-            return result;
+            return self.direct().save_key(obj);
         }
-        // QMI flash: queue for core0.
-        let mut copy = pico2hsm_firmware::security::key_management::KeyObject::new(
-            obj.key_type,
-            obj.key_id,
-            obj.owner,
-            obj.algorithm,
-        );
-        CORE1_PROGRESS.store(71, core::sync::atomic::Ordering::Relaxed);
-        copy.key_domain = obj.key_domain;
-        copy.key_flags = obj.key_flags;
-        copy.use_count = obj.use_count;
-        copy.generation = obj.generation;
-        copy.timestamp_ms = obj.timestamp_ms;
-        let _ = copy.private_key.extend_from_slice(&obj.private_key);
-        let _ = copy.public_key.extend_from_slice(&obj.public_key);
-        CORE1_PROGRESS.store(72, core::sync::atomic::Ordering::Relaxed);
-        let _ = self.ops.push(FlashOp::SaveKey(copy));
-        CORE1_PROGRESS.store(73, core::sync::atomic::Ordering::Relaxed);
-        Ok(())
+        Self::on_core0(FlashOp::SaveKey(obj))
     }
 
     fn fetch_key(
@@ -205,9 +192,7 @@ impl pico2hsm_firmware::storage::KeyStore for FlashQueueKeyStore {
     > {
         // Direct read — safe from any core.
         // For QMI flash this is XIP memory-mapped; for SD card it's SPI reads.
-        use pico2hsm_firmware::storage::KeyStore;
-        let store = unsafe { &mut *self.store_ptr };
-        store.fetch_key(key_id)
+        self.direct().fetch_key(key_id)
     }
 
     fn erase_key(
@@ -215,22 +200,16 @@ impl pico2hsm_firmware::storage::KeyStore for FlashQueueKeyStore {
         key_id: pico2hsm_core::key::KeyId,
     ) -> Result<(), pico2hsm_core::error::HsmError> {
         if Self::is_direct_write() {
-            use pico2hsm_firmware::storage::KeyStore;
-            let store = unsafe { &mut *self.store_ptr };
-            return store.erase_key(key_id);
+            return self.direct().erase_key(key_id);
         }
-        let _ = self.ops.push(FlashOp::EraseKey(key_id));
-        Ok(())
+        Self::on_core0(FlashOp::EraseKey(key_id))
     }
 
     fn wipe_all(&mut self) -> Result<(), pico2hsm_core::error::HsmError> {
         if Self::is_direct_write() {
-            use pico2hsm_firmware::storage::KeyStore;
-            let store = unsafe { &mut *self.store_ptr };
-            return store.wipe_all();
+            return self.direct().wipe_all();
         }
-        let _ = self.ops.push(FlashOp::WipeAll);
-        Ok(())
+        Self::on_core0(FlashOp::WipeAll)
     }
 
     fn wipe_by_owner(
@@ -238,12 +217,9 @@ impl pico2hsm_firmware::storage::KeyStore for FlashQueueKeyStore {
         owner: pico2hsm_core::key::AppletId,
     ) -> Result<(), pico2hsm_core::error::HsmError> {
         if Self::is_direct_write() {
-            use pico2hsm_firmware::storage::KeyStore;
-            let store = unsafe { &mut *self.store_ptr };
-            return store.wipe_by_owner(owner);
+            return self.direct().wipe_by_owner(owner);
         }
-        let _ = self.ops.push(FlashOp::WipeByOwner(owner));
-        Ok(())
+        Self::on_core0(FlashOp::WipeByOwner(owner))
     }
 
     fn enumerate_keys(&self) -> heapless::Vec<pico2hsm_core::key::KeyId, 64> {
@@ -388,29 +364,19 @@ fn dispatcher_loop(ptr_wrapper: DispatcherPtr) -> ! {
             // reconnect in a test session.  reset_in_place also zeroizes the
             // old session's secrets (DKEK, PIN state, cached keys).
             dispatcher.reset_in_place();
-            if FlashQueueKeyStore::is_direct_write() {
+            if Core1KeyStore::is_direct_write() {
                 // SD card: reload directly on core1.
-                use pico2hsm_firmware::storage::KeyStore;
                 let store = unsafe { &mut *store_ptr };
                 dispatcher.load_keys_from_store(store);
             } else {
                 // QMI flash: ask core0 to reload (it holds the store).
-                blocking_send(&FLASH_REQ, FlashOp::ReloadKeys);
-                let _ = blocking_receive(&FLASH_RESP);
+                let _ = Core1KeyStore::on_core0(FlashOp::ReloadKeys);
             }
             blocking_send(&RESP_CHANNEL, heapless::Vec::new());
         } else {
             CORE1_PROGRESS.store(10, core::sync::atomic::Ordering::Relaxed);
-            let mut q = FlashQueueKeyStore::new(store_ptr);
-            let response = dispatcher.dispatch_with_store(&apdu_bytes, &mut q);
-            CORE1_PROGRESS.store(40, core::sync::atomic::Ordering::Relaxed);
-            // Drain queued flash ops (QMI flash boards only).
-            // SD card boards write directly during dispatch — queue is empty.
-            for op in q.drain() {
-                CORE1_PROGRESS.store(50, core::sync::atomic::Ordering::Relaxed);
-                blocking_send(&FLASH_REQ, op);
-                let _ = blocking_receive(&FLASH_RESP);
-            }
+            let mut ks = Core1KeyStore::new(store_ptr);
+            let response = dispatcher.dispatch_with_store(&apdu_bytes, &mut ks);
             CORE1_PROGRESS.store(60, core::sync::atomic::Ordering::Relaxed);
             blocking_send(&RESP_CHANNEL, response);
             CORE1_PROGRESS.store(0, core::sync::atomic::Ordering::Relaxed);
@@ -616,8 +582,12 @@ fn handle_flash_op(
     dispatcher_ptr: *mut pico2hsm_firmware::apdu::dispatcher::Dispatcher,
 ) -> Result<(), pico2hsm_core::error::HsmError> {
     use pico2hsm_firmware::storage::KeyStore;
+    // Flash work counts as progress for the core1 stall detector.
+    WATCHDOG_HEARTBEAT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     match op {
-        FlashOp::SaveKey(ref obj) => {
+        FlashOp::SaveKey(ptr) => {
+            // SAFETY: see `FlashOp::SaveKey` — core1 is blocked until we reply.
+            let obj = unsafe { &*ptr };
             let result = store.save_key(obj);
             defmt::info!(
                 "FLASH_SVC: save_key 0x{:08x} => {}",
@@ -662,7 +632,7 @@ fn handle_flash_op(
 /// `FLASH_REQ` it issues first.
 ///
 /// Core1 may need core0 to perform flash operations before it can reply —
-/// queued key writes after a dispatch, or `ReloadKeys` after a USB-reconnect
+/// key writes during a dispatch, or `ReloadKeys` after a USB-reconnect
 /// reset on QMI flash boards.  Waiting on `RESP_CHANNEL` alone in those paths
 /// deadlocks both cores (core1 blocks on `FLASH_RESP`, core0 on `RESP_CHANNEL`).
 #[cfg(target_arch = "arm")]
@@ -681,6 +651,97 @@ async fn recv_core1_response(
             }
         }
     }
+}
+
+/// Wait for core1's response to an APDU, keeping the host and core1 serviced.
+///
+/// - Services `FLASH_REQ` so core1's flash writes can complete.
+/// - Sends a CCID time extension every 1.5 s of wall-clock time.  The deadline
+///   is absolute, so a stream of flash ops (which block this executor) cannot
+///   push it back; an overdue extension goes out as soon as the op finishes.
+/// - Stall detector: if core1's heartbeat doesn't move for
+///   `WATCHDOG_STALL_LIMIT` intervals (and `WATCHDOG_SUPPRESS` is clear),
+///   returns `None`; the caller must reset the device (see `watchdog_reset`).
+///
+/// On USB disconnect, drains core1's response and returns an empty Vec so the
+/// caller takes its normal disconnect path.
+#[cfg(target_arch = "arm")]
+async fn await_core1_response<'d, D: embassy_usb::driver::Driver<'d>>(
+    ccid: &mut pico2hsm_firmware::transport::CcidTransport<'d, D>,
+    store: &mut pico2hsm_firmware::storage::BoardKeyStore,
+    dispatcher_ptr: *mut pico2hsm_firmware::apdu::dispatcher::Dispatcher,
+) -> Option<heapless::Vec<u8, 4098>> {
+    use core::sync::atomic::Ordering::Relaxed;
+    use embassy_futures::select::{select3, Either3};
+    use embassy_time::{Duration, Instant};
+
+    const WTX_INTERVAL: Duration = Duration::from_millis(1500);
+    let mut deadline = Instant::now() + WTX_INTERVAL;
+    let mut stall_count: u32 = 0;
+    let mut last_heartbeat = WATCHDOG_HEARTBEAT.load(Relaxed);
+    loop {
+        match select3(
+            RESP_CHANNEL.receive(),
+            Timer::at(deadline),
+            FLASH_REQ.receive(),
+        )
+        .await
+        {
+            Either3::First(r) => return Some(r),
+            Either3::Second(()) => {
+                deadline = Instant::now() + WTX_INTERVAL;
+                let progress = CORE1_PROGRESS.load(Relaxed);
+                let heartbeat = WATCHDOG_HEARTBEAT.load(Relaxed);
+                if WATCHDOG_SUPPRESS.load(Relaxed) || heartbeat != last_heartbeat {
+                    stall_count = 0;
+                    last_heartbeat = heartbeat;
+                    defmt::warn!(
+                        "time ext: core1 progress={} heartbeat={}",
+                        progress,
+                        heartbeat
+                    );
+                } else {
+                    stall_count += 1;
+                    defmt::warn!(
+                        "time ext: core1 progress={} heartbeat={} STALL {}/{}",
+                        progress,
+                        heartbeat,
+                        stall_count,
+                        WATCHDOG_STALL_LIMIT
+                    );
+                    if stall_count >= WATCHDOG_STALL_LIMIT {
+                        return None;
+                    }
+                }
+                if let Err(pico2hsm_firmware::transport::ccid::CcidError::UsbDisconnected) =
+                    ccid.send_time_extension().await
+                {
+                    let _ = recv_core1_response(store, dispatcher_ptr).await;
+                    return Some(heapless::Vec::new());
+                }
+            }
+            Either3::Third(op) => {
+                let result = handle_flash_op(op, store, dispatcher_ptr);
+                FLASH_RESP.send(result).await;
+                cortex_m::asm::sev(); // wake core1 from WFE
+            }
+        }
+    }
+}
+
+/// Core1 is stuck: tell the host (SW 6F00) and reset the whole chip.
+///
+/// Core1 cannot be safely abandoned — it would still own the dispatcher and
+/// its late response would be taken as the answer to the next APDU — so a
+/// full reset is the only state that is known to be consistent.
+#[cfg(target_arch = "arm")]
+async fn watchdog_reset<'d, D: embassy_usb::driver::Driver<'d>>(
+    ccid: &mut pico2hsm_firmware::transport::CcidTransport<'d, D>,
+) -> ! {
+    defmt::error!("watchdog: core1 stuck — sending 6F00 and resetting");
+    let _ = ccid.send_response(&[0x6F, 0x00]).await;
+    Timer::after_millis(50).await;
+    cortex_m::peripheral::SCB::sys_reset()
 }
 
 // ─── RP2350-One main function ─────────────────────────────────────────────────
@@ -833,73 +894,11 @@ async fn run_one_board(p: embassy_rp::Peripherals) {
                         board.led().set_status(LedStatus::Busy);
                         let _ = APDU_CHANNEL.send(apdu_bytes).await;
                         cortex_m::asm::sev(); // wake core1 from WFE
-                        let response = {
-                            use embassy_futures::select::{select3, Either3};
-                            let mut stall_count: u32 = 0;
-                            let mut last_heartbeat =
-                                WATCHDOG_HEARTBEAT.load(core::sync::atomic::Ordering::Relaxed);
-                            loop {
-                                match select3(
-                                    RESP_CHANNEL.receive(),
-                                    embassy_time::Timer::after_millis(1500),
-                                    FLASH_REQ.receive(),
-                                )
-                                .await
-                                {
-                                    Either3::First(r) => break r,
-                                    Either3::Second(_) => {
-                                        let progress = CORE1_PROGRESS
-                                            .load(core::sync::atomic::Ordering::Relaxed);
-                                        let heartbeat = WATCHDOG_HEARTBEAT
-                                            .load(core::sync::atomic::Ordering::Relaxed);
-                                        let suppress = WATCHDOG_SUPPRESS
-                                            .load(core::sync::atomic::Ordering::Relaxed);
-                                        if suppress {
-                                            // RSA keygen (or similar long pure-compute op)
-                                            // disarms the stall detector; heartbeat stops
-                                            // bumping because no RNG calls happen during
-                                            // Miller–Rabin. Reset counter and keep sending
-                                            // time extensions until keygen completes.
-                                            stall_count = 0;
-                                            last_heartbeat = heartbeat;
-                                        } else if heartbeat == last_heartbeat {
-                                            stall_count += 1;
-                                            defmt::warn!("time ext: core1 progress={} heartbeat={} STALL {}/{}", progress, heartbeat, stall_count, WATCHDOG_STALL_LIMIT);
-                                            if stall_count >= WATCHDOG_STALL_LIMIT {
-                                                defmt::error!(
-                                                    "watchdog: core1 stuck — aborting APDU"
-                                                );
-                                                // Return SW 6F00 (internal error) to unblock the host.
-                                                let mut err_resp = heapless::Vec::<u8, 4098>::new();
-                                                let _ = err_resp.push(0x6F);
-                                                let _ = err_resp.push(0x00);
-                                                break err_resp;
-                                            }
-                                        } else {
-                                            stall_count = 0;
-                                            last_heartbeat = heartbeat;
-                                            defmt::warn!(
-                                                "time ext: core1 progress={} heartbeat={}",
-                                                progress,
-                                                heartbeat
-                                            );
-                                        }
-                                        if let Err(CcidError::UsbDisconnected) =
-                                            ccid.send_time_extension().await
-                                        {
-                                            let _ =
-                                                recv_core1_response(store, dispatcher_ptr).await;
-                                            break heapless::Vec::new();
-                                        }
-                                    }
-                                    Either3::Third(op) => {
-                                        let result = handle_flash_op(op, store, dispatcher_ptr);
-                                        FLASH_RESP.send(result).await;
-                                        cortex_m::asm::sev(); // wake core1 from WFE
-                                    }
-                                }
-                            }
-                        };
+                        let response =
+                            match await_core1_response(&mut ccid, store, dispatcher_ptr).await {
+                                Some(r) => r,
+                                None => watchdog_reset(&mut ccid).await,
+                            };
                         match ccid.send_response(&response).await {
                             Ok(()) => {
                                 for _ in 0..16 {
@@ -1268,74 +1267,11 @@ async fn run_geek_board(p: embassy_rp::Peripherals) {
                         cortex_m::asm::sev(); // wake core1 from WFE
 
                         // Wait for core1 response (with time extensions every 1.5s)
-                        let response = {
-                            use embassy_futures::select::{select3, Either3};
-                            let mut stall_count: u32 = 0;
-                            let mut last_heartbeat =
-                                WATCHDOG_HEARTBEAT.load(core::sync::atomic::Ordering::Relaxed);
-                            loop {
-                                match select3(
-                                    RESP_CHANNEL.receive(),
-                                    embassy_time::Timer::after_millis(1500),
-                                    FLASH_REQ.receive(),
-                                )
-                                .await
-                                {
-                                    Either3::First(r) => break r,
-                                    Either3::Second(_) => {
-                                        let progress = CORE1_PROGRESS
-                                            .load(core::sync::atomic::Ordering::Relaxed);
-                                        let heartbeat = WATCHDOG_HEARTBEAT
-                                            .load(core::sync::atomic::Ordering::Relaxed);
-                                        let suppress = WATCHDOG_SUPPRESS
-                                            .load(core::sync::atomic::Ordering::Relaxed);
-                                        if suppress {
-                                            // RSA keygen (or similar long pure-compute op)
-                                            // disarms the stall detector; heartbeat stops
-                                            // bumping because no RNG calls happen during
-                                            // Miller–Rabin. Reset counter and keep sending
-                                            // time extensions until keygen completes.
-                                            stall_count = 0;
-                                            last_heartbeat = heartbeat;
-                                        } else if heartbeat == last_heartbeat {
-                                            stall_count += 1;
-                                            defmt::warn!("time ext: core1 progress={} heartbeat={} STALL {}/{}", progress, heartbeat, stall_count, WATCHDOG_STALL_LIMIT);
-                                            if stall_count >= WATCHDOG_STALL_LIMIT {
-                                                defmt::error!(
-                                                    "watchdog: core1 stuck — aborting APDU"
-                                                );
-                                                // Return SW 6F00 (internal error) to unblock the host.
-                                                let mut err_resp = heapless::Vec::<u8, 4098>::new();
-                                                let _ = err_resp.push(0x6F);
-                                                let _ = err_resp.push(0x00);
-                                                break err_resp;
-                                            }
-                                        } else {
-                                            stall_count = 0;
-                                            last_heartbeat = heartbeat;
-                                            defmt::warn!(
-                                                "time ext: core1 progress={} heartbeat={}",
-                                                progress,
-                                                heartbeat
-                                            );
-                                        }
-                                        if let Err(CcidError::UsbDisconnected) =
-                                            ccid.send_time_extension().await
-                                        {
-                                            let _ =
-                                                recv_core1_response(store, dispatcher_ptr).await;
-                                            break heapless::Vec::new();
-                                        }
-                                    }
-                                    Either3::Third(op) => {
-                                        let result = handle_flash_op(op, store, dispatcher_ptr);
-                                        FLASH_RESP.send(result).await;
-                                        cortex_m::asm::sev(); // wake core1 from WFE
-                                    }
-                                }
-                            }
-                        };
-
+                        let response =
+                            match await_core1_response(&mut ccid, store, dispatcher_ptr).await {
+                                Some(r) => r,
+                                None => watchdog_reset(&mut ccid).await,
+                            };
                         match ccid.send_response(&response).await {
                             Ok(()) => {
                                 display_state.status = LedStatus::Ready;
@@ -1604,73 +1540,11 @@ async fn run_pico2_board(p: embassy_rp::Peripherals) {
                         // the APDU reaches Core1, causing a permanent hang.
                         let _ = APDU_CHANNEL.send(apdu_bytes).await;
                         cortex_m::asm::sev(); // wake core1 from WFE
-                        let response = {
-                            use embassy_futures::select::{select3, Either3};
-                            let mut stall_count: u32 = 0;
-                            let mut last_heartbeat =
-                                WATCHDOG_HEARTBEAT.load(core::sync::atomic::Ordering::Relaxed);
-                            loop {
-                                match select3(
-                                    RESP_CHANNEL.receive(),
-                                    embassy_time::Timer::after_millis(1500),
-                                    FLASH_REQ.receive(),
-                                )
-                                .await
-                                {
-                                    Either3::First(r) => break r,
-                                    Either3::Second(_) => {
-                                        let progress = CORE1_PROGRESS
-                                            .load(core::sync::atomic::Ordering::Relaxed);
-                                        let heartbeat = WATCHDOG_HEARTBEAT
-                                            .load(core::sync::atomic::Ordering::Relaxed);
-                                        let suppress = WATCHDOG_SUPPRESS
-                                            .load(core::sync::atomic::Ordering::Relaxed);
-                                        if suppress {
-                                            // RSA keygen (or similar long pure-compute op)
-                                            // disarms the stall detector; heartbeat stops
-                                            // bumping because no RNG calls happen during
-                                            // Miller–Rabin. Reset counter and keep sending
-                                            // time extensions until keygen completes.
-                                            stall_count = 0;
-                                            last_heartbeat = heartbeat;
-                                        } else if heartbeat == last_heartbeat {
-                                            stall_count += 1;
-                                            defmt::warn!("time ext: core1 progress={} heartbeat={} STALL {}/{}", progress, heartbeat, stall_count, WATCHDOG_STALL_LIMIT);
-                                            if stall_count >= WATCHDOG_STALL_LIMIT {
-                                                defmt::error!(
-                                                    "watchdog: core1 stuck — aborting APDU"
-                                                );
-                                                // Return SW 6F00 (internal error) to unblock the host.
-                                                let mut err_resp = heapless::Vec::<u8, 4098>::new();
-                                                let _ = err_resp.push(0x6F);
-                                                let _ = err_resp.push(0x00);
-                                                break err_resp;
-                                            }
-                                        } else {
-                                            stall_count = 0;
-                                            last_heartbeat = heartbeat;
-                                            defmt::warn!(
-                                                "time ext: core1 progress={} heartbeat={}",
-                                                progress,
-                                                heartbeat
-                                            );
-                                        }
-                                        if let Err(CcidError::UsbDisconnected) =
-                                            ccid.send_time_extension().await
-                                        {
-                                            let _ =
-                                                recv_core1_response(store, dispatcher_ptr).await;
-                                            break heapless::Vec::new();
-                                        }
-                                    }
-                                    Either3::Third(op) => {
-                                        let result = handle_flash_op(op, store, dispatcher_ptr);
-                                        FLASH_RESP.send(result).await;
-                                        cortex_m::asm::sev(); // wake core1 from WFE
-                                    }
-                                }
-                            }
-                        };
+                        let response =
+                            match await_core1_response(&mut ccid, store, dispatcher_ptr).await {
+                                Some(r) => r,
+                                None => watchdog_reset(&mut ccid).await,
+                            };
                         match ccid.send_response(&response).await {
                             Ok(()) => {
                                 for _ in 0..16 {
@@ -2119,73 +1993,11 @@ async fn run_waveshare_lcd_board(p: embassy_rp::Peripherals) {
                         let _ = APDU_CHANNEL.send(apdu_bytes).await;
                         cortex_m::asm::sev(); // wake core1 from WFE
                                               // Wait for response with time-extension support.
-                        let response = {
-                            use embassy_futures::select::{select3, Either3};
-                            let mut stall_count: u32 = 0;
-                            let mut last_heartbeat =
-                                WATCHDOG_HEARTBEAT.load(core::sync::atomic::Ordering::Relaxed);
-                            loop {
-                                match select3(
-                                    RESP_CHANNEL.receive(),
-                                    embassy_time::Timer::after_millis(1500),
-                                    FLASH_REQ.receive(),
-                                )
-                                .await
-                                {
-                                    Either3::First(r) => break r,
-                                    Either3::Second(_) => {
-                                        let progress = CORE1_PROGRESS
-                                            .load(core::sync::atomic::Ordering::Relaxed);
-                                        let heartbeat = WATCHDOG_HEARTBEAT
-                                            .load(core::sync::atomic::Ordering::Relaxed);
-                                        let suppress = WATCHDOG_SUPPRESS
-                                            .load(core::sync::atomic::Ordering::Relaxed);
-                                        if suppress {
-                                            // RSA keygen (or similar long pure-compute op)
-                                            // disarms the stall detector; heartbeat stops
-                                            // bumping because no RNG calls happen during
-                                            // Miller–Rabin. Reset counter and keep sending
-                                            // time extensions until keygen completes.
-                                            stall_count = 0;
-                                            last_heartbeat = heartbeat;
-                                        } else if heartbeat == last_heartbeat {
-                                            stall_count += 1;
-                                            defmt::warn!("time ext: core1 progress={} heartbeat={} STALL {}/{}", progress, heartbeat, stall_count, WATCHDOG_STALL_LIMIT);
-                                            if stall_count >= WATCHDOG_STALL_LIMIT {
-                                                defmt::error!(
-                                                    "watchdog: core1 stuck — aborting APDU"
-                                                );
-                                                // Return SW 6F00 (internal error) to unblock the host.
-                                                let mut err_resp = heapless::Vec::<u8, 4098>::new();
-                                                let _ = err_resp.push(0x6F);
-                                                let _ = err_resp.push(0x00);
-                                                break err_resp;
-                                            }
-                                        } else {
-                                            stall_count = 0;
-                                            last_heartbeat = heartbeat;
-                                            defmt::warn!(
-                                                "time ext: core1 progress={} heartbeat={}",
-                                                progress,
-                                                heartbeat
-                                            );
-                                        }
-                                        if let Err(CcidError::UsbDisconnected) =
-                                            ccid.send_time_extension().await
-                                        {
-                                            let _ =
-                                                recv_core1_response(store, dispatcher_ptr).await;
-                                            break heapless::Vec::new();
-                                        }
-                                    }
-                                    Either3::Third(op) => {
-                                        let result = handle_flash_op(op, store, dispatcher_ptr);
-                                        FLASH_RESP.send(result).await;
-                                        cortex_m::asm::sev(); // wake core1 from WFE
-                                    }
-                                }
-                            }
-                        };
+                        let response =
+                            match await_core1_response(&mut ccid, store, dispatcher_ptr).await {
+                                Some(r) => r,
+                                None => watchdog_reset(&mut ccid).await,
+                            };
                         match ccid.send_response(&response).await {
                             Ok(()) => {
                                 display_state.status = LedStatus::Ready;
