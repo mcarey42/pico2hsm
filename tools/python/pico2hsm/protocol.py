@@ -190,6 +190,11 @@ def build_verify_pin(pin: str) -> bytes:
     return _encode_apdu(0x00, INS_VERIFY, 0x00, 0x81, _pin_bytes(pin))
 
 
+def build_verify_so_pin(so_pin: str) -> bytes:
+    """Build VERIFY APDU for the SO-PIN (INS=0x20, P2=0x88)."""
+    return _encode_apdu(0x00, INS_VERIFY, 0x00, 0x88, _pin_bytes(so_pin))
+
+
 def build_change_pin(old_pin: str, new_pin: str) -> bytes:
     """Build CHANGE REFERENCE DATA APDU (INS=0x24, P2=0x81)."""
     data = _pin_bytes(old_pin) + _pin_bytes(new_pin)

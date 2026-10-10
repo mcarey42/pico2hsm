@@ -73,6 +73,9 @@ fn parse_and_set_se(state: &mut ScHsmState, data: &[u8], op: SeOperation) -> Apd
     }
 
     if let Some(kid) = key_id {
+        if kid >= crate::protocol::sc_hsm::RESERVED_KEY_REF_MIN {
+            return ApduResponse::err(SW_WRONG_DATA);
+        }
         state.current_key_id = Some(kid);
     }
     if let Some(a) = algo {

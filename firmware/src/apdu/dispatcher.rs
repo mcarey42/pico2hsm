@@ -182,7 +182,12 @@ impl Dispatcher {
     pub fn load_keys_from_store(&mut self, store: &mut dyn crate::storage::KeyStore) {
         let mut sc_hsm_ids: heapless::Vec<pico2hsm_core::key::KeyId, 64> = heapless::Vec::new();
         store.for_each_key(&mut |kid| {
-            if kid.applet_byte() == 0 && kid.proto_ref() != 0xFF {
+            // Skip firmware records that are not keys: PIN record (0xFF),
+            // persisted DKEK (0xFD) and enrolled peer key (0xFC).  The
+            // device identity key (0xFE) is a real key and stays listed.
+            let is_ef = (kid.0 >> 8) & 0xFF != 0;
+            let record = !is_ef && matches!(kid.proto_ref(), 0xFC | 0xFD | 0xFF);
+            if kid.applet_byte() == 0 && !record {
                 let _ = sc_hsm_ids.push(kid);
             }
         });
@@ -212,6 +217,7 @@ impl Dispatcher {
         self.openpgp.load_from_store(store);
         ScHsm::load_pin_state_from_store(&mut self.sc_hsm.state, store);
         ScHsm::load_peer_pubkey_from_store(&mut self.sc_hsm.state, store);
+        ScHsm::load_dkek_from_store(&mut self.sc_hsm.state, store);
     }
 
     /// Dispatch a raw APDU byte slice with access to persistent storage.
@@ -642,7 +648,7 @@ mod tests {
         let mut slot = core::mem::MaybeUninit::<Dispatcher>::uninit();
         let d = Dispatcher::init_in_place(&mut slot);
         let pattern = [0xA5u8; 32];
-        d.sc_hsm.state.dkek.set_dkek_direct(pattern);
+        d.sc_hsm.state.dkek.set_dkek_direct(&pattern);
         assert!(d.sc_hsm.state.dkek.is_ready());
 
         d.reset_in_place();

@@ -691,15 +691,16 @@ pub fn handle(
         return ApduResponse::err(SW_SECURITY_STATUS);
     }
 
-    // key_id: P1=0xFF means auto-assign (find first free slot 0..254).
+    // key_id: P1=0xFF means auto-assign (first free slot below the reserved range).
     // P1=0x00..0xFE is used directly as the key reference — OpenSC's
     // sc_hsm_determine_free_id() pre-computes the free slot and passes it
     // as P1, including P1=0x00 for the very first key.
     let key_id_proto: u8 = if cmd.p1 != 0xFF {
         cmd.p1
     } else {
+        let limit = crate::protocol::sc_hsm::RESERVED_KEY_REF_MIN;
         let mut id = 0u8;
-        while id < 0xFF
+        while id < limit
             && state
                 .key_index
                 .iter()
@@ -707,7 +708,7 @@ pub fn handle(
         {
             id = id.wrapping_add(1);
         }
-        if id == 0xFF {
+        if id == limit {
             return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED);
         }
         id

@@ -47,6 +47,9 @@ pub fn handle(
 
     let hi = file_id >> 8;
     let key_id_proto = (file_id & 0xFF) as u8;
+    if hi != 0xCE && key_id_proto >= crate::protocol::sc_hsm::RESERVED_KEY_REF_MIN {
+        return ApduResponse::err(SW_FILE_NOT_FOUND);
+    }
     let full_key_id = pico2hsm_core::key::KeyId::sc_hsm(0, key_id_proto).0; // u32 internal ID
 
     // Remove from key_index: check for both crypto keys and EfFile entries.

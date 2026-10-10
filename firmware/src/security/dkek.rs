@@ -402,12 +402,20 @@ impl DkekManager {
     ///
     /// Used by V2 DKEK exchange (NOISE_FINALIZE_RECV_V2) to store a
     /// decrypted DKEK received from a peer HSM.
-    pub fn set_dkek_direct(&mut self, dkek: [u8; 32]) {
+    /// Takes a reference so the caller's (zeroizing) buffer is the only
+    /// other copy — passing the array by value would leave one on the stack.
+    pub fn set_dkek_direct(&mut self, dkek: &[u8; 32]) {
         self.status.zeroize();
         self.status = DkekStatus::Ready {
-            dkek: Zeroizing::new(dkek),
+            dkek: Zeroizing::new(*dkek),
         };
         self.total_shares = 1;
+    }
+
+    /// Restore a persisted DKEK that was assembled from `total_shares` shares.
+    pub fn restore_ready(&mut self, dkek: &[u8; 32], total_shares: u8) {
+        self.set_dkek_direct(dkek);
+        self.total_shares = total_shares;
     }
 
     /// Zeroize and reset to `NotInitialized`.
@@ -905,7 +913,7 @@ mod tests {
     fn clear_wipes_dkek_in_place() {
         let pattern = [0xA5u8; 32];
         let mut mgr = DkekManager::new(test_device_id());
-        mgr.set_dkek_direct(pattern);
+        mgr.set_dkek_direct(&pattern);
         assert!(contains(&mgr, &pattern));
         mgr.clear();
         assert!(!mgr.is_ready());
@@ -916,8 +924,8 @@ mod tests {
     fn set_dkek_direct_wipes_previous_dkek() {
         let old = [0xA5u8; 32];
         let mut mgr = DkekManager::new(test_device_id());
-        mgr.set_dkek_direct(old);
-        mgr.set_dkek_direct([0x5Au8; 32]);
+        mgr.set_dkek_direct(&old);
+        mgr.set_dkek_direct(&[0x5Au8; 32]);
         assert!(!contains(&mgr, &old));
     }
 

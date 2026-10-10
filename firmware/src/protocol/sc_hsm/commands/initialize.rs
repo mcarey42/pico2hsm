@@ -212,10 +212,11 @@ pub fn handle(
     // Clear ephemeral exchange state.
     state.exchange_ephem_priv = None;
     state.exchange_ephem_pub = None;
+    state.exchange_challenge = None;
+    state.exchange_peer_ephem_pub = None;
 
-    // Clear enrolled peer pubkey and reset unauthenticated DKEK mode.
+    // Clear the enrolled peer pubkey (re-enroll with ENROLL_PEER_PUBKEY).
     state.noise_enrolled_peer_pubkey = None;
-    state.dkek_unauthenticated_allowed = true;
 
     // Wipe only SC-HSM-owned keys from persistent flash keystore.
     // Degraded flash does not fail the INITIALIZE command.

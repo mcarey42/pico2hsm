@@ -394,8 +394,14 @@ impl Piv {
         if *after == 0 {
             *blocked = true;
         }
-        if *after != spent {
-            let _ = Self::save_pin_to_store(&self.state, store);
+        if *after != spent && Self::save_pin_to_store(&self.state, store).is_err() {
+            // Keep RAM consistent with flash (spent counter, old PIN) and
+            // fail closed; see ScHsm::with_persisted_attempt.
+            Self::load_pin_state_from_store(&mut self.state, store);
+            *counter.get(&mut self.state).0 = spent;
+            self.state.pin_verified = false;
+            self.state.pin_state.session_authenticated = false;
+            return ApduResponse::err(pico2hsm_core::apdu::SW_MEMORY_FAILURE);
         }
         resp
     }

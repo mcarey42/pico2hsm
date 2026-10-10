@@ -53,24 +53,24 @@ class MockDevice:
 
 MOCK_SOURCE_PUBKEY = bytes([0x04] + [0xAA] * 32 + [0xBB] * 32)   # 65 bytes
 MOCK_TARGET_PUBKEY = bytes([0x04] + [0xCC] * 32 + [0xDD] * 32)   # 65 bytes
-MOCK_SOURCE_EPHEM_PUB = bytes([0x04] + [0x11] * 32 + [0x22] * 32)  # 65 bytes
-MOCK_TARGET_EPHEM_PUB = bytes([0x04] + [0x33] * 32 + [0x44] * 32)  # 65 bytes
+MOCK_TARGET_INIT = bytes([0x04] + [0x33] * 64) + bytes([0x77] * 32) + bytes([0x88] * 64)  # 161
+MOCK_SOURCE_RESPOND = bytes([0x04] + [0x11] * 64) + bytes([0x99] * 64)  # 129
 MOCK_ENCRYPTED_DKEK = bytes([0x55] * 60)  # nonce(12) + ct(32) + tag(16)
 
 
 def make_source_device() -> MockDevice:
     d = MockDevice("source")
     d.queue_response(MOCK_SOURCE_PUBKEY)     # GET_DEVICE_PUBKEY
-    d.queue_response(MOCK_SOURCE_EPHEM_PUB)  # NOISE_INITIATE
-    d.queue_response(MOCK_ENCRYPTED_DKEK)    # NOISE_FINALIZE_SEND
+    d.queue_response(MOCK_SOURCE_RESPOND)    # NOISE_SOURCE_RESPOND (0x36)
+    d.queue_response(MOCK_ENCRYPTED_DKEK)    # NOISE_FINALIZE_SEND_V2 (0x37)
     return d
 
 
 def make_target_device() -> MockDevice:
     d = MockDevice("target")
     d.queue_response(MOCK_TARGET_PUBKEY)     # GET_DEVICE_PUBKEY
-    d.queue_response(MOCK_TARGET_EPHEM_PUB)  # NOISE_INITIATE
-    d.queue_response(b"", 0x9000)            # NOISE_FINALIZE_RECV (SW OK, no data)
+    d.queue_response(MOCK_TARGET_INIT)       # NOISE_TARGET_INIT (0x35)
+    d.queue_response(b"", 0x9000)            # NOISE_FINALIZE_RECV_V2 (0x38)
     return d
 
 
@@ -92,6 +92,17 @@ class TestRelayExchange:
         # All queued responses should have been consumed
         assert len(source._responses) == 0, "Source has unconsumed responses"
         assert len(target._responses) == 0, "Target has unconsumed responses"
+
+    def test_device_error_aborts_exchange(self):
+        """A non-9000 SW at any step raises DKEKError instead of continuing."""
+        from pico2hsm.errors import DKEKError
+
+        source = MockDevice("source")
+        source.queue_response(MOCK_SOURCE_PUBKEY)
+        source.queue_response(b"", 0x6982)  # SOURCE_RESPOND refused
+        target = make_target_device()
+        with pytest.raises(DKEKError, match="NOISE_SOURCE_RESPOND"):
+            DkekExchange(config=None)._relay_exchange(source, target)
 
     def test_without_config_skips_enrollment(self):
         """Exchange without config should not raise EnrollmentError."""

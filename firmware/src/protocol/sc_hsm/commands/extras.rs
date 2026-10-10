@@ -10,10 +10,10 @@
 //! - P1=0x30: GET_DEVICE_PUBLIC_KEY
 //! - P1=0x31–0x33: (removed — V1 DKEK exchange, returns SW_INS_NOT_SUPPORTED)
 //! - P1=0x34: GET_GENERATION (V1 compat, returns low 4 bytes of generation counter)
-//! - P1=0x35: NOISE_TARGET_INIT (V2 mutual-auth DKEK exchange)
-//! - P1=0x36: NOISE_SOURCE_RESPOND (V2)
-//! - P1=0x37: NOISE_FINALIZE_SEND_V2
-//! - P1=0x38: NOISE_FINALIZE_RECV_V2
+//! - P1=0x35: NOISE_TARGET_INIT (V2 mutual-auth DKEK exchange, SO-PIN)
+//! - P1=0x36: NOISE_SOURCE_RESPOND (V2, SO-PIN)
+//! - P1=0x37: NOISE_FINALIZE_SEND_V2 (SO-PIN)
+//! - P1=0x38: NOISE_FINALIZE_RECV_V2 (SO-PIN)
 //! - P1=0x39: GET_KEY_MANIFEST
 //! - P1=0x3A: GET_STATE_HASH
 //! - P1=0x3B: SIGN_ENROLLMENT
@@ -61,6 +61,18 @@ pub fn handle(
             }
             handle_enroll_peer_pubkey(state, store, cmd)
         }
+        // V2 DKEK exchange: moves the master wrapping key, so SO-PIN only.
+        0x35..=0x38 => {
+            if !state.so_pin_verified {
+                return ApduResponse::err(SW_SECURITY_STATUS);
+            }
+            match cmd.p1 {
+                0x35 => handle_noise_target_init(state, store, cmd),
+                0x36 => handle_noise_source_respond(state, store, cmd),
+                0x37 => handle_noise_finalize_send_v2(state, store, cmd),
+                _ => handle_noise_finalize_recv_v2(state, store, cmd),
+            }
+        }
 
         // All remaining sub-commands require PIN authentication.
         _ => {
@@ -76,11 +88,6 @@ pub fn handle(
                 0x06 => hmac_sha256(cmd.data),
                 // V1 DKEK exchange (P1=0x31–0x33) removed — use V2 (P1=0x35–0x38).
                 0x31 | 0x32 | 0x33 => ApduResponse::err(pico2hsm_core::apdu::SW_INS_NOT_SUPPORTED),
-                // V2 mutual-auth DKEK exchange.
-                0x35 => handle_noise_target_init(state, store, cmd),
-                0x36 => handle_noise_source_respond(state, store, cmd),
-                0x37 => handle_noise_finalize_send_v2(state, store, cmd),
-                0x38 => handle_noise_finalize_recv_v2(state, store, cmd),
                 _ => ApduResponse::err(SW_WRONG_DATA),
             }
         }
@@ -135,160 +142,181 @@ fn handle_get_generation(state: &mut ScHsmState, _cmd: &ApduCommand<'_>) -> Apdu
 }
 
 // ---------------------------------------------------------------------------
-// P1=0x35  NOISE_TARGET_INIT (V2 mutual-auth)
+// V2 DKEK exchange (P1=0x35–0x38)
 // ---------------------------------------------------------------------------
+//
+// SOURCE (holds the DKEK) sends it to TARGET (has none).  Both devices must
+// have the other's static P-256 key enrolled via ENROLL_PEER_PUBKEY (0x3D);
+// there is no unauthenticated mode.  All four steps require the SO-PIN.
+//
+//   1. TARGET 0x35 (source_static_pub)        → ephem_T || chal || Sig_T
+//   2. SOURCE 0x36 (ephem_T || chal || Sig_T) → ephem_S || Sig_S
+//      SOURCE verifies Sig_T with its enrolled peer key, then generates its
+//      own ephemeral key.  Only now is SOURCE armed to send (see 0x37).
+//   3. SOURCE 0x37 (ephem_T || target_static || chal) → enc_DKEK
+//      Every field must match what step 2 verified; the DKEK is encrypted
+//      only to that ephemeral key, bound to the enrolled peer's static key.
+//   4. TARGET 0x38 (ephem_S || Sig_S || enc_DKEK)
+//      TARGET verifies Sig_S, decrypts, and installs the DKEK.  An existing
+//      DKEK is never overwritten.
+//
+// `exchange_peer_ephem_pub` is set only by a successful step 2, so it marks
+// "SOURCE, peer verified"; TARGET state has it `None`.  Every step that
+// fails, and every final step, clears all exchange state (one-shot).
 
+/// Drop all in-progress exchange state (ephemeral key is zeroized on drop).
+fn clear_exchange(state: &mut ScHsmState) {
+    state.exchange_ephem_priv = None;
+    state.exchange_ephem_pub = None;
+    state.exchange_challenge = None;
+    state.exchange_peer_ephem_pub = None;
+}
+
+/// Clear exchange state and return `sw`.
+fn abort_exchange(state: &mut ScHsmState, sw: u16) -> ApduResponse {
+    clear_exchange(state);
+    ApduResponse::err(sw)
+}
+
+/// Verify `sig` as the enrolled peer's ECDSA signature over
+/// SHA-256(ephem_pub || challenge).
+fn peer_signed(peer: &[u8; 65], ephem_pub: &[u8], challenge: &[u8; 32], sig: &[u8; 64]) -> bool {
+    use ecdsa::signature::hazmat::PrehashVerifier;
+    use p256::ecdsa::VerifyingKey;
+    use sha2::{Digest, Sha256};
+
+    let Ok(vk) = VerifyingKey::from_sec1_bytes(peer) else {
+        return false;
+    };
+    let Ok(sig) = ecdsa::Signature::<p256::NistP256>::from_bytes(sig.into()) else {
+        return false;
+    };
+    let mut hasher = Sha256::new();
+    hasher.update(ephem_pub);
+    hasher.update(challenge);
+    let msg_hash: [u8; 32] = hasher.finalize().into();
+    vk.verify_prehash(&msg_hash, &sig).is_ok()
+}
+
+/// Generate an ephemeral P-256 key pair: (private scalar, uncompressed public).
+fn new_ephemeral() -> Option<(zeroize::Zeroizing<[u8; 32]>, [u8; 65])> {
+    use crate::crypto::asymmetric::generate_ec_keypair;
+    use pico2hsm_core::key::KeyType as CoreKeyType;
+
+    let pair = generate_ec_keypair(CoreKeyType::EcPrivateP256, &mut FwRng).ok()?;
+    if pair.private_key.len() != 32 || pair.public_key.len() != 65 {
+        return None;
+    }
+    let mut private = zeroize::Zeroizing::new([0u8; 32]);
+    private.copy_from_slice(&pair.private_key);
+    let mut public = [0u8; 65];
+    public.copy_from_slice(&pair.public_key);
+    Some((private, public))
+}
+
+/// Sign SHA-256(ephem_pub || challenge) with the device static key.
+fn sign_ephemeral(
+    state: &ScHsmState,
+    store: &mut dyn KeyStore,
+    ephem_pub: &[u8; 65],
+    challenge: &[u8; 32],
+) -> Result<[u8; 64], ()> {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(ephem_pub);
+    hasher.update(challenge);
+    let msg_hash: [u8; 32] = hasher.finalize().into();
+    sign_with_device_key(state, store, &msg_hash)
+}
+
+// P1=0x35  NOISE_TARGET_INIT — TARGET, step 1.
 fn handle_noise_target_init(
     state: &mut ScHsmState,
     store: &mut dyn KeyStore,
     cmd: &ApduCommand<'_>,
 ) -> ApduResponse {
-    use crate::crypto::asymmetric::generate_ec_keypair;
-    use pico2hsm_core::key::KeyType as CoreKeyType;
-    use sha2::{Digest, Sha256};
-    use zeroize::Zeroizing;
-
     // Input: source_static_pub(65)
     if cmd.data.len() != 65 {
-        return ApduResponse::err(SW_WRONG_DATA);
+        return abort_exchange(state, SW_WRONG_DATA);
     }
-
-    // Generate ephemeral P-256 keypair.
-    let mut rng = FwRng;
-    let pair = match generate_ec_keypair(CoreKeyType::EcPrivateP256, &mut rng) {
-        Ok(p) => p,
-        Err(_) => return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
+    let Some(peer) = state.noise_enrolled_peer_pubkey else {
+        return abort_exchange(state, SW_CONDITIONS_NOT_SATISFIED);
     };
-
-    if pair.private_key.len() != 32 || pair.public_key.len() != 65 {
-        return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED);
+    if cmd.data != peer.as_slice() {
+        return abort_exchange(state, SW_SECURITY_STATUS);
+    }
+    // A DKEK is never overwritten, so refuse up front rather than at step 4.
+    if state.dkek.is_ready() {
+        return abort_exchange(state, SW_CONDITIONS_NOT_SATISFIED);
     }
 
-    let mut priv_bytes = Zeroizing::new([0u8; 32]);
-    priv_bytes.copy_from_slice(&pair.private_key);
-
-    let mut ephem_pub = [0u8; 65];
-    ephem_pub.copy_from_slice(&pair.public_key);
-
-    // Generate challenge[32].
+    let Some((ephem_priv, ephem_pub)) = new_ephemeral() else {
+        return abort_exchange(state, SW_CONDITIONS_NOT_SATISFIED);
+    };
     let mut challenge = [0u8; 32];
-    rng.fill_bytes(&mut challenge);
-
-    // Compute msg = SHA-256(ephem_T_pub(65) || challenge(32))
-    let mut hasher = Sha256::new();
-    hasher.update(&ephem_pub);
-    hasher.update(&challenge);
-    let msg_hash: [u8; 32] = hasher.finalize().into();
-
-    // Sign with device static private key.
-    let sig_bytes = match sign_with_device_key(state, store, &msg_hash) {
-        Ok(s) => s,
-        Err(_) => return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
+    FwRng.fill_bytes(&mut challenge);
+    let Ok(sig) = sign_ephemeral(state, store, &ephem_pub, &challenge) else {
+        return abort_exchange(state, SW_CONDITIONS_NOT_SATISFIED);
     };
 
-    // Store ephemeral state.
-    state.exchange_ephem_priv = Some(priv_bytes);
+    clear_exchange(state);
+    state.exchange_ephem_priv = Some(ephem_priv);
     state.exchange_ephem_pub = Some(ephem_pub);
     state.exchange_challenge = Some(challenge);
 
-    // Return ephem_T_pub(65) || challenge(32) || Sig_T(64) = 161 bytes
-    let mut resp_buf = [0u8; 161];
-    resp_buf[..65].copy_from_slice(&ephem_pub);
-    resp_buf[65..97].copy_from_slice(&challenge);
-    resp_buf[97..161].copy_from_slice(&sig_bytes);
-
-    ApduResponse::ok(&resp_buf)
+    // ephem_T_pub(65) || challenge(32) || Sig_T(64) = 161 bytes
+    let mut out = [0u8; 161];
+    out[..65].copy_from_slice(&ephem_pub);
+    out[65..97].copy_from_slice(&challenge);
+    out[97..].copy_from_slice(&sig);
+    ApduResponse::ok(&out)
 }
 
-// ---------------------------------------------------------------------------
-// P1=0x36  NOISE_SOURCE_RESPOND (V2 mutual-auth)
-// ---------------------------------------------------------------------------
-
+// P1=0x36  NOISE_SOURCE_RESPOND — SOURCE, step 2.
 fn handle_noise_source_respond(
     state: &mut ScHsmState,
     store: &mut dyn KeyStore,
     cmd: &ApduCommand<'_>,
 ) -> ApduResponse {
-    use sha2::{Digest, Sha256};
-
     // Input: ephem_T_pub(65) || challenge(32) || Sig_T(64) = 161 bytes
     if cmd.data.len() != 161 {
-        return ApduResponse::err(SW_WRONG_DATA);
+        return abort_exchange(state, SW_WRONG_DATA);
     }
-
     let ephem_t_pub: &[u8; 65] = cmd.data[..65].try_into().unwrap();
     let challenge: &[u8; 32] = cmd.data[65..97].try_into().unwrap();
     let sig_t: &[u8; 64] = cmd.data[97..161].try_into().unwrap();
 
-    // Verify Sig_T: TARGET signed SHA-256(ephem_T_pub || challenge) with its static key.
-    if let Some(ref peer_pubkey) = state.noise_enrolled_peer_pubkey {
-        use ecdsa::signature::hazmat::PrehashVerifier;
-        use p256::ecdsa::VerifyingKey;
-
-        let vk = match VerifyingKey::from_sec1_bytes(peer_pubkey) {
-            Ok(v) => v,
-            Err(_) => return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
-        };
-        // Reconstruct the message hash that TARGET signed.
-        let mut hasher = Sha256::new();
-        hasher.update(ephem_t_pub);
-        hasher.update(challenge);
-        let msg_hash: [u8; 32] = hasher.finalize().into();
-
-        let sig = match ecdsa::Signature::<p256::NistP256>::from_bytes(sig_t.into()) {
-            Ok(s) => s,
-            Err(_) => return ApduResponse::err(SW_WRONG_DATA),
-        };
-        if vk.verify_prehash(&msg_hash, &sig).is_err() {
-            return ApduResponse::err(SW_SECURITY_STATUS);
-        }
-    } else {
-        // No peer pubkey enrolled.
-        // Only allow unauthenticated mode if the flag permits it (P1-6 fix).
-        // Once a peer has been enrolled and dkek_unauthenticated_allowed is false,
-        // refuse unauthenticated exchanges to prevent downgrade attacks.
-        if !state.dkek_unauthenticated_allowed {
-            return ApduResponse::err(SW_SECURITY_STATUS);
-        }
-        // else: bootstrapping mode allowed, proceed without signature verification.
+    if !state.dkek.is_ready() {
+        return abort_exchange(state, SW_CONDITIONS_NOT_SATISFIED);
+    }
+    let Some(peer) = state.noise_enrolled_peer_pubkey else {
+        return abort_exchange(state, SW_CONDITIONS_NOT_SATISFIED);
+    };
+    if !peer_signed(&peer, ephem_t_pub, challenge, sig_t) {
+        return abort_exchange(state, SW_SECURITY_STATUS);
     }
 
-    // Source must already have an ephemeral keypair from a prior NOISE_INITIATE (P1=0x31).
-    let ephem_s_pub = match &state.exchange_ephem_pub {
-        Some(p) => *p,
-        None => return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
+    let Some((ephem_priv, ephem_pub)) = new_ephemeral() else {
+        return abort_exchange(state, SW_CONDITIONS_NOT_SATISFIED);
+    };
+    let Ok(sig) = sign_ephemeral(state, store, &ephem_pub, challenge) else {
+        return abort_exchange(state, SW_CONDITIONS_NOT_SATISFIED);
     };
 
-    // Store challenge and target ephem pub for channel binding.
+    clear_exchange(state);
+    state.exchange_ephem_priv = Some(ephem_priv);
+    state.exchange_ephem_pub = Some(ephem_pub);
     state.exchange_challenge = Some(*challenge);
-    let mut peer_ephem = [0u8; 65];
-    peer_ephem.copy_from_slice(ephem_t_pub);
-    state.exchange_peer_ephem_pub = Some(peer_ephem);
+    state.exchange_peer_ephem_pub = Some(*ephem_t_pub);
 
-    // Compute msg_S = SHA-256(ephem_S_pub(65) || challenge(32))
-    let mut hasher = Sha256::new();
-    hasher.update(&ephem_s_pub);
-    hasher.update(challenge);
-    let msg_hash: [u8; 32] = hasher.finalize().into();
-
-    // Sign with device static private key.
-    let sig_bytes = match sign_with_device_key(state, store, &msg_hash) {
-        Ok(s) => s,
-        Err(_) => return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
-    };
-
-    // Return ephem_S_pub(65) || Sig_S(64) = 129 bytes
-    let mut resp_buf = [0u8; 129];
-    resp_buf[..65].copy_from_slice(&ephem_s_pub);
-    resp_buf[65..129].copy_from_slice(&sig_bytes);
-
-    ApduResponse::ok(&resp_buf)
+    // ephem_S_pub(65) || Sig_S(64) = 129 bytes
+    let mut out = [0u8; 129];
+    out[..65].copy_from_slice(&ephem_pub);
+    out[65..].copy_from_slice(&sig);
+    ApduResponse::ok(&out)
 }
 
-// ---------------------------------------------------------------------------
-// P1=0x37  NOISE_FINALIZE_SEND_V2
-// ---------------------------------------------------------------------------
-
+// P1=0x37  NOISE_FINALIZE_SEND_V2 — SOURCE, step 3.
 fn handle_noise_finalize_send_v2(
     state: &mut ScHsmState,
     _store: &mut dyn KeyStore,
@@ -301,132 +329,67 @@ fn handle_noise_finalize_send_v2(
     };
     use zeroize::Zeroizing;
 
-    // Require DKEK ready.
-    if !state.dkek.is_ready() {
-        return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED);
-    }
-
     // Input: target_ephem_pub(65) || target_static_pub(65) || challenge(32) = 162 bytes
     if cmd.data.len() != 162 {
-        return ApduResponse::err(SW_WRONG_DATA);
+        return abort_exchange(state, SW_WRONG_DATA);
     }
-
     let target_ephem_pub: &[u8; 65] = cmd.data[..65].try_into().unwrap();
     let target_static_pub: &[u8; 65] = cmd.data[65..130].try_into().unwrap();
     let challenge: &[u8; 32] = cmd.data[130..162].try_into().unwrap();
 
-    // Require ephemeral private key from a prior NOISE_INITIATE.
-    let ephem_priv = match &state.exchange_ephem_priv {
-        Some(p) => **p,
-        None => return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
+    // Armed only by a successful step 2, and only for what it verified.
+    let (Some(peer), Some(peer_ephem), Some(stored_challenge), Some(ephem_priv), Some(ephem_pub)) = (
+        state.noise_enrolled_peer_pubkey,
+        state.exchange_peer_ephem_pub,
+        state.exchange_challenge,
+        state.exchange_ephem_priv.take(),
+        state.exchange_ephem_pub,
+    ) else {
+        return abort_exchange(state, SW_CONDITIONS_NOT_SATISFIED);
     };
-    let ephem_pub = match &state.exchange_ephem_pub {
-        Some(p) => *p,
-        None => return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
-    };
-
-    // Validate: input challenge matches exchange_challenge — ABORT if mismatch.
-    match &state.exchange_challenge {
-        Some(stored) => {
-            if stored != challenge {
-                // Clear ephemeral state on mismatch.
-                state.exchange_ephem_priv = None;
-                state.exchange_ephem_pub = None;
-                state.exchange_challenge = None;
-                state.exchange_peer_ephem_pub = None;
-                return ApduResponse::err(SW_WRONG_DATA);
-            }
-        }
-        None => {
-            state.exchange_ephem_priv = None;
-            state.exchange_ephem_pub = None;
-            return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED);
-        }
+    if target_ephem_pub != &peer_ephem
+        || target_static_pub != &peer
+        || challenge != &stored_challenge
+    {
+        return abort_exchange(state, SW_SECURITY_STATUS);
     }
-
-    // Compute ECDH shared secret.
-    let shared_secret = match p256_ecdh(&ephem_priv, target_ephem_pub) {
-        Ok(s) => s,
-        Err(_) => {
-            state.exchange_ephem_priv = None;
-            state.exchange_ephem_pub = None;
-            state.exchange_challenge = None;
-            return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED);
-        }
+    let Some(dkek) = state.dkek.get_dkek().map(|d| Zeroizing::new(*d)) else {
+        return abort_exchange(state, SW_CONDITIONS_NOT_SATISFIED);
     };
+    clear_exchange(state);
 
-    // Derive session key with channel binding.
+    let Ok(shared_secret) = p256_ecdh(&ephem_priv, &peer_ephem) else {
+        return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED);
+    };
     // info = b"pico2hsm-dkek-v2" || source_ephem_pub || target_ephem_pub || challenge
-    let session_key =
-        match derive_session_key_v2(&shared_secret, &ephem_pub, target_ephem_pub, challenge) {
-            Ok(k) => k,
-            Err(_) => {
-                state.exchange_ephem_priv = None;
-                state.exchange_ephem_pub = None;
-                state.exchange_challenge = None;
-                return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED);
-            }
-        };
-
-    // Encrypt DKEK with AES-256-GCM.
-    let dkek = match state.dkek.get_dkek() {
-        Some(d) => *d,
-        None => {
-            state.exchange_ephem_priv = None;
-            state.exchange_ephem_pub = None;
-            state.exchange_challenge = None;
-            return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED);
-        }
+    let Ok(session_key) =
+        derive_session_key_v2(&shared_secret, &ephem_pub, &peer_ephem, &stored_challenge)
+    else {
+        return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED);
+    };
+    let Ok(cipher) = Aes256Gcm::new_from_slice(&*session_key) else {
+        return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED);
     };
 
-    let mut rng = FwRng;
     let mut nonce_buf = [0u8; 12];
-    rng.fill_bytes(&mut nonce_buf);
-
-    // AAD = target_static_pub(65)
-    let cipher = match Aes256Gcm::new_from_slice(&*session_key) {
-        Ok(c) => c,
-        Err(_) => {
-            state.exchange_ephem_priv = None;
-            state.exchange_ephem_pub = None;
-            state.exchange_challenge = None;
-            return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED);
-        }
-    };
-    let nonce = GcmNonce::from_slice(&nonce_buf);
+    FwRng.fill_bytes(&mut nonce_buf);
     let mut ct = dkek;
-    let tag = match cipher.encrypt_in_place_detached(nonce, target_static_pub, &mut ct) {
-        Ok(t) => t,
-        Err(_) => {
-            state.exchange_ephem_priv = None;
-            state.exchange_ephem_pub = None;
-            state.exchange_challenge = None;
-            return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED);
-        }
+    // AAD = the enrolled peer's static key: only that device can open it.
+    let Ok(tag) =
+        cipher.encrypt_in_place_detached(GcmNonce::from_slice(&nonce_buf), &peer, ct.as_mut())
+    else {
+        return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED);
     };
 
-    // Clear ephemeral state.
-    state.exchange_ephem_priv = None;
-    state.exchange_ephem_pub = None;
-    state.exchange_challenge = None;
-    state.exchange_peer_ephem_pub = None;
-
-    // Return nonce(12) || ciphertext(32) || tag(16) = 60 bytes
+    // nonce(12) || ciphertext(32) || tag(16) = 60 bytes
     let mut out = [0u8; 60];
     out[..12].copy_from_slice(&nonce_buf);
-    out[12..44].copy_from_slice(&ct);
-    out[44..60].copy_from_slice(tag.as_slice());
-
-    // Zeroize ct copy.
-    ct.iter_mut().for_each(|b| *b = 0);
-
+    out[12..44].copy_from_slice(ct.as_ref());
+    out[44..].copy_from_slice(tag.as_slice());
     ApduResponse::ok(&out)
 }
 
-// ---------------------------------------------------------------------------
-// P1=0x38  NOISE_FINALIZE_RECV_V2
-// ---------------------------------------------------------------------------
-
+// P1=0x38  NOISE_FINALIZE_RECV_V2 — TARGET, step 4.
 fn handle_noise_finalize_recv_v2(
     state: &mut ScHsmState,
     store: &mut dyn KeyStore,
@@ -441,165 +404,65 @@ fn handle_noise_finalize_recv_v2(
 
     // Input: source_ephem_pub(65) || Sig_S(64) || encrypted_dkek(60) = 189 bytes
     if cmd.data.len() != 189 {
-        return ApduResponse::err(SW_WRONG_DATA);
+        return abort_exchange(state, SW_WRONG_DATA);
     }
-
     let source_ephem_pub: &[u8; 65] = cmd.data[..65].try_into().unwrap();
     let sig_s: &[u8; 64] = cmd.data[65..129].try_into().unwrap();
     let encrypted_dkek: &[u8; 60] = cmd.data[129..189].try_into().unwrap();
 
-    // Require ephemeral state from NOISE_TARGET_INIT.
-    let ephem_priv = match &state.exchange_ephem_priv {
-        Some(p) => **p,
-        None => return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
+    // TARGET state from step 1 (a SOURCE-armed state has a peer ephemeral).
+    let (Some(peer), Some(ephem_priv), Some(ephem_pub), Some(challenge), None) = (
+        state.noise_enrolled_peer_pubkey,
+        state.exchange_ephem_priv.take(),
+        state.exchange_ephem_pub,
+        state.exchange_challenge,
+        state.exchange_peer_ephem_pub,
+    ) else {
+        return abort_exchange(state, SW_CONDITIONS_NOT_SATISFIED);
     };
-    let ephem_pub = match &state.exchange_ephem_pub {
-        Some(p) => *p,
-        None => return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
-    };
-    let challenge = match &state.exchange_challenge {
-        Some(c) => *c,
-        None => return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
-    };
+    clear_exchange(state);
 
-    // Check challenge replay cache.
+    if state.dkek.is_ready() {
+        return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED);
+    }
     if !check_and_add_challenge(state, &challenge) {
-        state.exchange_ephem_priv = None;
-        state.exchange_ephem_pub = None;
-        state.exchange_challenge = None;
         return ApduResponse::err(SW_WRONG_DATA);
     }
-
-    // Verify Sig_S: SOURCE signed SHA-256(source_ephem_pub || challenge) with its static key.
-    if let Some(ref peer_pubkey) = state.noise_enrolled_peer_pubkey {
-        use ecdsa::signature::hazmat::PrehashVerifier;
-        use p256::ecdsa::VerifyingKey;
-        use sha2::{Digest, Sha256};
-
-        let vk = match VerifyingKey::from_sec1_bytes(peer_pubkey) {
-            Ok(v) => v,
-            Err(_) => {
-                state.exchange_ephem_priv = None;
-                state.exchange_ephem_pub = None;
-                state.exchange_challenge = None;
-                return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED);
-            }
-        };
-        // Reconstruct the message hash that SOURCE signed.
-        let mut hasher = Sha256::new();
-        hasher.update(source_ephem_pub.as_slice());
-        hasher.update(&challenge);
-        let msg_hash: [u8; 32] = hasher.finalize().into();
-
-        let sig = match ecdsa::Signature::<p256::NistP256>::from_bytes(sig_s.into()) {
-            Ok(s) => s,
-            Err(_) => {
-                state.exchange_ephem_priv = None;
-                state.exchange_ephem_pub = None;
-                state.exchange_challenge = None;
-                return ApduResponse::err(SW_WRONG_DATA);
-            }
-        };
-        if vk.verify_prehash(&msg_hash, &sig).is_err() {
-            state.exchange_ephem_priv = None;
-            state.exchange_ephem_pub = None;
-            state.exchange_challenge = None;
-            return ApduResponse::err(SW_SECURITY_STATUS);
-        }
-    } else {
-        // No peer pubkey enrolled.
-        // Only allow unauthenticated mode if the flag permits it (P1-6 fix).
-        if !state.dkek_unauthenticated_allowed {
-            state.exchange_ephem_priv = None;
-            state.exchange_ephem_pub = None;
-            state.exchange_challenge = None;
-            return ApduResponse::err(SW_SECURITY_STATUS);
-        }
-        // else: bootstrapping mode allowed, proceed without signature verification.
+    if !peer_signed(&peer, source_ephem_pub, &challenge, sig_s) {
+        return ApduResponse::err(SW_SECURITY_STATUS);
     }
 
-    // Compute ECDH shared secret.
-    let shared_secret = match p256_ecdh(&ephem_priv, source_ephem_pub) {
-        Ok(s) => s,
-        Err(_) => {
-            state.exchange_ephem_priv = None;
-            state.exchange_ephem_pub = None;
-            state.exchange_challenge = None;
-            return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED);
-        }
+    let Ok(shared_secret) = p256_ecdh(&ephem_priv, source_ephem_pub) else {
+        return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED);
+    };
+    // info = b"pico2hsm-dkek-v2" || source_ephem_pub || target_ephem_pub || challenge
+    let Ok(session_key) =
+        derive_session_key_v2(&shared_secret, source_ephem_pub, &ephem_pub, &challenge)
+    else {
+        return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED);
+    };
+    // AAD = own static public key (SOURCE bound the ciphertext to it).
+    let Some(own_static_pub) = get_device_static_pub(state, store) else {
+        return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED);
+    };
+    let Ok(cipher) = Aes256Gcm::new_from_slice(&*session_key) else {
+        return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED);
     };
 
-    // Derive session key with channel binding.
-    // info = b"pico2hsm-dkek-v2" || source_ephem_pub || our_ephem_pub || challenge
-    let session_key =
-        match derive_session_key_v2(&shared_secret, source_ephem_pub, &ephem_pub, &challenge) {
-            Ok(k) => k,
-            Err(_) => {
-                state.exchange_ephem_priv = None;
-                state.exchange_ephem_pub = None;
-                state.exchange_challenge = None;
-                return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED);
-            }
-        };
-
-    // AAD = own_static_pub(65) — device's own static pubkey.
-    let own_static_pub = match get_device_static_pub(state, store) {
-        Some(p) => p,
-        None => {
-            state.exchange_ephem_priv = None;
-            state.exchange_ephem_pub = None;
-            state.exchange_challenge = None;
-            return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED);
-        }
-    };
-
-    // Decrypt DKEK: encrypted_dkek = nonce(12) || ct(32) || tag(16)
-    let nonce_bytes: &[u8; 12] = encrypted_dkek[..12].try_into().unwrap();
-    let ct_bytes = &encrypted_dkek[12..44];
-    let tag_bytes: &[u8; 16] = encrypted_dkek[44..60].try_into().unwrap();
-
-    let cipher = match Aes256Gcm::new_from_slice(&*session_key) {
-        Ok(c) => c,
-        Err(_) => {
-            state.exchange_ephem_priv = None;
-            state.exchange_ephem_pub = None;
-            state.exchange_challenge = None;
-            return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED);
-        }
-    };
-    let nonce = GcmNonce::from_slice(nonce_bytes);
-    let tag = GcmTag::clone_from_slice(tag_bytes);
-
+    // encrypted_dkek = nonce(12) || ct(32) || tag(16)
+    let nonce = GcmNonce::from_slice(&encrypted_dkek[..12]);
+    let tag = GcmTag::clone_from_slice(&encrypted_dkek[44..60]);
     let mut dkek_buf = Zeroizing::new([0u8; 32]);
-    dkek_buf.copy_from_slice(ct_bytes);
-
+    dkek_buf.copy_from_slice(&encrypted_dkek[12..44]);
     if cipher
         .decrypt_in_place_detached(nonce, &own_static_pub, dkek_buf.as_mut(), &tag)
         .is_err()
     {
-        state.exchange_ephem_priv = None;
-        state.exchange_ephem_pub = None;
-        state.exchange_challenge = None;
-        return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED);
+        return ApduResponse::err(SW_SECURITY_STATUS);
     }
 
-    // Store DKEK via DkekManager — put it directly into Ready state.
-    state.dkek.set_dkek_direct(*dkek_buf);
+    state.dkek.set_dkek_direct(&dkek_buf);
     state.dkek_shares_imported = state.dkek.shares_total();
-
-    // P1-6: After the first successful unauthenticated DKEK exchange, lock out
-    // further unauthenticated exchanges. Once a peer has sent a DKEK, subsequent
-    // exchanges must use the enrolled peer pubkey for signature verification.
-    if state.noise_enrolled_peer_pubkey.is_none() {
-        state.dkek_unauthenticated_allowed = false;
-    }
-
-    // Clear ephemeral state.
-    state.exchange_ephem_priv = None;
-    state.exchange_ephem_pub = None;
-    state.exchange_challenge = None;
-    state.exchange_peer_ephem_pub = None;
-
     ApduResponse::ok(&[])
 }
 
@@ -783,11 +646,11 @@ fn handle_enroll_peer_pubkey(
     pubkey.copy_from_slice(cmd.data);
     state.noise_enrolled_peer_pubkey = Some(pubkey);
 
-    // Permanently lock out unauthenticated DKEK exchanges.
-    state.dkek_unauthenticated_allowed = false;
-
     // Persist to flash so the enrollment survives power cycles.
-    crate::protocol::sc_hsm::ScHsm::save_peer_pubkey_to_store(state, store);
+    if crate::protocol::sc_hsm::ScHsm::save_peer_pubkey_to_store(state, store).is_err() {
+        state.noise_enrolled_peer_pubkey = None;
+        return ApduResponse::err(pico2hsm_core::apdu::SW_MEMORY_FAILURE);
+    }
 
     ApduResponse::ok(&[])
 }
@@ -1439,85 +1302,6 @@ mod tests {
     }
 
     #[test]
-    fn test_noise_target_init_returns_correct_length() {
-        let (mut state, mut store) = state_with_device_key();
-
-        // Source static pubkey (dummy 65 bytes, starts with 0x04).
-        let mut source_pub = [0u8; 65];
-        source_pub[0] = 0x04;
-        source_pub[1] = 0x01;
-
-        let cmd = ApduCommand {
-            cla: 0x80,
-            ins: INS_EXTRAS,
-            p1: 0x35,
-            p2: 0x00,
-            data: &source_pub,
-            le: None,
-        };
-
-        let resp = handle(&mut state, &mut store, &cmd);
-        assert_eq!(resp.sw, 0x9000, "expected SW_OK, got {:04X}", resp.sw);
-        assert_eq!(
-            resp.data.len(),
-            161,
-            "expected 161 bytes: ephem_pub(65) + challenge(32) + sig(64)"
-        );
-
-        // Verify ephemeral state was stored.
-        assert!(state.exchange_ephem_priv.is_some());
-        assert!(state.exchange_ephem_pub.is_some());
-        assert!(state.exchange_challenge.is_some());
-    }
-
-    #[test]
-    fn test_noise_source_respond_returns_correct_length() {
-        use crate::crypto::asymmetric::generate_ec_keypair;
-
-        let (mut state, mut store) = state_with_device_key();
-
-        // Source needs an existing ephemeral keypair (from NOISE_INITIATE).
-        let mut rng = crate::protocol::sc_hsm::FwRng;
-        let pair = generate_ec_keypair(CoreKeyType::EcPrivateP256, &mut rng).unwrap();
-        let mut priv_bytes = zeroize::Zeroizing::new([0u8; 32]);
-        priv_bytes.copy_from_slice(&pair.private_key);
-        state.exchange_ephem_priv = Some(priv_bytes);
-        let mut pub_bytes = [0u8; 65];
-        pub_bytes.copy_from_slice(&pair.public_key);
-        state.exchange_ephem_pub = Some(pub_bytes);
-
-        // Build input: ephem_T_pub(65) || challenge(32) || Sig_T(64) = 161 bytes
-        let mut input = [0u8; 161];
-        // Fill with a valid-looking ephem pub (we won't verify sig in V1).
-        input[0] = 0x04;
-        input[1] = 0x42;
-        // challenge at [65..97] — random.
-        input[65] = 0xAA;
-        // sig at [97..161] — dummy 64 bytes (V1 doesn't verify).
-
-        let cmd = ApduCommand {
-            cla: 0x80,
-            ins: INS_EXTRAS,
-            p1: 0x36,
-            p2: 0x00,
-            data: &input,
-            le: None,
-        };
-
-        let resp = handle(&mut state, &mut store, &cmd);
-        assert_eq!(resp.sw, 0x9000, "expected SW_OK, got {:04X}", resp.sw);
-        assert_eq!(
-            resp.data.len(),
-            129,
-            "expected 129 bytes: ephem_S_pub(65) + Sig_S(64)"
-        );
-
-        // Verify challenge was stored.
-        assert!(state.exchange_challenge.is_some());
-        assert!(state.exchange_peer_ephem_pub.is_some());
-    }
-
-    #[test]
     fn test_challenge_replay_rejected() {
         let mut state = ScHsmState::new();
         let challenge = [0xBBu8; 32];
@@ -1939,29 +1723,145 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_enroll_peer_locks_unauthenticated() {
-        let (mut state, mut store) = state_with_device_key();
+    // -----------------------------------------------------------------------
+    // V2 DKEK exchange — two simulated devices
+    // -----------------------------------------------------------------------
 
-        assert!(
-            state.dkek_unauthenticated_allowed,
-            "should start as allowed"
-        );
-
-        let pubkey = generate_test_p256_pubkey();
+    fn extras(
+        state: &mut ScHsmState,
+        store: &mut DevKeyStore,
+        p1: u8,
+        data: &[u8],
+    ) -> ApduResponse {
         let cmd = ApduCommand {
             cla: 0x80,
             ins: INS_EXTRAS,
-            p1: 0x3D,
+            p1,
             p2: 0x00,
-            data: &pubkey,
+            data,
             le: None,
         };
-        let resp = handle(&mut state, &mut store, &cmd);
-        assert_eq!(resp.sw, 0x9000);
-        assert!(
-            !state.dkek_unauthenticated_allowed,
-            "should be locked after enrollment"
+        handle(state, store, &cmd)
+    }
+
+    fn static_pub(store: &DevKeyStore) -> [u8; 65] {
+        store.dev_key.as_ref().unwrap().public_key[..]
+            .try_into()
+            .unwrap()
+    }
+
+    /// SOURCE (holds DKEK) and TARGET, each enrolled to the other.
+    fn enrolled_pair() -> ((ScHsmState, DevKeyStore), (ScHsmState, DevKeyStore)) {
+        let (mut src, mut src_store) = state_with_device_key();
+        let (mut tgt, mut tgt_store) = state_with_device_key();
+        let (src_pub, tgt_pub) = (static_pub(&src_store), static_pub(&tgt_store));
+        assert_eq!(extras(&mut src, &mut src_store, 0x3D, &tgt_pub).sw, 0x9000);
+        assert_eq!(extras(&mut tgt, &mut tgt_store, 0x3D, &src_pub).sw, 0x9000);
+        src.dkek.set_dkek_direct(&[0x5Cu8; 32]);
+        ((src, src_store), (tgt, tgt_store))
+    }
+
+    #[test]
+    fn exchange_transfers_dkek_between_enrolled_peers() {
+        let ((mut src, mut ss), (mut tgt, mut ts)) = enrolled_pair();
+        let (src_pub, tgt_pub) = (static_pub(&ss), static_pub(&ts));
+
+        let init = extras(&mut tgt, &mut ts, 0x35, &src_pub);
+        assert_eq!(init.sw, 0x9000);
+        let respond = extras(&mut src, &mut ss, 0x36, &init.data);
+        assert_eq!(respond.sw, 0x9000);
+        let send = extras(
+            &mut src,
+            &mut ss,
+            0x37,
+            &make_data(&[&init.data[..65], &tgt_pub, &init.data[65..97]]),
         );
+        assert_eq!(send.sw, 0x9000);
+        let recv = extras(
+            &mut tgt,
+            &mut ts,
+            0x38,
+            &make_data(&[&respond.data, &send.data]),
+        );
+        assert_eq!(recv.sw, 0x9000);
+        assert_eq!(tgt.dkek.get_dkek(), Some(&[0x5Cu8; 32]));
+        // One-shot: both sides are disarmed.
+        assert!(src.exchange_ephem_priv.is_none() && tgt.exchange_ephem_priv.is_none());
+    }
+
+    #[test]
+    fn send_without_verified_respond_is_refused() {
+        // The S-02 attack: arm SOURCE with 0x35 (its own challenge), then ask
+        // it to send the DKEK to an attacker-chosen ephemeral key.
+        let ((mut src, mut ss), (_tgt, ts)) = enrolled_pair();
+        let tgt_pub = static_pub(&ts);
+        let init = extras(&mut src, &mut ss, 0x35, &tgt_pub);
+        // SOURCE holds a DKEK, so it refuses to act as TARGET at all.
+        assert_ne!(init.sw, 0x9000);
+        let attacker_ephem = static_pub(&ts); // any valid point
+        let send = extras(
+            &mut src,
+            &mut ss,
+            0x37,
+            &make_data(&[&attacker_ephem, &tgt_pub, &[0u8; 32]]),
+        );
+        assert_eq!(send.sw, SW_CONDITIONS_NOT_SATISFIED);
+    }
+
+    #[test]
+    fn send_to_substituted_ephemeral_is_refused() {
+        let ((mut src, mut ss), (mut tgt, mut ts)) = enrolled_pair();
+        let (src_pub, tgt_pub) = (static_pub(&ss), static_pub(&ts));
+        let init = extras(&mut tgt, &mut ts, 0x35, &src_pub);
+        assert_eq!(extras(&mut src, &mut ss, 0x36, &init.data).sw, 0x9000);
+        let attacker_ephem = src_pub; // valid point, but not the verified one
+        let send = extras(
+            &mut src,
+            &mut ss,
+            0x37,
+            &make_data(&[&attacker_ephem, &tgt_pub, &init.data[65..97]]),
+        );
+        assert_eq!(send.sw, SW_SECURITY_STATUS);
+        assert!(
+            src.exchange_peer_ephem_pub.is_none(),
+            "aborted exchange is disarmed"
+        );
+    }
+
+    #[test]
+    fn respond_rejects_forged_target_signature() {
+        let ((mut src, mut ss), (mut tgt, mut ts)) = enrolled_pair();
+        let init = extras(&mut tgt, &mut ts, 0x35, &static_pub(&ss));
+        let mut forged = make_data(&[&init.data]);
+        forged[100] ^= 0x01;
+        assert_eq!(
+            extras(&mut src, &mut ss, 0x36, &forged).sw,
+            SW_SECURITY_STATUS
+        );
+    }
+
+    #[test]
+    fn exchange_requires_enrolled_peer() {
+        let (mut tgt, mut ts) = state_with_device_key();
+        let (_src, ss) = state_with_device_key();
+        let resp = extras(&mut tgt, &mut ts, 0x35, &static_pub(&ss));
+        assert_eq!(resp.sw, SW_CONDITIONS_NOT_SATISFIED);
+    }
+
+    #[test]
+    fn exchange_requires_so_pin() {
+        let ((_src, ss), (mut tgt, mut ts)) = enrolled_pair();
+        tgt.so_pin_verified = false;
+        let resp = extras(&mut tgt, &mut ts, 0x35, &static_pub(&ss));
+        assert_eq!(resp.sw, SW_SECURITY_STATUS);
+    }
+
+    #[test]
+    fn target_with_dkek_is_never_overwritten() {
+        let ((_src, ss), (mut tgt, mut ts)) = enrolled_pair();
+        tgt.dkek.set_dkek_direct(&[0x11u8; 32]);
+        let resp = extras(&mut tgt, &mut ts, 0x35, &static_pub(&ss));
+        assert_eq!(resp.sw, SW_CONDITIONS_NOT_SATISFIED);
+        assert_eq!(tgt.dkek.get_dkek(), Some(&[0x11u8; 32]));
     }
 }

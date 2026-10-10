@@ -22,8 +22,8 @@ pub mod pkcs15_objects;
 use heapless::{String, Vec};
 use pico2hsm_core::{
     apdu::{
-        ApduCommand, ApduResponse, SW_CLASS_NOT_SUPPORTED, SW_INS_NOT_SUPPORTED, SW_MEMORY_FAILURE,
-        SW_OK,
+        ApduCommand, ApduResponse, SW_CLASS_NOT_SUPPORTED, SW_INCORRECT_P1P2, SW_INS_NOT_SUPPORTED,
+        SW_MEMORY_FAILURE, SW_OK,
     },
     error::HsmError,
     key::{AppletId, KeyId, KeyType as CoreKeyType},
@@ -34,6 +34,11 @@ use zeroize::Zeroizing;
 use crate::security::dkek::DkekManager;
 
 use commands::*;
+
+/// Lowest SC-HSM key reference reserved for firmware records:
+/// 0xFC enrolled peer key, 0xFD persisted DKEK, 0xFE device identity key,
+/// 0xFF PIN record.  User keys use 0x00–0xFB.
+pub const RESERVED_KEY_REF_MIN: u8 = 0xFC;
 
 /// EXTERNAL AUTHENTICATE retry limit.
 pub const EXT_AUTH_MAX_RETRIES: u8 = 5;
@@ -377,13 +382,6 @@ pub struct ScHsmState {
     /// Resets to 5 on success. Returns SW_AUTH_BLOCKED (0x6983) when zero.
     pub ext_auth_retry_count: u8,
 
-    /// When true, DKEK exchange is allowed without peer signature verification
-    /// (bootstrapping mode before the first peer is enrolled).
-    ///
-    /// Set to false permanently once a peer public key has been enrolled via
-    /// SIGN_ENROLLMENT, preventing unauthenticated exchanges after enrollment.
-    pub dkek_unauthenticated_allowed: bool,
-
     /// Lightweight metadata index for all keys and EF files in flash.
     /// Replaces the previous `keys`, `rsa_keys`, `sym_keys`, and `ef_files`
     /// Vec fields. Key material stays in flash; only metadata lives in RAM.
@@ -465,7 +463,6 @@ impl ScHsmState {
             puk_salt: [0u8; 16],
             puk_retry_count: 10,
             ext_auth_retry_count: 5,
-            dkek_unauthenticated_allowed: true,
             key_index: heapless::Vec::new(),
             op_buf: OpBuffer::new(),
             write_target_file: None,
@@ -512,7 +509,6 @@ impl ScHsmState {
             addr_of_mut!((*dest).puk_salt).write([0u8; 16]);
             addr_of_mut!((*dest).puk_retry_count).write(10);
             addr_of_mut!((*dest).ext_auth_retry_count).write(5);
-            addr_of_mut!((*dest).dkek_unauthenticated_allowed).write(true);
             addr_of_mut!((*dest).key_index).write(heapless::Vec::new());
             addr_of_mut!((*dest).op_buf).write(OpBuffer::new());
             addr_of_mut!((*dest).write_target_file).write(None);
@@ -625,6 +621,42 @@ impl ScHsm {
         }
     }
 
+    /// Whether `cmd` names a reserved key slot (`RESERVED_KEY_REF_MIN..`)
+    /// through a user-facing key command.  Those slots hold the peer record,
+    /// the DKEK, the device identity key and the PIN record; they are only
+    /// ever touched by the firmware's own code paths.
+    fn targets_reserved_slot(cmd: &ApduCommand<'_>) -> bool {
+        let reserved = |r: u8| r >= RESERVED_KEY_REF_MIN;
+        match cmd.ins {
+            sign::INS_SIGN
+            | decrypt::INS_DECRYPT
+            | bip_slip::INS_BIP_SLIP
+            | export_key::INS_EXPORT_KEY
+            | 0x34
+            | import_key::INS_IMPORT_KEY
+            | generate_key::INS_GENERATE_KEY => reserved(cmd.p1),
+            // P1=0xFF asks the card to pick a free slot.
+            generate_keypair::INS_GENERATE_KEYPAIR => cmd.p1 != 0xFF && reserved(cmd.p1),
+            _ => false,
+        }
+    }
+
+    /// After a command that may complete or clear the DKEK, persist the
+    /// change so wrap/unwrap keep working across resets.
+    fn persist_dkek_change(
+        &mut self,
+        had_dkek: bool,
+        resp: ApduResponse,
+        store: &mut dyn crate::storage::KeyStore,
+    ) -> ApduResponse {
+        if self.state.dkek.is_ready() != had_dkek
+            && Self::save_dkek_to_store(&self.state, store).is_err()
+        {
+            return ApduResponse::err(SW_MEMORY_FAILURE);
+        }
+        resp
+    }
+
     /// Spend one retry of `counter` on flash, run the command, then persist
     /// the outcome.
     ///
@@ -659,10 +691,15 @@ impl ScHsm {
         if resp.sw != SW_OK && *after > spent {
             *after = spent;
         }
-        if *after != spent {
-            // Success restored the counter (or changed the credential); a
-            // failure here only leaves the safe, already-spent value on flash.
-            let _ = Self::save_pin_to_store(&self.state, store);
+        if *after != spent && Self::save_pin_to_store(&self.state, store).is_err() {
+            // Flash still holds the spent counter and the old credentials.
+            // Make RAM match it rather than report a change that a reset
+            // would silently undo, and fail closed.
+            Self::load_pin_state_from_store(&mut self.state, store);
+            *counter.get(&mut self.state) = spent;
+            self.state.pin_verified = false;
+            self.state.so_pin_verified = false;
+            return ApduResponse::err(SW_MEMORY_FAILURE);
         }
         resp
     }
@@ -673,6 +710,9 @@ impl ScHsm {
         cmd: &ApduCommand<'_>,
         store: &mut dyn crate::storage::KeyStore,
     ) -> ApduResponse {
+        if Self::targets_reserved_slot(cmd) {
+            return ApduResponse::err(SW_INCORRECT_P1P2);
+        }
         match cmd.ins {
             initialize::INS_INITIALIZE => initialize::handle(&mut self.state, store, cmd),
             // Credential checks: persistence is handled by with_persisted_attempt.
@@ -699,7 +739,16 @@ impl ScHsm {
             reset_retry::INS_RESET_RETRY => {
                 reset_retry::handle_with_store(&mut self.state, store, cmd)
             }
-            extras::INS_EXTRAS => extras::handle(&mut self.state, store, cmd),
+            extras::INS_EXTRAS => {
+                let had_dkek = self.state.dkek.is_ready();
+                let resp = extras::handle(&mut self.state, store, cmd);
+                self.persist_dkek_change(had_dkek, resp, store)
+            }
+            key_domain::INS_KEY_DOMAIN => {
+                let had_dkek = self.state.dkek.is_ready();
+                let resp = key_domain::handle(&mut self.state, cmd);
+                self.persist_dkek_change(had_dkek, resp, store)
+            }
             // File commands that need flash access.
             read_binary::INS_READ_BINARY => read_binary::handle(&mut self.state, store, cmd),
             read_binary::INS_READ_BINARY_ODD => {
@@ -935,6 +984,50 @@ impl ScHsm {
         }
     }
 
+    /// KeyId for the persisted DKEK.
+    pub fn sc_hsm_dkek_key_id() -> pico2hsm_core::key::KeyId {
+        pico2hsm_core::key::KeyId::sc_hsm(0, 0xFD)
+    }
+
+    /// Persist the DKEK (or erase the record when there is none), encrypted
+    /// by the keystore like every other key.
+    ///
+    /// Layout: `[0..32]` DKEK, `[32]` number of shares it was assembled from.
+    pub fn save_dkek_to_store(
+        state: &ScHsmState,
+        store: &mut dyn crate::storage::KeyStore,
+    ) -> Result<(), HsmError> {
+        use crate::security::key_management::{AlgorithmId, KeyObject, KeyType as KmKeyType};
+
+        let kid = Self::sc_hsm_dkek_key_id();
+        let Some(dkek) = state.dkek.get_dkek() else {
+            return store.erase_key(kid);
+        };
+        let mut obj = KeyObject::new(
+            KmKeyType::Generic,
+            kid.0,
+            AppletId::ScHsm,
+            AlgorithmId::AesGcm,
+        );
+        let _ = obj.private_key.extend_from_slice(dkek);
+        let _ = obj.private_key.push(state.dkek.shares_total());
+        store.save_key(&obj)
+    }
+
+    /// Restore a persisted DKEK into `state`.
+    pub fn load_dkek_from_store(state: &mut ScHsmState, store: &mut dyn crate::storage::KeyStore) {
+        if let Ok(Some(obj)) = store.fetch_key(Self::sc_hsm_dkek_key_id()) {
+            let b = &obj.private_key;
+            if let (Some(dkek), Some(&shares)) = (b.get(..32), b.get(32)) {
+                if let Ok(dkek) = <&[u8; 32]>::try_from(dkek) {
+                    state.dkek.restore_ready(dkek, shares);
+                    state.dkek_shares_imported = shares;
+                    state.dkek_shares_required = shares;
+                }
+            }
+        }
+    }
+
     /// KeyId for the enrolled peer public key in flash.
     pub fn sc_hsm_peer_pubkey_key_id() -> pico2hsm_core::key::KeyId {
         pico2hsm_core::key::KeyId::sc_hsm(0, 0xFC)
@@ -945,8 +1038,11 @@ impl ScHsm {
     /// Stored as a Generic key object at `KeyId::sc_hsm(0, 0xFC)`.
     /// Layout:
     ///   [0..65]  peer P-256 uncompressed public key (04 || x || y)
-    ///   [65]     dkek_unauthenticated_allowed (0 = locked, 1 = allowed)
-    pub fn save_peer_pubkey_to_store(state: &ScHsmState, store: &mut dyn crate::storage::KeyStore) {
+    ///   [65]     reserved (0; formerly the unauthenticated-exchange flag)
+    pub fn save_peer_pubkey_to_store(
+        state: &ScHsmState,
+        store: &mut dyn crate::storage::KeyStore,
+    ) -> Result<(), HsmError> {
         use crate::security::key_management::{AlgorithmId, KeyObject, KeyType as KmKeyType};
         use pico2hsm_core::key::AppletId;
 
@@ -955,7 +1051,7 @@ impl ScHsm {
         if let Some(ref pubkey) = state.noise_enrolled_peer_pubkey {
             let mut buf: heapless::Vec<u8, 128> = heapless::Vec::new();
             let _ = buf.extend_from_slice(pubkey);
-            let _ = buf.push(state.dkek_unauthenticated_allowed as u8);
+            let _ = buf.push(0);
 
             let mut obj = KeyObject::new(
                 KmKeyType::Generic,
@@ -964,10 +1060,10 @@ impl ScHsm {
                 AlgorithmId::AesGcm,
             );
             let _ = obj.private_key.extend_from_slice(&buf);
-            let _ = store.save_key(&obj);
+            store.save_key(&obj)
         } else {
             // No peer enrolled — erase from flash if present.
-            let _ = store.erase_key(kid);
+            store.erase_key(kid)
         }
     }
 
@@ -985,7 +1081,6 @@ impl ScHsm {
                 // Validate the key is still a valid P-256 point before trusting it.
                 if p256::ecdsa::VerifyingKey::from_sec1_bytes(&pubkey).is_ok() {
                     state.noise_enrolled_peer_pubkey = Some(pubkey);
-                    state.dkek_unauthenticated_allowed = b[65] != 0;
                 }
             }
         }
@@ -1049,6 +1144,9 @@ mod retry_persistence_tests {
     struct PinStore {
         saves: heapless::Vec<heapless::Vec<u8, 160>, 32>,
         fail_next: bool,
+        /// Fail the PIN-record write attempt with this index (0-based).
+        fail_attempt: Option<usize>,
+        attempts: usize,
     }
 
     impl PinStore {
@@ -1056,6 +1154,8 @@ mod retry_persistence_tests {
             PinStore {
                 saves: heapless::Vec::new(),
                 fail_next: false,
+                fail_attempt: None,
+                attempts: 0,
             }
         }
         /// (user, so, puk, ext-auth failures) from the record write `i`.
@@ -1073,7 +1173,9 @@ mod retry_persistence_tests {
             if obj.key_id != ScHsm::sc_hsm_pin_key_id().0 {
                 return Ok(());
             }
-            if core::mem::take(&mut self.fail_next) {
+            let attempt = self.attempts;
+            self.attempts += 1;
+            if core::mem::take(&mut self.fail_next) || self.fail_attempt == Some(attempt) {
                 return Err(HsmError::NotSupported);
             }
             let mut b = heapless::Vec::new();
@@ -1236,8 +1338,138 @@ mod retry_persistence_tests {
     }
 
     #[test]
+    fn change_pin_with_failed_final_write_keeps_old_pin() {
+        let (mut hsm, mut store) = initialized();
+        // Attempt 0 = spend-before-compare, attempt 1 = persist the new PIN.
+        store.fail_attempt = Some(store.attempts + 1);
+        let mut data: heapless::Vec<u8, 32> = heapless::Vec::new();
+        data.extend_from_slice(USER_PIN).unwrap();
+        data.extend_from_slice(b"111111").unwrap();
+        let r = hsm.process_apdu_with_store(&apdu(0x00, 0x24, 0, 0x81, &data), &mut store);
+        assert_eq!(sw(&r), SW_MEMORY_FAILURE);
+        // RAM matches flash: the old PIN still works, the new one does not.
+        assert_eq!(verify(&mut hsm, &mut store, 0x81, b"111111"), 0x63C1);
+        assert_eq!(verify(&mut hsm, &mut store, 0x81, USER_PIN), SW_OK);
+    }
+
+    #[test]
     fn short_user_pin_rejected() {
         let (mut hsm, mut store) = initialized();
         assert_eq!(verify(&mut hsm, &mut store, 0x81, b"1234"), 0x6700);
+    }
+}
+
+#[cfg(test)]
+mod reserved_slot_and_dkek_tests {
+    use super::*;
+    use crate::security::key_management::{AlgorithmId, KeyObject, KeyType as KmKeyType};
+
+    /// Minimal in-memory store: keeps each record's private bytes by KeyId.
+    struct MemStore {
+        records: heapless::Vec<(KeyId, heapless::Vec<u8, 160>), 16>,
+    }
+
+    impl crate::storage::KeyStore for MemStore {
+        fn save_key(&mut self, obj: &KeyObject) -> Result<(), HsmError> {
+            let kid = KeyId(obj.key_id);
+            self.records.retain(|(k, _)| *k != kid);
+            let mut b = heapless::Vec::new();
+            let _ = b.extend_from_slice(&obj.private_key[..obj.private_key.len().min(160)]);
+            let _ = self.records.push((kid, b));
+            Ok(())
+        }
+        fn fetch_key(&mut self, kid: KeyId) -> Result<Option<KeyObject>, HsmError> {
+            Ok(self.records.iter().find(|(k, _)| *k == kid).map(|(_, b)| {
+                let mut obj = KeyObject::new(
+                    KmKeyType::Generic,
+                    kid.0,
+                    AppletId::ScHsm,
+                    AlgorithmId::AesGcm,
+                );
+                obj.private_key.extend_from_slice(b).unwrap();
+                obj
+            }))
+        }
+        fn erase_key(&mut self, kid: KeyId) -> Result<(), HsmError> {
+            self.records.retain(|(k, _)| *k != kid);
+            Ok(())
+        }
+        fn wipe_all(&mut self) -> Result<(), HsmError> {
+            self.records.clear();
+            Ok(())
+        }
+        fn wipe_by_owner(&mut self, _: AppletId) -> Result<(), HsmError> {
+            self.records.clear();
+            Ok(())
+        }
+        fn enumerate_keys(&self) -> heapless::Vec<KeyId, 64> {
+            heapless::Vec::new()
+        }
+        fn for_each_key(&self, _: &mut dyn FnMut(KeyId)) {}
+    }
+
+    fn sw(hsm: &mut ScHsm, store: &mut MemStore, apdu: &[u8]) -> u16 {
+        let r = hsm.process_apdu_with_store(apdu, store);
+        u16::from_be_bytes([r[r.len() - 2], r[r.len() - 1]])
+    }
+
+    fn logged_in() -> ScHsm {
+        let mut hsm = ScHsm::new();
+        hsm.state.initialized = true;
+        hsm.state.pin_verified = true;
+        hsm.state.so_pin_verified = true;
+        hsm
+    }
+
+    #[test]
+    fn key_commands_cannot_touch_reserved_slots() {
+        let mut hsm = logged_in();
+        let mut store = MemStore {
+            records: heapless::Vec::new(),
+        };
+        for p1 in [0xFC, 0xFD, 0xFE] {
+            // EXPORT KEY, IMPORT KEY, GENERATE KEY PAIR, SIGN, DECRYPT
+            for ins in [0x72, 0x74, 0x46, 0x68, 0x62] {
+                let apdu = [0x80, ins, p1, 0x92, 0x01, 0x00];
+                assert_eq!(
+                    sw(&mut hsm, &mut store, &apdu),
+                    SW_INCORRECT_P1P2,
+                    "ins {ins:02X} p1 {p1:02X}"
+                );
+            }
+        }
+        // MSE SET cannot select the device identity key either.
+        assert_ne!(
+            sw(
+                &mut hsm,
+                &mut store,
+                &[0x00, 0x22, 0x41, 0xB6, 0x03, 0x84, 0x01, 0xFE]
+            ),
+            SW_OK
+        );
+        assert_eq!(hsm.state.current_key_id, None);
+    }
+
+    #[test]
+    fn dkek_from_shares_survives_reset() {
+        let mut hsm = logged_in();
+        let mut store = MemStore {
+            records: heapless::Vec::new(),
+        };
+        hsm.state.dkek.init_shares(2);
+        let mut share = [0x80, 0x52, 0x00, 0x00, 0x20].to_vec();
+        share.extend_from_slice(&[0x0Fu8; 32]);
+        assert_eq!(sw(&mut hsm, &mut store, &share), SW_OK);
+        assert!(
+            store.records.is_empty(),
+            "nothing to persist until complete"
+        );
+        share[5..].copy_from_slice(&[0xF0u8; 32]);
+        assert_eq!(sw(&mut hsm, &mut store, &share), SW_OK);
+
+        let mut fresh = ScHsm::new();
+        ScHsm::load_dkek_from_store(&mut fresh.state, &mut store);
+        assert_eq!(fresh.state.dkek.get_dkek(), Some(&[0xFFu8; 32]));
+        assert_eq!(fresh.state.dkek.shares_total(), 2);
     }
 }
