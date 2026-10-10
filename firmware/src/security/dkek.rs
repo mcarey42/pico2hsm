@@ -175,18 +175,17 @@ pub enum DkekStatus {
 
 impl Zeroize for DkekStatus {
     fn zeroize(&mut self) {
-        // Use mem::replace to take ownership of the old value without triggering
-        // Drop on it (which would call zeroize() again → infinite recursion).
-        let old = core::mem::replace(self, DkekStatus::NotInitialized);
-        match old {
-            DkekStatus::CollectingShares {
-                mut accumulated, ..
-            } => accumulated.zeroize(),
-            DkekStatus::Ready { mut dkek } => dkek.zeroize(),
+        // Wipe the secret where it lives *before* changing the variant.
+        // Moving it out first (e.g. via `mem::replace`) would zeroize only the
+        // moved copy: writing `NotInitialized` updates just the enum tag and
+        // leaves the old payload bytes in place.
+        match self {
+            DkekStatus::CollectingShares { accumulated, .. } => accumulated.zeroize(),
+            DkekStatus::Ready { dkek } => dkek.zeroize(),
             DkekStatus::NotInitialized => {}
         }
-        // `old` is consumed by the match — no Drop call.
-        // The inner Zeroizing<[u8;32]> fields zeroize themselves on drop.
+        // DkekStatus has no Drop impl, so this assignment cannot recurse.
+        *self = DkekStatus::NotInitialized;
     }
 }
 
@@ -890,6 +889,36 @@ mod tests {
             0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E,
             0x0F, 0x10,
         ]
+    }
+
+    fn contains(mgr: &DkekManager, pattern: &[u8; 32]) -> bool {
+        let bytes = unsafe {
+            core::slice::from_raw_parts(
+                (mgr as *const DkekManager).cast::<u8>(),
+                core::mem::size_of::<DkekManager>(),
+            )
+        };
+        bytes.windows(32).any(|w| w == pattern)
+    }
+
+    #[test]
+    fn clear_wipes_dkek_in_place() {
+        let pattern = [0xA5u8; 32];
+        let mut mgr = DkekManager::new(test_device_id());
+        mgr.set_dkek_direct(pattern);
+        assert!(contains(&mgr, &pattern));
+        mgr.clear();
+        assert!(!mgr.is_ready());
+        assert!(!contains(&mgr, &pattern));
+    }
+
+    #[test]
+    fn set_dkek_direct_wipes_previous_dkek() {
+        let old = [0xA5u8; 32];
+        let mut mgr = DkekManager::new(test_device_id());
+        mgr.set_dkek_direct(old);
+        mgr.set_dkek_direct([0x5Au8; 32]);
+        assert!(!contains(&mgr, &old));
     }
 
     /// Deterministic RNG for tests (no OsRng in no_std firmware builds).

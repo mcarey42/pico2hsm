@@ -385,8 +385,8 @@ fn dispatcher_loop(ptr_wrapper: DispatcherPtr) -> ! {
             // Dispatcher struct is ~82 KB; in debug builds `Dispatcher::new()`
             // would place the full struct on the Core1 stack before copying
             // it into BSS, risking silent stack overflow on the second USB
-            // reconnect in a test session.  See
-            // .claude/projects/-home-mcarey-pico2hsm/memory/dispatcher_stack_overflow.md
+            // reconnect in a test session.  reset_in_place also zeroizes the
+            // old session's secrets (DKEK, PIN state, cached keys).
             dispatcher.reset_in_place();
             if FlashQueueKeyStore::is_direct_write() {
                 // SD card: reload directly on core1.
@@ -497,7 +497,7 @@ async fn main(_spawner: Spawner) {
         let ebss = core::ptr::addr_of!(__ebss) as u32;
         // Core0 stack occupies the full gap between __ebss and 0x20082000 (520 KB SRAM end).
         // MSPLIM at __ebss — hardware UsageFault fires at exact boundary, no guard waste.
-        // With 192 KB Core1 stack the gap is smaller but still sufficient for
+        // With 128 KB Core1 stack the gap is smaller but still sufficient for
         // Embassy USB + CCID + init_in_place (~60 KB needed).
         cortex_m::register::msplim::write(ebss);
 
@@ -654,6 +654,31 @@ fn handle_flash_op(
                 core::sync::atomic::Ordering::Relaxed,
             );
             Ok(())
+        }
+    }
+}
+
+/// Wait for core1's next `RESP_CHANNEL` message while servicing any
+/// `FLASH_REQ` it issues first.
+///
+/// Core1 may need core0 to perform flash operations before it can reply —
+/// queued key writes after a dispatch, or `ReloadKeys` after a USB-reconnect
+/// reset on QMI flash boards.  Waiting on `RESP_CHANNEL` alone in those paths
+/// deadlocks both cores (core1 blocks on `FLASH_RESP`, core0 on `RESP_CHANNEL`).
+#[cfg(target_arch = "arm")]
+async fn recv_core1_response(
+    store: &mut pico2hsm_firmware::storage::BoardKeyStore,
+    dispatcher_ptr: *mut pico2hsm_firmware::apdu::dispatcher::Dispatcher,
+) -> heapless::Vec<u8, 4098> {
+    use embassy_futures::select::{select, Either};
+    loop {
+        match select(RESP_CHANNEL.receive(), FLASH_REQ.receive()).await {
+            Either::First(r) => return r,
+            Either::Second(op) => {
+                let result = handle_flash_op(op, store, dispatcher_ptr);
+                FLASH_RESP.send(result).await;
+                cortex_m::asm::sev(); // wake core1 from WFE
+            }
         }
     }
 }
@@ -862,7 +887,8 @@ async fn run_one_board(p: embassy_rp::Peripherals) {
                                         if let Err(CcidError::UsbDisconnected) =
                                             ccid.send_time_extension().await
                                         {
-                                            let _ = RESP_CHANNEL.receive().await;
+                                            let _ =
+                                                recv_core1_response(store, dispatcher_ptr).await;
                                             break heapless::Vec::new();
                                         }
                                     }
@@ -886,7 +912,7 @@ async fn run_one_board(p: embassy_rp::Peripherals) {
                             Err(CcidError::UsbDisconnected) => {
                                 let _ = APDU_CHANNEL.send(heapless::Vec::new()).await;
                                 cortex_m::asm::sev(); // wake core1 from WFE
-                                let _ = RESP_CHANNEL.receive().await;
+                                let _ = recv_core1_response(store, dispatcher_ptr).await;
                                 break;
                             }
                             Err(_) => {}
@@ -896,7 +922,7 @@ async fn run_one_board(p: embassy_rp::Peripherals) {
                     Err(CcidError::UsbDisconnected) => {
                         let _ = APDU_CHANNEL.send(heapless::Vec::new()).await;
                         cortex_m::asm::sev(); // wake core1 from WFE
-                        let _ = RESP_CHANNEL.receive().await;
+                        let _ = recv_core1_response(store, dispatcher_ptr).await;
                         board.led().set_status(LedStatus::Ready);
                         break;
                     }
@@ -1296,7 +1322,8 @@ async fn run_geek_board(p: embassy_rp::Peripherals) {
                                         if let Err(CcidError::UsbDisconnected) =
                                             ccid.send_time_extension().await
                                         {
-                                            let _ = RESP_CHANNEL.receive().await;
+                                            let _ =
+                                                recv_core1_response(store, dispatcher_ptr).await;
                                             break heapless::Vec::new();
                                         }
                                     }
@@ -1405,7 +1432,7 @@ async fn run_geek_board(p: embassy_rp::Peripherals) {
                             Err(CcidError::UsbDisconnected) => {
                                 let _ = APDU_CHANNEL.send(heapless::Vec::new()).await;
                                 cortex_m::asm::sev(); // wake core1 from WFE
-                                let _ = RESP_CHANNEL.receive().await;
+                                let _ = recv_core1_response(store, dispatcher_ptr).await;
                                 display_state.status = LedStatus::Ready;
                                 break;
                             }
@@ -1416,7 +1443,7 @@ async fn run_geek_board(p: embassy_rp::Peripherals) {
                     Err(CcidError::UsbDisconnected) => {
                         let _ = APDU_CHANNEL.send(heapless::Vec::new()).await;
                         cortex_m::asm::sev(); // wake core1 from WFE
-                        let _ = RESP_CHANNEL.receive().await;
+                        let _ = recv_core1_response(store, dispatcher_ptr).await;
                         display_state.status = LedStatus::Ready;
                         break;
                     }
@@ -1631,7 +1658,8 @@ async fn run_pico2_board(p: embassy_rp::Peripherals) {
                                         if let Err(CcidError::UsbDisconnected) =
                                             ccid.send_time_extension().await
                                         {
-                                            let _ = RESP_CHANNEL.receive().await;
+                                            let _ =
+                                                recv_core1_response(store, dispatcher_ptr).await;
                                             break heapless::Vec::new();
                                         }
                                     }
@@ -1655,7 +1683,7 @@ async fn run_pico2_board(p: embassy_rp::Peripherals) {
                             Err(CcidError::UsbDisconnected) => {
                                 let _ = APDU_CHANNEL.send(heapless::Vec::new()).await;
                                 cortex_m::asm::sev(); // wake core1 from WFE
-                                let _ = RESP_CHANNEL.receive().await;
+                                let _ = recv_core1_response(store, dispatcher_ptr).await;
                                 break;
                             }
                             Err(_) => {}
@@ -1665,7 +1693,7 @@ async fn run_pico2_board(p: embassy_rp::Peripherals) {
                     Err(CcidError::UsbDisconnected) => {
                         let _ = APDU_CHANNEL.send(heapless::Vec::new()).await;
                         cortex_m::asm::sev(); // wake core1 from WFE
-                        let _ = RESP_CHANNEL.receive().await;
+                        let _ = recv_core1_response(store, dispatcher_ptr).await;
                         board.led().set_status(LedStatus::Ready);
                         break;
                     }
@@ -2145,7 +2173,8 @@ async fn run_waveshare_lcd_board(p: embassy_rp::Peripherals) {
                                         if let Err(CcidError::UsbDisconnected) =
                                             ccid.send_time_extension().await
                                         {
-                                            let _ = RESP_CHANNEL.receive().await;
+                                            let _ =
+                                                recv_core1_response(store, dispatcher_ptr).await;
                                             break heapless::Vec::new();
                                         }
                                     }
@@ -2257,7 +2286,7 @@ async fn run_waveshare_lcd_board(p: embassy_rp::Peripherals) {
                             Err(CcidError::UsbDisconnected) => {
                                 let _ = APDU_CHANNEL.send(heapless::Vec::new()).await;
                                 cortex_m::asm::sev(); // wake core1 from WFE
-                                let _ = RESP_CHANNEL.receive().await;
+                                let _ = recv_core1_response(store, dispatcher_ptr).await;
                                 display_state.status = LedStatus::Ready;
                                 break;
                             }
@@ -2267,7 +2296,7 @@ async fn run_waveshare_lcd_board(p: embassy_rp::Peripherals) {
                     Err(CcidError::UsbDisconnected) => {
                         let _ = APDU_CHANNEL.send(heapless::Vec::new()).await;
                         cortex_m::asm::sev(); // wake core1 from WFE
-                        let _ = RESP_CHANNEL.receive().await;
+                        let _ = recv_core1_response(store, dispatcher_ptr).await;
                         display_state.status = LedStatus::Ready;
                         break;
                     }

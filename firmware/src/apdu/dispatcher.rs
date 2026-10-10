@@ -139,33 +139,27 @@ impl Dispatcher {
     /// In debug builds `Dispatcher::new()` (and therefore `*self = Self::new()`)
     /// materialises the entire struct on the Core1 stack before `memcpy`ing
     /// into place; on the 128 KB Core1 stack this risks silent overflow when
-    /// combined with the existing dispatch-chain temporaries.  See
-    /// `.claude/projects/-home-mcarey-pico2hsm/memory/dispatcher_stack_overflow.md`.
+    /// combined with the existing dispatch-chain temporaries.
     ///
-    /// This method rewrites each field directly through `addr_of_mut!` —
-    /// peak added stack usage is a few hundred bytes.  The caller is
-    /// responsible for reloading flash-backed keys afterwards via
-    /// `load_keys_from_store`; this method only resets in-memory state.
+    /// The old value is dropped in place first so that secret-bearing fields
+    /// (`DkekManager`, `PinState`, cached `KeyObject`s, the ephemeral exchange
+    /// key) run their zeroizing `Drop` impls — overwriting with `ptr::write`
+    /// alone would leave that material in SRAM.  The fresh state is then
+    /// written field-by-field via `init_in_place`, so peak added stack usage
+    /// stays at a few hundred bytes.
     ///
-    /// All fields are trivially-droppable (enums, `heapless::Vec` with inline
-    /// storage, fixed arrays), so overwriting them with `ptr::write` does
-    /// not leak anything.
+    /// The caller is responsible for reloading flash-backed keys afterwards
+    /// via `load_keys_from_store`; this method only resets in-memory state.
     #[inline(never)]
     pub fn reset_in_place(&mut self) {
         let ptr: *mut Self = self;
+        // SAFETY: `self` is a valid, initialised Dispatcher.  After
+        // `drop_in_place` the memory is logically uninitialised, and
+        // `init_in_place` fully re-initialises every field before `self` is
+        // used again.  None of the Drop impls or init helpers panic.
         unsafe {
-            core::ptr::addr_of_mut!((*ptr).active).write(ActiveProtocol::None);
-            ScHsm::init_in_place(core::ptr::addr_of_mut!((*ptr).sc_hsm));
-            Piv::init_in_place(core::ptr::addr_of_mut!((*ptr).piv));
-            Self::init_openpgp_in_place(core::ptr::addr_of_mut!((*ptr).openpgp));
-            {
-                let sb = core::ptr::addr_of_mut!((*ptr).shared_buf);
-                core::ptr::addr_of_mut!((*sb).data).write_bytes(0u8, 1);
-                core::ptr::addr_of_mut!((*sb).len).write(0);
-                core::ptr::addr_of_mut!((*sb).offset).write(0);
-                core::ptr::addr_of_mut!((*sb).state)
-                    .write(crate::apdu::shared_buffer::SharedBufState::Empty);
-            }
+            core::ptr::drop_in_place(ptr);
+            Self::init_in_place(&mut *ptr.cast::<core::mem::MaybeUninit<Self>>());
         }
     }
 
@@ -637,4 +631,30 @@ fn build_openpgp_fci(openpgp: &mut crate::protocol::openpgp::OpenPgp) -> ApduRes
     let _ = fci.extend_from_slice(version);
 
     ApduResponse::ok(&fci)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reset_in_place_zeroizes_dkek() {
+        let mut slot = core::mem::MaybeUninit::<Dispatcher>::uninit();
+        let d = Dispatcher::init_in_place(&mut slot);
+        let pattern = [0xA5u8; 32];
+        d.sc_hsm.state.dkek.set_dkek_direct(pattern);
+        assert!(d.sc_hsm.state.dkek.is_ready());
+
+        d.reset_in_place();
+
+        assert!(!d.sc_hsm.state.dkek.is_ready());
+        // The old DKEK bytes must not survive anywhere in the struct.
+        let bytes = unsafe {
+            core::slice::from_raw_parts(
+                (d as *const Dispatcher).cast::<u8>(),
+                core::mem::size_of::<Dispatcher>(),
+            )
+        };
+        assert!(!bytes.windows(32).any(|w| w == pattern));
+    }
 }
