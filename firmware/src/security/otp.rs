@@ -507,22 +507,45 @@ pub const DEV_STORAGE_KEY_ALLOWED: bool =
 ///   when [`DEV_STORAGE_KEY_ALLOWED`]; logged loudly.
 /// - **Unprovisioned, release build**: `None` — the keystore refuses to
 ///   store or load keys rather than encrypt them under a public key.
+///
+/// Fails closed: an OTP read error (state unknown) or a failed page lock
+/// yields `None` rather than a fallback key or an unlocked page.
 pub fn boot_storage_master_key() -> Option<zeroize::Zeroizing<[u8; 32]>> {
-    let provisioned = Otp::new().is_provisioned();
-    if !provisioned && !DEV_STORAGE_KEY_ALLOWED {
-        defmt::error!("OTP: unprovisioned — keystore disabled (no storage key)");
+    let Ok(provisioned) = provisioning_state() else {
+        defmt::error!("OTP: provisioning state unreadable — keystore disabled");
+        return None;
+    };
+    if !provisioned {
+        if !DEV_STORAGE_KEY_ALLOWED {
+            defmt::error!("OTP: unprovisioned — keystore disabled (no storage key)");
+            return None;
+        }
+        defmt::warn!("OTP: unprovisioned — using INSECURE fixed development storage key");
+        return derive_smk().ok();
+    }
+    let smk = derive_smk().ok()?;
+    let rows = layout::ROWS_PER_PAGE;
+    if lock_read(layout::KEY_PAGE * rows, rows).is_err() {
+        defmt::error!("OTP: key page lock failed — keystore disabled");
         return None;
     }
-    let smk = derive_smk().ok();
-    if provisioned {
-        let rows = layout::ROWS_PER_PAGE;
-        if lock_read(layout::KEY_PAGE * rows, rows).is_ok() {
-            KEY_PAGE_LOCKED.store(true, core::sync::atomic::Ordering::Relaxed);
+    KEY_PAGE_LOCKED.store(true, core::sync::atomic::Ordering::Relaxed);
+    Some(smk)
+}
+
+/// Whether the storage key IKM (or the PROVISIONED flag) is present.
+///
+/// Unlike [`Otp::is_provisioned`], any read error is reported as `Err`
+/// instead of being taken to mean "blank", so callers can fail closed.
+fn provisioning_state() -> Result<bool, ()> {
+    let start = OTP_STORAGE_KEY_ROW_START as usize;
+    for row in start..start + layout::STORAGE_KEY_ROWS as usize {
+        if otp::read_ecc_word(row).map_err(|_| ())? != 0 {
+            return Ok(true);
         }
-    } else {
-        defmt::warn!("OTP: unprovisioned — using INSECURE fixed development storage key");
     }
-    smk
+    let flags = otp::read_raw_word(OTP_BOOT_FLAGS_ROW as usize).map_err(|_| ())?;
+    Ok(flags & BOOT_FLAG_PROVISIONED != 0)
 }
 
 /// Whether the key page has been read-locked this boot.
