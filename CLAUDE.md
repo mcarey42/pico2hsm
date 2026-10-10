@@ -2,10 +2,22 @@
 
 ## Build, flash, and debug
 
-Always use the debug script to build and flash firmware. Do not run `cargo build` directly.
+Use the debug script to flash firmware and stream RTT logs:
 
 ```sh
 ./build-all-debug.sh pico2_4m
+```
+
+Building with `cargo` directly is fine for compile checks, size analysis
+(`arm-none-eabi-nm -S --size-sort`, `objdump`), and host tests. Always pass
+`--no-default-features --features <board>,...` (see "Feature flags and default
+features" below), and set `DEFMT_LOG=trace` if the build will be flashed and you
+need full log output. Flash only via the script, which handles signing.
+
+```sh
+# From the repo root, -p is required (the workspace includes host-only test crates).
+cargo build -p pico2hsm-firmware --no-default-features --features pico2_4m,rsa,applet-piv,applet-openpgp-curve25519
+# ELF: target/thumbv8m.main-none-eabihf/debug/pico2hsm
 ```
 
 Valid board arguments: `pico2_4m`, `rp2350_one_4m`, `rp2350_geek_16m`, `rp2350_geek_sdcard`, `waveshare_rp2350_lcd_16m`, `waveshare_rp2350_lcd_sdcard`.
