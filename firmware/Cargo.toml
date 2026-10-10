@@ -24,6 +24,9 @@ test = false
 
 [features]
 default = ["rp2350_one_4m", "rsa", "applet-piv", "applet-openpgp-curve25519"]
+# Let a release build use the fixed (public) development storage key on an
+# unprovisioned device.  Debug builds always allow it.  NEVER for deployment.
+insecure-dev-keystore = []
 rp2350_one_4m = ["uart-debug"]
 rp2350_geek_16m = ["uart-debug"]
 rp2350_geek_sdcard = ["uart-debug"]

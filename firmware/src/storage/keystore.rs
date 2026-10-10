@@ -81,10 +81,13 @@ pub trait KeyStore {
 
 /// Concrete key store backed by a `StorageManager<Chip>` and protected by the
 /// Storage Master Key (`smk`).
+///
+/// With no storage key (unprovisioned release build) every save and fetch
+/// fails with `StorageError::NoStorageKey` instead of using a public key.
 #[cfg(target_arch = "arm")]
 pub struct FlashKeyStore<Chip: FlashChip> {
     storage: StorageManager<Chip>,
-    smk: Zeroizing<[u8; 32]>,
+    smk: Option<Zeroizing<[u8; 32]>>,
 }
 
 #[cfg(target_arch = "arm")]
@@ -93,8 +96,14 @@ impl<Chip: FlashChip> FlashKeyStore<Chip> {
     ///
     /// `storage` should already have chips added via `KeyFilesystem::add_chip`.
     /// Call [`init`] before any key operations.
-    pub fn new(storage: StorageManager<Chip>, smk: Zeroizing<[u8; 32]>) -> Self {
+    pub fn new(storage: StorageManager<Chip>, smk: Option<Zeroizing<[u8; 32]>>) -> Self {
         FlashKeyStore { storage, smk }
+    }
+
+    fn smk(&self) -> Result<&[u8; 32], HsmError> {
+        self.smk
+            .as_deref()
+            .ok_or(HsmError::Storage(StorageError::NoStorageKey))
     }
 
     /// Initialise: scan chips, load directory, run WAL recovery.
@@ -106,6 +115,7 @@ impl<Chip: FlashChip> FlashKeyStore<Chip> {
 #[cfg(target_arch = "arm")]
 impl<Chip: FlashChip> KeyStore for FlashKeyStore<Chip> {
     fn save_key(&mut self, obj: &KeyObject) -> Result<(), HsmError> {
+        self.smk()?;
         // --- 0. Increment the generation counter before writing. ---
         // We cannot mutate `obj` (it's a shared reference), so we clone the
         // relevant fields into a local copy with generation bumped.
@@ -129,7 +139,7 @@ impl<Chip: FlashChip> KeyStore for FlashKeyStore<Chip> {
 
         // --- 2. Encrypt the key object (with bumped generation). ---
         let blob = obj_copy
-            .encrypt(&self.smk, &nonce)
+            .encrypt(self.smk()?, &nonce)
             .map_err(|_| HsmError::Crypto(CryptoError::EncryptFailure))?;
 
         // --- 3. Compute BLAKE2s-256 of the plaintext for integrity. ---
@@ -158,11 +168,12 @@ impl<Chip: FlashChip> KeyStore for FlashKeyStore<Chip> {
         if !self.storage.key_exists(key_id) {
             return Ok(None);
         }
+        self.smk()?;
 
         let blob = self.storage.read_key(key_id).map_err(HsmError::Storage)?;
 
         // Pass the u32 key_id to decrypt — decrypt uses the low byte for KEK derivation.
-        let obj = KeyObject::decrypt(&blob, key_id.0, &self.smk)
+        let obj = KeyObject::decrypt(&blob, key_id.0, self.smk()?)
             .map_err(|_| HsmError::Crypto(CryptoError::DecryptFailure))?;
 
         Ok(Some(obj))

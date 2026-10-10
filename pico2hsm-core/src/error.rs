@@ -44,6 +44,9 @@ pub enum StorageError {
     NotFormatted,
     /// A specific sector on a specific chip has permanently failed.
     BadBlock { chip: u8, sector: u32 },
+    /// No storage master key: the device is not provisioned, and this build
+    /// does not allow the insecure development key.
+    NoStorageKey,
 }
 
 /// Cryptographic operation errors.

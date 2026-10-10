@@ -777,8 +777,9 @@ async fn run_one_board(p: embassy_rp::Peripherals) {
     board.led().set_status(LedStatus::Busy);
 
     // ── Storage initialization (rp2350_one: internal QMI flash) ───────────────
-    let smk_bytes = pico2hsm_firmware::security::otp::derive_smk().unwrap_or([0u8; 32]);
-    let smk = zeroize::Zeroizing::new(smk_bytes);
+    // None on an unprovisioned release build: the keystore then refuses
+    // to store keys rather than use a public key (see otp::boot_storage_master_key).
+    let smk = pico2hsm_firmware::security::otp::boot_storage_master_key();
 
     let qmi_flash = embassy_rp::flash::Flash::<
         _,
@@ -1073,8 +1074,9 @@ async fn run_geek_board(p: embassy_rp::Peripherals) {
     board.led().set_status(LedStatus::Ready);
 
     // ── Storage initialization ──────────────────────────────────────────────
-    let smk_bytes = pico2hsm_firmware::security::otp::derive_smk().unwrap_or([0u8; 32]);
-    let smk = zeroize::Zeroizing::new(smk_bytes);
+    // None on an unprovisioned release build: the keystore then refuses
+    // to store keys rather than use a public key (see otp::boot_storage_master_key).
+    let smk = pico2hsm_firmware::security::otp::boot_storage_master_key();
 
     // rp2350_geek_sdcard: SD card keystore on SPI0 (GPIO18/19/20, CS=GPIO23).
     #[cfg(feature = "rp2350_geek_sdcard")]
@@ -1426,8 +1428,9 @@ async fn run_pico2_board(p: embassy_rp::Peripherals) {
     board.led().set_status(LedStatus::Busy);
 
     // ── Storage initialization (pico2_4m: RP2350 internal QMI flash) ─────────
-    let smk_bytes = pico2hsm_firmware::security::otp::derive_smk().unwrap_or([0u8; 32]); // degraded mode if OTP unprovisioned
-    let smk = zeroize::Zeroizing::new(smk_bytes);
+    // None on an unprovisioned release build: the keystore then refuses
+    // to store keys rather than use a public key (see otp::boot_storage_master_key).
+    let smk = pico2hsm_firmware::security::otp::boot_storage_master_key();
 
     let qmi_flash = embassy_rp::flash::Flash::<
         _,
@@ -1602,7 +1605,7 @@ fn init_sd_keystore(
     mosi: embassy_rp::Peri<'static, embassy_rp::peripherals::PIN_11>,
     miso: embassy_rp::Peri<'static, embassy_rp::peripherals::PIN_12>,
     cs_pin: embassy_rp::Peri<'static, embassy_rp::peripherals::PIN_15>,
-    smk: zeroize::Zeroizing<[u8; 32]>,
+    smk: Option<zeroize::Zeroizing<[u8; 32]>>,
 ) -> &'static mut pico2hsm_firmware::storage::BoardKeyStore {
     use embassy_rp::gpio::{Level, Output};
     use embassy_rp::spi::{Config as SpiConfig, Phase, Polarity, Spi};
@@ -1791,8 +1794,9 @@ async fn run_waveshare_lcd_board(p: embassy_rp::Peripherals) {
     // ── Storage initialisation ─────────────────────────────────────────────
 
     // Common: derive SMK from OTP.
-    let smk_bytes = pico2hsm_firmware::security::otp::derive_smk().unwrap_or([0u8; 32]);
-    let smk = zeroize::Zeroizing::new(smk_bytes);
+    // None on an unprovisioned release build: the keystore then refuses
+    // to store keys rather than use a public key (see otp::boot_storage_master_key).
+    let smk = pico2hsm_firmware::security::otp::boot_storage_master_key();
 
     // waveshare_rp2350_lcd_sdcard: single SD card keystore on SPI1.
     // Extracted to a separate function so SPI1 bus, SdCard driver, and

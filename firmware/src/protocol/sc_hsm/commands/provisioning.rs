@@ -47,9 +47,8 @@ const SW_WRONG_P1P2: u16 = 0x6A86;
 /// Internal error / no precise diagnosis.
 const SW_INTERNAL_ERROR: u16 = 0x6F00;
 
-// OTP constants (must match otp.rs).
-const OTP_BOOT_FLAGS_ROW: usize = 0x110;
-const BOOT_FLAG_PRODUCTION_MODE: u32 = 1 << 1;
+use crate::security::otp_layout::BOOT_FLAG_PRODUCTION_MODE;
+const OTP_BOOT_FLAGS_ROW: usize = crate::security::otp_layout::BOOT_FLAGS_ROW as usize;
 
 /// Handle GET PROVISIONING STATUS (INS=0xF0).
 ///
@@ -62,8 +61,8 @@ const BOOT_FLAG_PRODUCTION_MODE: u32 = 1 << 1;
 /// ```text
 /// 6F [len]
 ///   80 01 [production_mode: 0|1]
-///   81 01 [jtag_sw_flag: 0|1]         -- OTP row 0x110 bit 0
-///   82 01 [otp_rows_locked: 0|1]      -- STUB: always 0
+///   81 01 [jtag_sw_flag: 0|1]         -- boot flags row, bit 0
+///   82 01 [otp_rows_locked: 0|1]      -- key page read-locked this boot
 ///   83 01 [secure_boot_enabled: 0|1]  -- CRIT1 row 0x40 bit 0
 ///   84 01 [glitch_detector_armed: 0|1]
 /// ```
@@ -88,7 +87,7 @@ pub fn handle_get_status(_state: &mut ScHsmState, _cmd: &ApduCommand<'_>) -> Apd
         }
     };
 
-    // Read JTAG SW flag (bit 0 of OTP row 0x110).
+    // Read JTAG SW flag (bit 0 of the boot flags row).
     let jtag_sw_flag: u8 = {
         #[cfg(target_arch = "arm")]
         {
@@ -102,8 +101,17 @@ pub fn handle_get_status(_state: &mut ScHsmState, _cmd: &ApduCommand<'_>) -> Apd
         }
     };
 
-    // OTP row locking: not yet implemented, always report 0.
-    let otp_rows_locked: u8 = 0;
+    // Key page read lock (applied at boot on provisioned devices).
+    let otp_rows_locked: u8 = {
+        #[cfg(target_arch = "arm")]
+        {
+            crate::security::otp::key_page_locked() as u8
+        }
+        #[cfg(not(target_arch = "arm"))]
+        {
+            0
+        }
+    };
 
     // Secure boot enabled (CRIT1 row 0x40 bit 0).
     let secure_boot_enabled: u8 = {
@@ -174,7 +182,7 @@ pub fn handle_get_status(_state: &mut ScHsmState, _cmd: &ApduCommand<'_>) -> Apd
 /// Handle SET PRODUCTION MODE (INS=0xF1).
 ///
 /// # IRREVERSIBLE
-/// This permanently sets OTP bit 1 of row 0x110. Once set, the device will
+/// This permanently sets bit 1 of the OTP boot flags row. Once set, the device will
 /// auto-disable JTAG on every subsequent boot and reject debugger connections.
 /// This operation cannot be reversed.
 ///

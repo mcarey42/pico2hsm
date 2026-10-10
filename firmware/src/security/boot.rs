@@ -35,7 +35,7 @@
 //! - **BOOT_FLAGS0** (rows 0x48–0x4A, RBIT-3): boot path control (NOT secure boot enable)
 //! - **BOOT_FLAGS1** (rows 0x4B–0x4D, RBIT-3): KEY_INVALID flags
 //! - **BOOTKEY0** (rows 0x80–0x8F, ECC): SHA-256 hash of secp256k1 signing public key
-//! - The pico2hsm application boot flags are in OTP row 0x110 (see otp.rs)
+//! - The pico2hsm application boot flags row is defined in otp_layout.rs
 //!
 //! # Hardware JTAG disable (CRIT1.DEBUG_DISABLE)
 //!
@@ -116,7 +116,7 @@ pub fn security_checks() {
                 cortex_m::peripheral::SCB::sys_reset();
             }
 
-            // Record JTAG-disabled bookkeeping flag in OTP row 0x110 bit 0.
+            // Record the JTAG-disabled bookkeeping bit in the boot flags row.
             // Hardware JTAG disable (CRIT1.DEBUG_DISABLE) must be set via
             // picotool during provisioning — see docs/PROVISIONING.md Phase 8.
             disable_jtag_permanent();
@@ -132,7 +132,7 @@ pub fn security_checks() {
     }
 }
 
-/// Read the pico2hsm production-mode flag from OTP row 0x110.
+/// Read the pico2hsm production-mode flag from the boot flags row.
 ///
 /// Returns `Ok(true)` if bit 1 (BOOT_FLAG_PRODUCTION_MODE) is set.
 /// Returns `Ok(false)` if the bit is clear OR the row is blank (0xFFFF_FFFF,
@@ -141,7 +141,7 @@ pub fn security_checks() {
 ///
 /// # Why direct OTP read instead of embassy-rp
 /// `embassy_rp::otp::read_raw_word()` treats 0xFFFF_FFFF as
-/// `Err(InvalidPermissions)`, but for user-space OTP rows (0x110+) this
+/// `Err(InvalidPermissions)`, but for user-space OTP rows this
 /// value simply means "blank / unprogrammed fuses".  Reading the raw
 /// OTP_DATA_RAW address directly lets us distinguish blank rows from
 /// actual access errors and avoids a reboot loop on unprovisioned boards.
@@ -154,15 +154,15 @@ pub fn security_checks() {
 fn is_production_mode_otp() -> Result<bool, ()> {
     const OTP_DATA_RAW_BASE: *const u32 = 0x4013_4000 as *const u32;
     const OTP_NUM_ROWS: usize = 4096;
-    const OTP_BOOT_FLAGS_ROW: usize = 0x110;
-    const BOOT_FLAG_PRODUCTION_MODE: u32 = 1 << 1;
+    const OTP_BOOT_FLAGS_ROW: usize = crate::security::otp_layout::BOOT_FLAGS_ROW as usize;
+    const BOOT_FLAG_PRODUCTION_MODE: u32 = crate::security::otp_layout::BOOT_FLAG_PRODUCTION_MODE;
 
     if OTP_BOOT_FLAGS_ROW >= OTP_NUM_ROWS {
         return Err(()); // should never happen — compile-time constant
     }
 
     // SAFETY: OTP_DATA_RAW is a memory-mapped read-only register block.
-    // Row 0x110 is within the valid range (checked above).
+    // The boot flags row is within the valid range (checked above).
     let value = unsafe { OTP_DATA_RAW_BASE.add(OTP_BOOT_FLAGS_ROW).read() };
 
     if value == 0xFFFF_FFFF {
@@ -205,7 +205,7 @@ pub fn is_secure_boot_enabled() -> bool {
 
 /// Record JTAG-disabled status in the pico2hsm application boot flags.
 ///
-/// Sets bit 0 of OTP row 0x110 as a user-land bookkeeping marker that
+/// Sets bit 0 of the boot flags row as a user-land bookkeeping marker that
 /// JTAG has been disabled.  This does NOT disable JTAG at the hardware
 /// level — that requires writing CRIT1.DEBUG_DISABLE (OTP rows 0x40–0x47,
 /// RBIT-8), which must be done via `picotool otp set OTP_DATA_CRIT1.DEBUG_DISABLE 1`
@@ -227,7 +227,7 @@ pub fn is_secure_boot_enabled() -> bool {
 /// Only callable when production mode is active.
 pub fn disable_jtag_permanent() {
     use embassy_rp::otp;
-    const OTP_BOOT_FLAGS_ROW: usize = 0x110;
+    const OTP_BOOT_FLAGS_ROW: usize = crate::security::otp_layout::BOOT_FLAGS_ROW as usize;
     const BOOT_FLAG_JTAG_DISABLED: u32 = 1 << 0;
     const BOOT_FLAG_PRODUCTION_MODE: u32 = 1 << 1;
 
@@ -256,7 +256,7 @@ pub fn disable_jtag_permanent() {
     }
 
     // Burn the JTAG_DISABLED flag bit (0 → 1, irreversible).
-    // SAFETY: Writing to OTP_BOOT_FLAGS_ROW (0x110) is a pico2hsm
+    // SAFETY: Writing to OTP_BOOT_FLAGS_ROW is a pico2hsm
     // application-layer OTP row in the user-accessible OTP range
     // (rows 0x100–0x17F). The write uses the embassy-rp `otp::write_raw_word`
     // wrapper, which calls the RP2350 ROM `otp_access` function with
@@ -264,7 +264,9 @@ pub fn disable_jtag_permanent() {
     let new_flags = current | BOOT_FLAG_JTAG_DISABLED;
     match otp::write_raw_word(OTP_BOOT_FLAGS_ROW, new_flags) {
         Ok(()) => {
-            defmt::warn!("boot: JTAG disable bookkeeping flag set in OTP row 0x110 — IRREVERSIBLE");
+            defmt::warn!(
+                "boot: JTAG disable bookkeeping flag set in OTP boot flags row — IRREVERSIBLE"
+            );
             defmt::warn!(
                 "boot: hardware JTAG disable (CRIT1.DEBUG_DISABLE) must be set via picotool"
             );

@@ -209,19 +209,35 @@ opensc-tool --list-readers
 
 ### OTP layout
 
-The pico2hsm firmware uses these OTP regions (defined in
-`firmware/src/security/otp.rs`):
+The pico2hsm firmware uses these OTP regions (defined, with compile-time
+overlap checks, in `firmware/src/security/otp_layout.rs`):
 
 ```
+Page 4 — secrets, read-locked by the firmware after boot
 Rows 0x100–0x11F : Storage key IKM (64 bytes, 32 ECC words)
                    Input Keying Material for HKDF-SHA256 → Storage Master Key
-Row  0x110       : Boot flags (raw 24-bit word)
+Rows 0x120–0x12F : Device identity key (32 bytes, 16 ECC words)
+                   Static key for Noise_XX device authentication
+Page 5
+Row  0x140       : Boot flags (raw 24-bit word)
                    bit 0 — JTAG disabled (irreversible)
                    bit 1 — production mode (irreversible)
                    bit 2 — device provisioned
-Rows 0x120–0x12F : Device identity key (32 bytes, 16 ECC words)
-                   Static key for Noise_XX device authentication
 ```
+
+> **Layout change (2026-10):** firmware before this change put the boot
+> flags at row 0x110, which is *inside* the storage-key IKM rows. Writing a
+> flag there corrupts the IKM (and a random IKM bit could read as
+> "production mode"). Never write row 0x110. A device whose row 0x110 was
+> written under the old layout must be treated as having an unknown storage
+> key: re-provisioning is impossible (OTP is permanent), so retire it.
+
+**Unprovisioned devices:** with blank IKM rows the derived storage key is a
+fixed, public value. Debug builds (and release builds with the
+`insecure-dev-keystore` feature) accept this for development and log a
+warning at boot; release builds disable the keystore entirely until the IKM
+is written, so INITIALIZE and key generation fail rather than store keys
+under a public key.
 
 The RP2350 ROM uses these additional rows (programmed via `picotool otp set`
 or `picotool otp load`).  Row numbers verified against pico-sdk `otp_data.h`
@@ -328,7 +344,7 @@ would only write 1 of 8 copies, which is unreliable.
 
 ```bash
 # Via firmware APDU (Otp::set_production_mode()):
-# This sets bits 1+2 of OTP row 0x110 (PRODUCTION_MODE + PROVISIONED)
+# This sets bits 1+2 of the boot flags row 0x140 (PRODUCTION_MODE + PROVISIONED)
 # Requires SO-PIN authentication
 ```
 
@@ -367,7 +383,7 @@ Before disabling JTAG, verify **all** of the following:
 
 The hardware JTAG disable fuse is **CRIT1.DEBUG_DISABLE** (bit 2, OTP
 rows 0x40–0x47, RBIT-8).  The pico2hsm firmware also records a user-land
-bookkeeping flag in OTP row 0x110 bit 0.
+bookkeeping flag in boot flags row 0x140, bit 0.
 
 ```bash
 # Hardware JTAG disable (ROM-enforced, all 8 RBIT-8 copies):
@@ -382,7 +398,7 @@ picotool otp set OTP_DATA_CRIT1.GLITCH_DETECTOR_SENS 3
 
 # pico2hsm user-land flag (set automatically by firmware at next boot
 # when production mode is active):
-# Row 0x110 bit 0 = JTAG_DISABLED (bookkeeping only)
+# Row 0x140 bit 0 = JTAG_DISABLED (bookkeeping only)
 ```
 
 **Important**: CRIT1 fields (DEBUG_DISABLE, SECURE_BOOT_ENABLE, etc.)
@@ -406,22 +422,32 @@ probe-rs list
 
 ### Software locks (per-boot session)
 
-The firmware calls `lock_read()` at boot to prevent SWD reads of key
-material during the current session. These locks use the RP2350 SW_LOCK
-registers and reset on power cycle.
+On a provisioned device the firmware derives the storage master key at boot
+and then sets OTP page 4's SW_LOCK to inaccessible for both Secure and
+Non-secure access (`otp::boot_storage_master_key`). For the rest of that
+boot neither SWD nor any firmware code can read the IKM or the device
+identity key. GET PROVISIONING STATUS reports this as `otp_rows_locked`.
+SW_LOCK resets on every power cycle, so it does **not** protect against
+reading the OTP from BOOTSEL (`picotool otp get`) before the firmware runs.
 
 ```
-OTP page 4 (rows 0x100–0x13F): Contains all pico2hsm key material
+OTP page 4 (rows 0x100–0x13F): pico2hsm secrets
   - Storage key IKM (0x100–0x11F)
   - Device identity key (0x120–0x12F)
-  - Boot flags (0x110)
+OTP page 5 (rows 0x140–0x17F): boot flags (0x140) — not locked
 ```
 
-### Permanent OTP locks
+### Permanent OTP locks — NOT YET VALIDATED
 
-For permanent protection (survives power cycles), the OTP lock pages must
-be burned. This is done via picotool or direct PAC register writes. Consult
-the RP2350 datasheet §5.6 for the OTP lock page layout.
+Protecting the IKM from BOOTSEL/picotool reads requires burning page 4's
+permanent lock rows (OTP_DATA_PAGE4_LOCK0 / PAGE4_LOCK1; see the RP2350
+datasheet's OTP chapter for the LOCK_S / LOCK_NS / LOCK_BL fields). The
+firmware does not do this, and the exact field values have **not** been
+validated on hardware: a wrong value can lock the firmware itself out of its
+own key (bricking the keystore) or leave the bootloader path open. Validate
+on a sacrificial board before adding it to this procedure. Until then, a
+device is only protected against BOOTSEL OTP reads by being physically
+secured.
 
 ---
 
@@ -520,7 +546,7 @@ PHASE 6 — SECURE BOOT (irreversible)
 
 PHASE 7 — PRODUCTION MODE
   [ ] Set PRODUCTION_MODE via firmware APDU
-  [ ] Verify OTP row 0x110 flags
+  [ ] Verify boot flags (OTP row 0x140)
 
 PHASE 8 — JTAG DISABLE (irreversible)
   [ ] Final verification: all tests pass
@@ -530,7 +556,7 @@ PHASE 8 — JTAG DISABLE (irreversible)
   [ ] picotool otp set OTP_DATA_CRIT1.GLITCH_DETECTOR_ENABLE 1
   [ ] picotool otp set OTP_DATA_CRIT1.GLITCH_DETECTOR_SENS 3
   [ ] Verify probe-rs cannot connect
-  [ ] Reboot — firmware sets pico2hsm bookkeeping flag (row 0x110 bit 0)
+  [ ] Reboot — firmware sets pico2hsm bookkeeping flag (row 0x140 bit 0)
 
 PHASE 9 — RECORDS
   [ ] Record device serial, IKM, dates in production database
