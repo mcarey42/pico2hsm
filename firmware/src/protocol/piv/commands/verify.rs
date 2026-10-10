@@ -36,25 +36,6 @@ fn strip_pin_padding(padded: &[u8]) -> &[u8] {
     &padded[..end]
 }
 
-/// Handle VERIFY and persist PIN state to flash if the retry counter changed
-/// or the PIN was successfully authenticated.
-pub fn handle_with_store(
-    state: &mut PivState,
-    store: &mut dyn crate::storage::KeyStore,
-    cmd: &ApduCommand<'_>,
-) -> ApduResponse {
-    let retries_before = state.pin_state.pin_retries_remaining;
-    let resp = handle(state, cmd);
-    // Save if retry counter changed (wrong PIN) or session was authenticated.
-    if state.pin_state.pin_retries_remaining != retries_before
-        || state.pin_state.session_authenticated
-        || state.pin_verified
-    {
-        crate::protocol::piv::Piv::save_pin_to_store(state, store);
-    }
-    resp
-}
-
 /// Handle a VERIFY APDU command.
 pub fn handle(state: &mut PivState, cmd: &ApduCommand<'_>) -> ApduResponse {
     if cmd.p1 != 0x00 {

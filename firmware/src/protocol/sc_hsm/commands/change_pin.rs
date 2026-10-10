@@ -6,7 +6,7 @@
 //! when P1=0x00.
 //!
 //! Requires the current PIN to be correct before accepting the new PIN.
-//! PIN length constraints: minimum 4 bytes, maximum 16 bytes.
+//! PIN length constraints: minimum 6 bytes, maximum 16 bytes.
 
 use subtle::ConstantTimeEq;
 
@@ -68,8 +68,9 @@ pub fn handle_with_store(
     cmd: &ApduCommand<'_>,
 ) -> ApduResponse {
     let resp = handle(state, cmd);
-    if resp.sw == SW_OK {
-        crate::protocol::sc_hsm::ScHsm::save_pin_to_store(state, store);
+    if resp.sw == SW_OK && crate::protocol::sc_hsm::ScHsm::save_pin_to_store(state, store).is_err()
+    {
+        return ApduResponse::err(pico2hsm_core::apdu::SW_MEMORY_FAILURE);
     }
     resp
 }
@@ -104,7 +105,7 @@ pub fn handle(state: &mut ScHsmState, cmd: &ApduCommand<'_>) -> ApduResponse {
         return ApduResponse::err(SW_WRONG_DATA);
     };
 
-    if new_pin.len() < 4 || new_pin.len() > 16 {
+    if new_pin.len() < super::verify::MIN_PIN_LEN || new_pin.len() > 16 {
         return ApduResponse::err(SW_WRONG_LENGTH);
     }
 

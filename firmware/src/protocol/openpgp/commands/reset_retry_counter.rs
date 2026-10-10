@@ -22,8 +22,10 @@ pub fn handle_with_store(
     cmd: &ApduCommand<'_>,
 ) -> ApduResponse {
     let resp = handle(state, cmd);
-    if resp.sw == 0x9000 {
-        crate::protocol::openpgp::OpenPgp::save_pw1_to_store(state, store);
+    if resp.sw == 0x9000
+        && crate::protocol::openpgp::OpenPgp::save_pw1_to_store(state, store).is_err()
+    {
+        return ApduResponse::err(pico2hsm_core::apdu::SW_MEMORY_FAILURE);
     }
     resp
 }

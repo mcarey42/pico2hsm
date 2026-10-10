@@ -22,6 +22,10 @@ use crate::security::pin::PinState;
 /// INS byte for VERIFY.
 pub const INS_VERIFY: u8 = 0x20;
 
+/// Minimum User PIN length (matches INITIALIZE).  4-digit PINs fall to
+/// exhaustive search too quickly even with persisted retry counters.
+pub const MIN_PIN_LEN: usize = 6;
+
 /// P2 value for User PIN.
 pub const P2_USER_PIN: u8 = 0x81;
 
@@ -73,7 +77,7 @@ pub fn handle(state: &mut ScHsmState, cmd: &ApduCommand<'_>) -> ApduResponse {
             }
 
             let pin = cmd.data;
-            if pin.len() < 4 || pin.len() > 16 {
+            if pin.len() < MIN_PIN_LEN || pin.len() > 16 {
                 return ApduResponse::err(SW_WRONG_LENGTH);
             }
 

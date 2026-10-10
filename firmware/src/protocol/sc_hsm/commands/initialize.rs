@@ -106,6 +106,10 @@ pub fn handle(
     // The real SmartCard-HSM authenticates re-init via the init code in the
     // command itself — no prior VERIFY is required.
     if state.initialized {
+        // The retry itself is spent on flash by ScHsm::with_persisted_attempt.
+        if state.so_pin_hash.is_some() && state.so_pin_retry_count == 0 {
+            return ApduResponse::err(pico2hsm_core::apdu::SW_AUTH_BLOCKED);
+        }
         if let Some(stored_hash) = state.so_pin_hash {
             let provided_hash = hash_pin_pbkdf2(init_code, &state.so_pin_salt);
             if !bool::from(provided_hash.ct_eq(&stored_hash)) {
@@ -178,6 +182,7 @@ pub fn handle(
     state.pin_verified = false;
     state.so_pin_verified = false;
     state.so_pin_retry_count = 5;
+    state.ext_auth_retry_count = crate::protocol::sc_hsm::EXT_AUTH_MAX_RETRIES;
 
     // Reset MSE state.
     state.current_key_id = None;
@@ -285,7 +290,9 @@ pub fn handle(
 
     // Persist PIN/SO-PIN/PUK state to flash.
     crate::CORE1_PROGRESS.store(33, core::sync::atomic::Ordering::Relaxed);
-    crate::protocol::sc_hsm::ScHsm::save_pin_to_store(state, store);
+    if crate::protocol::sc_hsm::ScHsm::save_pin_to_store(state, store).is_err() {
+        return ApduResponse::err(pico2hsm_core::apdu::SW_MEMORY_FAILURE);
+    }
     crate::CORE1_PROGRESS.store(39, core::sync::atomic::Ordering::Relaxed);
 
     // cdc_log removed — CriticalSectionRawMutex is single-core only, unsafe on core1

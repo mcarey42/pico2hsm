@@ -26,31 +26,6 @@ fn verify_pin_hash(pin: &[u8], stored_hash: &[u8; 32]) -> bool {
     computed.ct_eq(stored_hash).into()
 }
 
-/// Handle VERIFY and persist PW1 or PW3 state to flash on retry counter change.
-pub fn handle_with_store(
-    state: &mut OpenPgpState,
-    store: &mut dyn crate::storage::KeyStore,
-    cmd: &ApduCommand<'_>,
-) -> ApduResponse {
-    let pw1_retries_before = state.pw1_retries;
-    let pw3_retries_before = state.pw3_retries;
-    let resp = handle(state, cmd);
-
-    // Save PW1 state if retry counter changed or verification succeeded.
-    if state.pw1_retries != pw1_retries_before
-        || state.pw1_verified_sign
-        || state.pw1_verified_other
-    {
-        crate::protocol::openpgp::OpenPgp::save_pw1_to_store(state, store);
-    }
-    // Save PW3 state if retry counter changed or verification succeeded.
-    if state.pw3_retries != pw3_retries_before || state.pw3_verified {
-        crate::protocol::openpgp::OpenPgp::save_pw3_to_store(state, store);
-    }
-
-    resp
-}
-
 /// Handle a VERIFY APDU command.
 pub fn handle(state: &mut OpenPgpState, cmd: &ApduCommand<'_>) -> ApduResponse {
     // P1=0xFF: reset verification status

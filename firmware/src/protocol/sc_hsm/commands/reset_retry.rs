@@ -39,8 +39,10 @@ pub fn handle_with_store(
     cmd: &ApduCommand<'_>,
 ) -> ApduResponse {
     let resp = handle(state, cmd);
-    if resp.sw == pico2hsm_core::apdu::SW_OK {
-        crate::protocol::sc_hsm::ScHsm::save_pin_to_store(state, store);
+    if resp.sw == pico2hsm_core::apdu::SW_OK
+        && crate::protocol::sc_hsm::ScHsm::save_pin_to_store(state, store).is_err()
+    {
+        return ApduResponse::err(pico2hsm_core::apdu::SW_MEMORY_FAILURE);
     }
     resp
 }
@@ -63,7 +65,7 @@ pub fn handle(state: &mut ScHsmState, cmd: &ApduCommand<'_>) -> ApduResponse {
         // P1=0x02: reset counter and set new PIN from data
         0x02 => {
             let new_pin = cmd.data;
-            if new_pin.len() < 4 || new_pin.len() > 16 {
+            if new_pin.len() < super::verify::MIN_PIN_LEN || new_pin.len() > 16 {
                 return ApduResponse::err(SW_WRONG_LENGTH);
             }
             // Generate a fresh salt and compute PBKDF2 hash (P1-1 fix).

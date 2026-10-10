@@ -19,6 +19,9 @@ pub const SW_OK: u16 = 0x9000;
 pub const SW_WRONG_LENGTH: u16 = 0x6700;
 
 /// Security status not satisfied (authentication required).
+/// Memory failure — a persistent write did not complete.
+pub const SW_MEMORY_FAILURE: u16 = 0x6581;
+
 pub const SW_SECURITY_STATUS: u16 = 0x6982;
 
 /// Authentication method blocked (PIN locked).

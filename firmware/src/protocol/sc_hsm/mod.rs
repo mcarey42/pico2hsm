@@ -21,7 +21,10 @@ pub mod pkcs15_objects;
 
 use heapless::{String, Vec};
 use pico2hsm_core::{
-    apdu::{ApduCommand, ApduResponse, SW_CLASS_NOT_SUPPORTED, SW_INS_NOT_SUPPORTED, SW_OK},
+    apdu::{
+        ApduCommand, ApduResponse, SW_CLASS_NOT_SUPPORTED, SW_INS_NOT_SUPPORTED, SW_MEMORY_FAILURE,
+        SW_OK,
+    },
     error::HsmError,
     key::{AppletId, KeyId, KeyType as CoreKeyType},
     protocol::HsmProtocol,
@@ -31,6 +34,50 @@ use zeroize::Zeroizing;
 use crate::security::dkek::DkekManager;
 
 use commands::*;
+
+/// EXTERNAL AUTHENTICATE retry limit.
+pub const EXT_AUTH_MAX_RETRIES: u8 = 5;
+
+/// A persistent retry counter that a credential-checking APDU spends.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RetryCounter {
+    UserPin,
+    SoPin,
+    Puk,
+    ExtAuth,
+}
+
+impl RetryCounter {
+    /// The counter `cmd` would spend, or `None` if it checks no credential
+    /// (including retry-count queries with an empty data field).
+    fn spent_by(cmd: &ApduCommand<'_>, state: &ScHsmState) -> Option<Self> {
+        match cmd.ins {
+            verify::INS_VERIFY | change_pin::INS_CHANGE_PIN if !cmd.data.is_empty() => {
+                match cmd.p2 {
+                    verify::P2_USER_PIN => Some(Self::UserPin),
+                    verify::P2_SO_PIN => Some(Self::SoPin),
+                    _ => None,
+                }
+            }
+            puk_auth::INS_PUK_AUTH if !cmd.data.is_empty() => Some(Self::Puk),
+            external_auth::INS_EXTERNAL_AUTH if !cmd.data.is_empty() => Some(Self::ExtAuth),
+            // Re-INITIALIZE is authorised by the SO-PIN carried in the command.
+            initialize::INS_INITIALIZE if state.initialized && state.so_pin_hash.is_some() => {
+                Some(Self::SoPin)
+            }
+            _ => None,
+        }
+    }
+
+    fn get(self, state: &mut ScHsmState) -> &mut u8 {
+        match self {
+            Self::UserPin => &mut state.pin_retry_count,
+            Self::SoPin => &mut state.so_pin_retry_count,
+            Self::Puk => &mut state.puk_retry_count,
+            Self::ExtAuth => &mut state.ext_auth_retry_count,
+        }
+    }
+}
 
 /// Local no-op `KeyStore` used by the legacy `dispatch()` path.
 ///
@@ -561,6 +608,9 @@ impl ScHsm {
 
     /// Dispatch an already-parsed APDU to the appropriate command handler,
     /// with access to persistent storage for key-mutating commands.
+    ///
+    /// Credential-checking commands go through [`Self::with_persisted_attempt`]
+    /// so their retry counter is spent on flash before any comparison.
     fn dispatch_with_store(
         &mut self,
         cmd: &ApduCommand<'_>,
@@ -569,8 +619,66 @@ impl ScHsm {
         if let Err(resp) = Self::validate_cla(cmd) {
             return resp;
         }
+        match RetryCounter::spent_by(cmd, &self.state) {
+            Some(counter) => self.with_persisted_attempt(counter, cmd, store),
+            None => self.route_with_store(cmd, store),
+        }
+    }
+
+    /// Spend one retry of `counter` on flash, run the command, then persist
+    /// the outcome.
+    ///
+    /// The decremented counter is written *before* the handler compares the
+    /// credential, so cutting power (or resetting USB) once the result is
+    /// known cannot undo a failed guess.  The RAM counter is restored before
+    /// the handler runs so its own retry logic is unchanged; afterwards a
+    /// failed command can never leave the counter above the spent value.
+    ///
+    /// A failed pre-write refuses the attempt (SW 6581), failing closed.
+    fn with_persisted_attempt(
+        &mut self,
+        counter: RetryCounter,
+        cmd: &ApduCommand<'_>,
+        store: &mut dyn crate::storage::KeyStore,
+    ) -> ApduResponse {
+        let before = *counter.get(&mut self.state);
+        if before == 0 {
+            // Blocked: the handler reports it without comparing anything.
+            return self.route_with_store(cmd, store);
+        }
+        let spent = before - 1;
+        *counter.get(&mut self.state) = spent;
+        if Self::save_pin_to_store(&self.state, store).is_err() {
+            return ApduResponse::err(SW_MEMORY_FAILURE);
+        }
+        *counter.get(&mut self.state) = before;
+
+        let resp = self.route_with_store(cmd, store);
+
+        let after = counter.get(&mut self.state);
+        if resp.sw != SW_OK && *after > spent {
+            *after = spent;
+        }
+        if *after != spent {
+            // Success restored the counter (or changed the credential); a
+            // failure here only leaves the safe, already-spent value on flash.
+            let _ = Self::save_pin_to_store(&self.state, store);
+        }
+        resp
+    }
+
+    /// Route an APDU to its handler with persistent storage available.
+    fn route_with_store(
+        &mut self,
+        cmd: &ApduCommand<'_>,
+        store: &mut dyn crate::storage::KeyStore,
+    ) -> ApduResponse {
         match cmd.ins {
             initialize::INS_INITIALIZE => initialize::handle(&mut self.state, store, cmd),
+            // Credential checks: persistence is handled by with_persisted_attempt.
+            verify::INS_VERIFY => verify::handle(&mut self.state, cmd),
+            puk_auth::INS_PUK_AUTH => puk_auth::handle(&mut self.state, cmd),
+            external_auth::INS_EXTERNAL_AUTH => external_auth::handle(&mut self.state, cmd),
             generate_keypair::INS_GENERATE_KEYPAIR => {
                 generate_keypair::handle(&mut self.state, store, cmd)
             }
@@ -587,9 +695,7 @@ impl ScHsm {
             // SW=9000 from LIST KEYS instead of import behaviour — this is a known
             // limitation.  Custom tooling should continue to use INS=0x74.
             import_key::INS_IMPORT_KEY => import_key::handle(&mut self.state, store, cmd),
-            change_pin::INS_CHANGE_PIN => {
-                change_pin::handle_with_store(&mut self.state, store, cmd)
-            }
+            change_pin::INS_CHANGE_PIN => change_pin::handle(&mut self.state, cmd),
             reset_retry::INS_RESET_RETRY => {
                 reset_retry::handle_with_store(&mut self.state, store, cmd)
             }
@@ -740,13 +846,17 @@ impl ScHsm {
     ///   [130..146] puk_salt (16 bytes)
     ///   [146]      puk_retry_count
     ///   [147]      initialized (1 = true, 0 = false)
-    ///   [148]      reserved (0x00)
+    ///   [148]      EXTERNAL AUTHENTICATE failures used (5 − retries left;
+    ///              0 in blobs written before this field existed)
     ///
     /// NOTE: Format changed from 101-byte (bare SHA-256, no salts) to 149-byte
     /// (PBKDF2 + per-credential salts).  Old flash blobs are ≤101 bytes and will
     /// be rejected by the length check in `load_pin_state_from_store`, requiring
     /// re-INITIALIZE.  This is intentional and acceptable for pre-production devices.
-    pub fn save_pin_to_store(state: &ScHsmState, store: &mut dyn crate::storage::KeyStore) {
+    pub fn save_pin_to_store(
+        state: &ScHsmState,
+        store: &mut dyn crate::storage::KeyStore,
+    ) -> Result<(), HsmError> {
         use crate::security::key_management::{AlgorithmId, KeyObject, KeyType as KmKeyType};
         use pico2hsm_core::key::AppletId;
 
@@ -765,7 +875,7 @@ impl ScHsm {
         let _ = buf.extend_from_slice(&state.puk_salt);
         let _ = buf.push(state.puk_retry_count);
         let _ = buf.push(state.initialized as u8);
-        let _ = buf.push(0x00); // reserved
+        let _ = buf.push(EXT_AUTH_MAX_RETRIES.saturating_sub(state.ext_auth_retry_count));
 
         crate::CORE1_PROGRESS.store(35, core::sync::atomic::Ordering::Relaxed);
         let kid = Self::sc_hsm_pin_key_id();
@@ -778,8 +888,9 @@ impl ScHsm {
         crate::CORE1_PROGRESS.store(36, core::sync::atomic::Ordering::Relaxed);
         let _ = obj.private_key.extend_from_slice(&buf);
         crate::CORE1_PROGRESS.store(37, core::sync::atomic::Ordering::Relaxed);
-        let _ = store.save_key(&obj);
+        let result = store.save_key(&obj);
         crate::CORE1_PROGRESS.store(38, core::sync::atomic::Ordering::Relaxed);
+        result
     }
 
     /// Load PIN/SO-PIN/PUK state from flash into `state`.
@@ -819,6 +930,7 @@ impl ScHsm {
                 state.puk_salt = b[130..146].try_into().unwrap_or([0u8; 16]);
                 state.puk_retry_count = b[146];
                 state.initialized = b[147] != 0;
+                state.ext_auth_retry_count = EXT_AUTH_MAX_RETRIES.saturating_sub(b[148]);
             }
         }
     }
@@ -924,5 +1036,208 @@ impl HsmProtocol for ScHsm {
 
     fn protocol_name(&self) -> &'static str {
         "SC-HSM"
+    }
+}
+
+#[cfg(test)]
+mod retry_persistence_tests {
+    use super::*;
+    use crate::security::key_management::{AlgorithmId, KeyObject, KeyType as KmKeyType};
+    use pico2hsm_core::apdu::SW_AUTH_BLOCKED;
+
+    /// Records every PIN-record write; optionally fails the next one.
+    struct PinStore {
+        saves: heapless::Vec<heapless::Vec<u8, 160>, 32>,
+        fail_next: bool,
+    }
+
+    impl PinStore {
+        fn new() -> Self {
+            PinStore {
+                saves: heapless::Vec::new(),
+                fail_next: false,
+            }
+        }
+        /// (user, so, puk, ext-auth failures) from the record write `i`.
+        fn counters(&self, i: usize) -> (u8, u8, u8, u8) {
+            let b = &self.saves[i];
+            (b[48], b[97], b[146], b[148])
+        }
+        fn last(&self) -> (u8, u8, u8, u8) {
+            self.counters(self.saves.len() - 1)
+        }
+    }
+
+    impl crate::storage::KeyStore for PinStore {
+        fn save_key(&mut self, obj: &KeyObject) -> Result<(), HsmError> {
+            if obj.key_id != ScHsm::sc_hsm_pin_key_id().0 {
+                return Ok(());
+            }
+            if core::mem::take(&mut self.fail_next) {
+                return Err(HsmError::NotSupported);
+            }
+            let mut b = heapless::Vec::new();
+            b.extend_from_slice(&obj.private_key).unwrap();
+            self.saves.push(b).unwrap();
+            Ok(())
+        }
+        fn fetch_key(&mut self, kid: KeyId) -> Result<Option<KeyObject>, HsmError> {
+            if kid != ScHsm::sc_hsm_pin_key_id() {
+                return Ok(None);
+            }
+            Ok(self.saves.last().map(|b| {
+                let mut obj = KeyObject::new(
+                    KmKeyType::Generic,
+                    kid.0,
+                    AppletId::ScHsm,
+                    AlgorithmId::AesGcm,
+                );
+                obj.private_key.extend_from_slice(b).unwrap();
+                obj
+            }))
+        }
+        fn erase_key(&mut self, _: KeyId) -> Result<(), HsmError> {
+            Ok(())
+        }
+        fn wipe_all(&mut self) -> Result<(), HsmError> {
+            Ok(())
+        }
+        fn wipe_by_owner(&mut self, _: AppletId) -> Result<(), HsmError> {
+            Ok(())
+        }
+        fn enumerate_keys(&self) -> heapless::Vec<KeyId, 64> {
+            heapless::Vec::new()
+        }
+        fn for_each_key(&self, _: &mut dyn FnMut(KeyId)) {}
+    }
+
+    const USER_PIN: &[u8] = b"648219";
+    const SO_PIN: &[u8] = b"57621880";
+
+    fn apdu(cla: u8, ins: u8, p1: u8, p2: u8, data: &[u8]) -> heapless::Vec<u8, 300> {
+        let mut v = heapless::Vec::new();
+        v.extend_from_slice(&[cla, ins, p1, p2, data.len() as u8])
+            .unwrap();
+        v.extend_from_slice(data).unwrap();
+        v
+    }
+
+    fn sw(resp: &[u8]) -> u16 {
+        u16::from_be_bytes([resp[resp.len() - 2], resp[resp.len() - 1]])
+    }
+
+    fn init_data(so_pin: &[u8]) -> heapless::Vec<u8, 64> {
+        let mut d = heapless::Vec::new();
+        d.extend_from_slice(&[0x81, USER_PIN.len() as u8]).unwrap();
+        d.extend_from_slice(USER_PIN).unwrap();
+        d.extend_from_slice(&[0x82, so_pin.len() as u8]).unwrap();
+        d.extend_from_slice(so_pin).unwrap();
+        d
+    }
+
+    fn initialized() -> (ScHsm, PinStore) {
+        let mut hsm = ScHsm::new();
+        let mut store = PinStore::new();
+        let r =
+            hsm.process_apdu_with_store(&apdu(0x80, 0x50, 0, 0, &init_data(SO_PIN)), &mut store);
+        assert_eq!(sw(&r), SW_OK);
+        store.saves.clear();
+        (hsm, store)
+    }
+
+    fn verify(hsm: &mut ScHsm, store: &mut PinStore, p2: u8, pin: &[u8]) -> u16 {
+        sw(&hsm.process_apdu_with_store(&apdu(0x00, 0x20, 0, p2, pin), store))
+    }
+
+    #[test]
+    fn failed_verify_is_on_flash_before_and_after() {
+        let (mut hsm, mut store) = initialized();
+        assert_eq!(verify(&mut hsm, &mut store, 0x81, b"000000"), 0x63C2);
+        // Exactly one write, already carrying the spent retry.
+        assert_eq!(store.saves.len(), 1);
+        assert_eq!(store.last().0, 2);
+    }
+
+    #[test]
+    fn successful_verify_spends_then_restores() {
+        let (mut hsm, mut store) = initialized();
+        assert_eq!(verify(&mut hsm, &mut store, 0x81, USER_PIN), SW_OK);
+        assert_eq!(store.saves.len(), 2);
+        assert_eq!(store.counters(0).0, 2, "retry spent before comparing");
+        assert_eq!(store.counters(1).0, 3, "restored after success");
+    }
+
+    #[test]
+    fn retries_survive_a_reset() {
+        let (mut hsm, mut store) = initialized();
+        verify(&mut hsm, &mut store, 0x81, b"000000");
+        verify(&mut hsm, &mut store, 0x81, b"000000");
+        // Power cycle / USB reset: fresh state reloaded from flash.
+        let mut fresh = ScHsm::new();
+        ScHsm::load_pin_state_from_store(&mut fresh.state, &mut store);
+        assert_eq!(fresh.state.pin_retry_count, 1);
+        assert_eq!(
+            verify(&mut fresh, &mut store, 0x81, b"000000"),
+            SW_AUTH_BLOCKED
+        );
+        assert_eq!(
+            verify(&mut fresh, &mut store, 0x81, USER_PIN),
+            SW_AUTH_BLOCKED
+        );
+        assert!(!fresh.state.pin_verified);
+    }
+
+    #[test]
+    fn failed_pre_write_refuses_attempt() {
+        let (mut hsm, mut store) = initialized();
+        store.fail_next = true;
+        assert_eq!(
+            verify(&mut hsm, &mut store, 0x81, USER_PIN),
+            SW_MEMORY_FAILURE
+        );
+        assert!(!hsm.state.pin_verified);
+    }
+
+    #[test]
+    fn wrong_change_pin_spends_retry() {
+        let (mut hsm, mut store) = initialized();
+        let mut data: heapless::Vec<u8, 32> = heapless::Vec::new();
+        data.extend_from_slice(b"000000").unwrap();
+        data.extend_from_slice(b"111111").unwrap();
+        let r = hsm.process_apdu_with_store(&apdu(0x00, 0x24, 0, 0x81, &data), &mut store);
+        assert_ne!(sw(&r), SW_OK);
+        assert_eq!(store.last().0, 2);
+    }
+
+    #[test]
+    fn reinitialize_spends_so_retry_and_honours_block() {
+        let (mut hsm, mut store) = initialized();
+        let wrong = init_data(b"00000000");
+        for left in (0..5u8).rev() {
+            let r = hsm.process_apdu_with_store(&apdu(0x80, 0x50, 0, 0, &wrong), &mut store);
+            assert_ne!(sw(&r), SW_OK);
+            assert_eq!(store.last().1, left);
+        }
+        // Blocked: even the correct SO-PIN can no longer re-initialize.
+        let r =
+            hsm.process_apdu_with_store(&apdu(0x80, 0x50, 0, 0, &init_data(SO_PIN)), &mut store);
+        assert_eq!(sw(&r), SW_AUTH_BLOCKED);
+    }
+
+    #[test]
+    fn ext_auth_failures_persist() {
+        let (mut hsm, mut store) = initialized();
+        let r = hsm.process_apdu_with_store(&apdu(0x00, 0x82, 0, 0, &[0u8; 8]), &mut store);
+        assert_ne!(sw(&r), SW_OK);
+        assert_eq!(store.last().3, 1);
+        let mut fresh = ScHsm::new();
+        ScHsm::load_pin_state_from_store(&mut fresh.state, &mut store);
+        assert_eq!(fresh.state.ext_auth_retry_count, EXT_AUTH_MAX_RETRIES - 1);
+    }
+
+    #[test]
+    fn short_user_pin_rejected() {
+        let (mut hsm, mut store) = initialized();
+        assert_eq!(verify(&mut hsm, &mut store, 0x81, b"1234"), 0x6700);
     }
 }

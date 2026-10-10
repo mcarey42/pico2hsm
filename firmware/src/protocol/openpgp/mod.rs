@@ -249,6 +249,46 @@ pub struct OpenPgp {
     pub state: OpenPgpState,
 }
 
+/// A persistent OpenPGP password retry counter spent by an APDU.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PwCounter {
+    Pw1,
+    Pw3,
+}
+
+impl PwCounter {
+    fn spent_by(cmd: &ApduCommand<'_>) -> Option<Self> {
+        if cmd.data.is_empty() {
+            return None;
+        }
+        match (cmd.ins, cmd.p2) {
+            (verify::INS_VERIFY, 0x81 | 0x82) | (change_pin::INS_CHANGE_PIN, 0x81) => {
+                Some(Self::Pw1)
+            }
+            (verify::INS_VERIFY, 0x83) | (change_pin::INS_CHANGE_PIN, 0x83) => Some(Self::Pw3),
+            _ => None,
+        }
+    }
+
+    fn get(self, state: &mut OpenPgpState) -> &mut u8 {
+        match self {
+            Self::Pw1 => &mut state.pw1_retries,
+            Self::Pw3 => &mut state.pw3_retries,
+        }
+    }
+
+    fn save(
+        self,
+        state: &OpenPgpState,
+        store: &mut dyn crate::storage::KeyStore,
+    ) -> Result<(), pico2hsm_core::error::HsmError> {
+        match self {
+            Self::Pw1 => OpenPgp::save_pw1_to_store(state, store),
+            Self::Pw3 => OpenPgp::save_pw3_to_store(state, store),
+        }
+    }
+}
+
 impl OpenPgp {
     /// Create a new OpenPGP Card protocol instance.
     pub fn new() -> Self {
@@ -319,14 +359,56 @@ impl OpenPgp {
             }
         }
 
+        if let Some(pw) = PwCounter::spent_by(cmd) {
+            return self.with_persisted_attempt(pw, cmd, store);
+        }
+        self.route_with_store(cmd, store)
+    }
+
+    /// Spend one PW1/PW3 retry on flash before the handler compares the
+    /// password; see `ScHsm::with_persisted_attempt` for the rationale.
+    fn with_persisted_attempt(
+        &mut self,
+        pw: PwCounter,
+        cmd: &ApduCommand<'_>,
+        store: &mut dyn crate::storage::KeyStore,
+    ) -> ApduResponse {
+        let before = *pw.get(&mut self.state);
+        if before == 0 {
+            return self.route_with_store(cmd, store);
+        }
+        let spent = before - 1;
+        *pw.get(&mut self.state) = spent;
+        if pw.save(&self.state, store).is_err() {
+            return ApduResponse::err(pico2hsm_core::apdu::SW_MEMORY_FAILURE);
+        }
+        *pw.get(&mut self.state) = before;
+
+        let resp = self.route_with_store(cmd, store);
+
+        let after = pw.get(&mut self.state);
+        if resp.sw != pico2hsm_core::apdu::SW_OK && *after > spent {
+            *after = spent;
+        }
+        if *after != spent {
+            let _ = pw.save(&self.state, store);
+        }
+        resp
+    }
+
+    /// Route an APDU to its handler with persistent storage available.
+    fn route_with_store(
+        &mut self,
+        cmd: &ApduCommand<'_>,
+        store: &mut dyn crate::storage::KeyStore,
+    ) -> ApduResponse {
         match cmd.ins {
             generate_keypair::INS_GENERATE_KEYPAIR => {
                 generate_keypair::handle_with_store(&mut self.state, store, cmd)
             }
-            verify::INS_VERIFY => verify::handle_with_store(&mut self.state, store, cmd),
-            change_pin::INS_CHANGE_PIN => {
-                change_pin::handle_with_store(&mut self.state, store, cmd)
-            }
+            // Password checks: persistence is handled by with_persisted_attempt.
+            verify::INS_VERIFY => verify::handle(&mut self.state, cmd),
+            change_pin::INS_CHANGE_PIN => change_pin::handle(&mut self.state, cmd),
             reset_retry_counter::INS_RESET_RETRY_COUNTER => {
                 reset_retry_counter::handle_with_store(&mut self.state, store, cmd)
             }
@@ -360,7 +442,10 @@ impl OpenPgp {
     ///   [32]    has_pw1_hash (1 if Some, 0 if None)
     ///   [33]    pw1_retries
     ///   [34]    pw1_blocked as u8
-    pub fn save_pw1_to_store(state: &OpenPgpState, store: &mut dyn crate::storage::KeyStore) {
+    pub fn save_pw1_to_store(
+        state: &OpenPgpState,
+        store: &mut dyn crate::storage::KeyStore,
+    ) -> Result<(), pico2hsm_core::error::HsmError> {
         use crate::security::key_management::{AlgorithmId, KeyObject, KeyType as KmKeyType};
         use pico2hsm_core::key::AppletId;
 
@@ -389,7 +474,7 @@ impl OpenPgp {
             public_key: heapless::Vec::new(),
         };
         let _ = obj.private_key.extend_from_slice(&buf);
-        let _ = store.save_key(&obj);
+        store.save_key(&obj)
     }
 
     /// Serialize and persist PW3 state to flash.
@@ -399,7 +484,10 @@ impl OpenPgp {
     ///   [32]    has_pw3_hash (1 if Some, 0 if None)
     ///   [33]    pw3_retries
     ///   [34]    pw3_blocked as u8
-    pub fn save_pw3_to_store(state: &OpenPgpState, store: &mut dyn crate::storage::KeyStore) {
+    pub fn save_pw3_to_store(
+        state: &OpenPgpState,
+        store: &mut dyn crate::storage::KeyStore,
+    ) -> Result<(), pico2hsm_core::error::HsmError> {
         use crate::security::key_management::{AlgorithmId, KeyObject, KeyType as KmKeyType};
         use pico2hsm_core::key::AppletId;
 
@@ -428,7 +516,7 @@ impl OpenPgp {
             public_key: heapless::Vec::new(),
         };
         let _ = obj.private_key.extend_from_slice(&buf);
-        let _ = store.save_key(&obj);
+        store.save_key(&obj)
     }
 
     /// Load persisted OpenPGP keys and PIN state from flash.

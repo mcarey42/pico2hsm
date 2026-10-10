@@ -148,6 +148,40 @@ pub struct Piv {
     pub state: PivState,
 }
 
+/// A persistent PIV retry counter spent by a credential-checking APDU.
+#[cfg(feature = "applet-piv")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PivRetryCounter {
+    Pin,
+    Puk,
+}
+
+#[cfg(feature = "applet-piv")]
+impl PivRetryCounter {
+    fn spent_by(cmd: &ApduCommand<'_>) -> Option<Self> {
+        use commands::*;
+        if cmd.data.is_empty() {
+            return None;
+        }
+        match (cmd.ins, cmd.p2) {
+            (verify::INS_VERIFY, 0x80) => Some(Self::Pin),
+            (change_reference_data::INS_CHANGE_REFERENCE_DATA, 0x80) => Some(Self::Pin),
+            (change_reference_data::INS_CHANGE_REFERENCE_DATA, 0x81) => Some(Self::Puk),
+            (reset_retry_counter::INS_RESET_RETRY_COUNTER, _) => Some(Self::Puk),
+            _ => None,
+        }
+    }
+
+    /// (retries remaining, blocked flag) for this counter.
+    fn get(self, state: &mut PivState) -> (&mut u8, &mut bool) {
+        let ps = &mut state.pin_state;
+        match self {
+            Self::Pin => (&mut ps.pin_retries_remaining, &mut ps.pin_blocked),
+            Self::Puk => (&mut ps.puk_retries_remaining, &mut ps.puk_blocked),
+        }
+    }
+}
+
 impl Piv {
     /// Create a new PIV protocol instance.
     pub fn new() -> Self {
@@ -260,7 +294,10 @@ impl Piv {
     ///   [99]     puk_retries_remaining
     ///   [100]    puk_blocked as u8
     #[cfg(feature = "applet-piv")]
-    pub fn save_pin_to_store(state: &PivState, store: &mut dyn crate::storage::KeyStore) {
+    pub fn save_pin_to_store(
+        state: &PivState,
+        store: &mut dyn crate::storage::KeyStore,
+    ) -> Result<(), pico2hsm_core::error::HsmError> {
         use crate::security::key_management::{AlgorithmId, KeyObject, KeyType as KmKeyType};
         use pico2hsm_core::key::AppletId;
 
@@ -290,7 +327,7 @@ impl Piv {
             public_key: heapless::Vec::new(),
         };
         let _ = obj.private_key.extend_from_slice(&buf);
-        let _ = store.save_key(&obj);
+        store.save_key(&obj)
     }
 
     /// Load PIN/PUK state from flash into `state`.
@@ -322,6 +359,54 @@ impl Piv {
         cmd: &ApduCommand<'_>,
         store: &mut dyn crate::storage::KeyStore,
     ) -> ApduResponse {
+        match PivRetryCounter::spent_by(cmd) {
+            Some(counter) => self.with_persisted_attempt(counter, cmd, store),
+            None => self.route_with_store(cmd, store),
+        }
+    }
+
+    /// Spend one PIN/PUK retry on flash before the handler compares the
+    /// credential; see `ScHsm::with_persisted_attempt` for the rationale.
+    #[cfg(feature = "applet-piv")]
+    fn with_persisted_attempt(
+        &mut self,
+        counter: PivRetryCounter,
+        cmd: &ApduCommand<'_>,
+        store: &mut dyn crate::storage::KeyStore,
+    ) -> ApduResponse {
+        let before = *counter.get(&mut self.state).0;
+        if before == 0 {
+            return self.route_with_store(cmd, store);
+        }
+        let spent = before - 1;
+        *counter.get(&mut self.state).0 = spent;
+        if Self::save_pin_to_store(&self.state, store).is_err() {
+            return ApduResponse::err(pico2hsm_core::apdu::SW_MEMORY_FAILURE);
+        }
+        *counter.get(&mut self.state).0 = before;
+
+        let resp = self.route_with_store(cmd, store);
+
+        let (after, blocked) = counter.get(&mut self.state);
+        if resp.sw != pico2hsm_core::apdu::SW_OK && *after > spent {
+            *after = spent;
+        }
+        if *after == 0 {
+            *blocked = true;
+        }
+        if *after != spent {
+            let _ = Self::save_pin_to_store(&self.state, store);
+        }
+        resp
+    }
+
+    /// Route an APDU to its handler with persistent storage available.
+    #[cfg(feature = "applet-piv")]
+    fn route_with_store(
+        &mut self,
+        cmd: &ApduCommand<'_>,
+        store: &mut dyn crate::storage::KeyStore,
+    ) -> ApduResponse {
         use commands::*;
 
         match cmd.ins {
@@ -331,12 +416,13 @@ impl Piv {
             general_authenticate::INS_GENERAL_AUTHENTICATE => {
                 general_authenticate::handle_with_store(&mut self.state, store, cmd)
             }
-            verify::INS_VERIFY => verify::handle_with_store(&mut self.state, store, cmd),
+            // Credential checks: persistence is handled by with_persisted_attempt.
+            verify::INS_VERIFY => verify::handle(&mut self.state, cmd),
             change_reference_data::INS_CHANGE_REFERENCE_DATA => {
-                change_reference_data::handle_with_store(&mut self.state, store, cmd)
+                change_reference_data::handle(&mut self.state, cmd)
             }
             reset_retry_counter::INS_RESET_RETRY_COUNTER => {
-                reset_retry_counter::handle_with_store(&mut self.state, store, cmd)
+                reset_retry_counter::handle(&mut self.state, cmd)
             }
             _ => {
                 // Fall through to the non-store dispatch path.
@@ -454,5 +540,91 @@ impl HsmProtocol for Piv {
 
     fn protocol_name(&self) -> &'static str {
         "PIV"
+    }
+}
+
+#[cfg(all(test, feature = "applet-piv"))]
+mod retry_persistence_tests {
+    use super::*;
+    use crate::security::key_management::{AlgorithmId, KeyObject, KeyType as KmKeyType};
+    use pico2hsm_core::error::HsmError;
+    use pico2hsm_core::key::{AppletId, KeyId};
+
+    /// Records every PIV PIN-record write.
+    struct PinStore {
+        saves: heapless::Vec<heapless::Vec<u8, 128>, 16>,
+    }
+
+    impl crate::storage::KeyStore for PinStore {
+        fn save_key(&mut self, obj: &KeyObject) -> Result<(), HsmError> {
+            if obj.key_id == Piv::piv_pin_key_id().0 {
+                let mut b = heapless::Vec::new();
+                b.extend_from_slice(&obj.private_key).unwrap();
+                self.saves.push(b).unwrap();
+            }
+            Ok(())
+        }
+        fn fetch_key(&mut self, kid: KeyId) -> Result<Option<KeyObject>, HsmError> {
+            if kid != Piv::piv_pin_key_id() {
+                return Ok(None);
+            }
+            Ok(self.saves.last().map(|b| {
+                let mut obj = KeyObject::new(
+                    KmKeyType::Generic,
+                    kid.0,
+                    AppletId::Piv,
+                    AlgorithmId::AesGcm,
+                );
+                obj.private_key.extend_from_slice(b).unwrap();
+                obj
+            }))
+        }
+        fn erase_key(&mut self, _: KeyId) -> Result<(), HsmError> {
+            Ok(())
+        }
+        fn wipe_all(&mut self) -> Result<(), HsmError> {
+            Ok(())
+        }
+        fn wipe_by_owner(&mut self, _: AppletId) -> Result<(), HsmError> {
+            Ok(())
+        }
+        fn enumerate_keys(&self) -> heapless::Vec<KeyId, 64> {
+            heapless::Vec::new()
+        }
+        fn for_each_key(&self, _: &mut dyn FnMut(KeyId)) {}
+    }
+
+    fn verify(piv: &mut Piv, store: &mut PinStore, pin: &[u8]) -> u16 {
+        let mut apdu: heapless::Vec<u8, 16> = heapless::Vec::new();
+        apdu.extend_from_slice(&[0x00, 0x20, 0x00, 0x80, 0x08])
+            .unwrap();
+        apdu.extend_from_slice(pin).unwrap();
+        for _ in pin.len()..8 {
+            apdu.push(0xFF).unwrap();
+        }
+        let r = piv.process_apdu_with_store(&apdu, store);
+        u16::from_be_bytes([r[r.len() - 2], r[r.len() - 1]])
+    }
+
+    #[test]
+    fn piv_wrong_pin_is_spent_on_flash_and_survives_reset() {
+        let mut piv = Piv::new();
+        let mut store = PinStore {
+            saves: heapless::Vec::new(),
+        };
+        let max = piv.state.pin_state.pin_retries_remaining;
+
+        assert_ne!(verify(&mut piv, &mut store, b"999999"), 0x9000);
+        assert_eq!(store.saves.len(), 1, "one write, before the compare");
+        assert_eq!(store.saves[0][48], max - 1);
+
+        let mut fresh = Piv::new();
+        Piv::load_pin_state_from_store(&mut fresh.state, &mut store);
+        assert_eq!(fresh.state.pin_state.pin_retries_remaining, max - 1);
+
+        assert_eq!(verify(&mut fresh, &mut store, DEFAULT_PIV_PIN), 0x9000);
+        let n = store.saves.len();
+        assert_eq!(store.saves[n - 2][48], max - 2, "spent before the compare");
+        assert_eq!(store.saves[n - 1][48], max, "restored after success");
     }
 }

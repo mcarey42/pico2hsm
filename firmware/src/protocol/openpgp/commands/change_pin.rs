@@ -26,22 +26,6 @@ fn sw_retry(remaining: u8) -> u16 {
     0x63C0 | (remaining as u16 & 0x0F)
 }
 
-/// Handle CHANGE REFERENCE DATA and persist updated PW1/PW3 state to flash.
-pub fn handle_with_store(
-    state: &mut OpenPgpState,
-    store: &mut dyn crate::storage::KeyStore,
-    cmd: &ApduCommand<'_>,
-) -> ApduResponse {
-    let resp = handle(state, cmd);
-    // Persist whether success or failed (retry counter may have decremented).
-    match cmd.p2 {
-        0x81 => crate::protocol::openpgp::OpenPgp::save_pw1_to_store(state, store),
-        0x83 => crate::protocol::openpgp::OpenPgp::save_pw3_to_store(state, store),
-        _ => {}
-    }
-    resp
-}
-
 /// Handle a CHANGE REFERENCE DATA APDU command.
 pub fn handle(state: &mut OpenPgpState, cmd: &ApduCommand<'_>) -> ApduResponse {
     if cmd.p1 != 0x00 {

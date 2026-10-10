@@ -76,7 +76,7 @@ pub fn handle(state: &mut ScHsmState, cmd: &ApduCommand<'_>) -> ApduResponse {
 
     if ok1 {
         state.so_pin_verified = true;
-        state.ext_auth_retry_count = 5; // Reset on success.
+        state.ext_auth_retry_count = crate::protocol::sc_hsm::EXT_AUTH_MAX_RETRIES; // Reset on success.
         ApduResponse::ok(&[])
     } else {
         // Wrong cryptogram — decrement retry counter (P1-5).
