@@ -511,26 +511,46 @@ pub const DEV_STORAGE_KEY_ALLOWED: bool =
 /// Fails closed: an OTP read error (state unknown) or a failed page lock
 /// yields `None` rather than a fallback key or an unlocked page.
 pub fn boot_storage_master_key() -> Option<zeroize::Zeroizing<[u8; 32]>> {
-    let Ok(provisioned) = provisioning_state() else {
-        defmt::error!("OTP: provisioning state unreadable — keystore disabled");
-        return None;
-    };
-    if !provisioned {
-        if !DEV_STORAGE_KEY_ALLOWED {
-            defmt::error!("OTP: unprovisioned — keystore disabled (no storage key)");
-            return None;
+    match provisioning_state() {
+        Ok(false) => {
+            // Definitely blank: leave the page writable so it can be provisioned.
+            if !DEV_STORAGE_KEY_ALLOWED {
+                defmt::error!("OTP: unprovisioned — keystore disabled (no storage key)");
+                return None;
+            }
+            defmt::warn!("OTP: unprovisioned — using INSECURE fixed development storage key");
+            derive_smk().ok()
         }
-        defmt::warn!("OTP: unprovisioned — using INSECURE fixed development storage key");
-        return derive_smk().ok();
+        Ok(true) => {
+            // Derive first (the lock makes the IKM unreadable), then lock on
+            // every outcome — including a failed derivation.
+            let smk = derive_smk().ok();
+            if !lock_key_page() {
+                defmt::error!("OTP: key page lock failed — keystore disabled");
+                return None;
+            }
+            if smk.is_none() {
+                defmt::error!("OTP: storage key derivation failed — keystore disabled");
+            }
+            smk
+        }
+        Err(()) => {
+            // State unknown: treat as provisioned for locking, and use no key.
+            let _ = lock_key_page();
+            defmt::error!("OTP: provisioning state unreadable — keystore disabled");
+            None
+        }
     }
-    let smk = derive_smk().ok()?;
+}
+
+/// Read-lock the key page for the rest of this boot; true on success.
+fn lock_key_page() -> bool {
     let rows = layout::ROWS_PER_PAGE;
-    if lock_read(layout::KEY_PAGE * rows, rows).is_err() {
-        defmt::error!("OTP: key page lock failed — keystore disabled");
-        return None;
+    let locked = lock_read(layout::KEY_PAGE * rows, rows).is_ok();
+    if locked {
+        KEY_PAGE_LOCKED.store(true, core::sync::atomic::Ordering::Relaxed);
     }
-    KEY_PAGE_LOCKED.store(true, core::sync::atomic::Ordering::Relaxed);
-    Some(smk)
+    locked
 }
 
 /// Whether the storage key IKM (or the PROVISIONED flag) is present.
