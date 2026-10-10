@@ -394,11 +394,22 @@ class TestSignEnrollment:
 # ---------------------------------------------------------------------------
 
 class TestNoiseTargetInit:
+    def test_requires_so_pin(self, initialized_device, runner: CLIRunner) -> None:
+        """The user PIN alone must not start a DKEK exchange (SW 6982)."""
+        r_pub = runner.send_apdu(SELECT_SC_HSM, APDU_GET_PUBKEY, reader=0)
+        source_pub_hex = _parse_received_bytes(r_pub.stdout).hex()
+        result = runner.send_apdu(
+            SELECT_SC_HSM, VERIFY_PIN, f"8054350041{source_pub_hex}",
+            reader=0, save_as="09_noise_target_init_user_pin",
+        )
+        assert _parse_sw(result.stdout)[-1] == 0x6982
+
     def test_requires_initialized_device(
         self, initialized_device, runner: CLIRunner
     ) -> None:
-        """NOISE_TARGET_INIT with a dummy source pubkey must return SW=9000 and 161 bytes."""
-        # Get the device's own static pub to use as the "source" pub (valid uncompressed point)
+        """NOISE_TARGET_INIT from an enrolled peer (SO-PIN) returns 161 bytes."""
+        # Use the device's own static pub as the "source" (a valid point) and
+        # enroll it: the exchange only talks to an enrolled peer.
         r_pub = runner.send_apdu(SELECT_SC_HSM, APDU_GET_PUBKEY, reader=0)
         source_pub_bytes = _parse_received_bytes(r_pub.stdout)
         assert len(source_pub_bytes) == 65
@@ -409,7 +420,8 @@ class TestNoiseTargetInit:
 
         result = runner.send_apdu(
             SELECT_SC_HSM,
-            VERIFY_PIN,
+            VERIFY_SO_PIN,
+            f"80543D00{lc}{source_pub_hex}",  # ENROLL_PEER_PUBKEY
             apdu_target_init,
             reader=0, save_as="09_noise_target_init",
         )

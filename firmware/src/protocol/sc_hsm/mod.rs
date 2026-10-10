@@ -53,21 +53,39 @@ enum RetryCounter {
 }
 
 impl RetryCounter {
-    /// The counter `cmd` would spend, or `None` if it checks no credential
-    /// (including retry-count queries with an empty data field).
+    /// The counter `cmd` would spend, or `None` if it compares no credential.
+    ///
+    /// Mirrors each handler's own pre-checks: retry-count queries (empty
+    /// data) and malformed APDUs (bad P1/P2 or lengths) are rejected before
+    /// any comparison, so they must not cost a retry — otherwise garbage
+    /// APDUs could block the PINs without ever guessing one.
     fn spent_by(cmd: &ApduCommand<'_>, state: &ScHsmState) -> Option<Self> {
+        let n = cmd.data.len();
         match cmd.ins {
-            verify::INS_VERIFY | change_pin::INS_CHANGE_PIN if !cmd.data.is_empty() => {
-                match cmd.p2 {
-                    verify::P2_USER_PIN => Some(Self::UserPin),
-                    verify::P2_SO_PIN => Some(Self::SoPin),
-                    _ => None,
+            verify::INS_VERIFY if cmd.p1 == 0x00 => match cmd.p2 {
+                verify::P2_USER_PIN if (verify::MIN_PIN_LEN..=16).contains(&n) => {
+                    Some(Self::UserPin)
                 }
+                verify::P2_SO_PIN if (6..=16).contains(&n) => Some(Self::SoPin),
+                _ => None,
+            },
+            change_pin::INS_CHANGE_PIN if change_pin::compares_credential(cmd) => match cmd.p2 {
+                verify::P2_USER_PIN => Some(Self::UserPin),
+                verify::P2_SO_PIN => Some(Self::SoPin),
+                _ => None,
+            },
+            puk_auth::INS_PUK_AUTH if (8..=16).contains(&n) && state.puk_hash.is_some() => {
+                Some(Self::Puk)
             }
-            puk_auth::INS_PUK_AUTH if !cmd.data.is_empty() => Some(Self::Puk),
-            external_auth::INS_EXTERNAL_AUTH if !cmd.data.is_empty() => Some(Self::ExtAuth),
+            external_auth::INS_EXTERNAL_AUTH if n != 0 && state.challenge.is_some() => {
+                Some(Self::ExtAuth)
+            }
             // Re-INITIALIZE is authorised by the SO-PIN carried in the command.
-            initialize::INS_INITIALIZE if state.initialized && state.so_pin_hash.is_some() => {
+            initialize::INS_INITIALIZE
+                if state.initialized
+                    && state.so_pin_hash.is_some()
+                    && initialize::init_code(cmd).is_some() =>
+            {
                 Some(Self::SoPin)
             }
             _ => None,
@@ -839,9 +857,7 @@ impl ScHsm {
                     decrypt::handle(&mut self.state, &mut LocalNullStore, cmd)
                 }
             }
-            change_pin::INS_CHANGE_PIN => {
-                change_pin::handle_with_store(&mut self.state, &mut LocalNullStore, cmd)
-            }
+            change_pin::INS_CHANGE_PIN => change_pin::handle(&mut self.state, cmd),
             reset_retry::INS_RESET_RETRY => {
                 reset_retry::handle_with_store(&mut self.state, &mut LocalNullStore, cmd)
             }
@@ -1329,6 +1345,12 @@ mod retry_persistence_tests {
     #[test]
     fn ext_auth_failures_persist() {
         let (mut hsm, mut store) = initialized();
+        // GET CHALLENGE first: without one the handler compares nothing.
+        let mut get_challenge: heapless::Vec<u8, 8> = heapless::Vec::new();
+        get_challenge
+            .extend_from_slice(&[0x00, 0x84, 0x00, 0x00, 0x08])
+            .unwrap();
+        hsm.process_apdu_with_store(&get_challenge, &mut store);
         let r = hsm.process_apdu_with_store(&apdu(0x00, 0x82, 0, 0, &[0u8; 8]), &mut store);
         assert_ne!(sw(&r), SW_OK);
         assert_eq!(store.last().3, 1);
@@ -1356,6 +1378,42 @@ mod retry_persistence_tests {
     fn short_user_pin_rejected() {
         let (mut hsm, mut store) = initialized();
         assert_eq!(verify(&mut hsm, &mut store, 0x81, b"1234"), 0x6700);
+    }
+
+    #[test]
+    fn malformed_attempts_spend_nothing() {
+        // The hardware fuzz suite (test_16) blocked both PINs this way.
+        let (mut hsm, mut store) = initialized();
+        let malformed: [&[u8]; 8] = [
+            &[0x00, 0x20, 0x00, 0x81, 0x01, 0x41], // 1-byte PIN
+            &[
+                0x00, 0x20, 0xFF, 0x81, 0x06, b'6', b'4', b'8', b'2', b'1', b'9',
+            ], // bad P1
+            &[0x00, 0x20, 0x00, 0x88, 0x01, 0x00], // 1-byte SO-PIN
+            &[0x00, 0x24, 0x00, 0xFF, 0x02, 0x31, 0x32], // CHANGE PIN, short new
+            &[
+                0x00, 0x24, 0x02, 0x81, 0x0C, b'1', b'2', b'3', b'4', b'5', b'6', b'1', b'2', b'3',
+                b'4', b'5', b'6',
+            ], // bad P1
+            &[0x00, 0x28, 0x00, 0x00, 0x03, 0x41, 0x42, 0x43], // PUK too short
+            &[
+                0x00, 0x82, 0x00, 0x81, 0x08, 0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE,
+            ], // no challenge
+            &[0x80, 0x50, 0x00, 0x00, 0x04, 0x80, 0xFF, 0x01, 0x02], // INITIALIZE, no init code
+        ];
+        for a in malformed {
+            let r = hsm.process_apdu_with_store(a, &mut store);
+            assert_ne!(sw(&r), SW_OK, "{a:02X?}");
+        }
+        assert!(store.saves.is_empty(), "no retry spent on malformed APDUs");
+        assert_eq!(
+            (
+                hsm.state.pin_retry_count,
+                hsm.state.so_pin_retry_count,
+                hsm.state.ext_auth_retry_count
+            ),
+            (3, 5, EXT_AUTH_MAX_RETRIES)
+        );
     }
 }
 

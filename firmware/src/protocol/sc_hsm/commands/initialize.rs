@@ -27,6 +27,15 @@ pub const INS_INITIALIZE: u8 = 0x50;
 
 /// Parse a BER-TLV primitive tag (single byte) from `data` starting at `pos`.
 /// Returns `(value_slice, new_pos)` or `None` if malformed / missing.
+/// The SO-PIN (init code) carried by an INITIALIZE APDU, if well formed —
+/// i.e. whether a re-INITIALIZE would compare it.
+pub fn init_code<'a>(cmd: &ApduCommand<'a>) -> Option<&'a [u8]> {
+    if cmd.p1 != 0x00 || cmd.p2 != 0x00 {
+        return None;
+    }
+    find_tlv(cmd.data, 0x82).filter(|c| c.len() == 8)
+}
+
 fn find_tlv<'a>(data: &'a [u8], tag: u8) -> Option<&'a [u8]> {
     let mut i = 0;
     while i + 1 < data.len() {

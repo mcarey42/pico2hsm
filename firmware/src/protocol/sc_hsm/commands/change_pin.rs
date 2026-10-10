@@ -61,18 +61,33 @@ fn find_tlv<'a>(data: &'a [u8], tag: u8) -> Option<&'a [u8]> {
     None
 }
 
-/// Handle a CHANGE REFERENCE DATA APDU command with flash persistence.
-pub fn handle_with_store(
-    state: &mut ScHsmState,
-    store: &mut dyn crate::storage::KeyStore,
-    cmd: &ApduCommand<'_>,
-) -> ApduResponse {
-    let resp = handle(state, cmd);
-    if resp.sw == SW_OK && crate::protocol::sc_hsm::ScHsm::save_pin_to_store(state, store).is_err()
-    {
-        return ApduResponse::err(pico2hsm_core::apdu::SW_MEMORY_FAILURE);
+/// Split CHANGE REFERENCE DATA into (old, new) PIN, or the SW to return.
+///
+/// P1=0x01: TLV (0x80 old, 0x81 new).  P1=0x00: old||new split at the
+/// midpoint.
+pub fn split_pins<'a>(cmd: &ApduCommand<'a>) -> Result<(&'a [u8], &'a [u8]), u16> {
+    match cmd.p1 {
+        0x01 => {
+            let old = find_tlv(cmd.data, 0x80).ok_or(SW_WRONG_DATA)?;
+            let new = find_tlv(cmd.data, 0x81).ok_or(SW_WRONG_DATA)?;
+            Ok((old, new))
+        }
+        0x00 => {
+            let half = cmd.data.len() / 2;
+            if half == 0 {
+                return Err(SW_WRONG_DATA);
+            }
+            Ok((&cmd.data[..half], &cmd.data[half..]))
+        }
+        _ => Err(SW_WRONG_DATA),
     }
-    resp
+}
+
+/// Whether the handler would compare the old PIN (i.e. the APDU is well
+/// formed); only such attempts spend a retry.
+pub fn compares_credential(cmd: &ApduCommand<'_>) -> bool {
+    matches!(split_pins(cmd), Ok((old, new))
+        if !old.is_empty() && (super::verify::MIN_PIN_LEN..=16).contains(&new.len()))
 }
 
 /// Handle a CHANGE REFERENCE DATA APDU command.
@@ -81,28 +96,9 @@ pub fn handle(state: &mut ScHsmState, cmd: &ApduCommand<'_>) -> ApduResponse {
     // P1=0x01: TLV-encoded
     // P2 selects which PIN reference
 
-    let (old_pin, new_pin) = if cmd.p1 == 0x01 {
-        // TLV encoding
-        let old = match find_tlv(cmd.data, 0x80) {
-            Some(v) => v,
-            None => return ApduResponse::err(SW_WRONG_DATA),
-        };
-        let new = match find_tlv(cmd.data, 0x81) {
-            Some(v) => v,
-            None => return ApduResponse::err(SW_WRONG_DATA),
-        };
-        (old, new)
-    } else if cmd.p1 == 0x00 {
-        // Concatenated — split at midpoint (must be even length with known old-pin len)
-        // SC-HSM typically uses 6 bytes for old + new; accept TLV or equal-split.
-        // Fall back: each half equal
-        let half = cmd.data.len() / 2;
-        if half == 0 {
-            return ApduResponse::err(SW_WRONG_DATA);
-        }
-        (&cmd.data[..half], &cmd.data[half..])
-    } else {
-        return ApduResponse::err(SW_WRONG_DATA);
+    let (old_pin, new_pin) = match split_pins(cmd) {
+        Ok(pins) => pins,
+        Err(sw) => return ApduResponse::err(sw),
     };
 
     if new_pin.len() < super::verify::MIN_PIN_LEN || new_pin.len() > 16 {

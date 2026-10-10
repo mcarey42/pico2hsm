@@ -414,26 +414,9 @@ class TestNoExportFlagPersistence:
         # 6. Reset device
         _reset_device()
 
-        # 7. Re-import DKEK share after reset (device clears DKEK state on reset)
-        share_import2 = subprocess.run(
-            ["sc-hsm-tool", "--import-dkek-share", share_path, "--password", "test"],
-            capture_output=True, timeout=30,
-        )
-        # DKEK import may fail if device reset cleared dkek_shares_required;
-        # in that case the test validates that key_flags persisted by checking
-        # the export rejection after a fresh INITIALIZE + DKEK import cycle.
-        if share_import2.returncode != 0:
-            log.warning(
-                "DKEK share re-import failed after reset (expected if DKEK config "
-                "is not persisted). Falling back to fresh init + re-keygen path."
-            )
-            # The NO_EXPORT flag is on the key in flash; re-initializing wipes it.
-            # Skip the post-reset export check in this case -- the pre-reset
-            # check already validated the flag enforcement.
-            pytest.skip(
-                "DKEK state not persisted across reset; cannot test NO_EXPORT "
-                "post-reset without re-initializing (which wipes the key)."
-            )
+        # 7. No re-import: the DKEK is persisted (reserved slot 0xFD) and
+        #    restored at boot, so the post-reset check runs against the same
+        #    DKEK.  (Before the S-02 fix it was RAM-only and this step skipped.)
 
         # 8. Attempt export after reset -- must still be rejected
         r = runner.send_apdu(

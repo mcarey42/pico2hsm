@@ -257,8 +257,17 @@ enum PwCounter {
 }
 
 impl PwCounter {
+    /// The counter `cmd` would spend; malformed APDUs (rejected by the
+    /// handler before any comparison) spend nothing.
     fn spent_by(cmd: &ApduCommand<'_>) -> Option<Self> {
-        if cmd.data.is_empty() {
+        let n = cmd.data.len();
+        let well_formed = cmd.p1 == 0x00
+            && match cmd.ins {
+                verify::INS_VERIFY => (6..=127).contains(&n),
+                change_pin::INS_CHANGE_PIN => n >= 12,
+                _ => false,
+            };
+        if !well_formed {
             return None;
         }
         match (cmd.ins, cmd.p2) {

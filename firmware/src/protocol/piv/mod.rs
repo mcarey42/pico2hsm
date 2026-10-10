@@ -158,16 +158,22 @@ enum PivRetryCounter {
 
 #[cfg(feature = "applet-piv")]
 impl PivRetryCounter {
+    /// The counter `cmd` would spend; malformed APDUs (rejected by the
+    /// handler before any comparison) spend nothing.
     fn spent_by(cmd: &ApduCommand<'_>) -> Option<Self> {
         use commands::*;
-        if cmd.data.is_empty() {
-            return None;
-        }
-        match (cmd.ins, cmd.p2) {
-            (verify::INS_VERIFY, 0x80) => Some(Self::Pin),
-            (change_reference_data::INS_CHANGE_REFERENCE_DATA, 0x80) => Some(Self::Pin),
-            (change_reference_data::INS_CHANGE_REFERENCE_DATA, 0x81) => Some(Self::Puk),
-            (reset_retry_counter::INS_RESET_RETRY_COUNTER, _) => Some(Self::Puk),
+        let n = cmd.data.len();
+        match (cmd.ins, cmd.p1, cmd.p2) {
+            (verify::INS_VERIFY, 0x00, 0x80) if n == 8 => Some(Self::Pin),
+            (change_reference_data::INS_CHANGE_REFERENCE_DATA, _, 0x80) if n == 16 => {
+                Some(Self::Pin)
+            }
+            (change_reference_data::INS_CHANGE_REFERENCE_DATA, _, 0x81) if n == 16 => {
+                Some(Self::Puk)
+            }
+            (reset_retry_counter::INS_RESET_RETRY_COUNTER, 0x00, 0x80) if n == 16 => {
+                Some(Self::Puk)
+            }
             _ => None,
         }
     }
