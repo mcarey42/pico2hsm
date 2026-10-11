@@ -43,11 +43,11 @@ pub fn init_code<'a>(cmd: &ApduCommand<'a>) -> Option<&'a [u8]> {
 pub fn well_formed(cmd: &ApduCommand<'_>) -> bool {
     let d = cmd.data;
     init_code(cmd).is_some()
-        && find_tlv(d, 0x81).is_none_or(|p| (6..=16).contains(&p.len()))
+        && find_tlv(d, 0x81).map_or(true, |p| (6..=16).contains(&p.len()))
         && find_tlv(d, 0x91)
             .and_then(|v| v.first().copied())
-            .is_none_or(|r| (1..=15).contains(&r))
-        && find_tlv(d, 0x93).is_none_or(|p| (8..=16).contains(&p.len()))
+            .map_or(true, |r| (1..=15).contains(&r))
+        && find_tlv(d, 0x93).map_or(true, |p| (8..=16).contains(&p.len()))
 }
 
 fn find_tlv(data: &[u8], tag: u8) -> Option<&[u8]> {
