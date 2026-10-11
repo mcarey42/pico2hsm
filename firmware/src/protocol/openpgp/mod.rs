@@ -471,15 +471,13 @@ impl OpenPgp {
         &mut self,
         apdu: &[u8],
         store: &mut dyn crate::storage::KeyStore,
-    ) -> Vec<u8, 4096> {
+    ) -> Vec<u8, 4098> {
         let resp = match pico2hsm_core::apdu::ApduCommand::parse(apdu) {
             Ok(cmd) => self.dispatch_with_store(&cmd, store),
             Err(_) => ApduResponse::err(SW_INS_NOT_SUPPORTED),
         };
-        let serialized = resp.serialize();
-        let mut out: Vec<u8, 4096> = Vec::new();
-        let _ = out.extend_from_slice(&serialized[..serialized.len().min(4096)]);
-        out
+        // Full serialized response: data (≤4096) + SW — never truncated.
+        resp.serialize()
     }
 
     /// Serialize and persist PW1 state to flash.
@@ -662,15 +660,13 @@ impl OpenPgp {
 }
 
 impl HsmProtocol for OpenPgp {
-    fn process_apdu(&mut self, apdu: &[u8]) -> Vec<u8, 4096> {
+    fn process_apdu(&mut self, apdu: &[u8]) -> Vec<u8, 4098> {
         let resp = match ApduCommand::parse(apdu) {
             Ok(cmd) => self.dispatch(&cmd),
             Err(_) => ApduResponse::err(SW_INS_NOT_SUPPORTED),
         };
-        let serialized = resp.serialize();
-        let mut out: Vec<u8, 4096> = Vec::new();
-        let _ = out.extend_from_slice(&serialized[..serialized.len().min(4096)]);
-        out
+        // Full serialized response: data (≤4096) + SW — never truncated.
+        resp.serialize()
     }
 
     fn handles_aid(&self, aid: &[u8]) -> bool {
@@ -690,9 +686,10 @@ mod terminate_tests {
     use pico2hsm_core::error::HsmError;
     use pico2hsm_core::key::{AppletId, KeyId};
 
-    /// Records which owner was wiped.
+    /// Records which owner was wiped; optionally fails the wipe.
     struct WipeStore {
         wiped: Option<AppletId>,
+        fail: bool,
     }
 
     impl crate::storage::KeyStore for WipeStore {
@@ -709,6 +706,9 @@ mod terminate_tests {
             Ok(())
         }
         fn wipe_by_owner(&mut self, owner: AppletId) -> Result<(), HsmError> {
+            if self.fail {
+                return Err(HsmError::NotSupported);
+            }
             self.wiped = Some(owner);
             Ok(())
         }
@@ -727,7 +727,10 @@ mod terminate_tests {
         key.extend_from_slice(&pattern).unwrap();
         pgp.state.sig_private = Some(key);
 
-        let mut store = WipeStore { wiped: None };
+        let mut store = WipeStore {
+            wiped: None,
+            fail: false,
+        };
         let r = pgp.process_apdu_with_store(&[0x00, 0xE6, 0x00, 0x00], &mut store);
         assert_eq!(&r[r.len() - 2..], &[0x90, 0x00]);
         assert_eq!(store.wiped, Some(AppletId::OpenPgp), "flash records erased");
@@ -742,5 +745,26 @@ mod terminate_tests {
             !bytes.windows(32).any(|w| w == pattern),
             "key bytes zeroized in place"
         );
+    }
+
+    #[test]
+    fn failed_flash_wipe_leaves_card_unchanged() {
+        let mut pgp = OpenPgp::new();
+        pgp.state.pw3_verified = true;
+        let mut key = heapless::Vec::new();
+        key.extend_from_slice(&[0x11u8; 32]).unwrap();
+        pgp.state.sig_private = Some(key);
+
+        let mut store = WipeStore {
+            wiped: None,
+            fail: true,
+        };
+        let r = pgp.process_apdu_with_store(&[0x00, 0xE6, 0x00, 0x00], &mut store);
+        assert_eq!(&r[r.len() - 2..], &[0x65, 0x81]);
+        assert!(
+            !pgp.state.terminated,
+            "not terminated: flash still holds the keys"
+        );
+        assert!(pgp.state.sig_private.is_some(), "RAM still matches flash");
     }
 }

@@ -34,23 +34,25 @@ pub const INS_ACTIVATE_FILE: u8 = 0x44;
 /// SW for "selected file in termination state" (ISO 7816-4).
 pub const SW_FILE_TERMINATED: u16 = 0x6285;
 
-/// TERMINATE DF with persistence: also erase every OpenPGP record (keys,
-/// PW1/PW3) from flash, so a reset cannot bring the old keys back under the
-/// default PINs.  A failed erase still clears RAM but reports 6581.
+/// TERMINATE DF with persistence: erase every OpenPGP record (keys, PW1/PW3)
+/// from flash first, so a reset cannot bring the old keys back under the
+/// default PINs.  RAM is wiped only once the erase succeeded; a failed erase
+/// returns 6581 and leaves the card unchanged, so RAM and flash never drift.
 pub fn handle_terminate_with_store(
     state: &mut OpenPgpState,
     store: &mut dyn crate::storage::KeyStore,
     cmd: &ApduCommand<'_>,
 ) -> ApduResponse {
-    let resp = handle_terminate(state, cmd);
-    if resp.sw == pico2hsm_core::apdu::SW_OK
-        && store
-            .wipe_by_owner(pico2hsm_core::key::AppletId::OpenPgp)
-            .is_err()
+    if !state.pw3_verified {
+        return ApduResponse::err(SW_SECURITY_STATUS);
+    }
+    if store
+        .wipe_by_owner(pico2hsm_core::key::AppletId::OpenPgp)
+        .is_err()
     {
         return ApduResponse::err(pico2hsm_core::apdu::SW_MEMORY_FAILURE);
     }
-    resp
+    handle_terminate(state, cmd)
 }
 
 /// Handle TERMINATE DF — mark card as terminated, wipe keys and PINs.
