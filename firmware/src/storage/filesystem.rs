@@ -364,6 +364,10 @@ pub struct KeyFilesystem<Chip: FlashChip> {
     /// ones (a PIN record rewritten on every VERIFY used to ping-pong
     /// between the same two sectors).
     alloc_cursor: u32,
+    /// A directory copy could not be read at mount.  The directory in RAM
+    /// may then be older than flash (or empty), so every write is refused:
+    /// it would overwrite the real directory or allocate over live keys.
+    read_only: bool,
 }
 
 impl<Chip: FlashChip> KeyFilesystem<Chip> {
@@ -375,6 +379,7 @@ impl<Chip: FlashChip> KeyFilesystem<Chip> {
             dir_slot: 0,
             dir_seq: 0,
             alloc_cursor: 0,
+            read_only: false,
         }
     }
 
@@ -407,11 +412,12 @@ impl<Chip: FlashChip> KeyFilesystem<Chip> {
                     .read(sector * SECTOR_SIZE as u32, buf)
                     .is_err()
                 {
-                    defmt::warn!(
-                        "KeyFilesystem: chip {} directory slot {} unreadable",
+                    defmt::error!(
+                        "KeyFilesystem: chip {} directory slot {} unreadable — read-only",
                         chip_index,
                         slot
                     );
+                    self.read_only = true;
                     continue;
                 }
                 match Directory::validate(buf) {
@@ -483,6 +489,9 @@ impl<Chip: FlashChip> KeyFilesystem<Chip> {
     pub fn flush_directory(&mut self) -> Result<(), StorageError> {
         if !self.directory.dirty {
             return Ok(());
+        }
+        if self.read_only {
+            return Err(StorageError::ReadError);
         }
         // Write the copy that is not current; the current one stays valid
         // until the new one is complete.
@@ -610,6 +619,9 @@ impl<Chip: FlashChip> KeyFilesystem<Chip> {
         plaintext_hash: &[u8; 32],
         sector_count: u8,
     ) -> Result<(), StorageError> {
+        if self.read_only {
+            return Err(StorageError::ReadError);
+        }
         // Find a chip and free sector.
         let (chip_index, free_sector) = self.find_free_location(sector_count as u32)?;
         self.alloc_cursor = free_sector + sector_count as u32;
@@ -745,6 +757,9 @@ impl<Chip: FlashChip> KeyFilesystem<Chip> {
 
     /// Delete a key: erase its sector(s), remove from directory.
     pub fn delete_key(&mut self, key_id: KeyId) -> Result<(), StorageError> {
+        if self.read_only {
+            return Err(StorageError::ReadError);
+        }
         // Look up entry before removing from directory.
         let (chip_index, sector_index, sector_count) = {
             let entry = self.directory.find(key_id).ok_or(StorageError::ReadError)?;
@@ -822,6 +837,9 @@ impl<Chip: FlashChip> KeyFilesystem<Chip> {
         pred: &dyn Fn(KeyId) -> bool,
         max: usize,
     ) -> Result<bool, StorageError> {
+        if self.read_only {
+            return Err(StorageError::ReadError);
+        }
         let mut done = 0usize;
         for i in 0..self.directory.entries.len() {
             let e = &self.directory.entries[i];
