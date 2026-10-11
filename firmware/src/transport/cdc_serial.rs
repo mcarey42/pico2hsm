@@ -139,12 +139,23 @@ pub async fn drain_one<'d, D: embassy_usb::driver::Driver<'d>>(
     }
 
     // Send in ≤63-byte chunks (never exact max_packet_size to avoid ZLP ambiguity).
+    // DTR only says a terminal has the port open, not that it is reading: a
+    // stalled reader would block write_packet — and the CCID loop with it —
+    // forever, so each chunk gets a deadline and the rest of the line is
+    // dropped on timeout.
+    use embassy_futures::select::{select, Either};
     let mut sent = 0usize;
     while sent < line.len() {
         let end = core::cmp::min(sent + 63, line.len());
-        if sender.write_packet(&line[sent..end]).await.is_err() {
-            break; // USB disconnected — drop remaining bytes
+        match select(
+            sender.write_packet(&line[sent..end]),
+            embassy_time::Timer::after_millis(50),
+        )
+        .await
+        {
+            Either::First(Ok(())) => sent = end,
+            // USB disconnected, or the host is not reading: drop the rest.
+            Either::First(Err(_)) | Either::Second(()) => break,
         }
-        sent = end;
     }
 }
