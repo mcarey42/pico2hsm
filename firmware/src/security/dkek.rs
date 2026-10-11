@@ -325,11 +325,12 @@ impl DkekManager {
         if received_now >= total {
             // All shares collected — move to Ready state.
             // Extract the accumulated DKEK before replacing status.
-            let dkek_val: [u8; 32] = **accumulated; // Copy inner array before zeroizing
+            let mut dkek_val: [u8; 32] = **accumulated;
             self.status.zeroize();
             self.status = DkekStatus::Ready {
                 dkek: Zeroizing::new(dkek_val),
             };
+            dkek_val.zeroize(); // the stack copy, not just the stored value
             Ok(DkekImportResult::Complete)
         } else {
             Ok(DkekImportResult::MoreSharesNeeded {
@@ -371,11 +372,12 @@ impl DkekManager {
 
         if received_now >= total {
             // All shares collected — move to Ready state.
-            let dkek_val: [u8; 32] = **accumulated;
+            let mut dkek_val: [u8; 32] = **accumulated;
             self.status.zeroize();
             self.status = DkekStatus::Ready {
                 dkek: Zeroizing::new(dkek_val),
             };
+            dkek_val.zeroize(); // the stack copy, not just the stored value
             Ok(DkekImportResult::Complete)
         } else {
             Ok(DkekImportResult::MoreSharesNeeded {
@@ -654,9 +656,8 @@ impl DkekManager {
             .map_err(|_| DkekError::EncryptFailure)?;
 
         // Zeroize plaintext buffer.
-        for b in pt.iter_mut() {
-            *b = 0;
-        }
+        // Volatile wipes: a plain loop over a dead buffer can be optimised out.
+        pt.zeroize();
 
         // Assemble output: KCV(8) || 0x02 || IV(16) || ciphertext || MAC(16),
         // MAC = HMAC-SHA256(kmac, everything before it) — encrypt-then-MAC.
@@ -708,7 +709,8 @@ impl DkekManager {
             return Err(DkekError::InvalidWrapBlob);
         }
         // AES-256-CBC decrypt.
-        let mut pt_buf = [0u8; 2400];
+        // Self-wiping: also covers the early error returns below.
+        let mut pt_buf = Zeroizing::new([0u8; 2400]);
         if ct_len > pt_buf.len() {
             return Err(DkekError::InvalidWrapBlob);
         }
