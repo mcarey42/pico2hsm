@@ -175,6 +175,11 @@ impl CcidHeader {
 
 // ─── CcidError ────────────────────────────────────────────────────────────
 
+/// Longest a single bulk-IN packet may wait for the host to read it.  A
+/// host expecting a reply polls continuously, so this only trips when the
+/// host has gone away.
+const WRITE_TIMEOUT: embassy_time::Duration = embassy_time::Duration::from_secs(2);
+
 /// Errors returned by the CCID transport.
 #[derive(Debug)]
 pub enum CcidError {
@@ -530,8 +535,7 @@ impl<'d, D: Driver<'d>> CcidTransport<'d, D> {
     async fn write_response(&mut self, data: &[u8]) -> Result<(), CcidError> {
         if data.is_empty() {
             // Zero-length packet
-            self.write_ep.write(&[]).await?;
-            return Ok(());
+            return self.write_packet(&[]).await;
         }
 
         // Stop if the host session ends mid-message: the remaining packets
@@ -543,10 +547,24 @@ impl<'d, D: Driver<'d>> CcidTransport<'d, D> {
                 return Err(CcidError::UsbDisconnected);
             }
             let end = (offset + BULK_MAX_PACKET_SIZE as usize).min(data.len());
-            self.write_ep.write(&data[offset..end]).await?;
+            self.write_packet(&data[offset..end]).await?;
             offset = end;
         }
         Ok(())
+    }
+
+    /// Write one bulk-IN packet.  A host that stops reading would otherwise
+    /// block core0 here forever — no flash service for core1, no stall
+    /// check, not even the watchdog's reset.  Treat it as an abandoned
+    /// session: end it (so nothing it authenticated carries over) and fail.
+    async fn write_packet(&mut self, pkt: &[u8]) -> Result<(), CcidError> {
+        match embassy_time::with_timeout(WRITE_TIMEOUT, self.write_ep.write(pkt)).await {
+            Ok(r) => Ok(r?),
+            Err(_) => {
+                crate::bump_session_epoch();
+                Err(CcidError::UsbDisconnected)
+            }
+        }
     }
 
     /// Handle `PC_TO_RDR_ICCPOWERON`: respond with ATR in a DataBlock.
