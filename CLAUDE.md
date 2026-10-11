@@ -128,7 +128,7 @@ via the `applet_id` byte (bits 23–16); SC-HSM `INITIALIZE` calls
 `KeyId` u32 encoding (in `pico2hsm-core/src/key.rs`):
 ```
 bits 31–24: partition_id  (u8)  — 0 = default partition
-bits 23–16: applet_id     (u8)  — 0=SC-HSM, 1=PIV, 2=OpenPGP
+bits 23–16: applet_id     (u8)  — 0=SC-HSM, 1=PIV, 2=OpenPGP, 0x10=domain records
 bits 15–8:  reserved            — always 0
 bits  7–0:  proto_ref     (u8)  — protocol-level key reference
 ```
@@ -197,8 +197,14 @@ when changing the code.
   in a handler: report 6581 and keep RAM consistent with flash.
 - **OTP layout lives in `security/otp_layout.rs`** (compile-time overlap
   checks). Never hard-code OTP rows elsewhere; never write row 0x110.
-- **Reserved SC-HSM key refs 0xFC–0xFF** (peer record, DKEK, device key, PIN
-  record) are refused by every user key command (`targets_reserved_slot`).
+- **Reserved SC-HSM key refs 0xFC–0xFF** (legacy peer record, migrated at
+  boot to the single-use pinned peer; DKEK; device key; PIN record) are
+  refused by every user key command (`targets_reserved_slot`).
+- **Domain records** (cluster plan V3: object-ID sidecars, member
+  certificates, the pinned peer) use applet byte 0x10 (`AppletId::Domain`,
+  `firmware/src/domain/`). SC-HSM INITIALIZE wipes them with its keys; PIV
+  and OpenPGP resets never touch them. The Lamport change counter lives in
+  the retry-counter log and is advanced before the change it numbers.
 - **The DKEK** is persisted at 0xFD, only replaced by an authenticated,
   SO-PIN, enrolled-peer exchange, never overwritten while set.
 - **Secrets are wiped in place.** Zeroize before moving or dropping; use
