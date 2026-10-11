@@ -154,7 +154,7 @@ fn extended_capabilities() -> [u8; 10] {
     //   0x01 = KDF-DO — NO
     // (Was 0x54, advertising 0x10 under the mistaken name "key import".)
     let byte0: u8 = 0x44;
-                          // Byte 1: 0x00 (no SM, no MSE, no PIN block 2)
+    // Byte 1: 0x00 (no SM, no MSE, no PIN block 2)
     let byte1: u8 = 0x00;
     // Bytes 2-3: max GET CHALLENGE length = 0x00FF (255 bytes)
     // Bytes 4-5: max certificate length = 0x0400 (1024 bytes, per cardholder_cert field size)

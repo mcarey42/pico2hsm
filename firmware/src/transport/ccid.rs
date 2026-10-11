@@ -473,61 +473,61 @@ impl<'d, D: Driver<'d>> CcidTransport<'d, D> {
 
         // `buf` arrives empty; on a restart it holds the new message's first packet.
         'message: loop {
-        // Read packets until we have at least the 10-byte CCID header.
-        while buf.len() < CCID_HEADER_LEN {
-            let n = self.read_ep.read(&mut pkt).await?;
-            let now = crate::SESSION_EPOCH.load(core::sync::atomic::Ordering::SeqCst);
-            if now != epoch {
-                buf.clear();
-                epoch = now;
-            }
-            buf.extend_from_slice(&pkt[..n])
-                .map_err(|_| CcidError::BufferOverflow)?;
-        }
-
-        let header = CcidHeader::from_bytes(buf).ok_or(CcidError::MalformedMessage)?;
-        let payload_len = header.length as usize;
-        let total = CCID_HEADER_LEN.saturating_add(payload_len);
-
-        if total > buf.capacity() {
-            // Too big to hold.  Consume the rest of this message (up to its
-            // declared end or a short packet) so the next read starts at a
-            // header — otherwise payload bytes would be parsed as headers
-            // and the bulk pipe would stay out of step — then fail it.
-            let mut consumed = buf.len();
-            while consumed < total {
+            // Read packets until we have at least the 10-byte CCID header.
+            while buf.len() < CCID_HEADER_LEN {
                 let n = self.read_ep.read(&mut pkt).await?;
-                consumed += n;
-                if n < pkt.len() {
-                    break;
+                let now = crate::SESSION_EPOCH.load(core::sync::atomic::Ordering::SeqCst);
+                if now != epoch {
+                    buf.clear();
+                    epoch = now;
                 }
-            }
-            // bmCommandStatus = failed (0x40), bError = 0x01: offset of the
-            // offending dwLength field (CCID §6.2.6).
-            let resp = self.build_slot_status(header.seq, 0x40, 0x01);
-            self.write_response(&resp).await?;
-            return Err(CcidError::BufferOverflow);
-        }
-
-        // Read remaining packets until we have the full message.
-        while buf.len() < total {
-            let n = self.read_ep.read(&mut pkt).await?;
-            let now = crate::SESSION_EPOCH.load(core::sync::atomic::Ordering::SeqCst);
-            if now != epoch {
-                // The session ended mid-message: this packet starts the
-                // next session's first message, not the rest of this one.
-                epoch = now;
-                buf.clear();
                 buf.extend_from_slice(&pkt[..n])
                     .map_err(|_| CcidError::BufferOverflow)?;
-                continue 'message;
             }
-            buf.extend_from_slice(&pkt[..n])
-                .map_err(|_| CcidError::BufferOverflow)?;
-        }
-        buf.truncate(total);
-        self.msg_epoch = epoch;
-        return Ok(header);
+
+            let header = CcidHeader::from_bytes(buf).ok_or(CcidError::MalformedMessage)?;
+            let payload_len = header.length as usize;
+            let total = CCID_HEADER_LEN.saturating_add(payload_len);
+
+            if total > buf.capacity() {
+                // Too big to hold.  Consume the rest of this message (up to its
+                // declared end or a short packet) so the next read starts at a
+                // header — otherwise payload bytes would be parsed as headers
+                // and the bulk pipe would stay out of step — then fail it.
+                let mut consumed = buf.len();
+                while consumed < total {
+                    let n = self.read_ep.read(&mut pkt).await?;
+                    consumed += n;
+                    if n < pkt.len() {
+                        break;
+                    }
+                }
+                // bmCommandStatus = failed (0x40), bError = 0x01: offset of the
+                // offending dwLength field (CCID §6.2.6).
+                let resp = self.build_slot_status(header.seq, 0x40, 0x01);
+                self.write_response(&resp).await?;
+                return Err(CcidError::BufferOverflow);
+            }
+
+            // Read remaining packets until we have the full message.
+            while buf.len() < total {
+                let n = self.read_ep.read(&mut pkt).await?;
+                let now = crate::SESSION_EPOCH.load(core::sync::atomic::Ordering::SeqCst);
+                if now != epoch {
+                    // The session ended mid-message: this packet starts the
+                    // next session's first message, not the rest of this one.
+                    epoch = now;
+                    buf.clear();
+                    buf.extend_from_slice(&pkt[..n])
+                        .map_err(|_| CcidError::BufferOverflow)?;
+                    continue 'message;
+                }
+                buf.extend_from_slice(&pkt[..n])
+                    .map_err(|_| CcidError::BufferOverflow)?;
+            }
+            buf.truncate(total);
+            self.msg_epoch = epoch;
+            return Ok(header);
         }
     }
 

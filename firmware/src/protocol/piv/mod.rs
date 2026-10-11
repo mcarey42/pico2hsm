@@ -607,7 +607,9 @@ impl Piv {
                 if let Some(tag_low) = put_data::object_tag_low(cmd.data) {
                     let cached = self.state.data_objects.iter().any(|o| o.tag_low == tag_low);
                     if !cached && get_data::readable(&self.state, tag_low) {
-                        if let Ok(Some(rec)) = store.fetch_key(Self::piv_data_object_key_id(tag_low)) {
+                        if let Ok(Some(rec)) =
+                            store.fetch_key(Self::piv_data_object_key_id(tag_low))
+                        {
                             return ApduResponse::ok(&rec.private_key);
                         }
                     }
@@ -913,7 +915,9 @@ mod retry_persistence_tests {
         };
         assert_eq!(verify(&mut piv, &mut store, DEFAULT_PIV_PIN), 0x9000);
         // GENERATE 9A, P-256.
-        let apdu = [0x00, 0x47, 0x00, 0x9A, 0x05, 0xAC, 0x03, 0x80, 0x01, 0x11, 0x00];
+        let apdu = [
+            0x00, 0x47, 0x00, 0x9A, 0x05, 0xAC, 0x03, 0x80, 0x01, 0x11, 0x00,
+        ];
         let r = piv.process_apdu_with_store(&apdu, &mut store);
         assert_eq!(&r[r.len() - 2..], &[0x69, 0x82], "PIN alone is not enough");
     }
@@ -1040,7 +1044,11 @@ mod data_object_tests {
         let mut store = MemStore {
             records: heapless::Vec::new(),
         };
-        let get = |low: u8| [0x00, 0xCB, 0x3F, 0xFF, 0x05, 0x5C, 0x03, 0x5F, 0xC1, low, 0x00];
+        let get = |low: u8| {
+            [
+                0x00, 0xCB, 0x3F, 0xFF, 0x05, 0x5C, 0x03, 0x5F, 0xC1, low, 0x00,
+            ]
+        };
         for low in 1..=6u8 {
             assert_eq!(
                 sw(&piv.process_apdu_with_store(&put_data(low, &[low; 40]), &mut store)),
@@ -1049,7 +1057,10 @@ mod data_object_tests {
             );
         }
         // 5FC103 (fingerprints) needs the PIN.
-        assert_eq!(sw(&piv.process_apdu_with_store(&get(3), &mut store)), 0x6982);
+        assert_eq!(
+            sw(&piv.process_apdu_with_store(&get(3), &mut store)),
+            0x6982
+        );
         piv.state.pin_verified = true;
         for low in 1..=6u8 {
             let r = piv.process_apdu_with_store(&get(low), &mut store);
@@ -1061,7 +1072,10 @@ mod data_object_tests {
             sw(&piv.process_apdu_with_store(&put_data(1, &[]), &mut store)),
             0x9000
         );
-        assert_eq!(sw(&piv.process_apdu_with_store(&get(1), &mut store)), 0x6A82);
+        assert_eq!(
+            sw(&piv.process_apdu_with_store(&get(1), &mut store)),
+            0x6A82
+        );
     }
 
     #[test]
@@ -1078,7 +1092,11 @@ mod data_object_tests {
         let ids: heapless::Vec<KeyId, 4> = store.records.iter().map(|(k, _)| *k).collect();
         assert_eq!(
             &ids[..],
-            &[Piv::piv_pin_key_id(), Piv::piv_mgmt_key_id(), Piv::piv_data_object_key_id(0x05)]
+            &[
+                Piv::piv_pin_key_id(),
+                Piv::piv_mgmt_key_id(),
+                Piv::piv_data_object_key_id(0x05)
+            ]
         );
     }
 

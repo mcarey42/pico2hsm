@@ -403,8 +403,15 @@ impl<Chip: FlashChip> KeyFilesystem<Chip> {
         let mut best: Option<(usize, usize, u32)> = None;
         for chip_index in 0..self.chips.len() {
             for (slot, &sector) in DIR_SLOTS.iter().enumerate() {
-                if self.chips[chip_index].read(sector * SECTOR_SIZE as u32, buf).is_err() {
-                    defmt::warn!("KeyFilesystem: chip {} directory slot {} unreadable", chip_index, slot);
+                if self.chips[chip_index]
+                    .read(sector * SECTOR_SIZE as u32, buf)
+                    .is_err()
+                {
+                    defmt::warn!(
+                        "KeyFilesystem: chip {} directory slot {} unreadable",
+                        chip_index,
+                        slot
+                    );
                     continue;
                 }
                 match Directory::validate(buf) {
@@ -740,7 +747,10 @@ impl<Chip: FlashChip> KeyFilesystem<Chip> {
         sector_index: u32,
         sector_count: u32,
     ) -> Result<(), StorageError> {
-        let chip = self.chips.get_mut(chip_index).ok_or(StorageError::WriteError)?;
+        let chip = self
+            .chips
+            .get_mut(chip_index)
+            .ok_or(StorageError::WriteError)?;
         for s in 0..sector_count {
             let addr = (sector_index + s) * SECTOR_SIZE as u32;
             if let Err(e) = chip.erase_sector(addr) {

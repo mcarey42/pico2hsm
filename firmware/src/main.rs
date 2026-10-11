@@ -977,7 +977,11 @@ async fn run_one_board(p: embassy_rp::Peripherals) {
                         match send_and_wipe(&mut ccid, &mut response, epoch).await {
                             Ok(()) => {
                                 for _ in 0..16 {
-                                    if !pico2hsm_firmware::transport::cdc_serial::drain_one(&mut cdc_sender).await {
+                                    if !pico2hsm_firmware::transport::cdc_serial::drain_one(
+                                        &mut cdc_sender,
+                                    )
+                                    .await
+                                    {
                                         break;
                                     }
                                 }
@@ -988,7 +992,10 @@ async fn run_one_board(p: embassy_rp::Peripherals) {
                                 let _ = recv_core1_response(store, dispatcher_ptr).await;
                                 break;
                             }
-                            Err(e) => defmt::error!("CCID: response not sent: {:?}", defmt::Debug2Format(&e)),
+                            Err(e) => defmt::error!(
+                                "CCID: response not sent: {:?}",
+                                defmt::Debug2Format(&e)
+                            ),
                         }
                         board.led().set_status(LedStatus::Ready);
                     }
@@ -1434,7 +1441,11 @@ async fn run_geek_board(p: embassy_rp::Peripherals) {
                                     board.led().flush().await;
                                 }
                                 for _ in 0..16 {
-                                    if !pico2hsm_firmware::transport::cdc_serial::drain_one(&mut cdc_sender).await {
+                                    if !pico2hsm_firmware::transport::cdc_serial::drain_one(
+                                        &mut cdc_sender,
+                                    )
+                                    .await
+                                    {
                                         break;
                                     }
                                 }
@@ -1446,7 +1457,10 @@ async fn run_geek_board(p: embassy_rp::Peripherals) {
                                 display_state.status = LedStatus::Ready;
                                 break;
                             }
-                            Err(e) => defmt::error!("CCID: response not sent: {:?}", defmt::Debug2Format(&e)),
+                            Err(e) => defmt::error!(
+                                "CCID: response not sent: {:?}",
+                                defmt::Debug2Format(&e)
+                            ),
                         }
                     }
 
@@ -1628,7 +1642,11 @@ async fn run_pico2_board(p: embassy_rp::Peripherals) {
                         match send_and_wipe(&mut ccid, &mut response, epoch).await {
                             Ok(()) => {
                                 for _ in 0..16 {
-                                    if !pico2hsm_firmware::transport::cdc_serial::drain_one(&mut cdc_sender).await {
+                                    if !pico2hsm_firmware::transport::cdc_serial::drain_one(
+                                        &mut cdc_sender,
+                                    )
+                                    .await
+                                    {
                                         break;
                                     }
                                 }
@@ -1639,7 +1657,10 @@ async fn run_pico2_board(p: embassy_rp::Peripherals) {
                                 let _ = recv_core1_response(store, dispatcher_ptr).await;
                                 break;
                             }
-                            Err(e) => defmt::error!("CCID: response not sent: {:?}", defmt::Debug2Format(&e)),
+                            Err(e) => defmt::error!(
+                                "CCID: response not sent: {:?}",
+                                defmt::Debug2Format(&e)
+                            ),
                         }
                         board.led().set_status(LedStatus::Ready);
                     }
@@ -2170,7 +2191,11 @@ async fn run_waveshare_lcd_board(p: embassy_rp::Peripherals) {
                                     .await;
                                 }
                                 for _ in 0..16 {
-                                    if !pico2hsm_firmware::transport::cdc_serial::drain_one(&mut cdc_sender).await {
+                                    if !pico2hsm_firmware::transport::cdc_serial::drain_one(
+                                        &mut cdc_sender,
+                                    )
+                                    .await
+                                    {
                                         break;
                                     }
                                 }
@@ -2182,7 +2207,10 @@ async fn run_waveshare_lcd_board(p: embassy_rp::Peripherals) {
                                 display_state.status = LedStatus::Ready;
                                 break;
                             }
-                            Err(e) => defmt::error!("CCID: response not sent: {:?}", defmt::Debug2Format(&e)),
+                            Err(e) => defmt::error!(
+                                "CCID: response not sent: {:?}",
+                                defmt::Debug2Format(&e)
+                            ),
                         }
                     }
                     Err(CcidError::UsbDisconnected) => {

@@ -130,7 +130,9 @@ pub struct WatchdogSuppressGuard(());
 impl WatchdogSuppressGuard {
     /// Disarm the core1 stall detector until the guard is dropped.
     pub fn new() -> Self {
-        let until = uptime_secs().saturating_add(WATCHDOG_SUPPRESS_MAX_SECS).max(1);
+        let until = uptime_secs()
+            .saturating_add(WATCHDOG_SUPPRESS_MAX_SECS)
+            .max(1);
         WATCHDOG_SUPPRESS_UNTIL.store(until, core::sync::atomic::Ordering::Relaxed);
         WatchdogSuppressGuard(())
     }

@@ -515,7 +515,9 @@ impl OpenPgp {
     ) -> ApduResponse {
         match cmd.ins {
             generate_keypair::INS_GENERATE_KEYPAIR
-                if cmd.p1 == 0x80 && self.state.pw3_verified && !self.state.credentials_persisted =>
+                if cmd.p1 == 0x80
+                    && self.state.pw3_verified
+                    && !self.state.credentials_persisted =>
             {
                 // First key for this card: PW1/PW3 go to flash first (see
                 // `OpenPgpState::credentials_persisted`).
@@ -659,14 +661,24 @@ impl OpenPgp {
             }
         });
         for kid in do_ids.iter() {
-            if let (Some(tag), Ok(Some(rec))) = (put_data::tag_of_record(*kid), store.fetch_key(*kid)) {
+            if let (Some(tag), Ok(Some(rec))) =
+                (put_data::tag_of_record(*kid), store.fetch_key(*kid))
+            {
                 let _ = put_data::set_do(&mut self.state, tag, &rec.private_key);
             }
         }
         let mut persisted = true;
         for (kid, hash, retries) in [
-            (OPENPGP_PW1_KEY_ID, &mut self.state.pw1_hash, &mut self.state.pw1_retries),
-            (OPENPGP_PW3_KEY_ID, &mut self.state.pw3_hash, &mut self.state.pw3_retries),
+            (
+                OPENPGP_PW1_KEY_ID,
+                &mut self.state.pw1_hash,
+                &mut self.state.pw1_retries,
+            ),
+            (
+                OPENPGP_PW3_KEY_ID,
+                &mut self.state.pw3_hash,
+                &mut self.state.pw3_retries,
+            ),
         ] {
             match store.fetch_key(kid) {
                 Ok(Some(obj)) => match decode_pw(&obj.private_key) {
@@ -1021,7 +1033,8 @@ mod pw_tests {
         );
         let fp = [0x7Au8; 20];
         let mut put: heapless::Vec<u8, 64> = heapless::Vec::new();
-        put.extend_from_slice(&[0x00, 0xDA, 0x00, 0xC7, 20]).unwrap();
+        put.extend_from_slice(&[0x00, 0xDA, 0x00, 0xC7, 20])
+            .unwrap();
         put.extend_from_slice(&fp).unwrap();
         assert_eq!(sw(&mut pgp, &mut store, &put), 0x9000);
 
