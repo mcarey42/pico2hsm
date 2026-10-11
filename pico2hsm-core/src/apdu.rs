@@ -19,6 +19,9 @@ pub const SW_OK: u16 = 0x9000;
 pub const SW_WRONG_LENGTH: u16 = 0x6700;
 
 /// Security status not satisfied (authentication required).
+/// Memory failure — a persistent write did not complete.
+pub const SW_MEMORY_FAILURE: u16 = 0x6581;
+
 pub const SW_SECURITY_STATUS: u16 = 0x6982;
 
 /// Authentication method blocked (PIN locked).
@@ -32,6 +35,9 @@ pub const SW_CONDITIONS_NOT_SATISFIED: u16 = 0x6985;
 
 /// Wrong data in command data field.
 pub const SW_WRONG_DATA: u16 = 0x6A80;
+
+/// Function not supported (e.g. a key type a format cannot express).
+pub const SW_FUNC_NOT_SUPPORTED: u16 = 0x6A81;
 
 /// File or application not found.
 pub const SW_FILE_NOT_FOUND: u16 = 0x6A82;
@@ -110,7 +116,7 @@ impl<'a> ApduCommand<'a> {
         if raw[4] == 0x00 && raw.len() != 5 {
             if raw.len() == 7 {
                 // Case 2E — two-byte Le; 0x0000 means 65536 (stored as 0)
-                let le = (raw[5] as u16) << 8 | (raw[6] as u16);
+                let le = u16::from(raw[5]) << 8 | u16::from(raw[6]);
                 return Ok(ApduCommand {
                     cla,
                     ins,
@@ -132,7 +138,7 @@ impl<'a> ApduCommand<'a> {
                     None
                 } else if raw.len() == data_end + 2 {
                     // Case 4E — two-byte Le; 0x0000 means 65536 (stored as 0)
-                    let le = (raw[data_end] as u16) << 8 | (raw[data_end + 1] as u16);
+                    let le = u16::from(raw[data_end]) << 8 | u16::from(raw[data_end + 1]);
                     Some(le)
                 } else {
                     return Err(ProtocolError::InvalidLe);
@@ -176,7 +182,11 @@ impl<'a> ApduCommand<'a> {
         } else if raw.len() == data_end + 1 {
             // Case 4S — one Le byte
             let le_byte = raw[data_end];
-            Some(if le_byte == 0 { 256 } else { le_byte as u16 })
+            Some(if le_byte == 0 {
+                256
+            } else {
+                u16::from(le_byte)
+            })
         } else {
             return Err(ProtocolError::InvalidLe);
         };
@@ -237,7 +247,7 @@ impl ApduResponse {
         let _ = buf.extend_from_slice(&data[..data.len().min(4096)]);
         ApduResponse {
             data: buf,
-            sw: 0x6100 | (next_len as u16),
+            sw: 0x6100 | u16::from(next_len),
         }
     }
 

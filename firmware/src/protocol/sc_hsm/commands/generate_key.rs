@@ -5,11 +5,11 @@
 //!
 //! # Command format
 //! - P1: key ID (0x01–0xFE)
-//! - P2: 0x00
-//! - Data: one-byte algorithm tag:
-//!   - 0x82: AES-128 (16 bytes)
-//!   - 0x83: AES-192 (24 bytes)
-//!   - 0x84: AES-256 (32 bytes)
+//! - SmartCard-HSM form: P2 = B0 / B1 / B2 (AES-128 / 192 / 256), data =
+//!   optional key attributes (`90` use counter, `91` algorithm list, `92`
+//!   key domain; see `key_policy`).
+//! - pico2hsm legacy form: P2 = 00, data = one-byte size tag 0x82 / 0x83 /
+//!   0x84 (AES-128 / 192 / 256), then the same optional attributes.
 
 use pico2hsm_core::{
     apdu::{
@@ -41,17 +41,23 @@ pub fn handle(
         return ApduResponse::err(SW_WRONG_DATA);
     }
 
-    // Data field must contain the algorithm tag
-    let algo_tag = match cmd.data.first().copied() {
-        Some(t @ (0x82 | 0x83 | 0x84)) => t,
-        _ => return ApduResponse::err(SW_WRONG_DATA),
+    // Key size and the key attributes (tags 90/91/92):
+    // - SmartCard-HSM: P2 = B0/B1/B2 (AES-128/192/256), data = attributes;
+    // - pico2hsm legacy: P2 = 00, data = 82/83/84 then attributes.
+    let (key_len, attrs): (usize, &[u8]) = match cmd.p2 {
+        0xB0 => (16, cmd.data),
+        0xB1 => (24, cmd.data),
+        0xB2 => (32, cmd.data),
+        _ => match cmd.data.split_first() {
+            Some((0x82, rest)) => (16, rest),
+            Some((0x83, rest)) => (24, rest),
+            Some((0x84, rest)) => (32, rest),
+            _ => return ApduResponse::err(SW_WRONG_DATA),
+        },
     };
-
-    let key_len: usize = match algo_tag {
-        0x82 => 16,
-        0x83 => 24,
-        0x84 => 32,
-        _ => unreachable!(),
+    let policy = match crate::security::key_policy::KeyPolicy::from_creation_tlvs(attrs) {
+        Ok(p) => p,
+        Err(sw) => return ApduResponse::err(sw),
     };
 
     // Generate random key bytes
@@ -91,10 +97,17 @@ pub fn handle(
 
     // Persist to flash: build a KeyObject
     let mut obj = KeyObject::new(KeyType::Aes, full_key_id, AppletId::ScHsm, algo);
-    obj.private_key.extend_from_slice(&key_buf[..key_len]).ok();
-
-    if store.save_key(&obj).is_err() {
+    obj.key_domain = policy.domain.unwrap_or(0);
+    obj.policy = policy;
+    let copied = obj.private_key.extend_from_slice(&key_buf[..key_len]);
+    zeroize::Zeroize::zeroize(&mut key_buf);
+    if copied.is_err() {
         return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED);
+    }
+
+    // Storage errors fail closed.
+    if store.save_key(&obj).is_err() {
+        return ApduResponse::err(pico2hsm_core::apdu::SW_MEMORY_FAILURE);
     }
 
     // Update key_index metadata (replace any existing entry).

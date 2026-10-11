@@ -4,7 +4,7 @@
 //! keystore. The operation and mode are specified via P1/P2.
 //!
 //! Supported modes:
-//! - AES-CBC (P2=0x02): `[IV:16][plaintext or ciphertext]`
+//! - AES-CBC (P2=0x02): `[IV:16][whole blocks]`, no padding either way (host pads)
 //! - AES-CTR (P2=0x03): `[nonce:16][data]`  (AES-256 only)
 //! - AES-GCM (P2=0x05): encrypt `[nonce:12][aad_len:2 BE][aad][plaintext]`
 //!                       decrypt `[nonce:12][aad_len:2 BE][aad][ct||tag]`
@@ -90,15 +90,29 @@ pub fn handle(
     };
 
     // Load key material from flash
-    let key_obj = match store.fetch_key(pico2hsm_core::key::KeyId(full_key_id)) {
+    let mut key_obj = match store.fetch_key(KeyId(full_key_id)) {
         Ok(Some(obj)) => obj,
         _ => return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
     };
 
-    let mut raw_key: heapless::Vec<u8, 32> = heapless::Vec::new();
-    let _ = raw_key.extend_from_slice(&key_obj.private_key);
+    // Usage policy: the SmartCard-HSM algorithm ID of this mode/direction.
+    // CTR and GCM have none (`None`: keys without an algorithm list only).
+    use crate::security::key_policy::{ALGO_AES_CBC_DECRYPT, ALGO_AES_CBC_ENCRYPT, ALGO_AES_CMAC};
+    let policy_algo = match (cmd.p2, cmd.p1) {
+        (P2_AES_CBC, P1_ENCRYPT) => Some(ALGO_AES_CBC_ENCRYPT),
+        (P2_AES_CBC, P1_DECRYPT) => Some(ALGO_AES_CBC_DECRYPT),
+        (P2_AES_CMAC, _) => Some(ALGO_AES_CMAC),
+        (P2_AES_CTR, _) | (P2_AES_GCM, P1_ENCRYPT | P1_DECRYPT) => None,
+        _ => return ApduResponse::err(SW_INS_NOT_SUPPORTED),
+    };
 
-    let km = match make_key_material(full_key_id, &raw_key) {
+    // Wiped on drop; a key that doesn't fit is refused, not truncated.
+    let mut raw_key = crate::security::zeroize::WipeOnDrop::<32>::new();
+    if raw_key.0.extend_from_slice(&key_obj.private_key).is_err() {
+        return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED);
+    }
+
+    let km = match make_key_material(full_key_id, &raw_key.0) {
         Some(k) => k,
         None => return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
     };
@@ -106,6 +120,20 @@ pub fn handle(
     let mode = cmd.p2;
     let direction = cmd.p1;
     let data = cmd.data;
+
+    // Refusals that need no key use go first (CTR is AES-256 only; CBC
+    // takes IV + whole blocks).
+    if mode == P2_AES_CTR && raw_key.0.len() != symmetric::AES256_KEY_SIZE {
+        return ApduResponse::err(SW_INS_NOT_SUPPORTED);
+    }
+    if mode == P2_AES_CBC
+        && (data.len() <= symmetric::AES_BLOCK_SIZE || data.len() % symmetric::AES_BLOCK_SIZE != 0)
+    {
+        return ApduResponse::err(SW_WRONG_LENGTH);
+    }
+    if let Err(sw) = crate::security::key_policy::authorize_use(store, &mut key_obj, policy_algo) {
+        return ApduResponse::err(sw);
+    }
 
     match mode {
         P2_AES_CBC => handle_cbc(&km, direction, data),
@@ -131,22 +159,14 @@ fn handle_cbc(km: &KeyMaterial, direction: u8, data: &[u8]) -> ApduResponse {
     };
     let payload = &data[16..];
 
+    // Whole blocks, no padding, in both directions (SmartCard-HSM
+    // ALGO_AES_CBC_ENCRYPT / _DECRYPT: the host pads).  Decryption used to
+    // strip PKCS#7 and answer 6985 on bad padding — a CBC padding oracle.
+    // Lengths were checked before the key was used (`cbc_payload_ok`).
     let mut out: heapless::Vec<u8, 4096> = heapless::Vec::new();
-
-    match direction {
-        P1_ENCRYPT => {
-            if symmetric::aes_cbc_encrypt(km, iv, payload, &mut out).is_err() {
-                return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED);
-            }
-        }
-        P1_DECRYPT => {
-            if symmetric::aes_cbc_decrypt(km, iv, payload, &mut out).is_err() {
-                return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED);
-            }
-        }
-        _ => return ApduResponse::err(SW_INS_NOT_SUPPORTED),
+    if symmetric::aes_cbc_nopad(km, iv, payload, direction == P1_ENCRYPT, &mut out).is_err() {
+        return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED);
     }
-
     ApduResponse::ok(&out)
 }
 

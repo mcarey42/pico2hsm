@@ -49,6 +49,15 @@ _PW1_DEFAULT = "313233343536"        # "123456"
 _PW3_DEFAULT = "3132333435363738"    # "12345678"
 _VERIFY_PW1_81 = f"002000810 6{_PW1_DEFAULT}".replace(" ", "")
 _VERIFY_PW3    = f"002000830 8{_PW3_DEFAULT}".replace(" ", "")
+# Algorithm attributes persist on the card (as on a real OpenPGP card), so
+# an earlier test (e.g. curve25519) may have left Ed25519/X25519 set:
+# put P-256 back explicitly before generating.  Needs PW3.
+_P256_OID = "2A8648CE3D030107"
+_SET_P256_ATTRS = (
+    f"00DA00C1 09 13{_P256_OID}".replace(" ", ""),  # SIG: ECDSA P-256
+    f"00DA00C2 09 12{_P256_OID}".replace(" ", ""),  # DEC: ECDH P-256
+    f"00DA00C3 09 13{_P256_OID}".replace(" ", ""),  # AUTH: ECDSA P-256
+)
 
 # GENERATE KEY PAIR — SIG slot (B6)
 _GENKEY_SIG    = "00478000 02B60000".replace(" ", "")
@@ -166,7 +175,8 @@ def _get_or_generate_sig_pubkey(runner: CLIRunner) -> EllipticCurvePublicKey | N
 
     # Generate a new key
     result_gen = _send_apdus(
-        runner, _SELECT_OPENPGP, _VERIFY_PW3, _GENKEY_SIG, timeout=120,
+        runner, _SELECT_OPENPGP, _VERIFY_PW3,
+        *_SET_P256_ATTRS, _GENKEY_SIG, timeout=120,
     )
     gen_sw = _sw_from_output(result_gen.stdout + result_gen.stderr)
     if gen_sw != "9000":

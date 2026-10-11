@@ -84,13 +84,42 @@ fn select_fid(fid: u16, want_fci: bool) -> Option<ApduResponse> {
     Some(resp)
 }
 
+/// SELECT with the keystore available: for a key file `CC <ref>` the FCP
+/// also carries the key's usage policy in its proprietary part, as a
+/// SmartCard-HSM reports it:
+/// `62 L 80 02 size 82 01 01 83 02 CC ref A5 L { 90 04 <uses left|FFFFFFFF> [91 algos] [92 01 domain] }`.
+pub fn handle_with_store(
+    state: &mut ScHsmState,
+    store: &mut dyn crate::storage::KeyStore,
+    cmd: &ApduCommand<'_>,
+) -> ApduResponse {
+    let resp = handle(state, cmd);
+    let Some(fid) = state.current_file else {
+        return resp;
+    };
+    if resp.sw != SW_OK || resp.data.len() < 13 || fid >> 8 != 0xCC {
+        return resp;
+    }
+    let key_id = pico2hsm_core::key::KeyId::sc_hsm(0, (fid & 0xFF) as u8);
+    let Ok(Some(obj)) = store.fetch_key(key_id) else {
+        // Unreadable key: the plain FCP (reporting grants nothing).
+        return resp;
+    };
+    let mut fcp: Vec<u8, 96> = Vec::new();
+    if fcp.extend_from_slice(&resp.data).is_err() || obj.policy.encode_fcp(&mut fcp).is_err() {
+        return resp;
+    }
+    fcp[1] = (fcp.len() - 2) as u8;
+    ApduResponse::ok(&fcp)
+}
+
 /// Handle a SELECT APDU command within the SC-HSM context.
 pub fn handle(state: &mut ScHsmState, cmd: &ApduCommand<'_>) -> ApduResponse {
     let want_fci = cmd.p2 != P2_NO_FCI;
 
     let fid: u16 = match cmd.p1 {
         // SELECT by file ID (child of current DF) or from MF/parent
-        0x00 | 0x01 | 0x02 => {
+        0x00..=0x02 => {
             if cmd.data.len() >= 2 {
                 (cmd.data[0] as u16) << 8 | (cmd.data[1] as u16)
             } else if cmd.data.is_empty() {
@@ -111,12 +140,8 @@ pub fn handle(state: &mut ScHsmState, cmd: &ApduCommand<'_>) -> ApduResponse {
         }
 
         // SELECT by AID — dispatcher should have intercepted this, but handle gracefully
-        0x04 => {
-            if cmd.data == crate::protocol::sc_hsm::SC_HSM_AID {
-                return ApduResponse::ok(&[]);
-            } else {
-                return ApduResponse::err(SW_FILE_NOT_FOUND);
-            }
+        0x04 if cmd.data == crate::protocol::sc_hsm::SC_HSM_AID => {
+            return ApduResponse::ok(&[]);
         }
 
         _ => return ApduResponse::err(SW_FILE_NOT_FOUND),

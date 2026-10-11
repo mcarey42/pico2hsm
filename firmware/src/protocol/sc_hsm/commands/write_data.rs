@@ -35,6 +35,9 @@ use crate::protocol::sc_hsm::{KeyMeta, ScHsmState};
 use crate::security::key_management::{AlgorithmId, KeyObject, KeyType as KmType};
 use crate::storage::KeyStore;
 
+/// Not enough memory space in the file (ISO 7816-4).
+const SW_WRONG_LENGTH_EF: u16 = 0x6A84;
+
 /// INS byte for WRITE DATA (SC-HSM extension).
 pub const INS_WRITE_DATA: u8 = 0xD7;
 
@@ -131,7 +134,9 @@ fn write_at_offset(
 ) -> ApduResponse {
     let file_id_hi = (file_id >> 8) as u8;
     let file_id_lo = (file_id & 0xFF) as u8;
-    let key_id = KeyId::sc_hsm_ef(0, file_id_hi, file_id_lo);
+    let Some(key_id) = KeyId::sc_hsm_ef_checked(0, file_id_hi, file_id_lo) else {
+        return ApduResponse::err(pico2hsm_core::apdu::SW_FILE_NOT_FOUND);
+    };
 
     // Check if this EF already exists in key_index.
     let exists = state
@@ -145,26 +150,30 @@ fn write_at_offset(
     if exists && offset > 0 {
         // Need existing data for offset writes — try ef_cache first,
         // then fall back to flash via cross-core fetch_key RPC.
+        // A read failure must fail the write, not zero-fill the file.
         if let Some(existing) = state.ef_cache_get(key_id.0) {
             let _ = data_buf.extend_from_slice(existing);
-        } else if let Ok(Some(obj)) = store.fetch_key(key_id) {
-            let _ = data_buf.extend_from_slice(&obj.private_key);
+        } else {
+            match store.fetch_key(key_id) {
+                Ok(Some(obj)) => {
+                    let _ = data_buf.extend_from_slice(&obj.private_key);
+                }
+                _ => return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
+            }
+        }
+        if offset > data_buf.capacity() {
+            return ApduResponse::err(SW_WRONG_LENGTH_EF);
         }
         // Pad with zeros up to offset if shorter.
-        while data_buf.len() < offset {
-            let _ = data_buf.push(0x00);
-        }
-        data_buf.truncate(offset);
+        data_buf.resize(offset, 0x00).ok();
     }
-    let _ = data_buf.extend_from_slice(payload);
+    // Never store a silently truncated file (it would still answer 9000).
+    if data_buf.extend_from_slice(payload).is_err() {
+        return ApduResponse::err(SW_WRONG_LENGTH_EF);
+    }
 
     if !exists && offset != 0 {
         return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED);
-    }
-
-    // Erase old entry if updating.
-    if exists {
-        let _ = store.erase_key(key_id);
     }
 
     let mut key_obj = KeyObject::new(
@@ -173,7 +182,9 @@ fn write_at_offset(
         AppletId::ScHsm,
         AlgorithmId::AesGcm,
     );
-    let _ = key_obj.private_key.extend_from_slice(&data_buf);
+    if key_obj.private_key.extend_from_slice(&data_buf).is_err() {
+        return ApduResponse::err(SW_WRONG_LENGTH_EF);
+    }
     match store.save_key(&key_obj) {
         Ok(()) => {
             // Update the in-memory EF cache so READ BINARY can serve

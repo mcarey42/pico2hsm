@@ -1,4 +1,4 @@
-//! DECIPHER command handler (INS = 0x62, P1 = 0x00).
+//! DECIPHER command handler (INS = 0x62, P1 = key slot, P2 = algorithm).
 //!
 //! For EC key agreement (ECDH) algorithms, the command data contains the
 //! peer's uncompressed public key point (`04 || X || Y`). The response is
@@ -25,6 +25,7 @@ use pico2hsm_core::{
 };
 
 use crate::protocol::sc_hsm::ScHsmState;
+use crate::security::key_policy::authorize_use;
 use crate::storage::KeyStore;
 
 /// INS byte for DECIPHER.
@@ -80,11 +81,22 @@ pub fn handle(
 
     // SC-HSM encodes the key reference in P1 and the algorithm in P2 directly
     // in the DECIPHER APDU (no preceding MSE SET required).
-    let key_id = cmd.p1; // u8 protocol key reference
-    let full_key_id = pico2hsm_core::key::KeyId::sc_hsm(0, key_id).0; // u32 internal ID
-    let algo = cmd.p2;
+    decipher(state, store, cmd.p1, cmd.p2, cmd.data)
+}
 
-    if cmd.data.is_empty() {
+/// DECIPHER / ECDH with key `key_ref` and algorithm `algo` (DECIPHER and
+/// PSO:DECIPHER).  The caller checked the PIN.  The key's usage policy is
+/// checked against `algo`, and a use spent, right before the operation.
+pub(crate) fn decipher(
+    state: &mut ScHsmState,
+    store: &mut dyn KeyStore,
+    key_ref: u8,
+    algo: u8,
+    data: &[u8],
+) -> ApduResponse {
+    let full_key_id = pico2hsm_core::key::KeyId::sc_hsm(0, key_ref).0; // u32 internal ID
+
+    if data.is_empty() {
         return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED);
     }
 
@@ -92,10 +104,18 @@ pub fn handle(
     // 0x21 = ALGO_RSA_DECRYPT: OpenSC sends ciphertext; card returns c^d mod n
     //        (raw, no padding removal). OpenSC strips PKCS#1v1.5 or OAEP in software.
     //        OpenSC uses P2=0x21 for BOTH CKM_RSA_PKCS and CKM_RSA_PKCS_OAEP.
-    // 0x22 = ALGO_RSA_OAEP (used by some OpenSC versions): same raw op.
+    // 0x22 = ALGO_RSA_DECRYPT_PKCS1 and 0x23 = ALGO_RSA_DECRYPT_OEP (card
+    //        removes the padding) are not supported and refused before any
+    //        key is touched.  0x22 used to run the raw operation of 0x21 (a
+    //        key whose list allowed only 22 was a raw RSA oracle); doing the
+    //        unpadding on the card instead would answer bad padding
+    //        differently from good — a Bleichenbacher oracle.  OpenSC never
+    //        sends either.  (0x23 on an EC key is the pico2hsm ECDH P-256
+    //        code, handled below.)
     #[cfg(feature = "rsa")]
     match algo {
-        0x21 | 0x22 => {
+        0x22 => return ApduResponse::err(SW_INS_NOT_SUPPORTED),
+        0x21 => {
             use crate::crypto::asymmetric::rsa_private_raw;
 
             // Check metadata index for the key
@@ -105,18 +125,28 @@ pub fn handle(
             };
 
             // Load key material from flash
-            let key_obj = match store.fetch_key(pico2hsm_core::key::KeyId(full_key_id)) {
+            let mut key_obj = match store.fetch_key(pico2hsm_core::key::KeyId(full_key_id)) {
                 Ok(Some(obj)) => obj,
                 _ => return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
             };
+            if key_obj.key_type != crate::security::key_management::KeyType::Rsa {
+                return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED);
+            }
 
             // RSA-2048 PKCS#1 DER is ≤1200 bytes; RSA-4096 is ≤2400 bytes.
-            let mut der_buf = [0u8; 2400];
             let der_len = key_obj.private_key.len();
-            der_buf[..der_len].copy_from_slice(&key_obj.private_key);
+            let Some(der_buf) = crate::security::zeroize::key_buf::<2400>(&key_obj.private_key)
+            else {
+                return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED);
+            };
+            // Policy first: nothing is decrypted for a refused use.
+            if let Err(sw) = authorize_use(store, &mut key_obj, Some(algo)) {
+                return ApduResponse::err(sw);
+            }
 
-            // Raw RSA: result = ciphertext^d mod n. OpenSC handles all unpadding.
-            return match rsa_private_raw(&der_buf[..der_len], cmd.data) {
+            // Raw RSA: result = ciphertext^d mod n, no padding check (and so
+            // no padding oracle).  OpenSC unpads.
+            return match rsa_private_raw(&der_buf[..der_len], data) {
                 Ok(p) => ApduResponse::ok(&p),
                 Err(_) => ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
             };
@@ -162,20 +192,32 @@ pub fn handle(
     let needs_04_prefix = algo == 0x80;
 
     // Load key material from flash
-    let key_obj = match store.fetch_key(pico2hsm_core::key::KeyId(full_key_id)) {
+    let mut key_obj = match store.fetch_key(pico2hsm_core::key::KeyId(full_key_id)) {
         Ok(Some(obj)) => obj,
         _ => return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
     };
 
-    let mut priv_buf = [0u8; 66];
     let priv_len = key_obj.private_key.len();
-    priv_buf[..priv_len].copy_from_slice(&key_obj.private_key);
+    let Some(priv_buf) = crate::security::zeroize::key_buf::<66>(&key_obj.private_key) else {
+        return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED);
+    };
+    // Every ECDH form is the CardContact operation ALGO_EC_DH (80) for the
+    // usage policy.  The pico2hsm per-curve codes 23/25/27/29 must not be
+    // checked as themselves: 23 is CardContact's RSA-OAEP decrypt, so a
+    // list meant for RSA would otherwise authorise ECDH (and vice versa).
+    if let Err(sw) = authorize_use(
+        store,
+        &mut key_obj,
+        Some(crate::security::key_policy::ALGO_EC_DH),
+    ) {
+        return ApduResponse::err(sw);
+    }
 
-    let shared =
-        match crate::crypto::asymmetric::ecdh_agree(key_type, &priv_buf[..priv_len], cmd.data) {
-            Ok(s) => s,
-            Err(_) => return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
-        };
+    let shared = match crate::crypto::asymmetric::ecdh_agree(key_type, &priv_buf[..priv_len], data)
+    {
+        Ok(s) => s,
+        Err(_) => return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
+    };
 
     if needs_04_prefix {
         // Prepend 0x04 so OpenSC can strip it and get the exact field-size

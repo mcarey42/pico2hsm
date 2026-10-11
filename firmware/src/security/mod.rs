@@ -27,7 +27,10 @@
 
 pub mod anti_glitch;
 pub mod dkek;
+pub mod key_blob;
 pub mod key_management;
+pub mod key_policy;
+pub mod otp_layout;
 pub mod pin;
 pub mod zeroize;
 

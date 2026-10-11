@@ -1,21 +1,19 @@
-"""DKEK exchange for pico2hsm — P-256 ECDH relay protocol.
+"""DKEK exchange for pico2hsm — V2 mutual-auth relay protocol.
 
-The host acts as a relay between two HSMs. DKEK material never passes through
-the host in plaintext. The exchange uses on-device P-256 ephemeral keypairs
-with HKDF-SHA256 session key derivation.
+The host relays messages between two HSMs; the DKEK never passes through it
+in plaintext.  Each HSM must have the other's static P-256 key enrolled
+(EXTRAS P1=0x3D) and the SO-PIN verified on both before starting — the
+firmware refuses every step otherwise.
 
-Exchange protocol (host-mediated relay):
-
-    Host                 Source HSM              Target HSM
-    ----                 ----------              ----------
-    GET_DEVICE_PUBKEY →  ← source_static_pub
-    GET_DEVICE_PUBKEY →                          ← target_static_pub
-    [verify both are enrolled]
-    NOISE_INITIATE →     ← source_ephem_pub
-    NOISE_INITIATE(source_ephem_pub) →           ← target_ephem_pub
-    NOISE_FINALIZE_SEND(target_ephem_pub) →      ← encrypted_dkek(60B)
-    NOISE_FINALIZE_RECV(source_ephem_pub + encrypted_dkek + device_id) →
-                                                 [DKEK stored on target]
+    Host                         Source HSM (has DKEK)     Target HSM
+    ----                         ---------------------     ----------
+    GET_DEVICE_PUBKEY        →   ← source_static
+    GET_DEVICE_PUBKEY        →                             ← target_static
+    [verify both are enrolled in the host config]
+    TARGET_INIT(source_static)                          →  ← ephem_T, chal, Sig_T
+    SOURCE_RESPOND(ephem_T, chal, Sig_T) →  ← ephem_S, Sig_S   (verifies Sig_T)
+    FINALIZE_SEND(ephem_T, target_static, chal) → ← enc_DKEK
+    FINALIZE_RECV(ephem_S, Sig_S, enc_DKEK)             →  [verifies Sig_S, stores DKEK]
 """
 
 from __future__ import annotations
@@ -32,22 +30,24 @@ from .enrollment import DeviceEnrollment
 from .errors import DKEKError, EnrollmentError
 from .protocol import (
     build_get_device_pubkey,
-    build_noise_initiate,
-    build_noise_finalize_send,
-    build_noise_finalize_recv,
+    build_noise_target_init,
+    build_noise_source_respond,
+    build_noise_finalize_send_v2,
+    build_noise_finalize_recv_v2,
     build_get_generation,
     EXTRAS_GET_DEVICE_PUBKEY,
 )
 
 logger = logging.getLogger(__name__)
 
-# Wire framing constants
-MAGIC = b"P2H1"
+# Wire framing constants.  "P2H2" = V2 exchange; V1 peers fail at the first frame.
+MAGIC = b"P2H2"
 MSG_TYPE_NOISE      = 0x01
 MSG_TYPE_ACK        = 0xFF
 MSG_TYPE_DEV_PUBKEY = 0x05
-MSG_TYPE_EPHEM_PUB  = 0x06
 MSG_TYPE_ENC_DKEK   = 0x07
+MSG_TYPE_TARGET_INIT    = 0x08  # ephem_T(65) || challenge(32) || Sig_T(64)
+MSG_TYPE_SOURCE_RESPOND = 0x09  # ephem_S(65) || Sig_S(64)
 
 # Cluster sync message types
 MSG_TYPE_MANIFEST_REQ    = 0x10
@@ -65,6 +65,8 @@ DEFAULT_PORT = 7890
 # Sizes
 PUBKEY_SIZE = 65      # uncompressed P-256
 ENCRYPTED_DKEK_SIZE = 60  # nonce(12) + ct(32) + tag(16)
+TARGET_INIT_SIZE = 161    # ephem_T(65) + challenge(32) + Sig_T(64)
+SOURCE_RESPOND_SIZE = 129  # ephem_S(65) + Sig_S(64)
 DEVICE_ID_SIZE = 16
 MAX_FRAME_SIZE = 65536  # 64 KB max payload
 
@@ -185,10 +187,50 @@ class DkekExchange:
         logger.info("Verified enrolled peer: %s (%s)", peer.name, peer.role)
         return peer
 
-    def _relay_exchange(self, source: Pico2HSM, target: Pico2HSM) -> None:
-        """Core 4-step DKEK relay protocol between two locally connected HSMs."""
+    @staticmethod
+    def _step(device: Pico2HSM, apdu: bytes, name: str, size: int) -> bytes:
+        """Send one exchange step; require SW 9000 and exactly `size` data bytes."""
+        data, sw = device.transmit(apdu)
+        if sw != 0x9000:
+            raise DKEKError(f"{name} failed: SW={sw:04X}")
+        if len(data) != size:
+            raise DKEKError(f"{name}: expected {size} bytes, got {len(data)}")
+        return data
 
-        # Step 0: Get static pubkeys and verify enrollment
+    def _target_init(self, target: Pico2HSM, source_static: bytes) -> bytes:
+        return self._step(
+            target, build_noise_target_init(source_static), "NOISE_TARGET_INIT", TARGET_INIT_SIZE
+        )
+
+    def _source_respond_and_send(
+        self, source: Pico2HSM, target_init: bytes, target_static: bytes
+    ) -> tuple[bytes, bytes]:
+        """Steps 2–3 on SOURCE: returns (source_respond, encrypted_dkek)."""
+        ephem_t, challenge, sig_t = target_init[:65], target_init[65:97], target_init[97:]
+        respond = self._step(
+            source,
+            build_noise_source_respond(ephem_t, challenge, sig_t),
+            "NOISE_SOURCE_RESPOND",
+            SOURCE_RESPOND_SIZE,
+        )
+        encrypted_dkek = self._step(
+            source,
+            build_noise_finalize_send_v2(ephem_t, target_static, challenge),
+            "NOISE_FINALIZE_SEND_V2",
+            ENCRYPTED_DKEK_SIZE,
+        )
+        return respond, encrypted_dkek
+
+    def _target_receive(self, target: Pico2HSM, respond: bytes, encrypted_dkek: bytes) -> None:
+        self._step(
+            target,
+            build_noise_finalize_recv_v2(respond[:65], respond[65:], encrypted_dkek),
+            "NOISE_FINALIZE_RECV_V2",
+            0,
+        )
+
+    def _relay_exchange(self, source: Pico2HSM, target: Pico2HSM) -> None:
+        """V2 DKEK relay between two locally connected HSMs."""
         source_static = self._get_device_pubkey(source)
         target_static = self._get_device_pubkey(target)
         source_peer = self._verify_enrolled(source_static)
@@ -199,42 +241,15 @@ class DkekExchange:
             target_peer.name if target_peer else "unknown",
         )
 
-        # Step 1: NOISE_INITIATE on source (no peer pubkey yet)
-        # Source generates ephemeral keypair, returns source_ephem_pub
-        apdu = build_noise_initiate(b"")
-        source_ephem_pub, _sw = source.transmit(apdu)
-        if len(source_ephem_pub) != PUBKEY_SIZE:
-            raise DKEKError(f"Source returned unexpected ephem_pub length: {len(source_ephem_pub)}")
-        logger.debug("Source ephemeral pubkey: %s...", source_ephem_pub[:4].hex())
-
-        # Step 2: NOISE_INITIATE on target with source's ephemeral pubkey
-        apdu = build_noise_initiate(source_ephem_pub)
-        target_ephem_pub, _sw = target.transmit(apdu)
-        if len(target_ephem_pub) != PUBKEY_SIZE:
-            raise DKEKError(f"Target returned unexpected ephem_pub length: {len(target_ephem_pub)}")
-        logger.debug("Target ephemeral pubkey: %s...", target_ephem_pub[:4].hex())
-
-        # Step 3: NOISE_FINALIZE_SEND on source with target's ephemeral pubkey
-        # Source computes ECDH, derives session key, encrypts DKEK, returns encrypted blob
-        apdu = build_noise_finalize_send(target_ephem_pub)
-        encrypted_dkek, _sw = source.transmit(apdu)
-        if len(encrypted_dkek) != ENCRYPTED_DKEK_SIZE:
-            raise DKEKError(f"Source returned unexpected encrypted_dkek length: {len(encrypted_dkek)}")
-        logger.debug("Received encrypted DKEK (%d bytes)", len(encrypted_dkek))
-
-        # Step 4: NOISE_FINALIZE_RECV on target
-        # Target computes ECDH, decrypts DKEK, stores it
-        # device_id is source's static pubkey first 16 bytes (used as AAD in firmware)
-        device_id = source_static[:DEVICE_ID_SIZE]
-        apdu = build_noise_finalize_recv(source_ephem_pub, encrypted_dkek, device_id)
-        _data, _sw = target.transmit(apdu)
+        target_init = self._target_init(target, source_static)
+        respond, encrypted_dkek = self._source_respond_and_send(source, target_init, target_static)
+        self._target_receive(target, respond, encrypted_dkek)
         logger.debug("Target confirmed DKEK receipt")
 
     def _tcp_server_relay(self, conn: socket.socket, source: Pico2HSM) -> None:
-        """TCP server side of relay: drives source HSM, relays messages with remote target."""
+        """TCP server side: drives the SOURCE HSM."""
         conn.settimeout(30.0)
 
-        # Exchange static pubkeys for enrollment verification
         source_static = self._get_device_pubkey(source)
         _send_framed(conn, MSG_TYPE_DEV_PUBKEY, source_static)
         msg_type, target_static = _recv_framed(conn)
@@ -244,34 +259,24 @@ class DkekExchange:
         self._verify_enrolled(source_static)
         self._verify_enrolled(target_static)
 
-        # Step 1: Get source ephemeral pubkey
-        apdu = build_noise_initiate(b"")
-        source_ephem_pub, _ = source.transmit(apdu)
-        _send_framed(conn, MSG_TYPE_EPHEM_PUB, source_ephem_pub)
+        msg_type, target_init = _recv_framed(conn)
+        if msg_type != MSG_TYPE_TARGET_INIT or len(target_init) != TARGET_INIT_SIZE:
+            raise DKEKError(f"Expected TARGET_INIT, got {msg_type:02X}")
 
-        # Step 2: Receive target ephemeral pubkey
-        msg_type, target_ephem_pub = _recv_framed(conn)
-        if msg_type != MSG_TYPE_EPHEM_PUB:
-            raise DKEKError(f"Expected EPHEM_PUB, got {msg_type:02X}")
-
-        # Step 3: Source encrypts DKEK
-        apdu = build_noise_finalize_send(target_ephem_pub)
-        encrypted_dkek, _ = source.transmit(apdu)
+        respond, encrypted_dkek = self._source_respond_and_send(source, target_init, target_static)
+        _send_framed(conn, MSG_TYPE_SOURCE_RESPOND, respond)
         _send_framed(conn, MSG_TYPE_ENC_DKEK, encrypted_dkek)
 
-        # Wait for ACK
         msg_type, _ = _recv_framed(conn)
         if msg_type != MSG_TYPE_ACK:
             raise DKEKError(f"Expected ACK, got {msg_type:02X}")
         logger.info("TCP DKEK server: exchange complete")
 
     def _tcp_client_relay(self, conn: socket.socket, target: Pico2HSM) -> None:
-        """TCP client side of relay: drives target HSM, relays messages with remote server."""
+        """TCP client side: drives the TARGET HSM."""
         conn.settimeout(30.0)
 
         target_static = self._get_device_pubkey(target)
-
-        # Exchange static pubkeys
         msg_type, source_static = _recv_framed(conn)
         if msg_type != MSG_TYPE_DEV_PUBKEY:
             raise DKEKError(f"Expected DEV_PUBKEY, got {msg_type:02X}")
@@ -280,23 +285,16 @@ class DkekExchange:
         self._verify_enrolled(source_static)
         self._verify_enrolled(target_static)
 
-        # Step 2: Receive source ephemeral pubkey, get target's
-        msg_type, source_ephem_pub = _recv_framed(conn)
-        if msg_type != MSG_TYPE_EPHEM_PUB:
-            raise DKEKError(f"Expected EPHEM_PUB, got {msg_type:02X}")
-        apdu = build_noise_initiate(source_ephem_pub)
-        target_ephem_pub, _ = target.transmit(apdu)
-        _send_framed(conn, MSG_TYPE_EPHEM_PUB, target_ephem_pub)
+        _send_framed(conn, MSG_TYPE_TARGET_INIT, self._target_init(target, source_static))
 
-        # Step 4: Receive encrypted DKEK and import into target
+        msg_type, respond = _recv_framed(conn)
+        if msg_type != MSG_TYPE_SOURCE_RESPOND or len(respond) != SOURCE_RESPOND_SIZE:
+            raise DKEKError(f"Expected SOURCE_RESPOND, got {msg_type:02X}")
         msg_type, encrypted_dkek = _recv_framed(conn)
         if msg_type != MSG_TYPE_ENC_DKEK:
             raise DKEKError(f"Expected ENC_DKEK, got {msg_type:02X}")
 
-        device_id = source_static[:DEVICE_ID_SIZE]
-        apdu = build_noise_finalize_recv(source_ephem_pub, encrypted_dkek, device_id)
-        target.transmit(apdu)
-
+        self._target_receive(target, respond, encrypted_dkek)
         _send_framed(conn, MSG_TYPE_ACK, b"")
         logger.info("TCP DKEK client: exchange complete")
 

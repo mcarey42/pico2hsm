@@ -23,7 +23,7 @@ use crate::protocol::sc_hsm::{ScHsmState, SeOperation};
 /// INS byte for MANAGE SECURITY ENVIRONMENT.
 pub const INS_MSE: u8 = 0x22;
 
-fn find_tlv<'a>(data: &'a [u8], tag: u8) -> Option<&'a [u8]> {
+fn find_tlv(data: &[u8], tag: u8) -> Option<&[u8]> {
     let mut i = 0;
     while i + 1 < data.len() {
         let t = data[i];
@@ -73,6 +73,9 @@ fn parse_and_set_se(state: &mut ScHsmState, data: &[u8], op: SeOperation) -> Apd
     }
 
     if let Some(kid) = key_id {
+        if kid >= crate::protocol::sc_hsm::RESERVED_KEY_REF_MIN {
+            return ApduResponse::err(SW_WRONG_DATA);
+        }
         state.current_key_id = Some(kid);
     }
     if let Some(a) = algo {

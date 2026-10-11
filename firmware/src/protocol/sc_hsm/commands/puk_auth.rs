@@ -48,6 +48,7 @@ pub fn handle(state: &mut ScHsmState, cmd: &ApduCommand<'_>) -> ApduResponse {
         state.puk_retry_count = 10;
         state.pin_retry_count = 3;
         state.pin_verified = true;
+        state.session_pin = None; // stood in for the old PIN
         ApduResponse::ok(&[])
     } else {
         state.puk_retry_count = state.puk_retry_count.saturating_sub(1);

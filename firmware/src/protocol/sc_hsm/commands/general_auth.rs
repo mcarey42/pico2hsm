@@ -26,7 +26,7 @@ pub const INS_GENERAL_AUTH: u8 = 0x86;
 /// Scan a flat TLV list and return the value slice for the first matching tag.
 ///
 /// Uses simple one-byte tag / one-byte length encoding (BER-TLV subset).
-fn find_tlv<'a>(data: &'a [u8], tag: u8) -> Option<&'a [u8]> {
+fn find_tlv(data: &[u8], tag: u8) -> Option<&[u8]> {
     let mut i = 0;
     while i + 1 < data.len() {
         let t = data[i];
@@ -74,8 +74,9 @@ pub fn handle(
     store: &mut dyn KeyStore,
     cmd: &ApduCommand<'_>,
 ) -> ApduResponse {
-    // Require PIN authentication.
-    if !state.pin_verified && !state.so_pin_verified {
+    // Private-key use needs the user PIN; the SO-PIN administers the card
+    // but must not be able to use the user's keys.
+    if !state.pin_verified {
         return ApduResponse::err(SW_SECURITY_STATUS);
     }
 
@@ -111,15 +112,26 @@ pub fn handle(
     };
 
     // Load key material from flash.
-    let key_obj = match store.fetch_key(pico2hsm_core::key::KeyId(full_key_id)) {
+    let mut key_obj = match store.fetch_key(pico2hsm_core::key::KeyId(full_key_id)) {
         Ok(Some(obj)) => obj,
         _ => return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
     };
 
     // Copy key data to local stack buffers.
     let priv_len = key_obj.private_key.len();
-    let mut priv_buf = [0u8; 66];
-    priv_buf[..priv_len].copy_from_slice(&key_obj.private_key);
+    let Some(priv_buf) = crate::security::zeroize::key_buf::<66>(&key_obj.private_key) else {
+        return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED);
+    };
+
+    // The card hashes the challenge with SHA-256 and signs it with ECDSA:
+    // SmartCard-HSM algorithm ALGO_EC_SHA256 for the key's usage policy.
+    if let Err(sw) = crate::security::key_policy::authorize_use(
+        store,
+        &mut key_obj,
+        Some(crate::security::key_policy::ALGO_EC_SHA256),
+    ) {
+        return ApduResponse::err(sw);
+    }
 
     // Hash the challenge with SHA-256 before signing.
     let hash = sha2::Sha256::digest(challenge);

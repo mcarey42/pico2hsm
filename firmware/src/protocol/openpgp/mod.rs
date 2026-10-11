@@ -21,6 +21,7 @@
 //! - GET CHALLENGE (0x84) — return random bytes
 
 pub mod commands;
+pub mod pw;
 
 use heapless::Vec;
 use pico2hsm_core::{
@@ -85,13 +86,17 @@ pub const PW3_MAX_RETRIES: u8 = 3;
 pub struct OpenPgpState {
     // --- PIN state (simple hash-based, matching SC-HSM pattern) ---
     /// PW1 hash (SHA-256). None if not yet initialized.
-    pub pw1_hash: Option<[u8; 32]>,
+    pub pw1_hash: Option<pw::PwHash>,
     /// PW3 hash (SHA-256). None if not yet initialized.
-    pub pw3_hash: Option<[u8; 32]>,
+    pub pw3_hash: Option<pw::PwHash>,
     /// PW1 remaining retries.
     pub pw1_retries: u8,
     /// PW3 remaining retries.
     pub pw3_retries: u8,
+    /// PW1 and PW3 records are on flash.  They must be before any key is:
+    /// on load, missing records next to stored keys mean tampering, not a
+    /// fresh card (see `load_from_store`).
+    pub credentials_persisted: bool,
 
     // --- PIN verification flags ---
     /// PW1 verified for signing (P2=0x81). Cleared after each PSO:CDS.
@@ -102,22 +107,28 @@ pub struct OpenPgpState {
     pub pw3_verified: bool,
 
     // --- Signature counter ---
-    /// Digital signature counter (incremented on each PSO:CDS). 3-byte BE.
+    /// Digital signature counter (DO 93): incremented on each PSO:CDS,
+    /// persisted before the signature is returned, reset when a new
+    /// signature key is generated.  3 bytes, saturating.
     pub sig_counter: u32,
+
+    /// PW status byte 1 (DO C4): 00 = PW1 (mode 81) valid for one PSO:CDS
+    /// only, 01 = for several.  Set by PUT DATA C4 (PW3), persisted.
+    pub pw1_status: u8,
 
     // --- Key storage (in-memory volatile) ---
     /// SIG key: private scalar (up to 66 bytes for P-521).
-    pub sig_private: Option<heapless::Vec<u8, 66>>,
+    pub sig_private: Option<Vec<u8, 66>>,
     /// SIG key: uncompressed public point (04 || X || Y).
-    pub sig_public: Option<heapless::Vec<u8, 133>>,
+    pub sig_public: Option<Vec<u8, 133>>,
     /// DEC key: private scalar.
-    pub dec_private: Option<heapless::Vec<u8, 66>>,
+    pub dec_private: Option<Vec<u8, 66>>,
     /// DEC key: uncompressed public point.
-    pub dec_public: Option<heapless::Vec<u8, 133>>,
+    pub dec_public: Option<Vec<u8, 133>>,
     /// AUTH key: private scalar.
-    pub auth_private: Option<heapless::Vec<u8, 66>>,
+    pub auth_private: Option<Vec<u8, 66>>,
     /// AUTH key: uncompressed public point.
-    pub auth_public: Option<heapless::Vec<u8, 133>>,
+    pub auth_public: Option<Vec<u8, 133>>,
 
     // --- Key type per slot (used to select the right crypto primitive) ---
     pub sig_key_type: Option<pico2hsm_core::key::KeyType>,
@@ -126,11 +137,11 @@ pub struct OpenPgpState {
 
     // --- Cardholder data (writable via PUT DATA) ---
     /// Cardholder name (DO 005B), up to 39 bytes.
-    pub cardholder_name: heapless::Vec<u8, 39>,
+    pub cardholder_name: Vec<u8, 39>,
     /// Login data (DO 005E), up to 254 bytes.
-    pub login_data: heapless::Vec<u8, 254>,
+    pub login_data: Vec<u8, 254>,
     /// Language preference (DO 5F2D), up to 8 bytes.
-    pub language: heapless::Vec<u8, 8>,
+    pub language: Vec<u8, 8>,
     /// Sex (DO 5F35), 1 byte.
     pub sex: u8,
 
@@ -151,33 +162,128 @@ pub struct OpenPgpState {
 
     // --- Algorithm attributes per slot (writable via PUT DATA) ---
     /// SIG algorithm attributes (DO C1). Default: ECDSA P-256.
-    pub algo_sig: heapless::Vec<u8, 12>,
+    pub algo_sig: Vec<u8, 12>,
     /// DEC algorithm attributes (DO C2). Default: ECDH P-256.
-    pub algo_dec: heapless::Vec<u8, 12>,
+    pub algo_dec: Vec<u8, 12>,
     /// AUTH algorithm attributes (DO C3). Default: ECDSA P-256.
-    pub algo_auth: heapless::Vec<u8, 12>,
+    pub algo_auth: Vec<u8, 12>,
 
     // --- DO 5F50: URL of public key server (up to 254 bytes) ---
-    pub url: heapless::Vec<u8, 254>,
+    pub url: Vec<u8, 254>,
 
     // --- DO 7F21: Cardholder Certificate (up to 1024 bytes) ---
-    pub cardholder_cert: heapless::Vec<u8, 1024>,
+    pub cardholder_cert: Vec<u8, 1024>,
 
     // --- Termination flag (set by TERMINATE DF, cleared by ACTIVATE FILE) ---
     pub terminated: bool,
 }
 
+/// Zeroize a private key slot in place, then empty it.
+///
+/// Assigning `None` alone only changes the discriminant and leaves the key
+/// bytes in RAM.
+/// Replace a private key slot's contents, writing the bytes in place:
+/// building a `Vec` and moving it in leaves a plaintext copy behind.
+pub(crate) fn set_key(slot: &mut Option<Vec<u8, 66>>, key: &[u8]) {
+    wipe_key(slot);
+    let _ = slot.insert(Vec::new()).extend_from_slice(key);
+}
+
+pub(crate) fn wipe_key(slot: &mut Option<Vec<u8, 66>>) {
+    if let Some(key) = slot.as_mut() {
+        zeroize::Zeroize::zeroize(key.as_mut_slice());
+    }
+    *slot = None;
+}
+
+impl Drop for OpenPgpState {
+    /// Wipe private keys and password hashes when the state is dropped or
+    /// replaced (ACTIVATE, `Dispatcher::reset_in_place`).
+    fn drop(&mut self) {
+        wipe_key(&mut self.sig_private);
+        wipe_key(&mut self.dec_private);
+        wipe_key(&mut self.auth_private);
+        for hash in [&mut self.pw1_hash, &mut self.pw3_hash] {
+            if let Some(h) = hash.as_mut() {
+                zeroize::Zeroize::zeroize(h);
+            }
+            *hash = None;
+        }
+    }
+}
+
+/// Serialize a PW record.
+///
+/// `[0..32]` digest, `[32]` has_hash, `[33]` 0 (was retries), `[34]` 1 (was
+/// blocked), `[35]` KDF (0 = legacy SHA-256, 1 = PBKDF2), `[36]` length
+/// (0 = unknown), `[37..53]` salt.  Records written before 2026-10 stop at
+/// byte 35 and load as legacy with unknown length.
+///
+/// The retry counters live in the retry-counter log
+/// (`storage::retry_counter`); a pre-log record's count is migrated and
+/// zeroed at boot, so a record never carries a usable count.
+fn encode_pw(buf: &mut Vec<u8, 64>, pw: Option<&pw::PwHash>) {
+    let retries = 0u8;
+    let empty = pw::PwHash {
+        digest: [0; 32],
+        salt: [0; 16],
+        len: 0,
+        kdf: pw::PwKdf::Legacy,
+    };
+    let rec = pw.unwrap_or(&empty);
+    let _ = buf.extend_from_slice(&rec.digest);
+    let _ = buf.push(pw.is_some() as u8);
+    let _ = buf.push(retries);
+    let _ = buf.push((retries == 0) as u8);
+    let _ = buf.push(rec.kdf as u8);
+    let _ = buf.push(rec.len);
+    let _ = buf.extend_from_slice(&rec.salt);
+}
+
+/// Parse a PW record (see `encode_pw`): `(hash, retries)`, or `None` if short.
+fn decode_pw(b: &[u8]) -> Option<(Option<pw::PwHash>, u8)> {
+    if b.len() < 35 {
+        return None;
+    }
+    let retries = b[33];
+    if b[32] == 0 {
+        return Some((None, retries));
+    }
+    let mut rec = pw::PwHash {
+        digest: b[0..32].try_into().ok()?,
+        salt: [0; 16],
+        len: 0,
+        kdf: pw::PwKdf::Legacy,
+    };
+    if b.len() >= 53 {
+        rec.kdf = if b[35] == 1 {
+            pw::PwKdf::Pbkdf2
+        } else {
+            pw::PwKdf::Legacy
+        };
+        rec.len = b[36];
+        rec.salt = b[37..53].try_into().ok()?;
+    }
+    Some((Some(rec), retries))
+}
+
+impl Default for OpenPgpState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl OpenPgpState {
     pub fn new() -> Self {
         // Compute default PW1 and PW3 hashes
-        let pw1_hash = Self::hash_pin(b"123456");
-        let pw3_hash = Self::hash_pin(b"12345678");
+        let pw1_hash = pw::PwHash::factory_default(b"123456");
+        let pw3_hash = pw::PwHash::factory_default(b"12345678");
 
-        let mut algo_sig = heapless::Vec::new();
+        let mut algo_sig = Vec::new();
         let _ = algo_sig.extend_from_slice(DEFAULT_ECDSA_ALGO_ATTRS);
-        let mut algo_dec = heapless::Vec::new();
+        let mut algo_dec = Vec::new();
         let _ = algo_dec.extend_from_slice(DEFAULT_ECDH_ALGO_ATTRS);
-        let mut algo_auth = heapless::Vec::new();
+        let mut algo_auth = Vec::new();
         let _ = algo_auth.extend_from_slice(DEFAULT_ECDSA_ALGO_ATTRS);
 
         OpenPgpState {
@@ -185,10 +291,12 @@ impl OpenPgpState {
             pw3_hash: Some(pw3_hash),
             pw1_retries: PW1_MAX_RETRIES,
             pw3_retries: PW3_MAX_RETRIES,
+            credentials_persisted: false,
             pw1_verified_sign: false,
             pw1_verified_other: false,
             pw3_verified: false,
             sig_counter: 0,
+            pw1_status: 0x00,
             sig_private: None,
             sig_public: None,
             dec_private: None,
@@ -198,9 +306,9 @@ impl OpenPgpState {
             sig_key_type: None,
             dec_key_type: None,
             auth_key_type: None,
-            cardholder_name: heapless::Vec::new(),
-            login_data: heapless::Vec::new(),
-            language: heapless::Vec::new(),
+            cardholder_name: Vec::new(),
+            login_data: Vec::new(),
+            language: Vec::new(),
             sex: 0x39, // '9' = not stated
             fp_sig: [0u8; 20],
             fp_dec: [0u8; 20],
@@ -214,21 +322,10 @@ impl OpenPgpState {
             algo_sig,
             algo_dec,
             algo_auth,
-            url: heapless::Vec::new(),
-            cardholder_cert: heapless::Vec::new(),
+            url: Vec::new(),
+            cardholder_cert: Vec::new(),
             terminated: false,
         }
-    }
-
-    /// Compute SHA-256 hash of a PIN (simple, same as SC-HSM verify pattern).
-    pub fn hash_pin(pin: &[u8]) -> [u8; 32] {
-        use sha2::{Digest, Sha256};
-        let mut h = Sha256::new();
-        h.update(pin);
-        let result = h.finalize();
-        let mut out = [0u8; 32];
-        out.copy_from_slice(&result);
-        out
     }
 
     /// Reset all PIN verification flags (called on SELECT).
@@ -248,6 +345,66 @@ pub const OPENPGP_PW3_KEY_ID: pico2hsm_core::key::KeyId = pico2hsm_core::key::Ke
 pub struct OpenPgp {
     pub state: OpenPgpState,
 }
+
+/// A persistent OpenPGP password retry counter spent by an APDU.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PwCounter {
+    Pw1,
+    Pw3,
+}
+
+impl PwCounter {
+    /// The counter `cmd` would spend; malformed APDUs (rejected by the
+    /// handler before any comparison) spend nothing.
+    fn spent_by(cmd: &ApduCommand<'_>, state: &OpenPgpState) -> Option<Self> {
+        let n = cmd.data.len();
+        let well_formed = cmd.p1 == 0x00
+            && match (cmd.ins, cmd.p2) {
+                // PW3 needs 8+ bytes; the handler refuses shorter ones
+                // before comparing, so they must not cost a retry.
+                (verify::INS_VERIFY, 0x83) => (8..=127).contains(&n),
+                (verify::INS_VERIFY, _) => (6..=127).contains(&n),
+                (change_pin::INS_CHANGE_PIN, 0x81) => change_pin::counts_as_attempt(
+                    state.pw1_hash.as_ref(),
+                    n,
+                    change_pin::PW1_MIN_LEN,
+                ),
+                (change_pin::INS_CHANGE_PIN, 0x83) => change_pin::counts_as_attempt(
+                    state.pw3_hash.as_ref(),
+                    n,
+                    change_pin::PW3_MIN_LEN,
+                ),
+                _ => false,
+            };
+        if !well_formed {
+            return None;
+        }
+        match (cmd.ins, cmd.p2) {
+            (verify::INS_VERIFY, 0x81 | 0x82) | (change_pin::INS_CHANGE_PIN, 0x81) => {
+                Some(Self::Pw1)
+            }
+            (verify::INS_VERIFY, 0x83) | (change_pin::INS_CHANGE_PIN, 0x83) => Some(Self::Pw3),
+            _ => None,
+        }
+    }
+
+    fn get(self, state: &mut OpenPgpState) -> &mut u8 {
+        match self {
+            Self::Pw1 => &mut state.pw1_retries,
+            Self::Pw3 => &mut state.pw3_retries,
+        }
+    }
+
+    /// Its entry in the retry-counter log.
+    fn credential(self) -> Credential {
+        match self {
+            Self::Pw1 => Credential::OpenPgpPw1,
+            Self::Pw3 => Credential::OpenPgpPw3,
+        }
+    }
+}
+
+use crate::storage::retry_counter::{self, CounterState, Credential};
 
 impl OpenPgp {
     /// Create a new OpenPGP Card protocol instance.
@@ -310,7 +467,11 @@ impl OpenPgp {
         if self.state.terminated {
             match cmd.ins {
                 terminate_activate::INS_ACTIVATE_FILE => {
-                    return terminate_activate::handle_activate(&mut self.state, cmd);
+                    return terminate_activate::handle_activate_with_store(
+                        &mut self.state,
+                        store,
+                        cmd,
+                    );
                 }
                 select::INS_SELECT => {
                     return select::handle(&mut self.state, cmd);
@@ -319,14 +480,122 @@ impl OpenPgp {
             }
         }
 
+        if let Some(pw) = PwCounter::spent_by(cmd, &self.state) {
+            return self.with_persisted_attempt(pw, cmd, store);
+        }
+        self.route_with_store(cmd, store)
+    }
+
+    /// Spend one PW1/PW3 retry on flash before the handler compares the
+    /// password; see `ScHsm::with_persisted_attempt` for the rationale.
+    fn with_persisted_attempt(
+        &mut self,
+        pw: PwCounter,
+        cmd: &ApduCommand<'_>,
+        store: &mut dyn crate::storage::KeyStore,
+    ) -> ApduResponse {
+        let ram = *pw.get(&mut self.state);
+        if ram == 0 {
+            return self.route_with_store(cmd, store);
+        }
+        let before = match retry_counter::spend(store, pw.credential(), ram) {
+            Ok(available) => available.min(ram),
+            Err(_) => return ApduResponse::err(pico2hsm_core::apdu::SW_MEMORY_FAILURE),
+        };
+        *pw.get(&mut self.state) = before;
+        if before == 0 {
+            // The log says blocked: nothing spent, nothing compared.
+            return self.route_with_store(cmd, store);
+        }
+        let spent = before - 1;
+        // Wiped on drop: copies of the password hashes.
+        let pw1_before = zeroize::Zeroizing::new(self.state.pw1_hash);
+        let pw3_before = zeroize::Zeroizing::new(self.state.pw3_hash);
+
+        let resp = self.route_with_store(cmd, store);
+
+        if resp.sw != pico2hsm_core::apdu::SW_OK {
+            // The failure is on flash already; RAM follows the log.
+            Self::load_counters(&mut self.state, store, false);
+            let after = pw.get(&mut self.state);
+            if *after > spent {
+                *after = spent;
+            }
+            return resp;
+        }
+        // Only a changed password rewrites its record; a successful VERIFY
+        // costs one counter record.
+        let mut persisted = Self::sync_counters(&self.state, store);
+        if persisted.is_ok() && self.state.pw1_hash != *pw1_before {
+            persisted = Self::save_pw1_to_store(&self.state, store);
+        }
+        if persisted.is_ok() && self.state.pw3_hash != *pw3_before {
+            persisted = Self::save_pw3_to_store(&self.state, store);
+        }
+        if persisted.is_err() {
+            // Keep RAM consistent with flash (spent counter, old password)
+            // and fail closed; see ScHsm::with_persisted_attempt.
+            (self.state.pw1_hash, self.state.pw3_hash) = (*pw1_before, *pw3_before);
+            Self::load_counters(&mut self.state, store, false);
+            self.state.pw1_verified_sign = false;
+            self.state.pw1_verified_other = false;
+            self.state.pw3_verified = false;
+            return ApduResponse::err(pico2hsm_core::apdu::SW_MEMORY_FAILURE);
+        }
+        resp
+    }
+
+    /// Route an APDU to its handler with persistent storage available.
+    fn route_with_store(
+        &mut self,
+        cmd: &ApduCommand<'_>,
+        store: &mut dyn crate::storage::KeyStore,
+    ) -> ApduResponse {
         match cmd.ins {
+            generate_keypair::INS_GENERATE_KEYPAIR
+                if cmd.p1 == 0x80
+                    && self.state.pw3_verified
+                    && cmd.data.first() == Some(&0xB6)
+                    && self.state.sig_counter != 0 =>
+            {
+                // A new signature key starts a new signature count (DO 93,
+                // OpenPGP Card 3.4 §4.4.3.9).  Reset on flash first.
+                let before = self.state.sig_counter;
+                self.state.sig_counter = 0;
+                if put_data::save_sig_counter(&self.state, store).is_err() {
+                    self.state.sig_counter = before;
+                    return ApduResponse::err(pico2hsm_core::apdu::SW_MEMORY_FAILURE);
+                }
+                self.route_with_store(cmd, store)
+            }
+            pso::INS_PSO => pso::handle_with_store(&mut self.state, store, cmd),
+            generate_keypair::INS_GENERATE_KEYPAIR
+                if cmd.p1 == 0x80
+                    && self.state.pw3_verified
+                    && !self.state.credentials_persisted =>
+            {
+                // First key for this card: PW1/PW3 go to flash first (see
+                // `OpenPgpState::credentials_persisted`).
+                if Self::save_pw1_to_store(&self.state, store).is_err()
+                    || Self::save_pw3_to_store(&self.state, store).is_err()
+                {
+                    return ApduResponse::err(pico2hsm_core::apdu::SW_MEMORY_FAILURE);
+                }
+                self.state.credentials_persisted = true;
+                generate_keypair::handle_with_store(&mut self.state, store, cmd)
+            }
             generate_keypair::INS_GENERATE_KEYPAIR => {
                 generate_keypair::handle_with_store(&mut self.state, store, cmd)
             }
-            verify::INS_VERIFY => verify::handle_with_store(&mut self.state, store, cmd),
-            change_pin::INS_CHANGE_PIN => {
-                change_pin::handle_with_store(&mut self.state, store, cmd)
+            terminate_activate::INS_TERMINATE_DF => {
+                terminate_activate::handle_terminate_with_store(&mut self.state, store, cmd)
             }
+            put_data::INS_PUT_DATA | put_data::INS_PUT_DATA_ODD => {
+                put_data::handle_with_store(&mut self.state, store, cmd)
+            }
+            // Password checks: persistence is handled by with_persisted_attempt.
+            verify::INS_VERIFY => verify::handle(&mut self.state, cmd),
+            change_pin::INS_CHANGE_PIN => change_pin::handle(&mut self.state, cmd),
             reset_retry_counter::INS_RESET_RETRY_COUNTER => {
                 reset_retry_counter::handle_with_store(&mut self.state, store, cmd)
             }
@@ -342,42 +611,47 @@ impl OpenPgp {
         &mut self,
         apdu: &[u8],
         store: &mut dyn crate::storage::KeyStore,
-    ) -> Vec<u8, 4096> {
-        let resp = match pico2hsm_core::apdu::ApduCommand::parse(apdu) {
+    ) -> Vec<u8, 4098> {
+        let resp = match ApduCommand::parse(apdu) {
             Ok(cmd) => self.dispatch_with_store(&cmd, store),
             Err(_) => ApduResponse::err(SW_INS_NOT_SUPPORTED),
         };
-        let serialized = resp.serialize();
-        let mut out: Vec<u8, 4096> = Vec::new();
-        let _ = out.extend_from_slice(&serialized[..serialized.len().min(4096)]);
-        out
+        // Full serialized response: data (≤4096) + SW — never truncated.
+        resp.serialize()
     }
 
-    /// Serialize and persist PW1 state to flash.
-    ///
-    /// Layout (35 bytes):
-    ///   [0..32] pw1_hash (32 bytes; all zeros if None)
-    ///   [32]    has_pw1_hash (1 if Some, 0 if None)
-    ///   [33]    pw1_retries
-    ///   [34]    pw1_blocked as u8
-    pub fn save_pw1_to_store(state: &OpenPgpState, store: &mut dyn crate::storage::KeyStore) {
+    /// Persist PW1: the retry counters first, then its record (layout:
+    /// `encode_pw`); see `ScHsm::save_pin_to_store` for the order.
+    pub fn save_pw1_to_store(
+        state: &OpenPgpState,
+        store: &mut dyn crate::storage::KeyStore,
+    ) -> Result<(), pico2hsm_core::error::HsmError> {
+        Self::sync_counters(state, store)?;
+        Self::save_pw_record(OPENPGP_PW1_KEY_ID, state.pw1_hash.as_ref(), store)
+    }
+
+    /// Persist PW3: the retry counters first, then its record.
+    pub fn save_pw3_to_store(
+        state: &OpenPgpState,
+        store: &mut dyn crate::storage::KeyStore,
+    ) -> Result<(), pico2hsm_core::error::HsmError> {
+        Self::sync_counters(state, store)?;
+        Self::save_pw_record(OPENPGP_PW3_KEY_ID, state.pw3_hash.as_ref(), store)
+    }
+
+    fn save_pw_record(
+        kid: pico2hsm_core::key::KeyId,
+        hash: Option<&pw::PwHash>,
+        store: &mut dyn crate::storage::KeyStore,
+    ) -> Result<(), pico2hsm_core::error::HsmError> {
         use crate::security::key_management::{AlgorithmId, KeyObject, KeyType as KmKeyType};
         use pico2hsm_core::key::AppletId;
 
-        let mut buf: heapless::Vec<u8, 64> = heapless::Vec::new();
-        let (hash_bytes, has_hash) = match &state.pw1_hash {
-            Some(h) => (*h, 1u8),
-            None => ([0u8; 32], 0u8),
-        };
-        let _ = buf.extend_from_slice(&hash_bytes);
-        let _ = buf.push(has_hash);
-        let _ = buf.push(state.pw1_retries);
-        let blocked = if state.pw1_retries == 0 { 1u8 } else { 0u8 };
-        let _ = buf.push(blocked);
-
+        let mut buf: zeroize::Zeroizing<Vec<u8, 64>> = zeroize::Zeroizing::new(Vec::new());
+        encode_pw(&mut buf, hash);
         let mut obj = KeyObject {
             key_type: KmKeyType::Generic,
-            key_id: OPENPGP_PW1_KEY_ID.0,
+            key_id: kid.0,
             owner: AppletId::OpenPgp,
             algorithm: AlgorithmId::AesGcm,
             key_domain: 0,
@@ -385,50 +659,81 @@ impl OpenPgp {
             generation: 0,
             key_flags: 0,
             timestamp_ms: 0,
-            private_key: heapless::Vec::new(),
-            public_key: heapless::Vec::new(),
+            private_key: Vec::new(),
+            public_key: Vec::new(),
+            policy: Default::default(),
         };
         let _ = obj.private_key.extend_from_slice(&buf);
-        let _ = store.save_key(&obj);
+        store.save_key(&obj)
     }
 
-    /// Serialize and persist PW3 state to flash.
-    ///
-    /// Layout (35 bytes):
-    ///   [0..32] pw3_hash (32 bytes; all zeros if None)
-    ///   [32]    has_pw3_hash (1 if Some, 0 if None)
-    ///   [33]    pw3_retries
-    ///   [34]    pw3_blocked as u8
-    pub fn save_pw3_to_store(state: &OpenPgpState, store: &mut dyn crate::storage::KeyStore) {
-        use crate::security::key_management::{AlgorithmId, KeyObject, KeyType as KmKeyType};
-        use pico2hsm_core::key::AppletId;
+    /// Write the PW1/PW3 counters where RAM differs from the log.
+    pub(crate) fn sync_counters(
+        state: &OpenPgpState,
+        store: &mut dyn crate::storage::KeyStore,
+    ) -> Result<(), pico2hsm_core::error::HsmError> {
+        retry_counter::set(store, Credential::OpenPgpPw1, state.pw1_retries)?;
+        retry_counter::set(store, Credential::OpenPgpPw3, state.pw3_retries)
+    }
 
-        let mut buf: heapless::Vec<u8, 64> = heapless::Vec::new();
-        let (hash_bytes, has_hash) = match &state.pw3_hash {
-            Some(h) => (*h, 1u8),
-            None => ([0u8; 32], 0u8),
-        };
-        let _ = buf.extend_from_slice(&hash_bytes);
-        let _ = buf.push(has_hash);
-        let _ = buf.push(state.pw3_retries);
-        let blocked = if state.pw3_retries == 0 { 1u8 } else { 0u8 };
-        let _ = buf.push(blocked);
+    /// Set the RAM counters from the log; see `retry_counter::load` for
+    /// `record_exists` (here per password: `[pw1, pw3]`).
+    pub(crate) fn load_counters(
+        state: &mut OpenPgpState,
+        store: &mut dyn crate::storage::KeyStore,
+        record_exists: bool,
+    ) {
+        Self::load_counters_each(state, store, [record_exists; 2]);
+    }
 
-        let mut obj = KeyObject {
-            key_type: KmKeyType::Generic,
-            key_id: OPENPGP_PW3_KEY_ID.0,
-            owner: AppletId::OpenPgp,
-            algorithm: AlgorithmId::AesGcm,
-            key_domain: 0,
-            use_count: 0,
-            generation: 0,
-            key_flags: 0,
-            timestamp_ms: 0,
-            private_key: heapless::Vec::new(),
-            public_key: heapless::Vec::new(),
-        };
-        let _ = obj.private_key.extend_from_slice(&buf);
-        let _ = store.save_key(&obj);
+    fn load_counters_each(
+        state: &mut OpenPgpState,
+        store: &mut dyn crate::storage::KeyStore,
+        record_exists: [bool; 2],
+    ) {
+        for (i, c) in [PwCounter::Pw1, PwCounter::Pw3].into_iter().enumerate() {
+            let n = c.get(state);
+            *n = retry_counter::load(store, c.credential(), record_exists[i], *n);
+        }
+    }
+
+    /// Migration: seeds for the retry-counter log from pre-log PW records
+    /// (see `ScHsm::legacy_retry_seeds`).
+    pub fn legacy_retry_seeds(
+        store: &mut dyn crate::storage::KeyStore,
+        seeds: &mut Vec<(Credential, CounterState), 8>,
+    ) -> Result<(), pico2hsm_core::error::HsmError> {
+        for (kid, c) in [
+            (OPENPGP_PW1_KEY_ID, PwCounter::Pw1),
+            (OPENPGP_PW3_KEY_ID, PwCounter::Pw3),
+        ] {
+            let Some(obj) = store.fetch_key(kid)? else {
+                continue;
+            };
+            let n = decode_pw(&obj.private_key).map_or(0, |(_, r)| r);
+            seeds
+                .push((c.credential(), CounterState::fresh(n)))
+                .map_err(|_| pico2hsm_core::error::HsmError::InvalidInput)?;
+        }
+        Ok(())
+    }
+
+    /// Migration, after the log is committed: zero the records' counts.
+    pub fn clear_legacy_retry_counts(
+        store: &mut dyn crate::storage::KeyStore,
+    ) -> Result<(), pico2hsm_core::error::HsmError> {
+        for kid in [OPENPGP_PW1_KEY_ID, OPENPGP_PW3_KEY_ID] {
+            let Some(mut obj) = store.fetch_key(kid)? else {
+                continue;
+            };
+            let b = &mut obj.private_key;
+            if b.len() < 35 || (b[33] == 0 && b[34] == 1) {
+                continue;
+            }
+            (b[33], b[34]) = (0, 1);
+            store.save_key(&obj)?;
+        }
+        Ok(())
     }
 
     /// Load persisted OpenPGP keys and PIN state from flash.
@@ -436,45 +741,83 @@ impl OpenPgp {
         use crate::security::key_management::{AlgorithmId, KeyType as KmKeyType};
         use pico2hsm_core::key::{AppletId, KeyType as CoreKeyType};
 
-        // Load PW1 state.
-        if let Ok(Some(obj)) = store.fetch_key(OPENPGP_PW1_KEY_ID) {
-            let b = &obj.private_key;
-            if b.len() >= 35 {
-                let has_hash = b[32] != 0;
-                if has_hash {
-                    let mut h = [0u8; 32];
-                    h.copy_from_slice(&b[0..32]);
-                    self.state.pw1_hash = Some(h);
-                } else {
-                    self.state.pw1_hash = None;
-                }
-                self.state.pw1_retries = b[33];
-                // b[34] is pw1_blocked but we derive it from retries
+        // PW1/PW3.  A missing record is a fresh card only while no key is
+        // stored (records are written before the first key).  Missing next
+        // to a key, unreadable, or malformed means the flash was tampered
+        // with: that password loads blocked instead of as the public
+        // factory default.  TERMINATE (allowed once PW3 is blocked) is the
+        // way out.
+        let mut has_keys = false;
+        // Persisted DOs (fingerprints, cardholder data) hold no secrets and
+        // may be written before any key; they don't count.
+        let mut do_ids: Vec<pico2hsm_core::key::KeyId, 20> = Vec::new();
+        store.for_each_key(&mut |kid| {
+            if kid.applet_byte() != AppletId::OpenPgp as u8 {
+                return;
+            }
+            if put_data::tag_of_record(kid).is_some() {
+                let _ = do_ids.push(kid);
+            } else if kid == put_data::sig_counter_key_id() {
+                // Holds no secret, like the DOs.
+            } else if kid != OPENPGP_PW1_KEY_ID && kid != OPENPGP_PW3_KEY_ID {
+                has_keys = true;
+            }
+        });
+        // Signature counter (DO 93).  An unreadable record loads as the
+        // largest count rather than 0: the counter must never go back.
+        self.state.sig_counter = match store.fetch_key(put_data::sig_counter_key_id()) {
+            Ok(None) => 0,
+            Ok(Some(rec)) => match rec.private_key[..] {
+                [a, b, c] => u32::from_be_bytes([0, a, b, c]),
+                _ => put_data::SIG_COUNTER_MAX,
+            },
+            Err(_) => put_data::SIG_COUNTER_MAX,
+        };
+        for kid in do_ids.iter() {
+            if let (Some(tag), Ok(Some(rec))) =
+                (put_data::tag_of_record(*kid), store.fetch_key(*kid))
+            {
+                let _ = put_data::set_do(&mut self.state, tag, &rec.private_key);
             }
         }
-
-        // Load PW3 state.
-        if let Ok(Some(obj)) = store.fetch_key(OPENPGP_PW3_KEY_ID) {
-            let b = &obj.private_key;
-            if b.len() >= 35 {
-                let has_hash = b[32] != 0;
-                if has_hash {
-                    let mut h = [0u8; 32];
-                    h.copy_from_slice(&b[0..32]);
-                    self.state.pw3_hash = Some(h);
-                } else {
-                    self.state.pw3_hash = None;
-                }
-                self.state.pw3_retries = b[33];
+        let mut persisted = true;
+        let mut record_exists = [false; 2];
+        let mut blocked = [false; 2];
+        for (i, (kid, hash)) in [
+            (OPENPGP_PW1_KEY_ID, &mut self.state.pw1_hash),
+            (OPENPGP_PW3_KEY_ID, &mut self.state.pw3_hash),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            match store.fetch_key(kid) {
+                Ok(Some(obj)) => match decode_pw(&obj.private_key) {
+                    // The record's own count is legacy; the log has it.
+                    Some((h, _)) => {
+                        *hash = h;
+                        record_exists[i] = true;
+                    }
+                    None => blocked[i] = true,
+                },
+                Ok(None) if !has_keys => persisted = false,
+                _ => blocked[i] = true,
             }
+        }
+        self.state.credentials_persisted = persisted;
+        Self::load_counters_each(&mut self.state, store, record_exists);
+        if blocked[0] {
+            self.state.pw1_retries = 0;
+        }
+        if blocked[1] {
+            self.state.pw3_retries = 0;
         }
 
         // Load key objects for OpenPGP slots.
-        let mut openpgp_ids: heapless::Vec<pico2hsm_core::key::KeyId, 8> = heapless::Vec::new();
+        let mut openpgp_ids: Vec<pico2hsm_core::key::KeyId, 8> = Vec::new();
         store.for_each_key(&mut |kid| {
             if kid.applet_byte() == AppletId::OpenPgp as u8 {
                 let slot = kid.proto_ref();
-                if slot != 0xFE && slot != 0xFF {
+                if matches!(slot, SLOT_SIG | SLOT_DEC | SLOT_AUTH) && kid.0 & 0xFF00 == 0 {
                     let _ = openpgp_ids.push(kid);
                 }
             }
@@ -498,24 +841,22 @@ impl OpenPgp {
                     _ => continue,
                 };
 
-                let mut priv_vec: heapless::Vec<u8, 66> = heapless::Vec::new();
-                let _ = priv_vec.extend_from_slice(&obj.private_key);
-                let mut pub_vec: heapless::Vec<u8, 133> = heapless::Vec::new();
+                let mut pub_vec: Vec<u8, 133> = Vec::new();
                 let _ = pub_vec.extend_from_slice(&obj.public_key);
 
                 match slot {
                     s if s == SLOT_SIG => {
-                        self.state.sig_private = Some(priv_vec);
+                        set_key(&mut self.state.sig_private, &obj.private_key);
                         self.state.sig_public = Some(pub_vec);
                         self.state.sig_key_type = Some(key_type);
                     }
                     s if s == SLOT_DEC => {
-                        self.state.dec_private = Some(priv_vec);
+                        set_key(&mut self.state.dec_private, &obj.private_key);
                         self.state.dec_public = Some(pub_vec);
                         self.state.dec_key_type = Some(key_type);
                     }
                     s if s == SLOT_AUTH => {
-                        self.state.auth_private = Some(priv_vec);
+                        set_key(&mut self.state.auth_private, &obj.private_key);
                         self.state.auth_public = Some(pub_vec);
                         self.state.auth_key_type = Some(key_type);
                     }
@@ -527,15 +868,13 @@ impl OpenPgp {
 }
 
 impl HsmProtocol for OpenPgp {
-    fn process_apdu(&mut self, apdu: &[u8]) -> Vec<u8, 4096> {
+    fn process_apdu(&mut self, apdu: &[u8]) -> Vec<u8, 4098> {
         let resp = match ApduCommand::parse(apdu) {
             Ok(cmd) => self.dispatch(&cmd),
             Err(_) => ApduResponse::err(SW_INS_NOT_SUPPORTED),
         };
-        let serialized = resp.serialize();
-        let mut out: Vec<u8, 4096> = Vec::new();
-        let _ = out.extend_from_slice(&serialized[..serialized.len().min(4096)]);
-        out
+        // Full serialized response: data (≤4096) + SW — never truncated.
+        resp.serialize()
     }
 
     fn handles_aid(&self, aid: &[u8]) -> bool {
@@ -547,3 +886,537 @@ impl HsmProtocol for OpenPgp {
         "OpenPGP"
     }
 }
+
+#[cfg(test)]
+mod terminate_tests {
+    use super::*;
+    use crate::security::key_management::KeyObject;
+    use pico2hsm_core::error::HsmError;
+    use pico2hsm_core::key::{AppletId, KeyId};
+
+    /// Records which owner was wiped; optionally fails the wipe.
+    struct WipeStore {
+        counters: retry_counter::MemCounters,
+        wiped: Option<AppletId>,
+        fail: bool,
+    }
+
+    impl crate::storage::KeyStore for WipeStore {
+        fn save_key(&mut self, _: &KeyObject) -> Result<(), HsmError> {
+            Ok(())
+        }
+        fn fetch_key(&mut self, _: KeyId) -> Result<Option<KeyObject>, HsmError> {
+            Ok(None)
+        }
+        fn erase_key(&mut self, _: KeyId) -> Result<(), HsmError> {
+            Ok(())
+        }
+        fn wipe_all(&mut self) -> Result<(), HsmError> {
+            Ok(())
+        }
+        fn wipe_by_owner(&mut self, owner: AppletId) -> Result<(), HsmError> {
+            if self.fail {
+                return Err(HsmError::NotSupported);
+            }
+            self.wiped = Some(owner);
+            Ok(())
+        }
+        fn enumerate_keys(&self) -> heapless::Vec<KeyId, 64> {
+            heapless::Vec::new()
+        }
+        fn for_each_key(&self, _: &mut dyn FnMut(KeyId)) {}
+        fn retry_counters(&mut self) -> Option<&mut dyn retry_counter::RetryCounterBackend> {
+            Some(&mut self.counters)
+        }
+    }
+
+    #[test]
+    fn terminate_erases_flash_and_zeroizes_keys() {
+        let pattern = [0xA5u8; 32];
+        let mut pgp = OpenPgp::new();
+        pgp.state.pw3_verified = true;
+        let mut key = heapless::Vec::new();
+        key.extend_from_slice(&pattern).unwrap();
+        pgp.state.sig_private = Some(key);
+
+        let mut store = WipeStore {
+            counters: Default::default(),
+            wiped: None,
+            fail: false,
+        };
+        let r = pgp.process_apdu_with_store(&[0x00, 0xE6, 0x00, 0x00], &mut store);
+        assert_eq!(&r[r.len() - 2..], &[0x90, 0x00]);
+        assert_eq!(store.wiped, Some(AppletId::OpenPgp), "flash records erased");
+
+        let bytes = unsafe {
+            core::slice::from_raw_parts(
+                (&pgp.state as *const OpenPgpState).cast::<u8>(),
+                core::mem::size_of::<OpenPgpState>(),
+            )
+        };
+        assert!(
+            !bytes.windows(32).any(|w| w == pattern),
+            "key bytes zeroized in place"
+        );
+    }
+
+    #[test]
+    fn failed_flash_wipe_leaves_card_unchanged() {
+        let mut pgp = OpenPgp::new();
+        pgp.state.pw3_verified = true;
+        let mut key = heapless::Vec::new();
+        key.extend_from_slice(&[0x11u8; 32]).unwrap();
+        pgp.state.sig_private = Some(key);
+
+        let mut store = WipeStore {
+            counters: Default::default(),
+            wiped: None,
+            fail: true,
+        };
+        let r = pgp.process_apdu_with_store(&[0x00, 0xE6, 0x00, 0x00], &mut store);
+        assert_eq!(&r[r.len() - 2..], &[0x65, 0x81]);
+        assert!(
+            !pgp.state.terminated,
+            "not terminated: flash still holds the keys"
+        );
+        assert!(pgp.state.sig_private.is_some(), "RAM still matches flash");
+    }
+
+    /// Store whose key writes fail.
+    struct FailSaveStore;
+
+    impl crate::storage::KeyStore for FailSaveStore {
+        fn save_key(&mut self, _: &KeyObject) -> Result<(), HsmError> {
+            Err(HsmError::NotSupported)
+        }
+        fn fetch_key(&mut self, _: KeyId) -> Result<Option<KeyObject>, HsmError> {
+            Ok(None)
+        }
+        fn erase_key(&mut self, _: KeyId) -> Result<(), HsmError> {
+            Ok(())
+        }
+        fn wipe_all(&mut self) -> Result<(), HsmError> {
+            Ok(())
+        }
+        fn wipe_by_owner(&mut self, _: AppletId) -> Result<(), HsmError> {
+            Ok(())
+        }
+        fn enumerate_keys(&self) -> heapless::Vec<KeyId, 64> {
+            heapless::Vec::new()
+        }
+        fn for_each_key(&self, _: &mut dyn FnMut(KeyId)) {}
+    }
+
+    #[test]
+    fn failed_keygen_save_drops_only_the_new_key() {
+        let mut pgp = OpenPgp::new();
+        pgp.state.pw3_verified = true;
+        let mut auth = heapless::Vec::new();
+        auth.extend_from_slice(&[0x77u8; 32]).unwrap();
+        pgp.state.auth_private = Some(auth.clone());
+
+        // GENERATE KEY PAIR for the signature slot (CRT B6).
+        let r = pgp.process_apdu_with_store(
+            &[0x00, 0x47, 0x80, 0x00, 0x02, 0xB6, 0x00],
+            &mut FailSaveStore,
+        );
+        assert_eq!(&r[r.len() - 2..], &[0x65, 0x81]);
+        assert!(
+            pgp.state.sig_private.is_none(),
+            "unsaved signature key dropped"
+        );
+        assert_eq!(
+            pgp.state.auth_private,
+            Some(auth),
+            "authentication key untouched"
+        );
+    }
+}
+
+#[cfg(test)]
+mod pw_tests {
+    use super::*;
+    use crate::security::key_management::{AlgorithmId, KeyObject, KeyType as KmKeyType};
+    use pico2hsm_core::error::HsmError;
+    use pico2hsm_core::key::{AppletId, KeyId};
+
+    /// Keeps the latest record per KeyId.
+    struct MemStore {
+        counters: retry_counter::MemCounters,
+        records: heapless::Vec<(KeyId, heapless::Vec<u8, 64>), 8>,
+    }
+
+    impl crate::storage::KeyStore for MemStore {
+        fn save_key(&mut self, obj: &KeyObject) -> Result<(), HsmError> {
+            let kid = KeyId(obj.key_id);
+            self.records.retain(|(k, _)| *k != kid);
+            let mut b = heapless::Vec::new();
+            let _ = b.extend_from_slice(&obj.private_key[..obj.private_key.len().min(64)]);
+            let _ = self.records.push((kid, b));
+            Ok(())
+        }
+        fn fetch_key(&mut self, kid: KeyId) -> Result<Option<KeyObject>, HsmError> {
+            Ok(self.records.iter().find(|(k, _)| *k == kid).map(|(_, b)| {
+                let mut o = KeyObject::new(
+                    KmKeyType::Generic,
+                    kid.0,
+                    AppletId::OpenPgp,
+                    AlgorithmId::AesGcm,
+                );
+                o.private_key.extend_from_slice(b).unwrap();
+                o
+            }))
+        }
+        fn erase_key(&mut self, _: KeyId) -> Result<(), HsmError> {
+            Ok(())
+        }
+        fn wipe_all(&mut self) -> Result<(), HsmError> {
+            Ok(())
+        }
+        fn wipe_by_owner(&mut self, _: AppletId) -> Result<(), HsmError> {
+            Ok(())
+        }
+        fn enumerate_keys(&self) -> heapless::Vec<KeyId, 64> {
+            heapless::Vec::new()
+        }
+        fn for_each_key(&self, f: &mut dyn FnMut(KeyId)) {
+            for (k, _) in self.records.iter() {
+                f(*k);
+            }
+        }
+        fn retry_counters(&mut self) -> Option<&mut dyn retry_counter::RetryCounterBackend> {
+            Some(&mut self.counters)
+        }
+    }
+
+    fn sw(pgp: &mut OpenPgp, store: &mut MemStore, apdu: &[u8]) -> u16 {
+        let r = pgp.process_apdu_with_store(apdu, store);
+        u16::from_be_bytes([r[r.len() - 2], r[r.len() - 1]])
+    }
+
+    fn apdu(ins: u8, p2: u8, data: &[u8]) -> heapless::Vec<u8, 64> {
+        let mut v = heapless::Vec::new();
+        v.extend_from_slice(&[0x00, ins, 0x00, p2, data.len() as u8])
+            .unwrap();
+        v.extend_from_slice(data).unwrap();
+        v
+    }
+
+    #[test]
+    fn verify_upgrades_default_to_salted_record_on_flash() {
+        let mut pgp = OpenPgp::new();
+        let mut store = MemStore {
+            counters: Default::default(),
+            records: heapless::Vec::new(),
+        };
+        assert_eq!(
+            sw(&mut pgp, &mut store, &apdu(0x20, 0x81, b"123456")),
+            0x9000
+        );
+        let rec = pgp.state.pw1_hash.unwrap();
+        assert_eq!(rec.kdf, pw::PwKdf::Pbkdf2);
+        assert_eq!(rec.len(), Some(6));
+        let mut fresh = OpenPgp::new();
+        fresh.load_from_store(&mut store);
+        assert_eq!(fresh.state.pw1_hash, Some(rec), "upgrade persisted");
+        assert_eq!(
+            sw(&mut fresh, &mut store, &apdu(0x20, 0x81, b"123456")),
+            0x9000
+        );
+    }
+
+    #[test]
+    fn missing_pw_record_next_to_a_key_loads_blocked() {
+        let mut store = MemStore {
+            counters: Default::default(),
+            records: heapless::Vec::new(),
+        };
+        // A stored signature key with no PW1/PW3 records: tampered flash.
+        let sig = KeyId(OPENPGP_PW1_KEY_ID.0 & 0xFFFF_FF00 | SLOT_SIG as u32);
+        store.records.push((sig, heapless::Vec::new())).unwrap();
+        let mut pgp = OpenPgp::new();
+        pgp.load_from_store(&mut store);
+        assert_eq!(pgp.state.pw1_retries, 0);
+        assert_eq!(pgp.state.pw3_retries, 0);
+        assert_eq!(
+            sw(&mut pgp, &mut store, &apdu(0x20, 0x81, b"123456")),
+            0x6983,
+            "factory default PIN must not work"
+        );
+        // ...but the card can still be reset.
+        assert_eq!(
+            sw(&mut pgp, &mut store, &[0x00, 0xE6, 0x00, 0x00]),
+            0x9000,
+            "TERMINATE allowed once PW3 is blocked"
+        );
+    }
+
+    #[test]
+    fn put_data_fingerprint_survives_reload() {
+        let mut store = MemStore {
+            counters: Default::default(),
+            records: heapless::Vec::new(),
+        };
+        let mut pgp = OpenPgp::new();
+        assert_eq!(
+            sw(&mut pgp, &mut store, &apdu(0x20, 0x83, b"12345678")),
+            0x9000
+        );
+        let fp = [0x7Au8; 20];
+        let mut put: heapless::Vec<u8, 64> = heapless::Vec::new();
+        put.extend_from_slice(&[0x00, 0xDA, 0x00, 0xC7, 20])
+            .unwrap();
+        put.extend_from_slice(&fp).unwrap();
+        assert_eq!(sw(&mut pgp, &mut store, &put), 0x9000);
+
+        let mut fresh = OpenPgp::new();
+        fresh.load_from_store(&mut store);
+        assert_eq!(fresh.state.fp_sig, fp);
+        // A DO record is not a key: PW defaults stay usable on this card.
+        assert_eq!(fresh.state.pw1_retries, PW1_MAX_RETRIES);
+    }
+
+    #[test]
+    fn empty_card_loads_factory_defaults() {
+        let mut store = MemStore {
+            counters: Default::default(),
+            records: heapless::Vec::new(),
+        };
+        let mut pgp = OpenPgp::new();
+        pgp.load_from_store(&mut store);
+        assert_eq!(pgp.state.pw1_retries, PW1_MAX_RETRIES);
+        assert!(!pgp.state.credentials_persisted);
+    }
+
+    #[test]
+    fn terminate_needs_pw3_unless_blocked() {
+        let mut store = MemStore {
+            counters: Default::default(),
+            records: heapless::Vec::new(),
+        };
+        let mut pgp = OpenPgp::new();
+        assert_eq!(sw(&mut pgp, &mut store, &[0x00, 0xE6, 0x00, 0x00]), 0x6982);
+    }
+
+    #[test]
+    fn change_pin_checks_exactly_one_candidate() {
+        let mut pgp = OpenPgp::new();
+        let mut store = MemStore {
+            counters: Default::default(),
+            records: heapless::Vec::new(),
+        };
+        // Old PIN is 6 bytes; "1234561234567" would match under some other
+        // split only if more than one were tried.
+        let before = pgp.state.pw1_retries;
+        assert_eq!(
+            sw(&mut pgp, &mut store, &apdu(0x24, 0x81, b"12345X654321")),
+            0x63C0 | (before - 1) as u16
+        );
+        assert_eq!(
+            sw(&mut pgp, &mut store, &apdu(0x24, 0x81, b"123456654321")),
+            0x9000
+        );
+        assert_eq!(
+            sw(&mut pgp, &mut store, &apdu(0x20, 0x81, b"654321")),
+            0x9000
+        );
+    }
+
+    #[test]
+    fn signing_needs_mode_81() {
+        let mut pgp = OpenPgp::new();
+        let mut store = MemStore {
+            counters: Default::default(),
+            records: heapless::Vec::new(),
+        };
+        assert_eq!(
+            sw(&mut pgp, &mut store, &apdu(0x20, 0x82, b"123456")),
+            0x9000
+        );
+        let pso_cds = [
+            0x00, 0x2A, 0x9E, 0x9A, 0x20, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
+        assert_eq!(sw(&mut pgp, &mut store, &pso_cds), 0x6982);
+    }
+
+    #[test]
+    fn legacy_record_of_unknown_length_asks_for_verify_without_spending() {
+        let mut pgp = OpenPgp::new();
+        let mut store = MemStore {
+            counters: Default::default(),
+            records: heapless::Vec::new(),
+        };
+        // A pre-2026-10 record: 35 bytes, SHA-256("123456"), no length.
+        let mut old: heapless::Vec<u8, 64> = heapless::Vec::new();
+        use sha2::Digest;
+        old.extend_from_slice(&sha2::Sha256::digest(b"123456"))
+            .unwrap();
+        old.extend_from_slice(&[1, 3, 0]).unwrap();
+        store.records.push((OPENPGP_PW1_KEY_ID, old)).unwrap();
+        // First boot of this firmware: the count moves to the counter log.
+        store.counters.unformatted = true;
+        assert_eq!(
+            crate::apdu::dispatcher::Dispatcher::migrate_retry_counters(&mut store),
+            Ok(true)
+        );
+        assert_eq!(store.counters.remaining(Credential::OpenPgpPw1), Some(3));
+        pgp.load_from_store(&mut store);
+        assert_eq!(pgp.state.pw1_hash.unwrap().len(), None);
+
+        assert_eq!(
+            sw(&mut pgp, &mut store, &apdu(0x24, 0x81, b"123456654321")),
+            0x6985
+        );
+        assert_eq!(pgp.state.pw1_retries, 3, "no retry spent");
+        assert_eq!(
+            sw(&mut pgp, &mut store, &apdu(0x20, 0x81, b"123456")),
+            0x9000
+        );
+        assert_eq!(
+            sw(&mut pgp, &mut store, &apdu(0x24, 0x81, b"123456654321")),
+            0x9000
+        );
+    }
+
+    #[test]
+    fn change_pin_does_not_reveal_pin_length() {
+        // Wrong total length and wrong old PIN must look identical: same SW,
+        // same retry cost.  (Default PW1 is 6 bytes.)
+        let mut pgp = OpenPgp::new();
+        let mut store = MemStore {
+            counters: Default::default(),
+            records: heapless::Vec::new(),
+        };
+        // Correct old PIN, but 134 trailing bytes: no valid split at length 6.
+        let mut long = [b'9'; 140];
+        long[..6].copy_from_slice(b"123456");
+        let mut cmd: heapless::Vec<u8, 160> = heapless::Vec::new();
+        cmd.extend_from_slice(&[0x00, 0x24, 0x00, 0x81, long.len() as u8])
+            .unwrap();
+        cmd.extend_from_slice(&long).unwrap();
+        let r = pgp.process_apdu_with_store(&cmd, &mut store);
+        let r1 = u16::from_be_bytes([r[r.len() - 2], r[r.len() - 1]]);
+        assert_eq!(r1, 0x63C2, "bad split fails like a wrong PIN, not 6700");
+        let r2 = sw(&mut pgp, &mut store, &apdu(0x24, 0x81, b"000000654321")); // right split, wrong PIN
+        assert_eq!(r2, 0x63C1);
+    }
+
+    fn pw3_history(store: &MemStore) -> heapless::Vec<u8, 16> {
+        store
+            .counters
+            .puts
+            .iter()
+            .filter(|(c, _)| *c == Credential::OpenPgpPw3)
+            .map(|(_, s)| s.remaining())
+            .collect()
+    }
+
+    #[test]
+    fn verify_costs_counter_records_not_pw_records() {
+        let mut pgp = OpenPgp::new();
+        let mut store = MemStore {
+            counters: Default::default(),
+            records: heapless::Vec::new(),
+        };
+        // The first VERIFY upgrades the factory hash (one PW3 record)...
+        assert_eq!(
+            sw(&mut pgp, &mut store, &apdu(0x20, 0x83, b"12345678")),
+            0x9000
+        );
+        let records = store.records.clone();
+        // ...after that, wrong and right guesses touch only the log.
+        assert_eq!(
+            sw(&mut pgp, &mut store, &apdu(0x20, 0x83, b"00000000")),
+            0x63C2
+        );
+        assert_eq!(
+            sw(&mut pgp, &mut store, &apdu(0x20, 0x83, b"12345678")),
+            0x9000
+        );
+        assert_eq!(store.records, records, "no PW record rewritten");
+        assert_eq!(&pw3_history(&store)[..], &[2, 3, 2, 1, 3]);
+        // The record holds no usable count.
+        let (_, b) = store
+            .records
+            .iter()
+            .find(|(k, _)| *k == OPENPGP_PW3_KEY_ID)
+            .unwrap();
+        assert_eq!((b[33], b[34]), (0, 1));
+    }
+
+    #[test]
+    fn pw_counters_survive_reload_and_fail_closed_without_entry() {
+        let mut pgp = OpenPgp::new();
+        let mut store = MemStore {
+            counters: Default::default(),
+            records: heapless::Vec::new(),
+        };
+        assert_eq!(
+            sw(&mut pgp, &mut store, &apdu(0x20, 0x83, b"12345678")),
+            0x9000
+        );
+        assert_eq!(
+            sw(&mut pgp, &mut store, &apdu(0x20, 0x83, b"00000000")),
+            0x63C2
+        );
+        let mut fresh = OpenPgp::new();
+        fresh.load_from_store(&mut store);
+        assert_eq!(fresh.state.pw3_retries, 2);
+        assert_eq!(fresh.state.pw1_retries, PW1_MAX_RETRIES, "no PW1 record");
+        // The PW3 record exists; without its counter entry it is blocked.
+        store.counters.entries = Default::default();
+        let mut fresh = OpenPgp::new();
+        fresh.load_from_store(&mut store);
+        assert_eq!(fresh.state.pw3_retries, 0);
+        assert_eq!(fresh.state.pw1_retries, PW1_MAX_RETRIES);
+    }
+
+    #[test]
+    fn failed_counter_spend_refuses_the_attempt() {
+        let mut pgp = OpenPgp::new();
+        let mut store = MemStore {
+            counters: Default::default(),
+            records: heapless::Vec::new(),
+        };
+        store.counters.fail_all = true;
+        assert_eq!(
+            sw(&mut pgp, &mut store, &apdu(0x20, 0x83, b"12345678")),
+            0x6581
+        );
+        assert!(!pgp.state.pw3_verified);
+    }
+
+    #[test]
+    fn terminate_and_activate_reset_the_counters() {
+        let mut pgp = OpenPgp::new();
+        let mut store = MemStore {
+            counters: Default::default(),
+            records: heapless::Vec::new(),
+        };
+        // Block PW3 (TERMINATE is then allowed without it).
+        for _ in 0..PW3_MAX_RETRIES {
+            sw(&mut pgp, &mut store, &apdu(0x20, 0x83, b"00000000"));
+        }
+        assert_eq!(store.counters.remaining(Credential::OpenPgpPw3), Some(0));
+        assert_eq!(sw(&mut pgp, &mut store, &[0x00, 0xE6, 0x00, 0x00]), 0x9000);
+        assert_eq!(
+            store.counters.remaining(Credential::OpenPgpPw3),
+            Some(PW3_MAX_RETRIES),
+            "a reboot now finds a factory-fresh card"
+        );
+        let mut fresh = OpenPgp::new();
+        fresh.load_from_store(&mut store);
+        assert_eq!(fresh.state.pw3_retries, PW3_MAX_RETRIES);
+        // ACTIVATE on the running card.
+        assert_eq!(sw(&mut pgp, &mut store, &[0x00, 0x44, 0x00, 0x00]), 0x9000);
+        assert_eq!(pgp.state.pw3_retries, PW3_MAX_RETRIES);
+        assert_eq!(
+            sw(&mut pgp, &mut store, &apdu(0x20, 0x83, b"12345678")),
+            0x9000
+        );
+    }
+}
+
+#[cfg(test)]
+mod policy_tests;

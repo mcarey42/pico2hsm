@@ -14,8 +14,10 @@ pub const INS_SESSION_PIN: u8 = 0x26;
 
 /// Handle a SESSION PIN APDU command.
 pub fn handle(state: &mut ScHsmState, _cmd: &ApduCommand<'_>) -> ApduResponse {
-    // Require PIN or SO-PIN to create a session PIN
-    if !state.pin_verified && !state.so_pin_verified {
+    // The session PIN grants user-PIN rights (VERIFY P2=0x82), so only the
+    // user may create one: allowing the SO here would let the SO use the
+    // user's keys without knowing the user PIN.
+    if !state.pin_verified {
         return ApduResponse::err(SW_SECURITY_STATUS);
     }
 
@@ -23,7 +25,7 @@ pub fn handle(state: &mut ScHsmState, _cmd: &ApduCommand<'_>) -> ApduResponse {
     let mut buf = [0u8; 8];
     #[cfg(target_arch = "arm")]
     {
-        let _ = crate::crypto::rng::fill_random(&mut buf);
+        crate::crypto::rng::fill_or_reset(&mut buf);
     }
     #[cfg(not(target_arch = "arm"))]
     {
@@ -111,5 +113,21 @@ mod tests {
         let sw2 = resp2.sw;
         assert_eq!(sw1, SW_OK);
         assert_eq!(sw2, SW_OK);
+    }
+
+    #[test]
+    fn so_pin_alone_cannot_create_session_pin() {
+        let mut state = ScHsmState::new();
+        state.so_pin_verified = true;
+        let cmd = ApduCommand {
+            cla: 0x80,
+            ins: INS_SESSION_PIN,
+            p1: 0x01,
+            p2: 0x81,
+            data: &[],
+            le: None,
+        };
+        assert_eq!(handle(&mut state, &cmd).sw, SW_SECURITY_STATUS);
+        assert!(state.session_pin.is_none());
     }
 }

@@ -169,7 +169,7 @@ impl<P: FlashChip, M: FlashChip> RaidManager<P, M> {
                     Ok(()) => {
                         // Quick CRC check if the sector looks written.
                         if verify_magic(buf) {
-                            verify_header_crc32(&buf[..HEADER_SIZE], &self.ciphertext_slice(buf))
+                            verify_header_crc32(&buf[..HEADER_SIZE], self.ciphertext_slice(buf))
                                 .is_ok()
                         } else {
                             true // blank or non-key sector; accept as-is
@@ -260,7 +260,7 @@ impl<P: FlashChip, M: FlashChip> RaidManager<P, M> {
         &mut self,
         sector: u32,
         data: &[u8; SECTOR_SIZE],
-        wal: &mut Wal<W>,
+        wal: &mut Wal<'_, W>,
     ) -> Result<(), StorageError> {
         let addr = sector * SECTOR_SIZE as u32;
 

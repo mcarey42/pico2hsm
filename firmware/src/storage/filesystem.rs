@@ -14,16 +14,35 @@
 //! mirroring — those responsibilities belong to the `StorageManager` in
 //! `mod.rs`.
 //!
-//! # Directory sector layout (sector 0, 4096 bytes)
+//! # Directory: two copies, A/B (sectors 0 and 1)
 //! ```text
-//! [0..4]   Magic  *b"P2KD"
-//! [4..6]   Entry count (u16 LE)
-//! [6..8]   CRC16 of entries area (u16 LE) — simple XOR sum for fast check
-//! [8..N]   DirectoryEntry records (12 bytes each)
+//! [0..4]    Magic  *b"P2D2"
+//! [4..6]    Entry count (u16 LE)
+//! [6..8]    Reserved (0)
+//! [8..12]   Sequence number (u32 LE) — the higher valid copy is current
+//! [12..16]  CRC32 of [4..12] and the entries
+//! [16..N]   DirectoryEntry records (12 bytes each)
 //! [N..4096] Padding (0xFF)
 //! ```
-//! Maximum entries per chip: (4096 - 8) / 12 = 340.  Total across 8 chips:
-//! 2720.  The in-RAM `Directory` caps at 512 entries (heapless Vec limit).
+//! A flush writes the copy that is *not* current, so losing power during
+//! the erase or program leaves the previous directory intact (the torn
+//! copy fails its CRC).  Each copy is erased half as often as the single
+//! sector 0 was.  Sector 1 was reserved for a write-ahead log that is not
+//! used at runtime.
+//!
+//! The legacy single-copy format (`P2KD` in sector 0, XOR checksum) is
+//! still read, as sequence 0; the first flush writes copy B.
+//!
+//! Falling back to the older copy rolls the directory back by one flush.
+//! Only someone able to corrupt the newer copy can force that, and such an
+//! attacker can already replay a whole old flash image (no anti-rollback
+//! counter; see S-15 in docs/AUDIT_2026-10.md).  What it can resurrect is
+//! limited: deleted and superseded objects have their data sectors erased
+//! before or right after the flush, and every applet loads a credential
+//! record it can't read as blocked or unset, never as a factory default
+//! (SC-HSM: no PIN, so VERIFY refuses; PIV/OpenPGP: blocked).
+//!
+//! Maximum entries per copy: (4096 - 16) / 12 = 340.
 
 use crate::storage::{
     integrity::{
@@ -45,16 +64,25 @@ use pico2hsm_core::{
 
 // ─── Directory sector constants ───────────────────────────────────────────────
 
-/// Magic bytes for the directory sector.
-const DIR_MAGIC: [u8; 4] = *b"P2KD";
-/// Size of the directory sector header (magic + count + crc16).
-const DIR_HEADER_SIZE: usize = 8;
+/// Magic of the legacy single-copy directory (XOR checksum, read only).
+const DIR_MAGIC_LEGACY: [u8; 4] = *b"P2KD";
+/// Size of the legacy header (magic + count + xor16).
+const DIR_HEADER_SIZE_LEGACY: usize = 8;
+/// Magic of an A/B directory copy.
+const DIR_MAGIC: [u8; 4] = *b"P2D2";
+/// Size of the A/B header (magic + count + reserved + seq + crc32).
+const DIR_HEADER_SIZE: usize = 16;
+/// Sectors holding directory copies A and B.  Sector 1 doubles as the
+/// first WAL sector, which nothing uses at runtime (`wal.rs`).
+pub const DIR_SLOTS: [u32; 2] = [DIRECTORY_SECTOR, WAL_SECTOR_0];
 /// Size of a single `DirectoryEntry` on disk (packed layout).
 const DIR_ENTRY_SIZE: usize = 12;
 /// Maximum number of directory entries in one sector.
 const DIR_MAX_ENTRIES: usize = (SECTOR_SIZE - DIR_HEADER_SIZE) / DIR_ENTRY_SIZE;
-/// Maximum entries tracked in the in-RAM `Directory`.
-const MAX_DIRECTORY_ENTRIES: usize = 512;
+/// Maximum entries tracked in the in-RAM `Directory` — exactly what one
+/// directory sector can hold, so RAM can never accept an entry that
+/// `serialize` would then fail to persist (was 512 vs. 340 on flash).
+pub const MAX_DIRECTORY_ENTRIES: usize = DIR_MAX_ENTRIES;
 
 // ─── Directory ────────────────────────────────────────────────────────────────
 
@@ -99,10 +127,16 @@ impl Directory {
             self.dirty = true;
             return Ok(());
         }
-        // Append new entry.
-        self.entries
-            .push(entry)
-            .map_err(|_| StorageError::KeystoreFull)?;
+        // Append, or reuse a tombstoned slot (tombstones are not written to
+        // flash, so they must not use up capacity).
+        if let Err(entry) = self.entries.push(entry) {
+            let slot = self
+                .entries
+                .iter_mut()
+                .find(|e| (e.flags & 0x01) != 0)
+                .ok_or(StorageError::KeystoreFull)?;
+            *slot = entry;
+        }
         self.dirty = true;
         Ok(())
     }
@@ -146,14 +180,63 @@ impl Directory {
     ///
     /// Only non-tombstoned entries are written.  Extra space is padded with
     /// 0xFF (erased-flash value).
-    pub fn serialize(&self, buf: &mut [u8; SECTOR_SIZE]) -> Result<(), StorageError> {
+    /// Serialize an empty directory (what `Directory::new().serialize()`
+    /// produces) without building the ~8 KB entry table on the stack.
+    pub fn serialize_empty(buf: &mut [u8; SECTOR_SIZE], seq: u32) {
         buf.fill(0xFF);
+        Self::finish_header(buf, 0, seq);
+    }
+
+    /// Fill in magic, count, sequence number and CRC32 (over everything
+    /// from the count to the last entry).
+    fn finish_header(buf: &mut [u8; SECTOR_SIZE], count: u16, seq: u32) {
         buf[0..4].copy_from_slice(&DIR_MAGIC);
+        buf[4..6].copy_from_slice(&count.to_le_bytes());
+        buf[6..8].copy_from_slice(&[0, 0]);
+        buf[8..12].copy_from_slice(&seq.to_le_bytes());
+        let crc = Self::crc_of(buf, count as usize);
+        buf[12..16].copy_from_slice(&crc.to_le_bytes());
+    }
+
+    fn crc_of(buf: &[u8; SECTOR_SIZE], count: usize) -> u32 {
+        let end = DIR_HEADER_SIZE + count * DIR_ENTRY_SIZE;
+        let mut h = crc32fast::Hasher::new();
+        h.update(&buf[4..12]);
+        h.update(&buf[DIR_HEADER_SIZE..end]);
+        h.finalize()
+    }
+
+    /// The sequence number of a valid directory copy in `buf`, or `None`
+    /// (blank, torn, corrupt).  A legacy `P2KD` sector counts as sequence 0.
+    pub fn validate(buf: &[u8; SECTOR_SIZE]) -> Option<u32> {
+        let count = u16::from_le_bytes([buf[4], buf[5]]) as usize;
+        if buf[0..4] == DIR_MAGIC {
+            if count > DIR_MAX_ENTRIES {
+                return None;
+            }
+            let stored = u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]);
+            (Self::crc_of(buf, count) == stored)
+                .then(|| u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]))
+        } else if buf[0..4] == DIR_MAGIC_LEGACY {
+            let end = DIR_HEADER_SIZE_LEGACY + count * DIR_ENTRY_SIZE;
+            if end > SECTOR_SIZE {
+                return None;
+            }
+            let xor = buf[DIR_HEADER_SIZE_LEGACY..end]
+                .iter()
+                .fold(0u16, |a, &b| a ^ b as u16);
+            (xor == u16::from_le_bytes([buf[6], buf[7]])).then_some(0)
+        } else {
+            None
+        }
+    }
+
+    pub fn serialize(&self, buf: &mut [u8; SECTOR_SIZE], seq: u32) -> Result<(), StorageError> {
+        buf.fill(0xFF);
 
         // Collect live entries.
         let mut count = 0u16;
         let mut offset = DIR_HEADER_SIZE;
-        let mut crc_accum: u16 = 0;
 
         for entry in self.entries.iter().filter(|e| (e.flags & 0x01) == 0) {
             if offset + DIR_ENTRY_SIZE > SECTOR_SIZE {
@@ -166,16 +249,11 @@ impl Directory {
             chunk[9] = entry.sector_count;
             chunk[10] = entry.flags;
             chunk[11] = entry._pad[0];
-            // XOR-sum CRC (simple; catches random corruption).
-            for &b in chunk.iter() {
-                crc_accum ^= b as u16;
-            }
             offset += DIR_ENTRY_SIZE;
             count += 1;
         }
 
-        buf[4..6].copy_from_slice(&count.to_le_bytes());
-        buf[6..8].copy_from_slice(&crc_accum.to_le_bytes());
+        Self::finish_header(buf, count, seq);
         Ok(())
     }
 
@@ -193,24 +271,26 @@ impl Directory {
     /// for `Vec<DirectoryEntry, 512>` that can overflow core0's stack on
     /// boards with tight SRAM headroom (SD card variants).
     pub fn deserialize_from(&mut self, buf: &[u8; SECTOR_SIZE]) -> Result<(), StorageError> {
-        if buf[0..4] != DIR_MAGIC {
+        let header_size = if buf[0..4] == DIR_MAGIC {
+            DIR_HEADER_SIZE
+        } else if buf[0..4] == DIR_MAGIC_LEGACY {
+            DIR_HEADER_SIZE_LEGACY
+        } else {
             return Err(StorageError::NotFormatted);
+        };
+        if Self::validate(buf).is_none() {
+            return Err(StorageError::IntegrityFailure);
         }
         let count = u16::from_le_bytes([buf[4], buf[5]]) as usize;
-        let stored_crc = u16::from_le_bytes([buf[6], buf[7]]);
 
         self.entries.clear();
-        let mut crc_accum: u16 = 0;
-        let mut offset = DIR_HEADER_SIZE;
+        let mut offset = header_size;
 
         for _ in 0..count {
             if offset + DIR_ENTRY_SIZE > SECTOR_SIZE {
                 break;
             }
             let chunk = &buf[offset..offset + DIR_ENTRY_SIZE];
-            for &b in chunk.iter() {
-                crc_accum ^= b as u16;
-            }
             let key_id = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
             let chip_index = chunk[4];
             let sector_index = u32::from_le_bytes([chunk[5], chunk[6], chunk[7], chunk[8]]);
@@ -230,15 +310,6 @@ impl Directory {
                 .push(entry)
                 .map_err(|_| StorageError::KeystoreFull)?;
             offset += DIR_ENTRY_SIZE;
-        }
-
-        if crc_accum != stored_crc {
-            defmt::warn!(
-                "Directory: CRC mismatch — stored {:04X}, computed {:04X}",
-                stored_crc,
-                crc_accum
-            );
-            return Err(StorageError::IntegrityFailure);
         }
 
         self.dirty = false;
@@ -284,6 +355,19 @@ pub struct ScrubReport {
 pub struct KeyFilesystem<Chip: FlashChip> {
     pub chips: Vec<Chip, 8>,
     pub directory: Directory,
+    /// Index into `DIR_SLOTS` of the current directory copy.
+    dir_slot: usize,
+    /// Its sequence number; the next flush writes the other slot with +1.
+    dir_seq: u32,
+    /// Where the next allocation search starts.  Rotating it spreads
+    /// erases over all free sectors instead of wearing out the lowest
+    /// ones (a PIN record rewritten on every VERIFY used to ping-pong
+    /// between the same two sectors).
+    alloc_cursor: u32,
+    /// A directory copy could not be read at mount.  The directory in RAM
+    /// may then be older than flash (or empty), so every write is refused:
+    /// it would overwrite the real directory or allocate over live keys.
+    read_only: bool,
 }
 
 impl<Chip: FlashChip> KeyFilesystem<Chip> {
@@ -292,6 +376,10 @@ impl<Chip: FlashChip> KeyFilesystem<Chip> {
         KeyFilesystem {
             chips: Vec::new(),
             directory: Directory::new(),
+            dir_slot: 0,
+            dir_seq: 0,
+            alloc_cursor: 0,
+            read_only: false,
         }
     }
 
@@ -310,69 +398,64 @@ impl<Chip: FlashChip> KeyFilesystem<Chip> {
     /// directory sector.  WAL recovery is run on every chip that has a
     /// valid WAL sector.
     pub fn mount(&mut self) -> Result<(), StorageError> {
-        let mut loaded = false;
+        // Static buffer avoids 4 KB stack allocation — critical on SD card
+        // boards with tight core0 stack headroom.
+        // SAFETY: mount() is single-threaded, called once at init.
+        static mut SECTOR0: [u8; SECTOR_SIZE] = [0u8; SECTOR_SIZE];
+        let buf = unsafe { &mut *core::ptr::addr_of_mut!(SECTOR0) };
 
+        // The newest valid copy on any chip: (chip, slot, seq).
+        let mut best: Option<(usize, usize, u32)> = None;
         for chip_index in 0..self.chips.len() {
-            let chip = &mut self.chips[chip_index];
-
-            // Run WAL recovery.
-            {
-                // We can't borrow `chip` via a Wal at the same time as mutating
-                // `self.directory`, so we do WAL scan first, then load directory.
-                // The borrow checker requires a scope here.
-            }
-
-            // Read sector 0 to check if it has a valid directory.
-            // Static buffer avoids 4 KB stack allocation — critical on
-            // SD card boards with tight core0 stack headroom.
-            // SAFETY: mount() is single-threaded, called once at init.
-            static mut SECTOR0: [u8; SECTOR_SIZE] = [0u8; SECTOR_SIZE];
-            let sector0 = unsafe { &mut *core::ptr::addr_of_mut!(SECTOR0) };
-            if chip.read(0, sector0).is_err() {
-                defmt::warn!("KeyFilesystem: chip {} read sector 0 failed", chip_index);
-                continue;
-            }
-
-            // Check for directory magic.
-            if sector0[0..4] == DIR_MAGIC {
-                if !loaded {
-                    // Deserialise directly into self.directory to avoid a 6 KB
-                    // stack-allocated Directory (Vec<DirectoryEntry, 512>).
-                    match self.directory.deserialize_from(sector0) {
-                        Ok(()) => {
-                            loaded = true;
-                            defmt::info!(
-                                "KeyFilesystem: loaded directory from chip {} ({} entries)",
-                                chip_index,
-                                self.directory.len(),
-                            );
-                        }
-                        Err(e) => {
-                            defmt::warn!(
-                                "KeyFilesystem: chip {} directory CRC/parse error: {:?}",
-                                chip_index,
-                                defmt::Debug2Format(&e),
-                            );
-                        }
-                    }
+            for (slot, &sector) in DIR_SLOTS.iter().enumerate() {
+                if self.chips[chip_index]
+                    .read(sector * SECTOR_SIZE as u32, buf)
+                    .is_err()
+                {
+                    defmt::error!(
+                        "KeyFilesystem: chip {} directory slot {} unreadable — read-only",
+                        chip_index,
+                        slot
+                    );
+                    self.read_only = true;
+                    continue;
                 }
-            } else if IntegrityChecker::is_blank(sector0) {
-                defmt::info!(
-                    "KeyFilesystem: chip {} sector 0 is blank — needs format",
-                    chip_index
-                );
-            } else {
-                defmt::warn!(
-                    "KeyFilesystem: chip {} sector 0 has unexpected content",
-                    chip_index
-                );
+                match Directory::validate(buf) {
+                    Some(seq) if best.map_or(true, |(_, _, b)| seq > b) => {
+                        best = Some((chip_index, slot, seq));
+                    }
+                    Some(_) => {}
+                    None if IntegrityChecker::is_blank(buf) => {}
+                    None => defmt::warn!(
+                        "KeyFilesystem: chip {} directory slot {} invalid (torn or corrupt)",
+                        chip_index,
+                        slot
+                    ),
+                }
             }
         }
 
-        if !loaded {
+        let Some((chip_index, slot, seq)) = best else {
             defmt::warn!("KeyFilesystem: no valid directory found on any chip");
-            // Not an error — caller can decide to format.
-        }
+            // Not an error — the first flush creates one.
+            return Ok(());
+        };
+        self.chips[chip_index]
+            .read(DIR_SLOTS[slot] * SECTOR_SIZE as u32, buf)
+            .map_err(|_| StorageError::ReadError)?;
+        // Deserialise directly into self.directory to avoid a stack copy.
+        self.directory.deserialize_from(buf)?;
+        self.dir_slot = slot;
+        self.dir_seq = seq;
+        // Different boots start allocating in different places.
+        self.alloc_cursor = seq.wrapping_mul(0x9E37_79B9);
+        defmt::info!(
+            "KeyFilesystem: directory from chip {} slot {} seq {} ({} entries)",
+            chip_index,
+            slot,
+            seq,
+            self.directory.len(),
+        );
         Ok(())
     }
 
@@ -383,16 +466,18 @@ impl<Chip: FlashChip> KeyFilesystem<Chip> {
         }
         let chip = &mut self.chips[chip_index];
 
-        // Erase directory sector, WAL sectors.
-        chip.erase_sector(DIRECTORY_SECTOR * SECTOR_SIZE as u32)?;
-        chip.erase_sector(WAL_SECTOR_0 * SECTOR_SIZE as u32)?;
+        // Erase both directory copies and the remaining WAL sector.
+        for &sector in DIR_SLOTS.iter() {
+            chip.erase_sector(sector * SECTOR_SIZE as u32)?;
+        }
         chip.erase_sector(WAL_SECTOR_1 * SECTOR_SIZE as u32)?;
 
-        // Write empty directory.
+        // Write an empty directory as copy A.
         let mut buf = [0xFFu8; SECTOR_SIZE];
-        let empty_dir = Directory::new();
-        empty_dir.serialize(&mut buf)?;
-        write_sector(chip, DIRECTORY_SECTOR * SECTOR_SIZE as u32, &buf)?;
+        Directory::serialize_empty(&mut buf, 0);
+        write_sector(chip, DIR_SLOTS[0] * SECTOR_SIZE as u32, &buf)?;
+        self.dir_slot = 0;
+        self.dir_seq = 0;
 
         defmt::info!("KeyFilesystem: chip {} formatted", chip_index);
         Ok(())
@@ -400,32 +485,61 @@ impl<Chip: FlashChip> KeyFilesystem<Chip> {
 
     // ── Directory persistence ────────────────────────────────────────────────
 
-    /// Flush the in-RAM directory to sector 0 of every healthy chip.
+    /// Flush the in-RAM directory to the non-current copy (A/B) of every chip.
     pub fn flush_directory(&mut self) -> Result<(), StorageError> {
         if !self.directory.dirty {
             return Ok(());
         }
+        if self.read_only {
+            return Err(StorageError::ReadError);
+        }
+        // Write the copy that is not current; the current one stays valid
+        // until the new one is complete.
+        let target = 1 - self.dir_slot;
+        let seq = self.dir_seq.wrapping_add(1);
         let mut buf = [0u8; SECTOR_SIZE];
-        self.directory.serialize(&mut buf)?;
+        self.directory.serialize(&mut buf, seq)?;
 
+        // A failed write is reported, and the directory stays dirty: callers
+        // (DELETE, INITIALIZE) must not believe a removal is durable when
+        // the old directory — still listing the key — is what's on flash.
+        let mut result = Ok(());
+        let mut written = 0usize;
         for chip in self.chips.iter_mut() {
-            let addr = DIRECTORY_SECTOR * SECTOR_SIZE as u32;
+            // A chip already known bad holds no current directory: skip it,
+            // as allocation does, so a dead mirror can't fail every save.
+            if chip.is_degraded() {
+                continue;
+            }
+            let addr = DIR_SLOTS[target] * SECTOR_SIZE as u32;
             if let Err(e) = chip.erase_sector(addr) {
                 defmt::warn!(
                     "KeyFilesystem: erase directory sector failed: {:?}",
                     defmt::Debug2Format(&e)
                 );
+                result = Err(e);
                 continue;
             }
-            if let Err(e) = write_sector(chip, addr, &buf) {
-                defmt::warn!(
-                    "KeyFilesystem: write directory sector failed: {:?}",
-                    defmt::Debug2Format(&e)
-                );
+            match write_sector(chip, addr, &buf) {
+                Ok(()) => written += 1,
+                Err(e) => {
+                    defmt::warn!(
+                        "KeyFilesystem: write directory sector failed: {:?}",
+                        defmt::Debug2Format(&e)
+                    );
+                    result = Err(e);
+                }
             }
         }
-        self.directory.dirty = false;
-        Ok(())
+        if written == 0 && result.is_ok() {
+            result = Err(StorageError::WriteError);
+        }
+        if result.is_ok() {
+            self.directory.dirty = false;
+            self.dir_slot = target;
+            self.dir_seq = seq;
+        }
+        result
     }
 
     // ── Key read ─────────────────────────────────────────────────────────────
@@ -436,8 +550,7 @@ impl<Chip: FlashChip> KeyFilesystem<Chip> {
     pub fn read_key(
         &mut self,
         key_id: KeyId,
-    ) -> Result<heapless::Vec<u8, { crate::security::key_management::MAX_BLOB_SIZE }>, StorageError>
-    {
+    ) -> Result<Vec<u8, { crate::security::key_management::MAX_BLOB_SIZE }>, StorageError> {
         let entry = self.directory.find(key_id).ok_or(StorageError::ReadError)?;
 
         let chip_index = entry.chip_index as usize;
@@ -448,8 +561,7 @@ impl<Chip: FlashChip> KeyFilesystem<Chip> {
             return Err(StorageError::ReadError);
         }
 
-        let mut out: heapless::Vec<u8, { crate::security::key_management::MAX_BLOB_SIZE }> =
-            heapless::Vec::new();
+        let mut out: Vec<u8, { crate::security::key_management::MAX_BLOB_SIZE }> = Vec::new();
         // The total plaintext length is stored in the header; read it from the
         // first sector and use it to truncate the output (sector data is padded
         // to 256-byte alignment for CRC, but the caller needs the exact blob).
@@ -507,8 +619,12 @@ impl<Chip: FlashChip> KeyFilesystem<Chip> {
         plaintext_hash: &[u8; 32],
         sector_count: u8,
     ) -> Result<(), StorageError> {
+        if self.read_only {
+            return Err(StorageError::ReadError);
+        }
         // Find a chip and free sector.
         let (chip_index, free_sector) = self.find_free_location(sector_count as u32)?;
+        self.alloc_cursor = free_sector + sector_count as u32;
 
         // Determine seq_no — increment if key already exists.
         let seq_no = if let Some(e) = self.directory.find(key_id) {
@@ -604,8 +720,36 @@ impl<Chip: FlashChip> KeyFilesystem<Chip> {
             flags: 0,
             _pad: [0],
         };
+        // The entry being replaced, if any (live entries only).
+        let superseded = self
+            .directory
+            .find(key_id)
+            .map(|e| (e.chip_index as usize, e.sector_index, e.sector_count as u32));
         self.directory.insert(new_entry)?;
-        self.flush_directory()?;
+        if let Err(e) = self.flush_directory() {
+            // RAM must not keep a change flash doesn't have: the next
+            // unrelated flush would commit a save the caller was told
+            // failed, and the old sectors — still referenced on flash —
+            // would look free.
+            match superseded {
+                Some((chip, sector, count)) => {
+                    let _ = self
+                        .directory
+                        .insert(dir_entry(key_id, chip, sector, count));
+                }
+                None => {
+                    self.directory.remove(key_id);
+                }
+            }
+            return Err(e);
+        }
+        // Only once the new copy is what the directory points at: erase the
+        // old one, so a replaced key's ciphertext doesn't linger in a free
+        // sector.  The save itself already succeeded; a failed erase here
+        // leaves only unreferenced ciphertext.
+        if let Some((chip, sector, count)) = superseded {
+            let _ = self.erase_data_sectors(chip, sector, count);
+        }
         Ok(())
     }
 
@@ -613,6 +757,9 @@ impl<Chip: FlashChip> KeyFilesystem<Chip> {
 
     /// Delete a key: erase its sector(s), remove from directory.
     pub fn delete_key(&mut self, key_id: KeyId) -> Result<(), StorageError> {
+        if self.read_only {
+            return Err(StorageError::ReadError);
+        }
         // Look up entry before removing from directory.
         let (chip_index, sector_index, sector_count) = {
             let entry = self.directory.find(key_id).ok_or(StorageError::ReadError)?;
@@ -627,22 +774,96 @@ impl<Chip: FlashChip> KeyFilesystem<Chip> {
             return Err(StorageError::WriteError);
         }
 
-        // Erase the data sectors.
+        // Erase the data sectors.  A failed erase is an error: the key's
+        // ciphertext may still be on flash, and the caller must not report
+        // it deleted.
+        self.erase_data_sectors(chip_index, sector_index, sector_count)?;
+
+        // Remove from directory.  If that can't be written, keep RAM as
+        // flash has it (the entry, now pointing at erased sectors).
+        self.directory.remove(key_id);
+        if let Err(e) = self.flush_directory() {
+            let _ =
+                self.directory
+                    .insert(dir_entry(key_id, chip_index, sector_index, sector_count));
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    fn erase_data_sectors(
+        &mut self,
+        chip_index: usize,
+        sector_index: u32,
+        sector_count: u32,
+    ) -> Result<(), StorageError> {
+        let chip = self
+            .chips
+            .get_mut(chip_index)
+            .ok_or(StorageError::WriteError)?;
         for s in 0..sector_count {
             let addr = (sector_index + s) * SECTOR_SIZE as u32;
-            if let Err(e) = self.chips[chip_index].erase_sector(addr) {
+            if let Err(e) = chip.erase_sector(addr) {
                 defmt::warn!(
                     "KeyFilesystem: erase sector {} failed: {:?}",
                     sector_index + s,
                     defmt::Debug2Format(&e)
                 );
+                return Err(e);
             }
         }
-
-        // Remove from directory.
-        self.directory.remove(key_id);
-        self.flush_directory()?;
         Ok(())
+    }
+
+    /// Delete every key whose id matches `pred`, writing the directory once.
+    ///
+    /// Walks the whole directory (no 64-entry cap: keys past it used to
+    /// survive INITIALIZE).  Data sectors are erased before the directory
+    /// drops the entry; a key whose erase fails stays listed and the call
+    /// fails, but the rest are still removed.
+    pub fn delete_where(&mut self, pred: &dyn Fn(KeyId) -> bool) -> Result<(), StorageError> {
+        while self.delete_where_step(pred, usize::MAX)? {}
+        Ok(())
+    }
+
+    /// One bounded step of [`delete_where`](Self::delete_where): erase at
+    /// most `max` matching keys.  Returns `Ok(true)` if matches remain (the
+    /// directory is written on the last step only), so a caller can return
+    /// to its event loop between steps — core0 must keep sending CCID time
+    /// extensions during a long INITIALIZE.  A failed erase writes the
+    /// directory for what was removed and fails (that key stays listed).
+    pub fn delete_where_step(
+        &mut self,
+        pred: &dyn Fn(KeyId) -> bool,
+        max: usize,
+    ) -> Result<bool, StorageError> {
+        if self.read_only {
+            return Err(StorageError::ReadError);
+        }
+        let mut done = 0usize;
+        for i in 0..self.directory.entries.len() {
+            let e = &self.directory.entries[i];
+            if e.key_id == 0xFFFF_FFFF || (e.flags & 0x01) != 0 || !pred(KeyId(e.key_id)) {
+                continue;
+            }
+            if done == max {
+                return Ok(true);
+            }
+            let (kid, chip, sector, count) = (
+                KeyId(e.key_id),
+                e.chip_index as usize,
+                e.sector_index,
+                e.sector_count as u32,
+            );
+            if let Err(err) = self.erase_data_sectors(chip, sector, count) {
+                let _ = self.flush_directory();
+                return Err(err);
+            }
+            self.directory.remove(kid);
+            done += 1;
+        }
+        self.flush_directory()?;
+        Ok(false)
     }
 
     // ── Key list ─────────────────────────────────────────────────────────────
@@ -652,8 +873,8 @@ impl<Chip: FlashChip> KeyFilesystem<Chip> {
     /// Returns a `Vec` of `KeyRecord` objects.  The `label` and
     /// `access_counter` fields are left at their defaults since they are
     /// not stored by the filesystem layer.
-    pub fn list_keys(&self) -> heapless::Vec<KeyRecord, 64> {
-        let mut out = heapless::Vec::new();
+    pub fn list_keys(&self) -> Vec<KeyRecord, 64> {
+        let mut out = Vec::new();
         for key_id in self.directory.list_keys() {
             if let Some(entry) = self.directory.find(key_id) {
                 let key_type = key_type_from_u8(entry.flags >> 4); // top nibble = type tag
@@ -719,10 +940,27 @@ impl<Chip: FlashChip> KeyFilesystem<Chip> {
             if chip.is_degraded() {
                 continue;
             }
-            let cap_sectors = (chip.capacity() / SECTOR_SIZE as u64) as u32;
-            // Find `needed_sectors` consecutive free sectors.
-            if let Some(start) =
-                self.find_consecutive_free(chip_idx as u8, cap_sectors, needed_sectors)
+            // Byte addresses are u32: never allocate a sector whose address
+            // would wrap (large SD cards).
+            let cap_sectors = (chip.capacity() / SECTOR_SIZE as u64)
+                .min((u32::MAX / SECTOR_SIZE as u32) as u64) as u32;
+            if cap_sectors <= DATA_START_SECTOR {
+                continue;
+            }
+            // Find `needed_sectors` consecutive free sectors, searching from
+            // the rotating cursor to the end, then from the start.
+            let span = cap_sectors - DATA_START_SECTOR;
+            let from = DATA_START_SECTOR + self.alloc_cursor % span;
+            if let Some(start) = self
+                .find_consecutive_free(chip_idx as u8, from, cap_sectors, needed_sectors)
+                .or_else(|| {
+                    self.find_consecutive_free(
+                        chip_idx as u8,
+                        DATA_START_SECTOR,
+                        cap_sectors,
+                        needed_sectors,
+                    )
+                })
             {
                 return Ok((chip_idx, start));
             }
@@ -734,13 +972,14 @@ impl<Chip: FlashChip> KeyFilesystem<Chip> {
     fn find_consecutive_free(
         &self,
         chip_index: u8,
+        from: u32,
         chip_capacity_sectors: u32,
         count: u32,
     ) -> Option<u32> {
-        let mut run_start = DATA_START_SECTOR;
+        let mut run_start = from;
         let mut run_len = 0u32;
 
-        'sector: for s in DATA_START_SECTOR..chip_capacity_sectors {
+        'sector: for s in from..chip_capacity_sectors {
             // Check if this sector is used by any directory entry.
             for entry in self.directory.entries.iter() {
                 if entry.chip_index == chip_index
@@ -764,6 +1003,18 @@ impl<Chip: FlashChip> KeyFilesystem<Chip> {
 }
 
 // ─── Free functions ───────────────────────────────────────────────────────────
+
+/// A live directory entry.
+fn dir_entry(key_id: KeyId, chip: usize, sector: u32, count: u32) -> DirectoryEntry {
+    DirectoryEntry {
+        key_id: key_id.0,
+        chip_index: chip as u8,
+        sector_index: sector,
+        sector_count: count as u8,
+        flags: 0,
+        _pad: [0],
+    }
+}
 
 /// Write a full 4096-byte sector to a chip using 16 × 256-byte page writes.
 pub fn write_sector<C: FlashChip>(

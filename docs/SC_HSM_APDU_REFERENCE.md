@@ -64,18 +64,18 @@ All SC-HSM commands use `CLA = 0x00` unless noted. OpenSC's session-PIN flow use
 | `0x28` | PUK AUTH | Authenticate with PUK to unblock PIN | Implemented |
 | `0x2A` | PSO | Perform Security Operation (sign / decipher / MAC) | Implemented |
 | `0x2C` | RESET RETRY COUNTER | Reset PIN retry counter (requires SO-PIN) | Implemented |
-| `0x34` | EXPORT KEY | Export DKEK-wrapped key blob | Stubbed (SW_INS_NOT_SUPPORTED) |
+| `0x34` / `0x72` | EXPORT KEY | Export a CardContact key blob under the DKEK (refused for NO_EXPORT keys) | Implemented |
 | `0x46` | GENERATE KEY PAIR | Generate asymmetric key pair on-device | Implemented |
 | `0x48` | GENERATE SYMMETRIC KEY | Generate AES-128/192/256 key on-device | Implemented |
 | `0x50` | INITIALIZE | Initialize / re-initialize device | Implemented |
-| `0x52` | KEY DOMAIN | Manage DKEK key domains | Partially implemented |
+| `0x52` | KEY DOMAIN | DKEK share import and status (CardContact); pico2hsm domain management | Partially implemented |
 | `0x54` | EXTRAS | Additional KDF / MAC primitives | Implemented |
-| `0x58` | LIST KEYS / IMPORT KEY | List key slots (P2=0x00) or import wrapped key (P2=0x93) | LIST: Implemented; IMPORT: Stubbed |
+| `0x58` | LIST KEYS | List key slots (IMPORT KEY uses `0x74`; see §3.25) | Implemented |
 | `0x60` | BIP/SLIP HD DERIVE | BIP32 / SLIP-0010 hierarchical key derivation | Implemented |
-| `0x62` | DECIPHER / DERIVE ASYM | ECDH key agreement or RSA decrypt (P1=key_id) or derive asymmetric key (P1=0x01) | Implemented |
+| `0x62` | DECIPHER / DERIVE ASYM | ECDH key agreement or RSA decrypt (P1=key_id, P2=algo) or derive asymmetric key (P1=0x01 **and** P2=0x00) | Implemented |
 | `0x68` | SIGN | Compute digital signature (ECDSA / RSA) | Implemented |
 | `0x78` | SYMMETRIC CIPHER | AES-CBC / CTR / GCM / CMAC | Implemented |
-| `0x82` | EXTERNAL AUTHENTICATE | Challenge-response authentication (HMAC-SHA256) | Implemented |
+| `0x82` | EXTERNAL AUTHENTICATE | Removed (2026-10): keyed by the stored SO-PIN hash, so reading the PIN record granted SO. Returns `6D00`. | Removed |
 | `0x84` | GET CHALLENGE | Return random bytes from TRNG | Implemented |
 | `0x86` | GENERAL AUTHENTICATE | Single-step challenge-sign via Dynamic Auth Template | Implemented |
 | `0xA4` | SELECT | Select EF/DF within SC-HSM virtual filesystem | Implemented |
@@ -139,6 +139,16 @@ Selects an EF or DF in the SC-HSM virtual PKCS#15 filesystem. When the SC-HSM ap
 | `0xC4xx` | PRKD for key slot `xx` (private key descriptor) |
 | `0xCCxx` | Key container slot `xx` (presence flag for LIST KEYS) |
 | `0xCExx` | EE certificate EF for key slot `xx` |
+
+**Key file FCP (`CCxx`, P2 ≠ 0x0C):** as a SmartCard-HSM does, the FCP of a
+key file carries the key's usage policy (§3.31) in a proprietary `A5` part:
+
+```
+62 L 80 02 .. 82 01 01 83 02 CC xx
+     A5 L 90 04 <uses left | FFFFFFFF>  [91 n <algorithm IDs>]  [92 01 <key domain>]
+```
+
+`90 04 FFFFFFFF` = no use counter; `91` only for a key with an algorithm list.
 
 **pico2hsm notes:** `CExx` files exist only if written via WRITE DATA (0xD7). `CCxx` files exist if the corresponding key is in the keystore. `C4xx` files exist if an EC key is in the keystore, an RSA key is in the keystore (feature `rsa`), or an EF was written via WRITE DATA. SELECT updates `state.current_file` for subsequent READ BINARY ODD operations.
 
@@ -607,7 +617,7 @@ At least one of tag `0x80` or `0x84` must be present. Either may be omitted if o
 
 ### 3.16 GET CHALLENGE (INS = 0x84)
 
-Returns random bytes from the hardware TRNG. The first 8 bytes are also stored in `state.challenge` for subsequent EXTERNAL AUTHENTICATE. The challenge is single-use (cleared by EXTERNAL AUTHENTICATE regardless of outcome).
+Returns random bytes from the hardware TRNG. The first 8 bytes are also stored in `state.challenge`.
 
 **Command:**
 
@@ -629,32 +639,12 @@ Returns random bytes from the hardware TRNG. The first 8 bytes are also stored i
 
 ---
 
-### 3.17 EXTERNAL AUTHENTICATE (INS = 0x82)
+### 3.17 EXTERNAL AUTHENTICATE (INS = 0x82) — removed
 
-Authenticates an external entity using HMAC-SHA256 challenge-response. Establishes SO-PIN session (`state.so_pin_verified = true`) without presenting the SO-PIN directly.
-
-**Command:**
-
-| Field | Value |
-|---|---|
-| CLA | `0x00` |
-| INS | `0x82` |
-| P1 | `0x00` |
-| P2 | `0x00` |
-| Data | 32 bytes: `HMAC-SHA256(so_pin_hash, challenge)` |
-
-The challenge is the 8-byte value previously returned by GET CHALLENGE. The key is the 32-byte SHA-256 hash of the SO-PIN (init code). The challenge is cleared from state immediately — whether or not the cryptogram matches — preventing replay.
-
-**Status words:**
-
-| SW | Meaning |
-|---|---|
-| `9000` | Cryptogram correct, SO-PIN session opened |
-| `6982` | SO-PIN hash not set |
-| `6984` | No challenge outstanding |
-| `6700` | Response not exactly 32 bytes |
-
----
+Removed in October 2026. The pico2hsm variant verified
+`HMAC-SHA256(so_pin_hash, challenge)`, i.e. it was keyed by the *stored*
+SO-PIN hash: anyone able to read the PIN record became SO without knowing
+the SO-PIN. No client used it. The command now returns `6D00`.
 
 ### 3.18 GENERAL AUTHENTICATE (INS = 0x86)
 
@@ -720,6 +710,15 @@ Generates an asymmetric key pair (EC or RSA) on-device. Requires User PIN. Retur
 | `42` | Key reference label (optional) |
 | `7F 49` | Public key template; contains curve domain params or RSA modulus-size |
 | `5F 20` | CA reference (optional) |
+| `D4` | pico2hsm key flags (bit 3 = NO_EXPORT) |
+| `90` | Key use counter, 4 bytes BE (CardContact; §3.31) |
+| `91` | Algorithm list: allowed algorithm IDs (CardContact; §3.31) |
+| `92` | Key domain, 1 byte; only `00` exists (CardContact; §3.31) |
+
+The command data is parsed as BER-TLV (1- and 2-byte tags, lengths up to
+`82 xx xx`); a structure that does not parse is refused with `6A80` rather
+than stored without its attributes (OpenSC's P-521 request has a 2-byte
+`7F49` length before `90`/`91`).
 
 **Algorithm inference from `7F49` content:**
 
@@ -764,8 +763,10 @@ Generates an asymmetric key pair (EC or RSA) on-device. Requires User PIN. Retur
 |---|---|
 | `9000` | Success |
 | `6982` | PIN not verified |
-| `6A80` | Missing algorithm byte or unknown algorithm |
+| `6A80` | Missing algorithm byte or unknown algorithm; malformed TLV or key attribute |
+| `6A88` | Key domain (`92`) other than 0 |
 | `6985` | Keystore full |
+| `6581` | The key could not be stored |
 
 ---
 
@@ -780,8 +781,8 @@ Generates an AES key from the on-chip TRNG and stores it in the in-memory symmet
 | CLA | `0x00` |
 | INS | `0x48` |
 | P1 | Key slot ID (`0x01–0xFE`) |
-| P2 | `0x00` |
-| Data | 1 byte: algorithm tag (`0x82`=AES-128, `0x83`=AES-192, `0x84`=AES-256) |
+| P2 | SmartCard-HSM form: `0xB0` / `0xB1` / `0xB2` = AES-128 / 192 / 256; or `0x00` (pico2hsm form) |
+| Data | P2 = B0–B2: optional key attributes `90` / `91` / `92` (§3.31). P2 = 00: 1 byte size tag (`0x82`=AES-128, `0x83`=AES-192, `0x84`=AES-256), then the same optional attributes |
 
 **Status words:**
 
@@ -789,8 +790,9 @@ Generates an AES key from the on-chip TRNG and stores it in the in-memory symmet
 |---|---|
 | `9000` | Success |
 | `6982` | PIN not verified |
-| `6A80` | Invalid key ID or unknown algorithm tag |
-| `6985` | Flash write failed |
+| `6A80` | Invalid key ID, unknown size tag, malformed attribute |
+| `6A88` | Key domain other than 0 |
+| `6581` | Flash write failed (was `6985`) |
 
 ---
 
@@ -817,11 +819,16 @@ Computes an ECDSA or RSA digital signature. The key reference and algorithm are 
 | `0x17` | ECDSA P-521 (pre-hashed) | 64-byte SHA-512 digest | |
 | `0x19` | ECDSA K-256 (pre-hashed) | 32-byte SHA-256 digest | |
 | `0x20` | RSA RAW | 256- or 512-byte PKCS#1-padded block | Host pre-pads; card does raw `m^d mod n` |
-| `0x31` | RSA PKCS#1v1.5 + SHA-256 | Raw message | Card hashes; `rsa` feature required |
-| `0x32` | RSA PKCS#1v1.5 + SHA-384 | Raw message | `rsa` feature required |
-| `0x33` | RSA PKCS#1v1.5 + SHA-512 | Raw message | `rsa` feature required |
-| `0x34` | RSA-PSS + SHA-256 (internal) | 32-byte SHA-256 digest | `rsa` feature required |
-| `0x40` | RSA-PSS + SHA-256 | 32-byte SHA-256 digest | `rsa` feature required |
+| `0x31` | RSA PKCS#1v1.5 + SHA-1 | Raw message | Card hashes; `rsa` feature required |
+| `0x32` | RSA PKCS#1v1.5 + SHA-224 | Raw message | Card hashes |
+| `0x33` | RSA PKCS#1v1.5 + SHA-256 | Raw message | Card hashes |
+| `0x34` | RSA PKCS#1v1.5 + SHA-384 | Raw message | Card hashes |
+| `0x35` | RSA PKCS#1v1.5 + SHA-512 | Raw message | Card hashes |
+| `0x40` | RSA-PSS, external hash | 32-byte SHA-256 digest only | Other digest lengths `6A80` |
+
+Since 2026-10 the RSA codes are the CardContact ones (OpenSC
+`card-sc-hsm.h`). Before, `31`/`32`/`33` signed a host digest as
+SHA-256/384/512 and `34` was PSS; OpenSC never sent them.
 | `0x70` | ECDSA EC-RAW (pre-hashed) | Any digest | Passes directly to sign primitive |
 | `0x71` | ECDSA + SHA-1 | Raw message | Card computes SHA-1 |
 | `0x72` | ECDSA + SHA-224 | Raw message | Card computes SHA-224 |
@@ -837,18 +844,29 @@ Computes an ECDSA or RSA digital signature. The key reference and algorithm are 
 |---|---|
 | `9000` | Success |
 | `6982` | PIN not verified |
-| `6985` | Empty data field |
+| `6985` | Empty data field; algorithm not in the key's list (`91`) |
+| `6A84` | Key use counter (`90`) exhausted |
 | `6A82` | Key not found |
 | `6D00` | Unknown algorithm byte |
+| `6581` | The spent use could not be written |
+
+The key's usage policy (§3.31) is checked against P2 — the per-curve
+codes `13`/`15`/`17`/`19` as `70` — and one use is written to flash before
+the signature is computed.
 
 ---
 
 ### 3.22 DECIPHER / DERIVE ASYMMETRIC KEY (INS = 0x62)
 
-INS `0x62` is shared between two operations, disambiguated by P1:
+INS `0x62` is shared between two operations, disambiguated by P1 **and** P2
+(since v1.0.1):
 
-- P1 = key slot ID (any value except `0x01`): **DECIPHER** — ECDH key agreement or RSA decrypt
-- P1 = `0x01`: **DERIVE ASYMMETRIC KEY** — KDF-based derivation using a stored key
+- P1 = `0x01` and P2 = `0x00`: **DERIVE ASYMMETRIC KEY** — KDF-based derivation using a stored key
+- anything else: **DECIPHER** — ECDH key agreement or RSA decrypt (P1 = key slot, P2 = non-zero algorithm code)
+
+P1 alone is not enough: OpenSC assigns key reference `0x01` to the first
+generated key, so a P-256 ECDH DECIPHER on slot 1 (`80 62 01 80`) must not
+reach the derive handler.
 
 #### 3.22a DECIPHER
 
@@ -866,13 +884,20 @@ INS `0x62` is shared between two operations, disambiguated by P1:
 
 | P2 | Operation | Input | Response |
 |---|---|---|---|
-| `0x21` | RSA decrypt (PKCS#1 or OAEP) | RSA ciphertext (`c`) | Raw `c^d mod n`; host strips padding |
-| `0x22` | RSA decrypt (OAEP variant) | Same as 0x21 | Same |
+| `0x21` | RSA decrypt (raw) | RSA ciphertext (`c`) | Raw `c^d mod n`; host strips padding |
+| `0x22` | RSA decrypt, card removes PKCS#1 v1.5 padding | — | **Refused (`6D00`)** before the key is touched |
 | `0x23` | ECDH P-256 | `04 \|\| Qx \|\| Qy` (65 bytes) | Raw X-coordinate (32 bytes) |
 | `0x25` | ECDH P-384 | `04 \|\| Qx \|\| Qy` (97 bytes) | Raw X-coordinate (48 bytes) |
 | `0x27` | ECDH P-521 | `04 \|\| Qx \|\| Qy` (133 bytes) | Raw X-coordinate (66 bytes) |
 | `0x29` | ECDH K-256 | `04 \|\| Qx \|\| Qy` (65 bytes) | Raw X-coordinate (32 bytes) |
 | `0x80` | ECDH generic (ALGO_EC_DH) | `04 \|\| Qx \|\| Qy` | `04 \|\| X-coord` (OpenSC strips the 0x04 prefix) |
+
+`0x22` used to run the raw operation of `0x21`; card-side unpadding would
+answer bad padding differently from good (a Bleichenbacher oracle), so
+`0x22` and `0x23` (OAEP, on an RSA key) are not supported. OpenSC sends
+`0x21` only. For the usage policy every ECDH code counts as `0x80`
+(`ALGO_EC_DH`); `0x23` is CardContact's RSA-OAEP ID and is never looked up
+as such for an EC key.
 
 **Response notes:** For `P2 = 0x80`, pico2hsm prepends `0x04` to the X-coordinate. OpenSC's `sc_hsm_decipher` strips this prefix to recover the field-size X bytes. For explicit ECDH codes (`0x23/0x25/0x27/0x29`), the raw X-coordinate is returned without the prefix.
 
@@ -969,7 +994,7 @@ Performs symmetric encryption or decryption. Key must be selected by a preceding
 
 | P2 | Mode | Input format | Response |
 |---|---|---|---|
-| `0x02` | AES-CBC | `[IV: 16 bytes][plaintext or ciphertext]` | CBC-encrypted or decrypted payload |
+| `0x02` | AES-CBC | `[IV: 16 bytes][whole blocks]` | Same number of blocks; **no padding** either way (host pads) |
 | `0x03` | AES-CTR | `[nonce: 16 bytes][data]` | XOR-keystream applied (encrypt=decrypt) |
 | `0x05` | AES-GCM | `[nonce: 12 bytes][aad_len: 2 BE][aad][payload]` | Encrypt: `ct \|\| tag(16)`; Decrypt: plaintext |
 | `0x06` | AES-CMAC | `[message]` | 16-byte CMAC tag (P1 ignored) |
@@ -977,7 +1002,12 @@ Performs symmetric encryption or decryption. Key must be selected by a preceding
 **Constraints:**
 - AES-CTR: AES-256 only (32-byte key). Payload max 4080 bytes.
 - AES-GCM decrypt: payload must include the 16-byte authentication tag appended to ciphertext.
-- AES-CBC: plaintext/ciphertext must be block-aligned (16-byte boundary).
+- AES-CBC: data must be one or more whole blocks (`6700` otherwise). Since
+  2026-10 there is no PKCS#7 padding: encrypt added and decrypt stripped it,
+  and decrypt answered bad padding with `6985` — a CBC padding oracle.
+- Usage policy (§3.31): CBC encrypt = `0x10`, CBC decrypt = `0x11`, CMAC =
+  `0x18`; CTR and GCM have no CardContact ID and are refused for a key with
+  an algorithm list.
 
 **Status words:**
 
@@ -992,83 +1022,103 @@ Performs symmetric encryption or decryption. Key must be selected by a preceding
 
 ---
 
-### 3.25 IMPORT KEY (INS = 0x58, P2 = 0x93)
+### 3.25 IMPORT KEY / UNWRAP KEY (INS = 0x74)
 
-Imports a wrapped key blob (SC-HSM DKEK wrap format). Stub — not yet implemented.
+Imports a DKEK-wrapped key into slot P1 (P2 = `0x93`). User PIN and a ready
+DKEK are required. The blob is either inline or written beforehand to EF
+`2F10` (the `sc-hsm-tool --unwrap-key` path: WRITE `2F10`, then a case-1
+`80 74 <ref> 93`). Slots `0x00` and `0xFC`–`0xFF` are refused.
 
-**Command:**
+**Accepted formats:**
 
-| Field | Value |
-|---|---|
-| CLA | `0x00` |
-| INS | `0x58` |
-| P1 | Key slot ID |
-| P2 | `0x93` |
-| Data | Wrapped key blob |
+- the SmartCard-HSM (CardContact) key blob, §3.32 — what WRAP writes, what
+  `sc-hsm-tool --wrap-key` stores in a `.wky` file, and what a real
+  SmartCard-HSM or pico-hsm exports;
+- **deprecated, this release only:** the pico2hsm formats of the previous
+  release (byte 8 = `0x02` or `0x03`, never a CardContact key type):
 
-**Status words:**
+  ```
+  KCV'(8) || 0x02|0x03 || IV(16) || AES-256-CBC(kenc', key [|| A5 L {..} || L+2] || algo || flags || PKCS#7) || MAC(16)
+  KCV'  = AES-256-CMAC(DKEK, 0^16)[..8]
+  kenc' = HMAC-SHA256(DKEK, "pico2hsm-wrap-v2-enc")
+  kmac' = HMAC-SHA256(DKEK, "pico2hsm-wrap-v2-mac")
+  MAC   = HMAC-SHA256(kmac', everything before the MAC)[..16]
+  ```
+  Version 3 carries the key's usage policy (§3.31), use counter included.
+  Version-1 blobs (no version byte, no MAC) are refused.
 
-| SW | Meaning |
-|---|---|
-| `6D00` | Not implemented (SW_INS_NOT_SUPPORTED) |
+Either way the blob is authenticated (KCV, then CMAC / HMAC, compared in
+constant time) before anything in it is decrypted or parsed, so every
+forged, altered or foreign blob fails the same way (`6A80`, which
+`sc-hsm-tool` reports as "Wrapped key does not match DKEK"). The imported
+key keeps the blob's algorithm list and key flags, joins key domain 0, and
+gets its public key (EC: recomputed as d·G and checked against the blob's
+Q; RSA: n and e).
+
+**Status words:** `9000` imported; `6A80` bad/forged blob, wrong DKEK, or
+inconsistent content; `6A81` authentic blob of a key this firmware cannot
+hold (brainpool, Curve25519, AES-512, RSA in a build without `rsa`, RSA
+outside 1024–4096 bits); `6A86` reserved slot; `6982` PIN not verified;
+`6985` no DKEK; `6581` the key could not be stored.
 
 ---
 
-### 3.26 EXPORT KEY (INS = 0x34)
+### 3.26 EXPORT KEY / WRAP KEY (INS = 0x72, alias 0x34)
 
-Exports a key wrapped under the DKEK. Stub — not yet implemented.
+Exports the key in slot P1 (P2 = `0x92`) as a CardContact key blob
+(§3.32). User PIN and a ready DKEK are required; keys generated or imported
+with the NO_EXPORT flag (bit 3 of tag `D4`) are refused with `6985`, as are
+reserved slots `0xFC`–`0xFF` (`6A86`).
 
-**Command:**
+Usage policy (§3.31): a key with an algorithm list must list `0x92`
+(`ALGO_WRAP`), else `6985`. A key with a **use counter is not exportable**
+(`6985`): every unwrap of a wrapped copy (into other slots, or back over
+the original after use) would start again from the exported count, and the
+CardContact format has no field for it anyway. Wrapping does not spend a
+use.
 
-| Field | Value |
-|---|---|
-| CLA | `0x00` |
-| INS | `0x34` |
-| P1 | Key slot ID |
-| P2 | `0x00` |
+Keys without a CardContact encoding — Ed25519, X25519, brainpool, BIP32
+masters — are refused with `6A81`.
 
-**Status words:**
-
-| SW | Meaning |
-|---|---|
-| `6D00` | Not implemented (SW_INS_NOT_SUPPORTED) |
+OpenSC reads the WRAP response into a 1500-byte buffer
+(`card-sc-hsm.c` `sc_hsm_wrap_key`), so `sc-hsm-tool --wrap-key` handles
+RSA up to 3072 bits (1421-byte blob); an RSA-4096 blob (1869 bytes) needs a
+client with a larger buffer (e.g. `pico2hsm-tool`).
 
 ---
 
 ### 3.27 KEY DOMAIN (INS = 0x52)
 
-Manages DKEK key domains. Requires SO-PIN session. Domain create/delete/assign and DKEK share import are stubbed; domain status query (P1=0x04) is implemented.
+The device has one key domain (0) and one DKEK.
 
-**Command:**
+**P1 = `0x00` — status and DKEK share import (CardContact, no PIN):**
 
-| Field | Value |
+| Data | Operation |
 |---|---|
-| CLA | `0x00` |
-| INS | `0x52` |
-| P1 | Sub-command (see table) |
-| P2 | Domain ID |
-| Data | Sub-command specific |
+| none | status (what `sc-hsm-tool` without a command asks for each domain) |
+| 32 bytes | import one DKEK share (`sc-hsm-tool --import-dkek-share` decrypts the share file on the host and sends the raw share) |
 
-**Sub-commands (P1):**
+Response, as OpenSC `sc_hsm_manage_key_domain` reads it:
+`[shares in the DKEK (1), shares still missing (1), KCV (8)]`, KCV =
+SHA-256(DKEK)[0..8] (§3.32), zeros while shares are missing.
+`sc-hsm-tool` prints it as "Key Check Value", so devices loaded with the
+same shares — and a real SmartCard-HSM — show the same value.
 
-| P1 | Operation | Status |
-|---|---|---|
-| `0x01` | Create key domain | Stub |
-| `0x02` | Delete key domain | Stub |
-| `0x03` | Import DKEK share | Partial (increments counter only) |
-| `0x04` | Query domain status | Implemented |
-| `0x05` | Assign key to domain | Stub |
+Shares combine by XOR: DKEK = share₁ ⊕ … ⊕ shareₙ (pico-hsm
+`import_dkek_share`; the SmartCard-HSM key-domain scheme).
 
-**P1=0x04 response:** `[dkek_shares_required, dkek_shares_imported]` (2 bytes).
+`P2 ≠ 0` → `6A86` (ends `sc-hsm-tool`'s domain loop); no DKEK configured
+(INITIALIZE without `--dkek-shares`) → `6A88` (`sc-hsm-tool` prints
+"Empty"); a share when the DKEK is complete → `6A80`.
 
-**Status words:**
-
-| SW | Meaning |
-|---|---|
-| `9000` | Success (P1=0x04) |
-| `6982` | SO-PIN not verified |
-| `6D00` | Sub-command not implemented |
-| `6A80` | Unknown P1 |
+**P1 = `0x01`–`0x05` — pico2hsm domain management (SO-PIN):** create
+(`01`: restart share collection), delete (`02`), import an encrypted share
+blob (`03`), status `[required, imported, ready]` (`04`), assign (`05`, not
+supported). Create and delete are refused while a DKEK is set. These P1
+values differ from CardContact's (`01` create DKEK domain with the share
+count as data, `02` create XKEK domain, `03` delete domain, `04` delete
+KEK); `sc-hsm-tool --create-dkek-key-domain` / `--delete-key-domain` are not
+supported.
 
 ---
 
@@ -1179,6 +1229,156 @@ Dumps a region of RAM, flash, or OTP memory. Currently a stub returning `SW = 0x
 
 ---
 
+### 3.31 Key usage policy (CardContact key attributes)
+
+Since 2026-10 (audit S-10). A key may be created with:
+
+| Tag | Length | Meaning |
+|---|---|---|
+| `90` | 4 | Key use counter: uses left (BE). `0` = unusable |
+| `91` | 1–32 | Algorithm list: the algorithm IDs (CardContact, OpenSC `card-sc-hsm.h`) the key may be used with |
+| `92` | 1 | Key domain; only domain `00` exists (one DKEK) — others `6A88` |
+
+Without `91` every algorithm valid for the key type is allowed; without
+`90` there is no limit. Keys created before this firmware load with no
+restriction (that is what the spec gives a key generated without the
+tags). An empty `91` counts as absent.
+
+**Enforcement.** Every use checks the operation's algorithm ID against the
+list, then, for a key with a counter, writes the decremented counter to
+flash **before** the operation (like the PIN retry counters): a result never
+leaves the device without its use on flash, and a malformed request (bad
+P2, empty data, wrong key type, CBC length) is refused before anything is
+spent. Errors: `6A84` counter exhausted, `6985` algorithm not allowed,
+`6581` the counter could not be written.
+
+| Operation | Algorithm ID checked |
+|---|---|
+| COMPUTE DIGITAL SIGNATURE, PSO:CDS | P2 / MSE algorithm (`13`/`15`/`17`/`19` as `70`) |
+| DECIPHER, PSO:DECIPHER | RSA: `21`; ECDH (any code): `80` |
+| GENERAL AUTHENTICATE (ECDSA over SHA-256 of the challenge) | `73` |
+| PSO checksum AES-CMAC (compute or verify) | `18` |
+| CIPHER CBC encrypt / decrypt / CMAC | `10` / `11` / `18` |
+| WRAP KEY (export) | `92` (no use spent; counted keys refused) |
+| CIPHER CTR / GCM, PSO HMAC, DERIVE (HKDF, `62 01 00`), BIP/SLIP | none in CardContact's list: only keys **without** a list |
+
+**Who sets it.** OpenSC's default key generation (pkcs11-tool,
+pkcs15-init) sends none of the tags. `sc-hsm-tool --generate-key
+--key-use-counter N --key-domain D` sends `90` (and `92` = D−1); no OpenSC
+tool sends `91` — use a raw GENERATE KEY PAIR (see `tests/hw/test_17_key_policy.py`)
+or CardContact's own tooling.
+
+**Storage.** The policy is part of the encrypted key object (magic `P2KP`
+= `P2K4` + policy; keys without a policy keep `P2K4`, so firmware before
+2026-10 refuses a restricted key rather than use it unrestricted). It is
+reported in the key file's FCP (§3.1). WRAP / UNWRAP carry the algorithm
+list in the CardContact blob's own field (§3.32); a use counter makes a key
+unexportable. A key created by DERIVE gets no policy (none is
+stored by this firmware's derive commands, which return data).
+
+---
+
+### 3.32 Key backup blob (WRAP / UNWRAP) — CardContact format
+
+The blob WRAP KEY returns and UNWRAP KEY accepts on a SmartCard-HSM.
+`sc-hsm-tool --wrap-key` stores it in a `.wky` file as
+`30 { 04 <blob>, [PRKD from EF C4xx], [certificate from EF CExx] }` and
+`--unwrap-key` writes the blob to EF `2F10`, sends UNWRAP, then restores the
+PRKD and certificate EFs.
+
+**Sources.**
+[1] OpenSC `src/tools/sc-hsm-tool.c` (`wrap_key`, `unwrap_key`,
+`print_dkek_info`, `import_dkek_share`) and `src/libopensc/card-sc-hsm.c`
+(`sc_hsm_wrap_key`, `sc_hsm_unwrap_key`, `sc_hsm_manage_key_domain`),
+master, fetched 2026-10-11.
+[2] pico-hsm (the C reference firmware, which imports SmartCard-HSM
+backups) `src/hsm/kek.c` — `dkek_kcv`, `dkek_kenc`, `dkek_kmac`,
+`dkek_encode_key`, `dkek_decode_key`, `import_dkek_share` — and
+`cmd_key_wrap.c`, `cmd_key_unwrap.c`, `cmd_key_domain.c`, commit
+`32435f01`; `py-picohsm` `PicoHSM.wrap_key`.
+[3] CardContact Smart Card Shell `scsh/sc-hsm/DKEK.js` `dumpKeyBLOB`
+field list and descriptions, as printed in Nitrokey support threads
+(support.nitrokey.com, "How to port keys and certificates from nitrokey
+USB to softhsm token", 2024; "How to encrypt the wky file outside of the
+Nitrokey HSM"): KCV "[Must match the KCV of the DKEK for import]", key type
+"[5=RSA, 6=RSA-CRT, 12=ECC, 15=AES]", "Default Algorithm ID", "Allowed
+Algorithm IDs", "Access Conditions [Not used]", "Key OID [Not used]",
+"Randomize [Random data prepended at export]", "Key size [Key size in bits
+(ECC/RSA) or bytes (AES)]", RSA-CRT fields in the order DP1, DQ1, prime
+factor p, PQ, prime factor q, modulus, public exponent.
+
+**Keys** (DKEK = 32 bytes, the XOR of the shares) [2]:
+
+```
+KCV   = SHA-256(DKEK)[0..8]
+K_enc = SHA-256(DKEK || 00 00 00 01)      AES-256 key
+K_mac = SHA-256(DKEK || 00 00 00 02)      AES-256 key
+```
+
+**Layout** (`LV(x)` = 2-byte big-endian length, then `x`) [2][3]:
+
+| Offset | Length | Field |
+|---|---|---|
+| 0 | 8 | KCV — must match the importing device's |
+| 8 | 1 | key type: `5` RSA, `6` RSA-CRT, `12` EC, `15` AES |
+| 9 | 2 + o | default algorithm OID (DER content octets) |
+| … | 2 + m | allowed algorithm IDs (tag `91` list; empty = all algorithms valid for the key type) |
+| … | 2 + a | access conditions (unused by CardContact: empty) |
+| … | 2 + k | key OID (unused: empty) |
+| … | 16·n | AES-256-CBC(K_enc, IV = 0, encrypted part) |
+| end − 16 | 16 | AES-256-CMAC(K_mac, every byte before it) |
+
+Default algorithm OIDs: RSA `04 00 7F 00 07 02 02 02 01 02`
+(id-TA-RSA-v1-5-SHA-256), EC `04 00 7F 00 07 02 02 02 02 03`
+(id-TA-ECDSA-SHA-256), AES `60 86 48 01 65 03 04 01` (aes).
+
+**Encrypted part** (before encryption):
+
+| Offset | Length | Field |
+|---|---|---|
+| 0 | 8 | random ("Randomize"); with IV = 0 it makes each blob unique |
+| 8 | 2 | key size: bits of the modulus (RSA) or field prime (EC), bytes (AES) |
+| 10 | … | key material, below |
+| … | ≥ 1 | padding `80 00 …` to a multiple of 16 (ISO/IEC 9797-1 method 2) |
+
+| Type | Key material |
+|---|---|
+| 5 RSA | `LV(d) LV(n) LV(e)` |
+| 6 RSA-CRT | `LV(dP) LV(dQ) LV(p) LV(qInv = q⁻¹ mod p) LV(q) LV(n) LV(e)` |
+| 12 EC | `LV(a) LV(b) LV(p) LV(order) LV(G) LV(d) LV(Q)`; G, Q uncompressed `04‖X‖Y` |
+| 15 AES | the key (16, 24 or 32 bytes; length = key size field) |
+
+**pico2hsm encoding choices.** WRAP writes RSA as type 6 (what a
+SmartCard-HSM exports [3]); EC a, b, p fixed to the field length, order
+and d to the order length, key size 521 for P-521; integers of RSA without
+leading zeros; always at least one padding byte; empty key OID. The
+allowed-algorithm list is the key's (§3.31). The access-condition field is
+empty unless the key has key flags (`D4` bits ALLOW_SIGN / ALLOW_DECRYPT /
+ALLOW_DERIVE), which pico2hsm puts there as one byte so another pico2hsm
+restores them; other devices ignore the field [2][3]. A use counter or key
+domain has no field: counted keys are not exportable, and UNWRAP places the
+key in domain 0, the domain whose DKEK opened it.
+
+**UNWRAP decoding** is lenient where implementations differ, strict where
+it matters: KCV, then CMAC (constant time) before anything else; header
+fields bounded (OIDs ≤ 32, list ≤ 32, access ≤ 16 bytes); integers of any
+length with or without leading zeros (pico-hsm writes minimal lengths,
+an empty `a` for curves with a = −3 or 0, and key size 528 for P-521); the
+curve is identified by its prime (P-256, P-384, P-521, secp256k1) and the
+order must match; d must be in [1, n−1] and Q, when present, must equal
+d·G; RSA types 5 and 6, 1024–4096 bits, key rebuilt and validated (type 5
+by prime recovery); padding bytes are not checked (covered by the CMAC);
+the key OID and default algorithm OID are not interpreted.
+
+**Test vectors.** `firmware/tests/vectors/cardcontact_wrap.txt` (from the
+independent Python reference `tools/python/pico2hsm/cardcontact_wrap.py`;
+every blob also decodes with pico-hsm's own `dkek_decode_key` built on the
+host) and `picohsm_wrap.txt` (written by pico-hsm's `dkek_encode_key`);
+`firmware/tests/cardcontact_wrap_vectors.rs` checks both, and that WRAP
+reproduces the reference blobs byte for byte.
+
+---
+
 ## 4. TLV Tag Glossary
 
 Common BER-TLV tags used across SC-HSM commands.
@@ -1228,16 +1428,17 @@ SC-HSM AlgorithmId bytes used in MSE SET (tag `0x80`) and directly in INS=0x68 P
 | `0x19` | ECDSA K-256 (pre-hashed) | `EcPrivateK256` | secp256k1 |
 | `0x20` | RSA RAW | `RsaPrivate2048/4096` | Host pre-pads; card does `m^d mod n` |
 | `0x21` | RSA decrypt (PKCS#1/OAEP) | `RsaPrivate2048/4096` | Raw `c^d mod n`; host unpadding |
-| `0x22` | RSA decrypt (OAEP variant) | `RsaPrivate2048/4096` | Same raw op |
+| `0x22` | RSA decrypt, PKCS#1 unpadding on card | — | Refused (`6D00`): padding oracle |
 | `0x23` | ECDH P-256 | `EcPrivateP256` | Decipher; returns raw X |
 | `0x25` | ECDH P-384 | `EcPrivateP384` | |
 | `0x27` | ECDH P-521 | `EcPrivateP521` | |
 | `0x29` | ECDH K-256 | `EcPrivateK256` | |
-| `0x31` | RSA PKCS#1v1.5 + SHA-256 | `RsaPrivate*` | Card hashes |
-| `0x32` | RSA PKCS#1v1.5 + SHA-384 | `RsaPrivate*` | |
-| `0x33` | RSA PKCS#1v1.5 + SHA-512 | `RsaPrivate*` | |
-| `0x34` | RSA-PSS + SHA-256 (internal) | `RsaPrivate*` | Pre-hashed (32-byte input) |
-| `0x40` | RSA-PSS + SHA-256 | `RsaPrivate*` | Pre-hashed (32-byte input) |
+| `0x31` | RSA PKCS#1v1.5 + SHA-1 | `RsaPrivate*` | Card hashes |
+| `0x32` | RSA PKCS#1v1.5 + SHA-224 | `RsaPrivate*` | Card hashes |
+| `0x33` | RSA PKCS#1v1.5 + SHA-256 | `RsaPrivate*` | Card hashes |
+| `0x34` | RSA PKCS#1v1.5 + SHA-384 | `RsaPrivate*` | Card hashes |
+| `0x35` | RSA PKCS#1v1.5 + SHA-512 | `RsaPrivate*` | Card hashes |
+| `0x40` | RSA-PSS, external SHA-256 digest | `RsaPrivate*` | 32-byte input only |
 | `0x70` | ECDSA EC-RAW (pre-hashed) | Any EC | Generic; digest passed directly |
 | `0x71` | ECDSA + SHA-1 | Any EC | Card hashes; 20-byte digest |
 | `0x72` | ECDSA + SHA-224 | Any EC | Card hashes; 28-byte digest |
@@ -1245,6 +1446,9 @@ SC-HSM AlgorithmId bytes used in MSE SET (tag `0x80`) and directly in INS=0x68 P
 | `0x74` | ECDSA + SHA-384 | Any EC | Card hashes; 48-byte digest |
 | `0x75` | ECDSA + SHA-512 | Any EC | Card hashes; 64-byte digest |
 | `0x80` | ECDH generic (ALGO_EC_DH) | Any EC | OpenSC generic; response has `0x04` prefix |
+| `0x10` / `0x11` | AES-CBC encrypt / decrypt | AES | Usage-policy IDs (CIPHER P2 is pico2hsm's own) |
+| `0x18` | AES-CMAC | AES | Usage-policy ID |
+| `0x92` | WRAP | Any | Usage-policy ID for EXPORT KEY |
 | `0x82` | AES-128 keygen | Symmetric | GENERATE SYMMETRIC KEY only |
 | `0x83` | AES-192 keygen | Symmetric | |
 | `0x84` | AES-256 keygen | Symmetric | |
@@ -1290,9 +1494,11 @@ SC-HSM key slot ID conventions and corresponding internal types.
 | `6983` | Authentication method blocked | PIN/PUK retry counter = 0 |
 | `6984` | Referenced data invalidated | No PIN hash stored (uninitialized) |
 | `6985` | Conditions of use not satisfied | No challenge outstanding; MSE not set; slot full |
-| `6A80` | Incorrect parameters in the command data field | Malformed TLV; unknown P1/P2 |
+| `6A80` | Incorrect parameters in the command data field | Malformed TLV; unknown P1/P2; UNWRAP blob not authentic for this DKEK |
+| `6A81` | Function not supported | WRAP / UNWRAP of a key with no CardContact encoding (Ed25519, X25519, brainpool, AES-512; RSA without the `rsa` feature) |
 | `6A82` | File or application not found | Key not in store; EF not found |
-| `6A88` | Referenced data not found | Unknown PIN reference P2 |
+| `6A84` | Not enough memory space in the file | Key use counter (`90`) exhausted |
+| `6A88` | Referenced data not found | Unknown PIN reference P2; key domain other than 0; KEY DOMAIN status with no DKEK configured |
 | `6D00` | Instruction code not supported or invalid | Unknown INS; not-yet-implemented command |
 
 ---
@@ -1328,20 +1534,58 @@ MF  (3F00)
 
 2. **Key persistence:** EC and RSA keys are persisted to flash via `storage::KeyStore`. Symmetric keys are also persisted. Keys survive power cycles.
 
-3. **DKEK / key wrapping:** EXPORT KEY and IMPORT KEY are stubs (return `SW_INS_NOT_SUPPORTED`). KEY DOMAIN management (create/delete/assign) is also not implemented.
+3. **DKEK / key wrapping:** WRAP / UNWRAP KEY use the CardContact key blob (§3.32); the previous pico2hsm v2/v3 blobs still import, deprecated, for one release. KCV = SHA-256(DKEK)[0..8] as on a SmartCard-HSM. The DKEK is persisted (reserved slot `0xFD`) and restored at boot. KEY DOMAIN P1 = `01`–`05` are pico2hsm-specific (§3.27); one key domain.
 
 4. **Session PIN P2=0x82:** The session PIN is cleared from state after the first VERIFY attempt, whether correct or wrong, preventing replay. This matches the reference spec behavior.
 
 5. **SIGN uses P1=key_id, P2=algo directly** rather than requiring a prior MSE SET. Both paths (direct P1/P2 in INS=0x68, and MSE SET + INS=0x2A) are supported.
 
-6. **DECIPHER / DERIVE ASYM sharing INS=0x62:** When INS=0x62 and P1=0x01, the DERIVE ASYMMETRIC handler is invoked. Any other P1 value routes to DECIPHER.
+6. **DECIPHER / DERIVE ASYM sharing INS=0x62:** DERIVE ASYMMETRIC is selected only by P1=0x01 **and** P2=0x00; everything else routes to DECIPHER (see §3.22).
 
 7. **LIST KEYS / IMPORT KEY sharing INS=0x58:** When INS=0x58 and P2=0x93, the IMPORT KEY handler is invoked. P2=0x00 routes to LIST KEYS.
 
 8. **EF.PrKDF is always empty:** The standard PKCS#15 PrKDF mechanism is not used. OpenSC is expected to call LIST KEYS (INS=0x58) to discover occupied slots, then read per-key PRKD (C4xx) EFs for key metadata.
 
-9. **EXTERNAL AUTHENTICATE:** Uses `HMAC-SHA256(so_pin_hash, challenge)` rather than a hardware-stored key pair. This is a pico2hsm simplification.
+9. **EXTERNAL AUTHENTICATE:** not supported (removed 2026-10; see §3.17).
 
 10. **DEBUG DUMP (INS=0xFE):** Only compiled in `#[cfg(feature = "debug")]` builds. The stub currently returns `SW_WRONG_DATA`. Never enable the `debug` feature in production.
 
+12. **Usage-policy gaps (§3.31):** RSA-PSS only with an external SHA-256
+    digest (`41`–`45` unsupported); `30` (DigestInfo input) and RSA
+    decrypt with card-side unpadding (`22`, `23`) unsupported; the
+    pico2hsm ECDH (`23`/`25`/`27`/`29`) and pre-hashed ECDSA
+    (`13`/`15`/`17`/`19`) codes are extensions; CIPHER uses its own P1/P2
+    (direction / mode), not CardContact's P1 = key, P2 = algorithm; only
+    key domain 0; no XKEK / `ALGO_EC_DH_XKEK`. Algorithms without a
+    CardContact ID are refused for a key with an algorithm list.
+
 11. **ECDH1-COFACTOR-DERIVE:** For all supported curves the cofactor h=1, making COFACTOR-DERIVE and plain DERIVE identical at the APDU level. OpenSC 0.25's SC-HSM driver rejects COFACTOR-DERIVE for P-256 at the PKCS#11 layer; tests use `ECDH1-DERIVE` to avoid this driver-side restriction.
+
+---
+
+## Security notes (October 2026 audit)
+
+See `docs/AUDIT_2026-10.md` for the full list and commits.
+
+- **Retry counters** for the user PIN, SO-PIN and PUK are written to flash
+  *before* the credential is compared, so a power cycle or USB reset cannot
+  undo a failed guess. Only well-formed attempts count (malformed APDUs
+  are rejected without spending a retry). Re-INITIALIZE spends the SO-PIN
+  counter and is refused while the SO-PIN is blocked. Minimum user PIN
+  length is 6.
+- **Reserved key references `0xFC`–`0xFF`** (enrolled peer, DKEK, device
+  identity key, PIN record) are refused by SIGN, DECIPHER, PSO via MSE,
+  GENERAL AUTHENTICATE, BIP/SLIP, GENERATE KEY [PAIR], IMPORT/EXPORT KEY and
+  DELETE FILE.
+- **EXTRAS DKEK exchange (`0x35`–`0x38`)** requires the SO-PIN and a peer
+  enrolled with `0x3D` on both devices; there is no unauthenticated mode.
+  SOURCE encrypts the DKEK only to the ephemeral key whose signature it
+  verified in `0x36`; TARGET never overwrites an existing DKEK.
+- **EXTRAS `0x39` GET_KEY_MANIFEST** requires the user PIN (`0x3A` state hash
+  stays open: it is a device-signed attestation).
+- **EXTERNAL AUTHENTICATE (`0x82`)** is removed (returns `6D00`).
+- **BIP/SLIP derive** refuses NO_EXPORT keys and the empty path (which would
+  return the master key).
+- **Write failures** (`6581`) are reported; the card state is left as it was
+  on flash.
+

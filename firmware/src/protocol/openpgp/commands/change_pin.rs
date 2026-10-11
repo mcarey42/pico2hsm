@@ -2,20 +2,14 @@
 //!
 //! Changes PW1 (P2=0x81) or PW3 (P2=0x83).
 //! Data format: old PIN bytes immediately followed by new PIN bytes.
-//! The card must determine the split point using the known old PIN length
-//! (from verification) — but since we don't know the old PIN length, the
-//! spec says we use the minimum lengths: PW1 min=6, PW3 min=8.
-//!
-//! In practice, GnuPG sends the old PIN length known to the user, so the
-//! split is: data[0..old_len] = old PIN, data[old_len..] = new PIN.
-//! We verify the old PIN by trying all valid split points.
-
-use subtle::ConstantTimeEq;
+//! The split point is the stored length of the current password (kept in
+//! its `PwHash` record), so each attempt checks exactly one candidate.
 
 use pico2hsm_core::apdu::{
     ApduCommand, ApduResponse, SW_AUTH_BLOCKED, SW_WRONG_DATA, SW_WRONG_LENGTH,
 };
 
+use crate::protocol::openpgp::pw::PwHash;
 use crate::protocol::openpgp::OpenPgpState;
 
 /// INS byte for CHANGE REFERENCE DATA.
@@ -26,20 +20,75 @@ fn sw_retry(remaining: u8) -> u16 {
     0x63C0 | (remaining as u16 & 0x0F)
 }
 
-/// Handle CHANGE REFERENCE DATA and persist updated PW1/PW3 state to flash.
-pub fn handle_with_store(
-    state: &mut OpenPgpState,
-    store: &mut dyn crate::storage::KeyStore,
-    cmd: &ApduCommand<'_>,
+/// Minimum PW1 / PW3 lengths (OpenPGP Card 3.4).
+pub const PW1_MIN_LEN: usize = 6;
+pub const PW3_MIN_LEN: usize = 8;
+
+/// Where `old || new` splits: the stored password length, if the new
+/// password that leaves is a valid length.
+fn split_at(stored: &PwHash, data_len: usize, min_len: usize) -> Option<usize> {
+    let old_len = stored.len()?;
+    let new_len = data_len.checked_sub(old_len)?;
+    (min_len..=127).contains(&new_len).then_some(old_len)
+}
+
+/// Whether a CHANGE REFERENCE DATA attempt counts against the retry
+/// counter.  Deliberately independent of the stored password length: any
+/// plausibly sized request is an attempt, and one that does not split at
+/// the stored length fails exactly like a wrong password.  Otherwise the
+/// free 6700 vs. retry-costing 63Cx responses would reveal the length.
+pub fn counts_as_attempt(stored: Option<&PwHash>, data_len: usize, min_len: usize) -> bool {
+    stored.is_some_and(|s| s.len().is_some()) && (2 * min_len..=2 * 127).contains(&data_len)
+}
+
+/// CHANGE REFERENCE DATA for one password.  `old || new` is split at the
+/// stored length — exactly one candidate per attempt (previously every
+/// split point was tried, several guesses for one retry).
+fn change(
+    slot: &mut Option<PwHash>,
+    retries: &mut u8,
+    max_retries: u8,
+    min_len: usize,
+    data: &[u8],
 ) -> ApduResponse {
-    let resp = handle(state, cmd);
-    // Persist whether success or failed (retry counter may have decremented).
-    match cmd.p2 {
-        0x81 => crate::protocol::openpgp::OpenPgp::save_pw1_to_store(state, store),
-        0x83 => crate::protocol::openpgp::OpenPgp::save_pw3_to_store(state, store),
-        _ => {}
+    if *retries == 0 {
+        return ApduResponse::err(SW_AUTH_BLOCKED);
     }
-    resp
+    let Some(stored) = slot.as_ref() else {
+        return ApduResponse::err(SW_AUTH_BLOCKED);
+    };
+    if stored.len().is_none() {
+        // Legacy record of unknown length: a VERIFY records it first.
+        return ApduResponse::err(pico2hsm_core::apdu::SW_CONDITIONS_NOT_SATISFIED);
+    }
+    if !(2 * min_len..=2 * 127).contains(&data.len()) {
+        return ApduResponse::err(SW_WRONG_LENGTH);
+    }
+    // A request that does not split at the stored length fails like a
+    // wrong password (same SW, same retry cost) — see counts_as_attempt.
+    let matched = match split_at(stored, data.len(), min_len) {
+        Some(old_len) => {
+            let (old, new) = data.split_at(old_len);
+            stored.matches(old).then_some(new)
+        }
+        None => {
+            // Same KDF work as a real comparison, so timing doesn't reveal
+            // whether the request split at the stored length either.
+            let _ = stored.matches(&data[..min_len]);
+            None
+        }
+    };
+    let Some(new) = matched else {
+        *retries = retries.saturating_sub(1);
+        return if *retries == 0 {
+            ApduResponse::err(SW_AUTH_BLOCKED)
+        } else {
+            ApduResponse::err(sw_retry(*retries))
+        };
+    };
+    *slot = Some(PwHash::new(new));
+    *retries = max_retries;
+    ApduResponse::ok(&[])
 }
 
 /// Handle a CHANGE REFERENCE DATA APDU command.
@@ -48,90 +97,24 @@ pub fn handle(state: &mut OpenPgpState, cmd: &ApduCommand<'_>) -> ApduResponse {
         return ApduResponse::err(SW_WRONG_DATA);
     }
 
+    use crate::protocol::openpgp::{PW1_MAX_RETRIES, PW3_MAX_RETRIES};
     match cmd.p2 {
         // Change PW1
-        0x81 => {
-            if state.pw1_retries == 0 {
-                return ApduResponse::err(SW_AUTH_BLOCKED);
-            }
-
-            let stored = match &state.pw1_hash {
-                Some(h) => *h,
-                None => return ApduResponse::err(SW_AUTH_BLOCKED),
-            };
-
-            // Try split points: old PIN from 6..data.len()-6 bytes
-            // (new PIN must also be at least 6 bytes)
-            let min_old = 6usize;
-            let min_new = 6usize;
-            if cmd.data.len() < min_old + min_new {
-                return ApduResponse::err(SW_WRONG_LENGTH);
-            }
-
-            let max_old = cmd.data.len() - min_new;
-            for split in min_old..=max_old {
-                let old_pin = &cmd.data[..split];
-                let computed = OpenPgpState::hash_pin(old_pin);
-                if bool::from(computed.ct_eq(&stored)) {
-                    let new_pin = &cmd.data[split..];
-                    if new_pin.len() < min_new || new_pin.len() > 127 {
-                        return ApduResponse::err(SW_WRONG_LENGTH);
-                    }
-                    state.pw1_hash = Some(OpenPgpState::hash_pin(new_pin));
-                    state.pw1_retries = crate::protocol::openpgp::PW1_MAX_RETRIES;
-                    return ApduResponse::ok(&[]);
-                }
-            }
-
-            // No valid split found — old PIN is wrong
-            state.pw1_retries = state.pw1_retries.saturating_sub(1);
-            if state.pw1_retries == 0 {
-                ApduResponse::err(SW_AUTH_BLOCKED)
-            } else {
-                ApduResponse::err(sw_retry(state.pw1_retries))
-            }
-        }
-
+        0x81 => change(
+            &mut state.pw1_hash,
+            &mut state.pw1_retries,
+            PW1_MAX_RETRIES,
+            PW1_MIN_LEN,
+            cmd.data,
+        ),
         // Change PW3
-        0x83 => {
-            if state.pw3_retries == 0 {
-                return ApduResponse::err(SW_AUTH_BLOCKED);
-            }
-
-            let stored = match &state.pw3_hash {
-                Some(h) => *h,
-                None => return ApduResponse::err(SW_AUTH_BLOCKED),
-            };
-
-            let min_old = 8usize;
-            let min_new = 8usize;
-            if cmd.data.len() < min_old + min_new {
-                return ApduResponse::err(SW_WRONG_LENGTH);
-            }
-
-            let max_old = cmd.data.len() - min_new;
-            for split in min_old..=max_old {
-                let old_pin = &cmd.data[..split];
-                let computed = OpenPgpState::hash_pin(old_pin);
-                if bool::from(computed.ct_eq(&stored)) {
-                    let new_pin = &cmd.data[split..];
-                    if new_pin.len() < min_new || new_pin.len() > 127 {
-                        return ApduResponse::err(SW_WRONG_LENGTH);
-                    }
-                    state.pw3_hash = Some(OpenPgpState::hash_pin(new_pin));
-                    state.pw3_retries = crate::protocol::openpgp::PW3_MAX_RETRIES;
-                    return ApduResponse::ok(&[]);
-                }
-            }
-
-            state.pw3_retries = state.pw3_retries.saturating_sub(1);
-            if state.pw3_retries == 0 {
-                ApduResponse::err(SW_AUTH_BLOCKED)
-            } else {
-                ApduResponse::err(sw_retry(state.pw3_retries))
-            }
-        }
-
+        0x83 => change(
+            &mut state.pw3_hash,
+            &mut state.pw3_retries,
+            PW3_MAX_RETRIES,
+            PW3_MIN_LEN,
+            cmd.data,
+        ),
         _ => ApduResponse::err(0x6A86), // Incorrect P2
     }
 }

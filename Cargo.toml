@@ -23,19 +23,9 @@ unused_import_braces = "warn"
 unused_qualifications = "warn"
 
 [workspace.lints.clippy]
-# Categorical ramps
-pedantic = { level = "warn", priority = -1 }
-# Carve-outs: allow style choices we already make
-module_name_repetitions = "allow"
-must_use_candidate = "allow"
-missing_errors_doc = "allow"
-missing_panics_doc = "allow"
-similar_names = "allow"
-too_many_lines = "allow"
-cast_possible_truncation = "allow"
-cast_sign_loss = "allow"
-cast_precision_loss = "allow"
-cast_possible_wrap = "allow"
+# Default clippy set for every crate (CI: -D warnings).  `pico2hsm-core`
+# additionally opts into `pedantic` in its lib.rs; the firmware does not yet
+# (~900 mostly doc-backtick hits).
 
 [profile.release]
 opt-level = "z"

@@ -17,6 +17,73 @@ use crate::protocol::piv::{PivDataObject, PivState, MAX_PIV_DATA_SIZE};
 /// INS byte for PUT DATA.
 pub const INS_PUT_DATA: u8 = 0xDB;
 
+/// PUT DATA with persistence: the object is written to flash, so PIV
+/// certificates, CHUID etc. survive a reset.  A failed write restores the
+/// previous object in RAM and returns 6581.
+pub fn handle_with_store(
+    state: &mut PivState,
+    store: &mut dyn crate::storage::KeyStore,
+    cmd: &ApduCommand<'_>,
+) -> ApduResponse {
+    let Some(tag_low) = object_tag_low(cmd.data) else {
+        return handle(state, cmd);
+    };
+    if !state.mgmt_key_authenticated {
+        return handle(state, cmd);
+    }
+    let previous = state
+        .data_objects
+        .iter()
+        .find(|o| o.tag_low == tag_low)
+        .cloned();
+    // RAM holds a few objects as a cache; flash holds them all (GET DATA
+    // reads through).  Make room by evicting the oldest cached object —
+    // it is already on flash.
+    let mut evicted = None;
+    if previous.is_none() && state.data_objects.is_full() {
+        evicted = Some(state.data_objects.remove(0));
+    }
+    let resp = handle(state, cmd);
+    let saved = if resp.sw != pico2hsm_core::apdu::SW_OK {
+        Ok(())
+    } else {
+        let kid = crate::protocol::piv::Piv::piv_data_object_key_id(tag_low);
+        match state.data_objects.iter().find(|o| o.tag_low == tag_low) {
+            Some(o) => crate::protocol::piv::Piv::save_data_object_to_store(o, store),
+            // `53 00`: deleted — remove it from flash too.
+            None => match store.fetch_key(kid) {
+                Ok(None) => Ok(()),
+                Ok(Some(_)) => store.erase_key(kid),
+                Err(e) => Err(e),
+            },
+        }
+    };
+    if resp.sw != pico2hsm_core::apdu::SW_OK || saved.is_err() {
+        state.data_objects.retain(|o| o.tag_low != tag_low);
+        for old in [previous, evicted].into_iter().flatten() {
+            let _ = state.data_objects.push(old);
+        }
+        if saved.is_err() {
+            return ApduResponse::err(pico2hsm_core::apdu::SW_MEMORY_FAILURE);
+        }
+    }
+    resp
+}
+
+/// Low bytes of the SP 800-73-4 data objects 5FC101–5FC123.
+const PIV_OBJECT_MIN: u8 = 0x01;
+const PIV_OBJECT_MAX: u8 = 0x23;
+
+/// The stored-object tag (low byte) a GET/PUT DATA body names:
+/// `5C 03 5F C1 xx` or `5C 01 7E` (discovery object).
+pub fn object_tag_low(data: &[u8]) -> Option<u8> {
+    match data {
+        [0x5C, 0x03, 0x5F, 0xC1, low @ PIV_OBJECT_MIN..=PIV_OBJECT_MAX, ..] => Some(*low),
+        [0x5C, 0x01, 0x7E, ..] => Some(0x7E),
+        _ => None,
+    }
+}
+
 /// Handle a PUT DATA APDU command.
 pub fn handle(state: &mut PivState, cmd: &ApduCommand<'_>) -> ApduResponse {
     // P1=0x3F, P2=0xFF
@@ -45,8 +112,12 @@ pub fn handle(state: &mut PivState, cmd: &ApduCommand<'_>) -> ApduResponse {
     let tag_bytes = &data[2..2 + tag_len];
 
     // Determine tag_low for storage
+    // SP 800-73-4 objects only (5FC101–5FC123, 7E).  Any 5FC1xx used to be
+    // stored, so the (by default public) management key could fill the
+    // keystore directory shared with SC-HSM and OpenPGP; and 5FC17E
+    // collided with the discovery object 7E.
     let tag_low = match tag_bytes {
-        [0x5F, 0xC1, low] => *low,
+        [0x5F, 0xC1, low @ PIV_OBJECT_MIN..=PIV_OBJECT_MAX] => *low,
         [0x7E] => 0x7E,
         _ => return ApduResponse::err(0x6A82), // unrecognised tag
     };
@@ -76,25 +147,31 @@ pub fn handle(state: &mut PivState, cmd: &ApduCommand<'_>) -> ApduResponse {
 
     let content = &rest[content_start..content_start + content_len];
 
-    if content.len() > MAX_PIV_DATA_SIZE {
-        return ApduResponse::err(0x6A84); // not enough memory
+    // `53 00` deletes the object (ykman, yubico-piv-tool).
+    if content.is_empty() {
+        state.data_objects.retain(|o| o.tag_low != tag_low);
+        return ApduResponse::ok(&[]);
     }
 
-    // Build the complete stored object (including the 53 wrapper)
+    // Build the complete stored object (including the 53 wrapper) so GET
+    // DATA can return it directly.  The wrapper counts against the capacity:
+    // refuse rather than silently truncate the object.
     let mut obj_data = heapless::Vec::<u8, MAX_PIV_DATA_SIZE>::new();
-    // Store the raw 53-wrapped content so GET DATA can return it directly
-    let _ = obj_data.push(0x53);
-    if content_len < 128 {
-        let _ = obj_data.push(content_len as u8);
+    let header: &[u8] = if content_len < 128 {
+        &[0x53, content_len as u8]
     } else if content_len < 256 {
-        let _ = obj_data.push(0x81);
-        let _ = obj_data.push(content_len as u8);
+        &[0x53, 0x81, content_len as u8]
     } else {
-        let _ = obj_data.push(0x82);
-        let _ = obj_data.push((content_len >> 8) as u8);
-        let _ = obj_data.push((content_len & 0xFF) as u8);
+        &[
+            0x53,
+            0x82,
+            (content_len >> 8) as u8,
+            (content_len & 0xFF) as u8,
+        ]
+    };
+    if obj_data.extend_from_slice(header).is_err() || obj_data.extend_from_slice(content).is_err() {
+        return ApduResponse::err(0x6A84); // not enough memory
     }
-    let _ = obj_data.extend_from_slice(content);
 
     // Remove existing object with this tag
     state.data_objects.retain(|o| o.tag_low != tag_low);

@@ -38,9 +38,16 @@ pub fn handle_with_store(
     store: &mut dyn crate::storage::KeyStore,
     cmd: &ApduCommand<'_>,
 ) -> ApduResponse {
+    let before = (state.user_pin_salt, state.user_pin_hash);
     let resp = handle(state, cmd);
-    if resp.sw == pico2hsm_core::apdu::SW_OK {
-        crate::protocol::sc_hsm::ScHsm::save_pin_to_store(state, store);
+    if resp.sw == pico2hsm_core::apdu::SW_OK
+        && crate::protocol::sc_hsm::ScHsm::save_pin_to_store(state, store).is_err()
+    {
+        // Keep RAM what flash holds: no new PIN that a reboot would
+        // silently undo, and the counters as the log has them.
+        (state.user_pin_salt, state.user_pin_hash) = before;
+        crate::protocol::sc_hsm::ScHsm::reload_counters(state, store);
+        return ApduResponse::err(pico2hsm_core::apdu::SW_MEMORY_FAILURE);
     }
     resp
 }
@@ -57,13 +64,14 @@ pub fn handle(state: &mut ScHsmState, cmd: &ApduCommand<'_>) -> ApduResponse {
         0x00 => {
             state.pin_retry_count = 3;
             state.pin_verified = false;
+            state.session_pin = None; // stood in for the old PIN
             ApduResponse::ok(&[])
         }
 
         // P1=0x02: reset counter and set new PIN from data
         0x02 => {
             let new_pin = cmd.data;
-            if new_pin.len() < 4 || new_pin.len() > 16 {
+            if new_pin.len() < super::verify::MIN_PIN_LEN || new_pin.len() > 16 {
                 return ApduResponse::err(SW_WRONG_LENGTH);
             }
             // Generate a fresh salt and compute PBKDF2 hash (P1-1 fix).
@@ -72,6 +80,7 @@ pub fn handle(state: &mut ScHsmState, cmd: &ApduCommand<'_>) -> ApduResponse {
             state.user_pin_hash = Some(hash_pin_pbkdf2(new_pin, &new_salt));
             state.pin_retry_count = 3;
             state.pin_verified = false;
+            state.session_pin = None; // stood in for the old PIN
             ApduResponse::ok(&[])
         }
 

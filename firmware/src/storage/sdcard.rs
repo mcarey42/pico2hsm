@@ -43,6 +43,9 @@ const SD_RESERVED_SECTORS: u32 = 8; // 8 × 512 = 4 096 bytes = one 4 KiB logica
 /// Byte offset added to every FlashChip address before issuing SD card I/O.
 const SD_BYTE_OFFSET: u32 = SD_RESERVED_SECTORS * SD_SECTOR_BYTES;
 
+/// Keystore region on the card (16 MiB = 4096 sectors of 4 KiB).
+const SD_KEYSTORE_MAX_BYTES: u64 = 16 * 1024 * 1024;
+
 /// SDCard wrapped as a `FlashChip`.
 ///
 /// `SPI` must implement `embedded_hal::spi::SpiDevice<u8>`.
@@ -79,8 +82,14 @@ where
 
         let total_bytes = card.num_bytes().map_err(|_| StorageError::NotFormatted)?;
 
-        // Subtract the reserved region (signature block) from usable capacity.
-        let capacity_bytes = total_bytes.saturating_sub(SD_BYTE_OFFSET as u64);
+        // Subtract the reserved region (signature block) from usable capacity,
+        // and use only the first SD_KEYSTORE_MAX_BYTES: addresses are u32, so
+        // anything past 4 GiB (minus the offset) would wrap onto other keys,
+        // the directory or the signature block.  340 directory entries need
+        // only a few MB.
+        let capacity_bytes = total_bytes
+            .saturating_sub(SD_BYTE_OFFSET as u64)
+            .min(SD_KEYSTORE_MAX_BYTES);
 
         defmt::info!(
             "SdCardFlash: total={} B usable={} B ({} MiB), reserved {} sectors for signature",
@@ -105,7 +114,8 @@ where
     pub fn from_initialized(card: SdCard<SPI, DELAY>, capacity_bytes: u64) -> Self {
         SdCardFlash {
             card,
-            capacity_bytes,
+            // Same cap as `new`: u32 addresses must not wrap on big cards.
+            capacity_bytes: capacity_bytes.min(SD_KEYSTORE_MAX_BYTES),
             degraded: false,
             write_errors: 0,
         }
@@ -178,6 +188,8 @@ where
         let sd_sector_idx = physical_addr / SD_SECTOR_BYTES;
         let byte_offset = (physical_addr % SD_SECTOR_BYTES) as usize;
 
+        // Feeds the hardware watchdog on core0 / bumps core1's heartbeat.
+        crate::watchdog::progress();
         // Step 1: read existing 512-byte sector.
         let mut block = [Block::new()];
         self.card
@@ -233,6 +245,8 @@ where
         let blocks = [blank_block];
 
         for i in 0..SD_SECTORS_PER_LOGICAL {
+            // A slow card can take up to 250 ms per block write.
+            crate::watchdog::progress();
             self.card
                 .write(&blocks, BlockIdx(first_sd_sector + i))
                 .map_err(|_| StorageError::EraseError)?;
@@ -388,7 +402,9 @@ where
     /// The usable capacity exposed to the filesystem is reduced by the
     /// reserved signature region.
     pub fn from_card(card: SdCard<SPI, DELAY>, total_bytes: u64) -> Self {
-        let capacity_bytes = total_bytes.saturating_sub(SD_BYTE_OFFSET as u64);
+        let capacity_bytes = total_bytes
+            .saturating_sub(SD_BYTE_OFFSET as u64)
+            .min(SD_KEYSTORE_MAX_BYTES);
         defmt::info!(
             "SdCardFlash::from_card: total={} B usable={} B ({} MiB)",
             total_bytes,

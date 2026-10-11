@@ -4,8 +4,14 @@
 //! Requires prior management key authentication.
 //!
 //! # Command format
-//! - CLA=0x00, INS=0x47, P1=0x00, P2=key reference (0x9A/9C/9D/9E)
-//! - Data: AC <len> 80 01 <alg_id>
+//! - CLA=0x00, INS=0x47, P1=0x00, P2=key reference (9A/9C/9D/9E, retired 82–95)
+//! - Data: AC <len> 80 01 <alg_id> [AA 01 <pin policy>] [AB 01 <touch policy>]
+//!
+//! `AA` / `AB` are the Yubico PIN- and touch-policy extension.  PIN policy:
+//! 00 slot default, 01 never, 02 once per session, 03 always; it is stored
+//! with the key and enforced by GENERAL AUTHENTICATE.  Touch policy: this
+//! device has no button, so only 00 (default) and 01 (never) are accepted;
+//! anything else is refused with 6A80.
 //!
 //! # Response format
 //! For ECC keys:
@@ -30,20 +36,32 @@ const ALG_ECC_P256: u8 = 0x11;
 /// PIV algorithm ID for ECC P-384.
 const ALG_ECC_P384: u8 = 0x14;
 
-/// Valid PIV key slot references.
-fn is_valid_key_ref(key_ref: u8) -> bool {
-    matches!(key_ref, 0x9A | 0x9C | 0x9D | 0x9E)
+/// Valid PIV asymmetric key references: PIV Authentication (9A), Digital
+/// Signature (9C), Key Management (9D), Card Authentication (9E) and the
+/// twenty retired Key Management keys (82–95), SP 800-73-4 Part 1 Table 4b.
+pub fn is_valid_key_ref(key_ref: u8) -> bool {
+    matches!(key_ref, 0x9A | 0x9C | 0x9D | 0x9E | 0x82..=0x95)
 }
 
-/// Map key reference to slot index (0-3).
-fn key_ref_to_slot(key_ref: u8) -> Option<usize> {
-    match key_ref {
-        0x9A => Some(0),
-        0x9C => Some(1),
-        0x9D => Some(2),
-        0x9E => Some(3),
-        _ => None,
+/// The PIN policy that applies to `key_ref`: the stored Yubico policy, or
+/// the SP 800-73-4 slot default when none was given — 9C "PIN always",
+/// 9E none (Card Authentication), every other key "PIN once per session".
+pub fn effective_pin_policy(key_ref: u8, stored: u8) -> u8 {
+    use crate::security::key_policy::pin_policy;
+    if stored != pin_policy::DEFAULT {
+        return stored;
     }
+    match key_ref {
+        0x9C => pin_policy::ALWAYS,
+        0x9E => pin_policy::NEVER,
+        _ => pin_policy::ONCE,
+    }
+}
+
+/// The policy as kept in `KeyMeta::key_flags` (RAM): PIN policy in the
+/// low nibble, touch policy in the high nibble.
+pub fn policy_flags(policy: &crate::security::key_policy::KeyPolicy) -> u8 {
+    (policy.pin_policy & 0x0F) | (policy.touch_policy << 4)
 }
 
 /// Handle a GENERATE KEY PAIR APDU command (non-store path, used by legacy dispatch).
@@ -71,13 +89,15 @@ pub fn handle_with_store(
         return ApduResponse::err(0x6A86); // incorrect P2
     }
 
-    // Require management key authentication OR PIN verification.
-    if !state.mgmt_key_authenticated && !state.pin_verified {
+    // SP 800-73-4 §3.3.2: GENERATE ASYMMETRIC KEY PAIR requires the PIV
+    // card application administrator (management key).  The cardholder PIN
+    // alone must not be able to replace a slot's key.
+    if !state.mgmt_key_authenticated {
         return ApduResponse::err(0x6982); // security status not satisfied
     }
 
     // Parse the Cryptographic Algorithm Identifier Template (tag 0xAC)
-    let alg_id = match parse_keygen_template(cmd.data) {
+    let (alg_id, policy) = match parse_keygen_template(cmd.data) {
         Some(a) => a,
         None => return ApduResponse::err(0x6A80), // incorrect data
     };
@@ -96,8 +116,8 @@ pub fn handle_with_store(
         Err(_) => return ApduResponse::err(0x6985), // conditions not satisfied
     };
 
-    let _slot_idx = key_ref_to_slot(key_ref).unwrap();
     let key_id = KeyId::piv(key_ref);
+    let flags = policy_flags(&policy);
 
     // Persist to flash.
     {
@@ -111,9 +131,12 @@ pub fn handle_with_store(
         };
 
         let mut obj = KeyObject::new(KmKeyType::Ec, key_id.0, AppletId::Piv, algorithm);
+        obj.policy = policy;
         let _ = obj.private_key.extend_from_slice(&keypair.private_key);
         let _ = obj.public_key.extend_from_slice(&keypair.public_key);
-        let _ = store.save_key(&obj);
+        if store.save_key(&obj).is_err() {
+            return ApduResponse::err(pico2hsm_core::apdu::SW_MEMORY_FAILURE);
+        }
     }
 
     // Update key_index metadata (replace any existing entry for this slot).
@@ -122,9 +145,12 @@ pub fn handle_with_store(
         key_id: key_id.0,
         key_type: key_type as u8,
         algo: alg_id,
-        key_flags: 0,
+        key_flags: flags,
     };
-    let _ = state.key_index.push(meta);
+    if state.key_index.push(meta).is_err() {
+        // Every valid slot fits (MAX_PIV_KEYS); never report an unindexed key.
+        return ApduResponse::err(pico2hsm_core::apdu::SW_CONDITIONS_NOT_SATISFIED);
+    }
 
     // Build response per NIST SP 800-73-4 Part 2 Table 3.3-1:
     //   7C [len]  Dynamic Authentication Template
@@ -174,34 +200,44 @@ pub fn handle_with_store(
     ApduResponse::ok(&resp)
 }
 
-/// Parse the AC template to extract the algorithm ID.
+/// Parse the AC template: the algorithm ID (tag 80) and the Yubico PIN /
+/// touch policies (AA / AB).
 ///
-/// Expected format: AC <len> 80 01 <alg_id> [optional policy tags...]
-fn parse_keygen_template(data: &[u8]) -> Option<u8> {
-    if data.len() < 5 {
-        return None;
-    }
-
-    // Must start with AC tag
-    if data[0] != 0xAC {
-        return None;
-    }
-
-    let ac_len = data[1] as usize;
-    if data.len() < 2 + ac_len {
-        return None;
-    }
-
-    // Search for tag 0x80 (algorithm identifier) in the template
-    let mut pos = 2;
-    while pos + 2 <= 2 + ac_len {
-        let tag = data[pos];
-        let len = data[pos + 1] as usize;
-        if tag == 0x80 && len == 1 && pos + 2 < data.len() {
-            return Some(data[pos + 2]);
+/// Expected format: `AC <len> 80 01 <alg_id> [AA 01 <pin>] [AB 01 <touch>]`.
+/// `None` (6A80) for a malformed template, a missing algorithm, or a policy
+/// value this device can't honour (touch "always"/"cached": no button).
+fn parse_keygen_template(data: &[u8]) -> Option<(u8, crate::security::key_policy::KeyPolicy)> {
+    use crate::security::key_policy::{for_each_tlv, KeyPolicy};
+    let mut template: Option<&[u8]> = None;
+    for_each_tlv(data, |tag, value| {
+        if tag == 0xAC && template.is_none() {
+            template = Some(value);
         }
-        pos += 2 + len;
-    }
-
-    None
+        Ok(())
+    })
+    .ok()?;
+    let mut alg = None;
+    let mut policy = KeyPolicy::default();
+    let mut attrs: heapless::Vec<u8, 8> = heapless::Vec::new();
+    for_each_tlv(template?, |tag, value| {
+        match tag {
+            0x80 => match value {
+                [a] if alg.is_none() => alg = Some(*a),
+                _ => return Err(0x6A80),
+            },
+            0xAA | 0xAB => {
+                // Each at most once, one byte, a supported value.
+                if attrs.contains(&(tag as u8)) || attrs.push(tag as u8).is_err() {
+                    return Err(0x6A80);
+                }
+                let p = KeyPolicy::from_piv_attribute(tag as u8, value)?;
+                policy.pin_policy |= p.pin_policy;
+                policy.touch_policy |= p.touch_policy;
+            }
+            _ => {}
+        }
+        Ok(())
+    })
+    .ok()?;
+    Some((alg?, policy))
 }

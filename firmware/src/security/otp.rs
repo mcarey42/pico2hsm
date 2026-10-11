@@ -4,15 +4,9 @@
 //! or 16 bits of ECC-protected data (ECC consumes the upper 8 bits).
 //!
 //! # pico2hsm OTP layout
-//! ```text
-//! Rows 0x100–0x107 : Storage key bytes  0–31   (32 bytes via ECC words)
-//! Rows 0x108–0x10F : Storage key bytes 32–63   (32 bytes via ECC words)
-//! Row  0x110       : Boot flags
-//!                    bit 0 — JTAG disabled (irreversible)
-//!                    bit 1 — production mode active (irreversible)
-//!                    bit 2 — device has been provisioned
-//! Rows 0x120–0x127 : Device identity key bytes 0–31
-//! ```
+//! See [`crate::security::otp_layout`] (the single source of truth, with
+//! compile-time overlap checks).  Secrets live in OTP page 4 and are
+//! read-locked for the rest of the boot once the storage key is derived.
 //!
 //! # Row access model
 //! - Each ECC row stores a 16-bit value.  Two bytes of key material map to
@@ -44,27 +38,44 @@ use pico2hsm_core::error::{HsmError, StorageError};
 
 // ─── OTP row layout constants ─────────────────────────────────────────────────
 
-/// First OTP row of the storage key material block (covers bytes 0–31).
-/// Each ECC row holds 2 bytes; 16 rows → 32 bytes.
-pub const OTP_STORAGE_KEY_ROW_START: u16 = 0x100;
+use crate::security::otp_layout as layout;
+
+/// First OTP row of the storage key material block.
+pub const OTP_STORAGE_KEY_ROW_START: u16 = layout::STORAGE_KEY_ROW_START;
 
 /// Total length of the storage key material in bytes (2 × 32 = 64).
 pub const OTP_STORAGE_KEY_LEN: usize = 64; // stored across 32 ECC rows
 
 /// OTP row holding the boot flags.
-pub const OTP_BOOT_FLAGS_ROW: u16 = 0x110;
+pub const OTP_BOOT_FLAGS_ROW: u16 = layout::BOOT_FLAGS_ROW;
 
-/// First OTP row of the device identity key (used for Noise_XX auth).
-pub const OTP_DEVICE_ID_KEY_ROW_START: u16 = 0x120;
+/// First OTP row of the device identity key.
+pub const OTP_DEVICE_ID_KEY_ROW_START: u16 = layout::DEVICE_ID_KEY_ROW_START;
 
 /// Length of the device identity key in bytes (32 bytes = 16 ECC rows).
 pub const OTP_DEVICE_ID_KEY_LEN: usize = 32;
 
 // ─── Boot flags bit positions ─────────────────────────────────────────────────
 
-const BOOT_FLAG_JTAG_DISABLED: u32 = 1 << 0;
-const BOOT_FLAG_PRODUCTION_MODE: u32 = 1 << 1;
-const BOOT_FLAG_PROVISIONED: u32 = 1 << 2;
+const BOOT_FLAG_JTAG_DISABLED: u32 = layout::BOOT_FLAG_JTAG_DISABLED;
+const BOOT_FLAG_PRODUCTION_MODE: u32 = layout::BOOT_FLAG_PRODUCTION_MODE;
+const BOOT_FLAG_PROVISIONED: u32 = layout::BOOT_FLAG_PROVISIONED;
+
+/// Set once the key page has been read-locked for this boot.  Locking only
+/// happens on a provisioned device, so it also answers `is_provisioned`
+/// after the key rows become unreadable.
+static KEY_PAGE_LOCKED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Set at boot when the OTP storage key was present and derived — recorded
+/// before the key page is read-locked, after which it can't be re-checked.
+static STORAGE_KEY_PROVISIONED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Whether this boot found a provisioned OTP storage key (see
+/// [`boot_storage_master_key`]).  SET PRODUCTION MODE requires it.
+pub fn storage_key_provisioned() -> bool {
+    STORAGE_KEY_PROVISIONED.load(core::sync::atomic::Ordering::Relaxed)
+}
 
 // ─── Legacy constants (kept for backward compat with old stubs) ───────────────
 
@@ -121,7 +132,7 @@ impl Otp {
 
     // ── Key material read/write ──────────────────────────────────────────────
 
-    /// Read 64 bytes of raw key material from OTP rows 0x100–0x10F.
+    /// Read 64 bytes of raw key material from the storage key rows.
     ///
     /// Each pair of bytes is stored as one ECC-protected 16-bit word.
     /// Returns `Err` if any row yields an ECC error or is read-locked.
@@ -129,12 +140,12 @@ impl Otp {
         read_ecc_bytes_64(OTP_STORAGE_KEY_ROW_START as usize).map_err(otp_err_to_hsm)
     }
 
-    /// Read 32 bytes of device identity key material from OTP rows 0x120–0x127.
+    /// Read 32 bytes of device identity key material.
     pub fn read_device_identity_material(&self) -> Result<[u8; 32], HsmError> {
         read_ecc_bytes_32(OTP_DEVICE_ID_KEY_ROW_START as usize).map_err(otp_err_to_hsm)
     }
 
-    /// Read the boot flags word from OTP row 0x110.
+    /// Read the boot flags word.
     ///
     /// Returns the lower 24 bits (raw read, not ECC) since flags are packed
     /// as individual bits and do not benefit from ECC.
@@ -165,6 +176,9 @@ impl Otp {
     /// Returns `true` if the storage key material rows contain at least one
     /// non-zero byte, indicating provisioning has occurred.
     pub fn is_provisioned(&self) -> bool {
+        if KEY_PAGE_LOCKED.load(core::sync::atomic::Ordering::Relaxed) {
+            return true;
+        }
         // Read the first two ECC words (4 bytes) and check for non-zero.
         for row in (OTP_STORAGE_KEY_ROW_START as usize)..(OTP_STORAGE_KEY_ROW_START as usize + 2) {
             if let Ok(word) = otp::read_ecc_word(row) {
@@ -196,12 +210,12 @@ impl Otp {
 
     /// Set the production mode flag (irreversible).
     ///
-    /// Writes bit 1 of OTP row 0x110.  Once set, this bit cannot be cleared.
+    /// Sets the production-mode bit of the boot flags row.  Irreversible.
     pub fn set_production_mode(&mut self) -> Result<(), HsmError> {
         let current = otp::read_raw_word(OTP_BOOT_FLAGS_ROW as usize).map_err(otp_err_to_hsm)?;
         let new_flags = current | BOOT_FLAG_PRODUCTION_MODE | BOOT_FLAG_PROVISIONED;
         otp::write_raw_word(OTP_BOOT_FLAGS_ROW as usize, new_flags).map_err(otp_err_to_hsm)?;
-        defmt::warn!("OTP: production mode flag set — IRREVERSIBLE");
+        // No defmt: this runs on core1 (SET PRODUCTION MODE).
         Ok(())
     }
 
@@ -209,10 +223,10 @@ impl Otp {
     ///
     /// IRREVERSIBLE.  Only callable when production mode is active.
     ///
-    /// Writes bit 0 of OTP row 0x110 and then configures the RP2350
+    /// Writes the JTAG-disabled boot flag and then configures the RP2350
     /// JTAG disable fuse via the SWD interface lock register.
     ///
-    /// Note: OTP row 0x110 bit 0 is the pico2hsm user-land bookkeeping
+    /// Note: the boot-flags JTAG bit is the pico2hsm user-land bookkeeping
     /// flag only.  The hardware JTAG fuse is CRIT1.DEBUG_DISABLE (OTP
     /// rows 0x40–0x47, RBIT-8) and must be set via `picotool otp set
     /// OTP_DATA_CRIT1.DEBUG_DISABLE 1` during provisioning.  See
@@ -264,7 +278,7 @@ fn read_ecc_bytes_64(row_start: usize) -> Result<[u8; 64], otp::Error> {
 /// with 0x00 if `data.len()` is odd.
 fn write_ecc_bytes(row_start: usize, data: &[u8]) -> Result<(), otp::Error> {
     let len = data.len();
-    let num_rows = (len + 1) / 2;
+    let num_rows = len.div_ceil(2);
     for i in 0..num_rows {
         let high = data[i * 2] as u16;
         let low = if i * 2 + 1 < len {
@@ -310,9 +324,9 @@ pub fn write_row(row: u8, data: [u8; 3]) -> Result<(), StorageError> {
 /// Each OTP page covers 64 consecutive rows:
 ///   page = row / 64  (integer division)
 ///
-/// Rows 0x100–0x127 (IKM, device key, boot flags) all fall in OTP page 4
-/// (rows 0x100–0x13F). Locking page 4 makes the key material unreadable via
-/// SWD after provisioning.
+/// The storage key and device identity key share OTP page 4 (see
+/// `otp_layout`); locking that page makes them unreadable via SWD and by any
+/// later code for the rest of the boot.
 ///
 /// # Effect
 /// After this call, `embassy_rp::otp::read_raw_word` and `read_ecc_word` for
@@ -330,7 +344,7 @@ pub fn write_row(row: u8, data: [u8; 3]) -> Result<(), StorageError> {
 /// at address 0x4012_0000 (RP2350 datasheet §5.4 "OTP Control Registers").
 /// Single-caller assumption: this is called once at provisioning time.
 #[cfg(target_arch = "arm")]
-pub fn lock_read(row_start: u8, row_count: u8) -> Result<(), StorageError> {
+pub fn lock_read(row_start: u16, row_count: u16) -> Result<(), StorageError> {
     use embassy_rp::pac::otp::vals::{SwLockNsec, SwLockSec};
     use embassy_rp::pac::OTP;
 
@@ -380,7 +394,7 @@ pub fn lock_read(row_start: u8, row_count: u8) -> Result<(), StorageError> {
 
 /// Stub for non-ARM targets (host tests).
 #[cfg(not(target_arch = "arm"))]
-pub fn lock_read(_row_start: u8, _row_count: u8) -> Result<(), StorageError> {
+pub fn lock_read(_row_start: u16, _row_count: u16) -> Result<(), StorageError> {
     Ok(())
 }
 
@@ -391,7 +405,7 @@ pub fn lock_read(_row_start: u8, _row_count: u8) -> Result<(), StorageError> {
 ///
 /// See `lock_read()` for page mapping and register layout details.
 #[cfg(target_arch = "arm")]
-pub fn lock_write(row_start: u8, row_count: u8) -> Result<(), StorageError> {
+pub fn lock_write(row_start: u16, row_count: u16) -> Result<(), StorageError> {
     use embassy_rp::pac::otp::vals::{SwLockNsec, SwLockSec};
     use embassy_rp::pac::OTP;
 
@@ -435,7 +449,7 @@ pub fn lock_write(row_start: u8, row_count: u8) -> Result<(), StorageError> {
 
 /// Stub for non-ARM targets (host tests).
 #[cfg(not(target_arch = "arm"))]
-pub fn lock_write(_row_start: u8, _row_count: u8) -> Result<(), StorageError> {
+pub fn lock_write(_row_start: u16, _row_count: u16) -> Result<(), StorageError> {
     Ok(())
 }
 
@@ -446,7 +460,7 @@ pub fn lock_write(_row_start: u8, _row_count: u8) -> Result<(), StorageError> {
 pub fn read_root_secret() -> Result<[u8; 32], StorageError> {
     let mut out = [0u8; 32];
     let mut byte_idx = 0usize;
-    for row in (OTP_ROOT_SECRET_START as usize)..=(0x3F_usize) {
+    for row in (OTP_ROOT_SECRET_START as usize)..=0x3F_usize {
         if byte_idx >= 32 {
             break;
         }
@@ -475,17 +489,108 @@ pub fn read_root_secret() -> Result<[u8; 32], StorageError> {
 /// upgrading from earlier firmware.
 ///
 /// TODO (crypto agent): pass the device serial number from OTP as `info`.
-pub fn derive_smk() -> Result<[u8; 32], StorageError> {
+pub fn derive_smk() -> Result<zeroize::Zeroizing<[u8; 32]>, StorageError> {
     use hkdf::Hkdf;
     use sha2::Sha256;
-
-    let ikm = read_ecc_bytes_64(OTP_STORAGE_KEY_ROW_START as usize).map_err(otp_err_to_storage)?;
+    use zeroize::Zeroizing;
+    let ikm = Zeroizing::new(
+        read_ecc_bytes_64(OTP_STORAGE_KEY_ROW_START as usize).map_err(otp_err_to_storage)?,
+    );
     let salt = b"pico2hsm-smk";
-
-    let hk = Hkdf::<Sha256>::new(Some(salt), &ikm);
-    let mut okm = [0u8; 32];
-    hk.expand(b"storage-master-key", &mut okm)
+    let hk = Hkdf::<Sha256>::new(Some(salt), ikm.as_ref());
+    let mut okm = Zeroizing::new([0u8; 32]);
+    hk.expand(b"storage-master-key", okm.as_mut())
         .map_err(|_| StorageError::WriteError)?;
-
     Ok(okm)
+}
+
+/// Whether this build may fall back to the fixed development storage key
+/// on an unprovisioned device (debug builds, or the explicit feature).
+pub const DEV_STORAGE_KEY_ALLOWED: bool =
+    cfg!(any(debug_assertions, feature = "insecure-dev-keystore"));
+
+/// Storage master key for this boot, then read-lock the key page.
+///
+/// - **Provisioned**: derive from the OTP IKM, then read-lock OTP page 4 so
+///   neither SWD nor any later code can read the IKM again this boot.
+/// - **Unprovisioned, development build**: the IKM rows are blank, so the
+///   derivation yields a fixed key that anyone can compute.  Allowed only
+///   when [`DEV_STORAGE_KEY_ALLOWED`]; logged loudly.
+/// - **Unprovisioned, release build**: `None` — the keystore refuses to
+///   store or load keys rather than encrypt them under a public key.
+///
+/// Fails closed: an OTP read error (state unknown) or a failed page lock
+/// yields `None` rather than a fallback key or an unlocked page.
+pub fn boot_storage_master_key() -> Option<zeroize::Zeroizing<[u8; 32]>> {
+    match provisioning_state() {
+        Ok(false) => {
+            // Definitely blank: leave the page writable so it can be provisioned.
+            if !DEV_STORAGE_KEY_ALLOWED {
+                defmt::error!("OTP: unprovisioned — keystore disabled (no storage key)");
+                return None;
+            }
+            defmt::warn!("OTP: unprovisioned — using INSECURE fixed development storage key");
+            derive_smk().ok()
+        }
+        Ok(true) => {
+            // Derive first (the lock makes the IKM unreadable), then lock on
+            // every outcome — including a failed derivation.
+            let smk = derive_smk().ok();
+            if !lock_key_page() {
+                defmt::error!("OTP: key page lock failed — keystore disabled");
+                return None;
+            }
+            if smk.is_none() {
+                defmt::error!("OTP: storage key derivation failed — keystore disabled");
+            } else {
+                STORAGE_KEY_PROVISIONED.store(true, core::sync::atomic::Ordering::Relaxed);
+            }
+            smk
+        }
+        Err(()) => {
+            // State unknown: treat as provisioned for locking, and use no key.
+            let _ = lock_key_page();
+            defmt::error!("OTP: provisioning state unreadable — keystore disabled");
+            None
+        }
+    }
+}
+
+/// Read-lock the key page for the rest of this boot; true on success.
+fn lock_key_page() -> bool {
+    let rows = layout::ROWS_PER_PAGE;
+    let locked = lock_read(layout::KEY_PAGE * rows, rows).is_ok();
+    if locked {
+        KEY_PAGE_LOCKED.store(true, core::sync::atomic::Ordering::Relaxed);
+    }
+    locked
+}
+
+/// Whether the storage key IKM is present (`Ok(true)`), the OTP is blank
+/// (`Ok(false)`), or the state is unusable (`Err`: read error, or the
+/// PROVISIONED flag without key material).
+///
+/// Unlike [`Otp::is_provisioned`], any read error is reported as `Err`
+/// instead of being taken to mean "blank", so callers can fail closed.
+fn provisioning_state() -> Result<bool, ()> {
+    let start = OTP_STORAGE_KEY_ROW_START as usize;
+    for row in start..start + layout::STORAGE_KEY_ROWS as usize {
+        if otp::read_ecc_word(row).map_err(|_| ())? != 0 {
+            return Ok(true);
+        }
+    }
+    // Key rows all zero.  With the PROVISIONED flag set, the key material
+    // is missing (or was destroyed): not "blank" — deriving from zero rows
+    // would give a public key — and not usable either.  Report it as
+    // unknown, which locks the page and disables the keystore.
+    let flags = otp::read_raw_word(OTP_BOOT_FLAGS_ROW as usize).map_err(|_| ())?;
+    if flags & BOOT_FLAG_PROVISIONED != 0 {
+        return Err(());
+    }
+    Ok(false)
+}
+
+/// Whether the key page has been read-locked this boot.
+pub fn key_page_locked() -> bool {
+    KEY_PAGE_LOCKED.load(core::sync::atomic::Ordering::Relaxed)
 }

@@ -6,14 +6,18 @@
 //! sc-hsm-tool sends: `80 74 <target_key_ref> 93 <len> <wrapped_blob>`.
 //!
 //! # Command data
-//! Wrapped key blob in SC-HSM wrap format.
+//! A SmartCard-HSM (CardContact) key blob (`security::key_blob`,
+//! docs/SC_HSM_APDU_REFERENCE.md).  The pico2hsm version-2/3 blobs of the
+//! previous release are still accepted, deprecated, for one release.
 
 use pico2hsm_core::apdu::{
-    ApduCommand, ApduResponse, SW_CONDITIONS_NOT_SATISFIED, SW_SECURITY_STATUS, SW_WRONG_DATA,
+    ApduCommand, ApduResponse, SW_CONDITIONS_NOT_SATISFIED, SW_FUNC_NOT_SUPPORTED,
+    SW_SECURITY_STATUS, SW_WRONG_DATA,
 };
 use pico2hsm_core::key::{AppletId, KeyId};
 
 use crate::protocol::sc_hsm::{KeyMeta, ScHsmState};
+use crate::security::dkek::DkekError;
 use crate::security::key_management::{AlgorithmId, KeyObject, KeyType as KmType};
 use crate::storage::KeyStore;
 
@@ -56,113 +60,95 @@ pub fn handle(
     // as a Case-1 APDU with no inline data.  We must support both paths.
 
     // Copy blob into a local buffer so we can later mutate state.
-    let blob_data: heapless::Vec<u8, 2400> = if !cmd.data.is_empty() {
-        let mut v: heapless::Vec<u8, 2400> = heapless::Vec::new();
-        if v.extend_from_slice(cmd.data).is_err() {
-            return ApduResponse::err(SW_WRONG_DATA);
-        }
-        v
-    } else {
-        // Standard sc-hsm-tool protocol: host wrote the blob to EF 0x2F10 first,
-        // then sends IMPORT KEY as Case-1 APDU (no inline data).
-        // EF 0x2F10 is stored via write_data; read from ef_cache first,
-        // then fall back to flash via cross-core fetch_key RPC.
-        let ef_key_id = KeyId::sc_hsm_ef(0, 0x2F, 0x10);
-        if let Some(data) = state.ef_cache_get(ef_key_id.0) {
-            if !data.is_empty() {
-                let mut v: heapless::Vec<u8, 2400> = heapless::Vec::new();
-                if v.extend_from_slice(data).is_err() {
-                    return ApduResponse::err(SW_WRONG_DATA);
-                }
-                v
-            } else {
+    let blob_data: heapless::Vec<u8, { crate::security::dkek::WRAP_MAX_BLOB }> =
+        if !cmd.data.is_empty() {
+            let mut v: heapless::Vec<u8, { crate::security::dkek::WRAP_MAX_BLOB }> =
+                heapless::Vec::new();
+            if v.extend_from_slice(cmd.data).is_err() {
                 return ApduResponse::err(SW_WRONG_DATA);
             }
-        } else if let Ok(Some(obj)) = store.fetch_key(ef_key_id) {
-            if !obj.private_key.is_empty() {
-                state.ef_cache_put(ef_key_id.0, &obj.private_key);
-                let mut v: heapless::Vec<u8, 2400> = heapless::Vec::new();
-                if v.extend_from_slice(&obj.private_key).is_err() {
-                    return ApduResponse::err(SW_WRONG_DATA);
-                }
-                v
-            } else {
-                return ApduResponse::err(SW_WRONG_DATA);
-            }
+            v
         } else {
-            return ApduResponse::err(SW_WRONG_DATA);
-        }
-    };
+            // Standard sc-hsm-tool protocol: host wrote the blob to EF 0x2F10 first,
+            // then sends IMPORT KEY as Case-1 APDU (no inline data).
+            // EF 0x2F10 is stored via write_data; read from ef_cache first,
+            // then fall back to flash via cross-core fetch_key RPC.
+            let ef_key_id = KeyId::sc_hsm_ef(0, 0x2F, 0x10);
+            if let Some(data) = state.ef_cache_get(ef_key_id.0) {
+                if !data.is_empty() {
+                    let mut v: heapless::Vec<u8, { crate::security::dkek::WRAP_MAX_BLOB }> =
+                        heapless::Vec::new();
+                    if v.extend_from_slice(data).is_err() {
+                        return ApduResponse::err(SW_WRONG_DATA);
+                    }
+                    v
+                } else {
+                    return ApduResponse::err(SW_WRONG_DATA);
+                }
+            } else if let Ok(Some(obj)) = store.fetch_key(ef_key_id) {
+                if !obj.private_key.is_empty() {
+                    state.ef_cache_put(ef_key_id.0, &obj.private_key);
+                    let mut v: heapless::Vec<u8, { crate::security::dkek::WRAP_MAX_BLOB }> =
+                        heapless::Vec::new();
+                    if v.extend_from_slice(&obj.private_key).is_err() {
+                        return ApduResponse::err(SW_WRONG_DATA);
+                    }
+                    v
+                } else {
+                    return ApduResponse::err(SW_WRONG_DATA);
+                }
+            } else {
+                return ApduResponse::err(SW_WRONG_DATA);
+            }
+        };
 
-    // Unwrap key blob under DKEK.
-    let (key_material, algo_id, key_flags) = match state.dkek.unwrap(&blob_data) {
-        Ok(result) => result,
+    // Unwrap the blob under the DKEK into a new key object: a SmartCard-HSM
+    // (CardContact) key blob, or — deprecated, this release only — a
+    // pico2hsm version-2/3 blob.  The blob is authenticated before anything
+    // in it is decrypted or parsed; all such failures are one SW (6A80,
+    // which sc-hsm-tool reports as "Wrapped key does not match DKEK").
+    let full_key_id = KeyId::sc_hsm(0, key_ref);
+    let mut key_obj = KeyObject::new(
+        KmType::Generic,
+        full_key_id.0,
+        AppletId::ScHsm,
+        AlgorithmId::AesGcm,
+    );
+    let unwrapped = match state.dkek.unwrap(&blob_data, &mut key_obj) {
+        Ok(u) => u,
+        // Authentic, but a key this firmware cannot hold (brainpool,
+        // Curve25519, RSA in a build without `rsa`).
+        Err(DkekError::UnsupportedKey) => return ApduResponse::err(SW_FUNC_NOT_SUPPORTED),
         Err(_) => return ApduResponse::err(SW_WRONG_DATA),
     };
+    if unwrapped.legacy {
+        crate::cdc_log!("SC-HSM IMPORT KEY: deprecated pico2hsm blob format (v2/v3)");
+    }
+    let algo_id = unwrapped.decoded.meta_algo;
+    let key_flags = unwrapped.key_flags;
 
     // Clear EF 0x2F10 now that we have consumed the blob.
     let ef_key_id_2f10 = KeyId::sc_hsm_ef(0, 0x2F, 0x10);
-    let _ = store.erase_key(ef_key_id_2f10);
+    if cmd.data.is_empty() && store.erase_key(ef_key_id_2f10).is_err() {
+        // Fail closed: RAM and flash stay consistent, nothing imported.
+        return ApduResponse::err(pico2hsm_core::apdu::SW_MEMORY_FAILURE);
+    }
     state.key_index.retain(|m| m.key_id != ef_key_id_2f10.0);
     state.ef_cache_remove(ef_key_id_2f10.0);
 
-    let full_key_id = KeyId::sc_hsm(0, key_ref);
+    key_obj.key_domain = key_obj.policy.domain.unwrap_or(0);
 
-    // Determine AlgorithmId from the algo byte stored in the wrapped blob.
-    let km_algo = match AlgorithmId::from_u8(algo_id) {
-        Some(a) => a,
-        None => return ApduResponse::err(SW_WRONG_DATA),
-    };
-
-    // Determine key type family for KeyObject.
-    let km_type = match algo_id {
-        0x13 | 0x15 | 0x17 | 0x19 | 0x23 | 0x25 | 0x27 | 0x53 | 0x54 | 0x55 => KmType::Ec,
-        0x05 | 0x07 | 0x31 | 0x32 | 0x33 | 0x34 | 0x41 => KmType::Rsa,
-        0x60 | 0x61 | 0x62 | 0x63 => KmType::Aes,
-        0x20 | 0x21 => KmType::Ec, // Ed25519/X25519 stored as EC family
-        _ => return ApduResponse::err(SW_WRONG_DATA),
-    };
-
-    // Build KeyObject for persistent storage.
-    let mut key_obj = KeyObject::new(km_type, full_key_id.0, AppletId::ScHsm, km_algo);
-    key_obj.key_flags = key_flags;
-    let _ = key_obj.private_key.extend_from_slice(&key_material);
-
-    // Persist to flash (best-effort; flash writes fail with InvalidCore on Core1
-    // and the key remains available in the in-memory store for the session).
-    let _ = store.save_key(&key_obj);
+    // Persist to flash; an import that is not stored did not happen.
+    if store.save_key(&key_obj).is_err() {
+        return ApduResponse::err(pico2hsm_core::apdu::SW_MEMORY_FAILURE);
+    }
     state.generation = state.generation.wrapping_add(1);
-
-    // Map algo byte to CoreKeyType for metadata.
-    let core_key_type = match algo_id {
-        0x13 | 0x23 => pico2hsm_core::key::KeyType::EcPrivateP256,
-        0x15 | 0x25 => pico2hsm_core::key::KeyType::EcPrivateP384,
-        0x17 | 0x27 => pico2hsm_core::key::KeyType::EcPrivateP521,
-        0x19 => pico2hsm_core::key::KeyType::EcPrivateK256,
-        0x53 => pico2hsm_core::key::KeyType::EcPrivateBrainpoolP256,
-        0x54 => pico2hsm_core::key::KeyType::EcPrivateBrainpoolP384,
-        0x55 => pico2hsm_core::key::KeyType::EcPrivateBrainpoolP512,
-        0x20 => pico2hsm_core::key::KeyType::Ed25519,
-        0x21 => pico2hsm_core::key::KeyType::X25519,
-        0x05 | 0x07 | 0x31 | 0x32 | 0x33 | 0x34 | 0x41 => {
-            pico2hsm_core::key::KeyType::RsaPrivate2048
-        } // RSA family placeholder
-        0x60 | 0x61 | 0x62 | 0x63 => pico2hsm_core::key::KeyType::Aes256,
-        _ => {
-            crate::cdc_log!(
-                "SC-HSM IMPORT KEY done key=0x{:08x} algo=0x{:02x}",
-                full_key_id.0,
-                algo_id
-            );
-            return ApduResponse::ok(&[]);
-        }
-    };
 
     // Store metadata in key_index (replacing any existing entry with the same ID).
     state.key_index.retain(|m| m.key_id != full_key_id.0);
     let _ = state.key_index.push(KeyMeta {
         key_id: full_key_id.0,
-        key_type: core_key_type as u8,
+        key_type: unwrapped.decoded.core_type as u8,
         algo: algo_id,
         key_flags,
     });
@@ -225,9 +211,34 @@ mod tests {
     }
 
     /// Wrap a known key so we have a valid blob for import tests.
-    fn wrap_test_key(state: &ScHsmState, private_key: &[u8], algo: u8) -> heapless::Vec<u8, 2448> {
+    fn wrap_test_key(
+        state: &ScHsmState,
+        private_key: &[u8],
+        algo: u8,
+    ) -> heapless::Vec<u8, { crate::security::dkek::WRAP_MAX_BLOB }> {
         let mut rng = FwRng;
-        state.dkek.wrap(private_key, algo, 0x01, &mut rng).unwrap()
+        let mut key = KeyObject::new(
+            KmType::Ec,
+            0,
+            AppletId::ScHsm,
+            AlgorithmId::from_u8(algo).unwrap(),
+        );
+        key.private_key.extend_from_slice(private_key).unwrap();
+        state.dkek.wrap(&key, 0x01, &mut rng).unwrap()
+    }
+
+    /// A blob in the deprecated pico2hsm format (version 2).
+    fn wrap_legacy_key(
+        state: &ScHsmState,
+        material: &[u8],
+        algo: u8,
+    ) -> heapless::Vec<u8, { crate::security::dkek::WRAP_MAX_BLOB }> {
+        let mut rng = FwRng;
+        let none = crate::security::key_policy::KeyPolicy::default();
+        state
+            .dkek
+            .wrap_legacy(material, algo, 0x01, &none, &mut rng)
+            .unwrap()
     }
 
     fn make_cmd<'a>(p1: u8, p2: u8, data: &'a [u8]) -> ApduCommand<'a> {
@@ -260,6 +271,83 @@ mod tests {
         assert!(found.is_some(), "imported key should be in key_index");
         let meta = found.unwrap();
         assert_eq!(meta.algo, 0x13);
+    }
+
+    #[test]
+    fn test_import_oversized_ec_key_rejected() {
+        // An authenticated blob whose "P-256 key" is 100 bytes used to be
+        // stored and then panic core1 on the fixed 66-byte copy at use.
+        let mut state = state_with_dkek();
+        let wrapped = wrap_legacy_key(&state, &[0x42u8; 100], 0x13);
+        let cmd = make_cmd(0x01, P2_IMPORT, &wrapped);
+        let resp = handle(&mut state, &mut NullStore, &cmd);
+        assert_eq!(resp.sw, SW_WRONG_DATA);
+        assert!(!state
+            .key_index
+            .iter()
+            .any(|m| m.key_id == KeyId::sc_hsm(0, 0x01).0));
+    }
+
+    #[test]
+    fn test_import_legacy_v2_blob_still_accepted() {
+        let mut state = state_with_dkek();
+        let wrapped = wrap_legacy_key(&state, &[0x42u8; 32], 0x13);
+        let resp = handle(
+            &mut state,
+            &mut NullStore,
+            &make_cmd(0x02, P2_IMPORT, &wrapped),
+        );
+        assert_eq!(resp.sw, SW_OK);
+        let meta = state
+            .key_index
+            .iter()
+            .find(|m| m.key_id == KeyId::sc_hsm(0, 0x02).0)
+            .copied()
+            .unwrap();
+        assert_eq!((meta.algo, meta.key_flags), (0x13, 0x01));
+    }
+
+    #[test]
+    fn test_import_keeps_policy_and_flags() {
+        let mut state = state_with_dkek();
+        let mut key = KeyObject::new(KmType::Ec, 0, AppletId::ScHsm, AlgorithmId::EcdsaP256);
+        key.private_key.extend_from_slice(&[0x42u8; 32]).unwrap();
+        key.policy.algorithms.extend_from_slice(&[0x73]).unwrap();
+        let wrapped = state.dkek.wrap(&key, 0x02, &mut FwRng).unwrap();
+        struct Keep(Option<KeyObject>);
+        impl KeyStore for Keep {
+            fn save_key(&mut self, o: &KeyObject) -> Result<(), HsmError> {
+                let mut c = KeyObject::new(o.key_type, o.key_id, o.owner, o.algorithm);
+                c.policy = o.policy.clone();
+                c.key_flags = o.key_flags;
+                c.public_key.extend_from_slice(&o.public_key).unwrap();
+                self.0 = Some(c);
+                Ok(())
+            }
+            fn fetch_key(&mut self, _: KeyId) -> Result<Option<KeyObject>, HsmError> {
+                Ok(None)
+            }
+            fn erase_key(&mut self, _: KeyId) -> Result<(), HsmError> {
+                Ok(())
+            }
+            fn wipe_all(&mut self) -> Result<(), HsmError> {
+                Ok(())
+            }
+            fn wipe_by_owner(&mut self, _: AppletId) -> Result<(), HsmError> {
+                Ok(())
+            }
+            fn enumerate_keys(&self) -> heapless::Vec<KeyId, 64> {
+                heapless::Vec::new()
+            }
+            fn for_each_key(&self, _f: &mut dyn FnMut(KeyId)) {}
+        }
+        let mut store = Keep(None);
+        let resp = handle(&mut state, &mut store, &make_cmd(0x03, P2_IMPORT, &wrapped));
+        assert_eq!(resp.sw, SW_OK);
+        let saved = store.0.unwrap();
+        assert_eq!(&saved.policy.algorithms[..], &[0x73]);
+        assert_eq!(saved.key_flags, 0x02);
+        assert_eq!(saved.public_key.len(), 65);
     }
 
     #[test]
@@ -310,7 +398,7 @@ mod tests {
 
     /// A store that holds one EF 0x2F10 blob for testing the standard import path.
     struct EfStore {
-        ef_data: Option<heapless::Vec<u8, 2400>>,
+        ef_data: Option<heapless::Vec<u8, { crate::security::dkek::WRAP_MAX_BLOB }>>,
     }
     impl KeyStore for EfStore {
         fn save_key(

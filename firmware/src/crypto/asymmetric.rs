@@ -243,10 +243,7 @@ pub fn generate_ec_keypair(
 ///
 /// Returns a 64-byte raw signature (`r || s`, each 32 bytes).
 #[cfg(feature = "applet-openpgp-curve25519")]
-pub fn ed25519_sign(
-    private_key: &[u8],
-    message: &[u8],
-) -> Result<heapless::Vec<u8, 64>, CryptoError> {
+pub fn ed25519_sign(private_key: &[u8], message: &[u8]) -> Result<Vec<u8, 64>, CryptoError> {
     use ed25519_dalek::{Signature, Signer, SigningKey};
 
     if private_key.len() != 32 {
@@ -261,7 +258,7 @@ pub fn ed25519_sign(
     let sig: Signature = signing_key.sign(message);
     let sig_bytes = sig.to_bytes(); // 64 bytes (R || S = 32 || 32)
 
-    let mut out: heapless::Vec<u8, 64> = heapless::Vec::new();
+    let mut out: Vec<u8, 64> = Vec::new();
     out.extend_from_slice(&sig_bytes)
         .map_err(|_| CryptoError::BufferTooSmall)?;
     Ok(out)
@@ -518,11 +515,10 @@ where
     C: elliptic_curve::PrimeCurve
         + elliptic_curve::CurveArithmetic
         + ecdsa::hazmat::DigestPrimitive,
-    C::Scalar: elliptic_curve::ops::Invert<Output = elliptic_curve::subtle::CtOption<C::Scalar>>
+    C::Scalar: elliptic_curve::ops::Invert<Output = subtle::CtOption<C::Scalar>>
         + ecdsa::hazmat::SignPrimitive<C>,
     elliptic_curve::FieldBytesSize<C>: elliptic_curve::sec1::ModulusSize,
-    elliptic_curve::AffinePoint<C>:
-        elliptic_curve::sec1::FromEncodedPoint<C> + elliptic_curve::sec1::ToEncodedPoint<C>,
+    elliptic_curve::AffinePoint<C>: elliptic_curve::sec1::FromEncodedPoint<C> + ToEncodedPoint<C>,
     ecdsa::SignatureSize<C>: elliptic_curve::generic_array::ArrayLength<u8>,
     ecdsa::der::MaxSize<C>: elliptic_curve::generic_array::ArrayLength<u8>,
     <elliptic_curve::FieldBytesSize<C> as core::ops::Add>::Output:
@@ -547,27 +543,60 @@ where
 }
 
 /// P-521 ECDSA sign — dedicated impl because NistP521 has no DigestPrimitive.
-/// Uses randomized k from CryptoRng (hardware TRNG on RP2350).
-/// No standard hash has OutputSize == 66 bytes (P-521 field size), so RFC 6979's
-/// type-level guarantee cannot be used. Randomized k with a CSPRNG is equally secure.
+///
+/// The nonce is RFC 6979 (HMAC-DRBG over SHA-512) *hedged* with 32 fresh
+/// random bytes as additional data (RFC 6979 §3.6): a weak or faulted RNG no
+/// longer leaks the key through a biased `k`, and the randomness still
+/// defeats fault attacks on deterministic signing.
 fn ecdsa_sign_p521(
     private_key_raw: &[u8],
     hash_data: &[u8],
-    rng: &mut (impl rand_core::CryptoRng + rand_core::RngCore),
+    rng: &mut (impl rand_core::CryptoRng + RngCore),
+) -> Result<EcdsaSignature, CryptoError> {
+    let mut extra = [0u8; 32];
+    rng.try_fill_bytes(&mut extra)
+        .map_err(|_| CryptoError::RngFailure)?;
+    ecdsa_sign_p521_with_ad(private_key_raw, hash_data, &extra)
+}
+
+/// P-521 ECDSA with an RFC 6979 nonce over SHA-512 and additional data `ad`
+/// (empty = plain deterministic RFC 6979, used by the test vectors).
+fn ecdsa_sign_p521_with_ad(
+    private_key_raw: &[u8],
+    hash_data: &[u8],
+    ad: &[u8],
 ) -> Result<EcdsaSignature, CryptoError> {
     use ecdsa::hazmat::{bits2field, SignPrimitive};
-    use elliptic_curve::NonZeroScalar;
+    use elliptic_curve::ops::Reduce;
+    use elliptic_curve::PrimeField;
 
     let secret = SecretKey::<p521::NistP521>::from_slice(private_key_raw)
         .map_err(|_| CryptoError::WrongKeyLength)?;
     // SignPrimitive<NistP521> is implemented on p521::Scalar, not NonZeroScalar.
-    // Deref with explicit type annotation to avoid Rust resolving to the NonZeroScalar copy.
     let nz = secret.to_nonzero_scalar();
     let scalar: p521::Scalar = *nz;
     let z = bits2field::<p521::NistP521>(hash_data).map_err(|_| CryptoError::SignFailure)?;
-    // Generate a random k from the hardware TRNG, convert to Scalar for Invert bound.
-    let k_nz = NonZeroScalar::<p521::NistP521>::random(rng);
-    let k: p521::Scalar = *k_nz;
+
+    // RFC 6979 §3.2 with qlen = 521, rlen = 528: x = int2octets(d),
+    // h1 = bits2octets(z) = int2octets(z mod n).
+    let x = zeroize::Zeroizing::new(scalar.to_repr());
+    let h1 =
+        <p521::Scalar as Reduce<<p521::NistP521 as elliptic_curve::Curve>::Uint>>::reduce_bytes(&z)
+            .to_repr();
+    let mut drbg = rfc6979::HmacDrbg::<sha2::Sha512>::new(x.as_slice(), &h1, ad);
+    let k = loop {
+        // T = 66 bytes of DRBG output; k = bits2int(T) = leftmost 521 bits.
+        let mut t = zeroize::Zeroizing::new(p521::FieldBytes::default());
+        drbg.fill_bytes(t.as_mut_slice());
+        shift_right_bits(t.as_mut_slice(), 66 * 8 - 521);
+        let candidate: Option<p521::Scalar> = p521::Scalar::from_repr(*t).into();
+        match candidate {
+            Some(k) if !bool::from(k.is_zero()) => break k,
+            // k ≥ n or k = 0: fill_bytes already did the §3.2(h) K/V update.
+            _ => continue,
+        }
+    };
+
     let (sig, _recid) = scalar
         .try_sign_prehashed(k, &z)
         .map_err(|_| CryptoError::SignFailure)?;
@@ -577,6 +606,17 @@ fn ecdsa_sign_p521(
     out.extend_from_slice(sig_bytes)
         .map_err(|_| CryptoError::BufferTooSmall)?;
     Ok(out)
+}
+
+/// Shift a big-endian integer right by `bits` (< 8) in place.
+fn shift_right_bits(be: &mut [u8], bits: usize) {
+    debug_assert!(bits < 8);
+    let mut carry = 0u8;
+    for b in be.iter_mut() {
+        let next = *b << (8 - bits);
+        *b = (*b >> bits) | carry;
+        carry = next;
+    }
 }
 
 /// P-521 ECDSA verify — dedicated impl because NistP521 has no DigestPrimitive.
@@ -666,7 +706,7 @@ where
         + ecdsa::hazmat::DigestPrimitive,
     elliptic_curve::AffinePoint<C>: ecdsa::hazmat::VerifyPrimitive<C>
         + elliptic_curve::sec1::FromEncodedPoint<C>
-        + elliptic_curve::sec1::ToEncodedPoint<C>,
+        + ToEncodedPoint<C>,
     elliptic_curve::FieldBytesSize<C>: elliptic_curve::sec1::ModulusSize,
     ecdsa::SignatureSize<C>: elliptic_curve::generic_array::ArrayLength<u8>,
     ecdsa::der::MaxSize<C>: elliptic_curve::generic_array::ArrayLength<u8>,
@@ -741,8 +781,7 @@ fn ecdh_agree_curve<C>(
 ) -> Result<Vec<u8, 66>, CryptoError>
 where
     C: elliptic_curve::CurveArithmetic,
-    elliptic_curve::AffinePoint<C>:
-        elliptic_curve::sec1::FromEncodedPoint<C> + elliptic_curve::sec1::ToEncodedPoint<C>,
+    elliptic_curve::AffinePoint<C>: elliptic_curve::sec1::FromEncodedPoint<C> + ToEncodedPoint<C>,
     elliptic_curve::FieldBytesSize<C>: elliptic_curve::sec1::ModulusSize,
 {
     let secret =
@@ -771,7 +810,7 @@ pub fn generate_keypair(
     key_type: KeyType,
     key_id: KeyId,
     rng: &mut (impl RngCore + rand_core::CryptoRng),
-) -> Result<(KeyMaterial, heapless::Vec<u8, 512>), CryptoError> {
+) -> Result<(KeyMaterial, Vec<u8, 512>), CryptoError> {
     match key_type {
         KeyType::EcPrivateP256
         | KeyType::EcPrivateP384
@@ -779,7 +818,7 @@ pub fn generate_keypair(
         | KeyType::EcPrivateK256 => {
             let pair = generate_ec_keypair(key_type, rng)?;
             let material = ec_private_to_key_material(key_type, key_id, &pair.private_key)?;
-            let mut pub_out: heapless::Vec<u8, 512> = heapless::Vec::new();
+            let mut pub_out: Vec<u8, 512> = Vec::new();
             pub_out
                 .extend_from_slice(&pair.public_key)
                 .map_err(|_| CryptoError::BufferTooSmall)?;
@@ -804,10 +843,7 @@ pub fn sign_ecdsa(
 /// Perform ECDH key agreement (legacy API, operates on `KeyMaterial`).
 ///
 /// `peer_pubkey` is the peer's uncompressed SEC1 point (`0x04 || X || Y`).
-pub fn ecdh(
-    private_key: &KeyMaterial,
-    peer_pubkey: &[u8],
-) -> Result<heapless::Vec<u8, 66>, CryptoError> {
+pub fn ecdh(private_key: &KeyMaterial, peer_pubkey: &[u8]) -> Result<Vec<u8, 66>, CryptoError> {
     ecdh_agree(private_key.key_type, &private_key.raw, peer_pubkey)
 }
 
@@ -829,63 +865,29 @@ pub fn rsa_sign_pkcs1v15(
     hash_data: &[u8],
     hash_algo: HashAlgorithm,
     _rng: &mut impl RngCore,
-) -> Result<heapless::Vec<u8, 512>, CryptoError> {
+) -> Result<Vec<u8, 512>, CryptoError> {
     use ::rsa::pkcs1::DecodeRsaPrivateKey;
-    use ::rsa::pkcs1v15::SigningKey;
-    use ::rsa::signature::hazmat::PrehashSigner;
-    use ::rsa::RsaPrivateKey;
+    use ::rsa::{Pkcs1v15Sign, RsaPrivateKey};
     use sha1::Sha1;
-    use sha2::{Sha256, Sha384, Sha512};
+    use sha2::{Sha224, Sha256, Sha384, Sha512};
 
     let priv_key =
         RsaPrivateKey::from_pkcs1_der(private_key_der).map_err(|_| CryptoError::WrongKeyLength)?;
 
-    // Each arm produces the raw signature bytes (heap-allocated by rsa crate).
-    let sig_bytes: alloc::vec::Vec<u8> = match hash_algo {
-        HashAlgorithm::Sha1 => {
-            let key: SigningKey<Sha1> = SigningKey::new(priv_key);
-            let sig = key
-                .sign_prehash(hash_data)
-                .map_err(|_| CryptoError::SignFailure)?;
-            use ::rsa::signature::SignatureEncoding;
-            sig.to_bytes().to_vec()
-        }
-        HashAlgorithm::Sha224 => {
-            use sha2::Sha224;
-            let key: SigningKey<Sha224> = SigningKey::new(priv_key);
-            let sig = key
-                .sign_prehash(hash_data)
-                .map_err(|_| CryptoError::SignFailure)?;
-            use ::rsa::signature::SignatureEncoding;
-            sig.to_bytes().to_vec()
-        }
-        HashAlgorithm::Sha256 => {
-            let key: SigningKey<Sha256> = SigningKey::new(priv_key);
-            let sig = key
-                .sign_prehash(hash_data)
-                .map_err(|_| CryptoError::SignFailure)?;
-            use ::rsa::signature::SignatureEncoding;
-            sig.to_bytes().to_vec()
-        }
-        HashAlgorithm::Sha384 => {
-            let key: SigningKey<Sha384> = SigningKey::new(priv_key);
-            let sig = key
-                .sign_prehash(hash_data)
-                .map_err(|_| CryptoError::SignFailure)?;
-            use ::rsa::signature::SignatureEncoding;
-            sig.to_bytes().to_vec()
-        }
-        HashAlgorithm::Sha512 => {
-            let key: SigningKey<sha2::Sha512> = SigningKey::new(priv_key);
-            let sig = key
-                .sign_prehash(hash_data)
-                .map_err(|_| CryptoError::SignFailure)?;
-            use ::rsa::signature::SignatureEncoding;
-            sig.to_bytes().to_vec()
-        }
+    // Blinded (random r per operation) and fault-checked: sign_with_rng runs
+    // rsa_decrypt_and_check with blinding, unlike the rng-less SigningKey path.
+    let scheme = match hash_algo {
+        HashAlgorithm::Sha1 => Pkcs1v15Sign::new::<Sha1>(),
+        HashAlgorithm::Sha224 => Pkcs1v15Sign::new::<Sha224>(),
+        HashAlgorithm::Sha256 => Pkcs1v15Sign::new::<Sha256>(),
+        HashAlgorithm::Sha384 => Pkcs1v15Sign::new::<Sha384>(),
+        HashAlgorithm::Sha512 => Pkcs1v15Sign::new::<Sha512>(),
     };
+    let sig_bytes = priv_key
+        .sign_with_rng(&mut crate::protocol::sc_hsm::FwRng, scheme, hash_data)
+        .map_err(|_| CryptoError::SignFailure)?;
 
-    let mut out: heapless::Vec<u8, 512> = heapless::Vec::new();
+    let mut out: Vec<u8, 512> = Vec::new();
     out.extend_from_slice(&sig_bytes)
         .map_err(|_| CryptoError::BufferTooSmall)?;
     Ok(out)
@@ -906,7 +908,7 @@ pub fn rsa_sign_pss(
     _hash_algo: HashAlgorithm,
     _salt_len: usize,
     rng: &mut (impl RngCore + rand_core::CryptoRng),
-) -> Result<heapless::Vec<u8, 512>, CryptoError> {
+) -> Result<Vec<u8, 512>, CryptoError> {
     use ::rsa::pkcs1::DecodeRsaPrivateKey;
     use ::rsa::pss::BlindedSigningKey;
     use ::rsa::signature::hazmat::RandomizedPrehashSigner;
@@ -925,7 +927,7 @@ pub fn rsa_sign_pss(
     use ::rsa::signature::SignatureEncoding;
     let sig_bytes = sig.to_bytes();
 
-    let mut out: heapless::Vec<u8, 512> = heapless::Vec::new();
+    let mut out: Vec<u8, 512> = Vec::new();
     out.extend_from_slice(sig_bytes.as_ref())
         .map_err(|_| CryptoError::BufferTooSmall)?;
     Ok(out)
@@ -942,7 +944,7 @@ pub fn rsa_decrypt_pkcs1v15(
     _key_type: KeyType,
     private_key_der: &[u8],
     ciphertext: &[u8],
-) -> Result<heapless::Vec<u8, 512>, CryptoError> {
+) -> Result<Vec<u8, 512>, CryptoError> {
     use ::rsa::pkcs1::DecodeRsaPrivateKey;
     use ::rsa::Pkcs1v15Encrypt;
     use ::rsa::RsaPrivateKey;
@@ -950,11 +952,16 @@ pub fn rsa_decrypt_pkcs1v15(
     let priv_key =
         RsaPrivateKey::from_pkcs1_der(private_key_der).map_err(|_| CryptoError::WrongKeyLength)?;
 
+    // Blinded against timing side channels (Marvin-class attacks).
     let plaintext = priv_key
-        .decrypt(Pkcs1v15Encrypt, ciphertext)
+        .decrypt_blinded(
+            &mut crate::protocol::sc_hsm::FwRng,
+            Pkcs1v15Encrypt,
+            ciphertext,
+        )
         .map_err(|_| CryptoError::DecryptFailure)?;
 
-    let mut out: heapless::Vec<u8, 512> = heapless::Vec::new();
+    let mut out: Vec<u8, 512> = Vec::new();
     out.extend_from_slice(&plaintext)
         .map_err(|_| CryptoError::BufferTooSmall)?;
     Ok(out)
@@ -973,7 +980,7 @@ pub fn rsa_decrypt_oaep(
     ciphertext: &[u8],
     _hash_algo: HashAlgorithm,
     _rng: &mut impl RngCore,
-) -> Result<heapless::Vec<u8, 512>, CryptoError> {
+) -> Result<Vec<u8, 512>, CryptoError> {
     use ::rsa::pkcs1::DecodeRsaPrivateKey;
     use ::rsa::Oaep;
     use ::rsa::RsaPrivateKey;
@@ -984,10 +991,10 @@ pub fn rsa_decrypt_oaep(
 
     let scheme = Oaep::new::<Sha256>();
     let plaintext = priv_key
-        .decrypt(scheme, ciphertext)
+        .decrypt_blinded(&mut crate::protocol::sc_hsm::FwRng, scheme, ciphertext)
         .map_err(|_| CryptoError::DecryptFailure)?;
 
-    let mut out: heapless::Vec<u8, 512> = heapless::Vec::new();
+    let mut out: Vec<u8, 512> = Vec::new();
     out.extend_from_slice(&plaintext)
         .map_err(|_| CryptoError::BufferTooSmall)?;
     Ok(out)
@@ -1002,10 +1009,7 @@ pub fn rsa_decrypt_oaep(
 /// Returns the result as big-endian bytes, zero-padded to the modulus length.
 /// For RSA-2048 this is always 256 bytes.
 #[cfg(feature = "rsa")]
-pub fn rsa_private_raw(
-    private_key_der: &[u8],
-    data: &[u8],
-) -> Result<heapless::Vec<u8, 512>, CryptoError> {
+pub fn rsa_private_raw(private_key_der: &[u8], data: &[u8]) -> Result<Vec<u8, 512>, CryptoError> {
     use ::rsa::pkcs1::DecodeRsaPrivateKey;
     use ::rsa::traits::PublicKeyParts;
     use ::rsa::RsaPrivateKey;
@@ -1014,34 +1018,24 @@ pub fn rsa_private_raw(
         RsaPrivateKey::from_pkcs1_der(private_key_der).map_err(|_| CryptoError::WrongKeyLength)?;
 
     let n = priv_key.n();
-    let key_len = (n.bits() + 7) / 8; // modulus length in bytes
+    let key_len = n.bits().div_ceil(8); // modulus length in bytes
 
     // Convert input bytes to BigUint (rsa 0.9 re-exports BigUint)
     let c = ::rsa::BigUint::from_bytes_be(data);
 
-    // Raw RSA private key operation: m = c^d mod n (with CRT, no blinding)
-    // SAFETY: hazmat — caller is responsible for ensuring correct use.
-    // We pass None for the blinding RNG; a local phantom type satisfies the generic bound.
-    struct NoRng;
-    impl ::rsa::rand_core::RngCore for NoRng {
-        fn next_u32(&mut self) -> u32 {
-            0
-        }
-        fn next_u64(&mut self) -> u64 {
-            0
-        }
-        fn fill_bytes(&mut self, _: &mut [u8]) {}
-        fn try_fill_bytes(&mut self, _: &mut [u8]) -> Result<(), ::rsa::rand_core::Error> {
-            Ok(())
-        }
-    }
-    impl ::rsa::rand_core::CryptoRng for NoRng {}
-    let m = ::rsa::hazmat::rsa_decrypt(None::<&mut NoRng>, &priv_key, &c)
-        .map_err(|_| CryptoError::DecryptFailure)?;
+    // Raw RSA private key operation: m = c^d mod n (CRT), blinded with a
+    // fresh random r, and checked by re-encrypting the result: a faulted CRT
+    // half (Bellcore attack) is caught instead of leaking a factor of n.
+    let m = ::rsa::hazmat::rsa_decrypt_and_check(
+        &priv_key,
+        Some(&mut crate::protocol::sc_hsm::FwRng),
+        &c,
+    )
+    .map_err(|_| CryptoError::DecryptFailure)?;
 
     // Convert result to big-endian, zero-padded to key_len bytes
     let m_bytes = m.to_bytes_be();
-    let mut out: heapless::Vec<u8, 512> = heapless::Vec::new();
+    let mut out: Vec<u8, 512> = Vec::new();
     for _ in 0..key_len.saturating_sub(m_bytes.len()) {
         let _ = out.push(0x00);
     }
@@ -1052,10 +1046,7 @@ pub fn rsa_private_raw(
 
 /// Legacy RSA PKCS#1v1.5 sign (SHA-256) — operates on `KeyMaterial`.
 #[cfg(feature = "rsa")]
-pub fn rsa_sign(
-    key: &KeyMaterial,
-    hash_data: &[u8],
-) -> Result<heapless::Vec<u8, 512>, CryptoError> {
+pub fn rsa_sign(key: &KeyMaterial, hash_data: &[u8]) -> Result<Vec<u8, 512>, CryptoError> {
     struct DummyRng;
     impl RngCore for DummyRng {
         fn next_u32(&mut self) -> u32 {
@@ -1080,10 +1071,7 @@ pub fn rsa_sign(
 
 /// Legacy RSA PKCS#1v1.5 decrypt — operates on `KeyMaterial`.
 #[cfg(feature = "rsa")]
-pub fn rsa_decrypt(
-    key: &KeyMaterial,
-    ciphertext: &[u8],
-) -> Result<heapless::Vec<u8, 512>, CryptoError> {
+pub fn rsa_decrypt(key: &KeyMaterial, ciphertext: &[u8]) -> Result<Vec<u8, 512>, CryptoError> {
     rsa_decrypt_pkcs1v15(key.key_type, &key.raw, ciphertext)
 }
 
@@ -1104,7 +1092,7 @@ pub fn ec_private_to_key_material(
         return Err(CryptoError::WrongKeyLength);
     }
 
-    let mut raw: heapless::Vec<u8, MAX_KEY_BYTES> = heapless::Vec::new();
+    let mut raw: Vec<u8, MAX_KEY_BYTES> = Vec::new();
     raw.extend_from_slice(private_key_raw)
         .map_err(|_| CryptoError::BufferTooSmall)?;
 
@@ -1305,5 +1293,106 @@ mod tests {
             generate_ec_keypair(KeyType::EcPrivateBrainpoolP256, &mut rng),
             Err(CryptoError::UnsupportedAlgorithm)
         ));
+    }
+}
+
+#[cfg(all(test, feature = "rsa"))]
+mod rsa_blinding_tests {
+    use super::*;
+    use ::rsa::pkcs1::EncodeRsaPrivateKey;
+    use ::rsa::traits::PublicKeyParts;
+    use ::rsa::{Pkcs1v15Encrypt, Pkcs1v15Sign, RsaPrivateKey, RsaPublicKey};
+    use sha2::{Digest, Sha256};
+
+    fn key() -> (RsaPrivateKey, alloc::vec::Vec<u8>) {
+        // 1024-bit keeps the debug-build test fast; the code path is size-independent.
+        let k = RsaPrivateKey::new(&mut crate::protocol::sc_hsm::FwRng, 1024).unwrap();
+        let der = k.to_pkcs1_der().unwrap().as_bytes().to_vec();
+        (k, der)
+    }
+
+    #[test]
+    fn blinded_sign_decrypt_and_raw_are_correct() {
+        let (k, der) = key();
+        let public = RsaPublicKey::from(&k);
+        let hash: [u8; 32] = Sha256::digest(b"pico2hsm").into();
+
+        let sig = rsa_sign_pkcs1v15(
+            KeyType::RsaPrivate2048,
+            &der,
+            &hash,
+            HashAlgorithm::Sha256,
+            &mut crate::protocol::sc_hsm::FwRng,
+        )
+        .unwrap();
+        public
+            .verify(Pkcs1v15Sign::new::<Sha256>(), &hash, &sig)
+            .unwrap();
+
+        let ct = public
+            .encrypt(
+                &mut crate::protocol::sc_hsm::FwRng,
+                Pkcs1v15Encrypt,
+                b"secret",
+            )
+            .unwrap();
+        let pt = rsa_decrypt_pkcs1v15(KeyType::RsaPrivate2048, &der, &ct).unwrap();
+        assert_eq!(&pt[..], b"secret");
+
+        // Raw op: (m^e)^d == m.
+        let m = ::rsa::BigUint::from(0x1234_5678u32);
+        let c = ::rsa::hazmat::rsa_encrypt(&public, &m).unwrap();
+        let out = rsa_private_raw(&der, &c.to_bytes_be()).unwrap();
+        assert_eq!(::rsa::BigUint::from_bytes_be(&out), m);
+        assert_eq!(out.len(), k.size());
+    }
+}
+
+#[cfg(test)]
+mod p521_rfc6979_tests {
+    use super::*;
+    use sha2::{Digest, Sha512};
+
+    fn hex(s: &str) -> heapless::Vec<u8, 66> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    const X: &str = "00FAD06DAA62BA3B25D2FB40133DA757205DE67F5BB0018FEE8C86E1B68C7E75CAA896EB32F1F47C70855836A6D16FCC1466F6D8FBEC67DB89EC0C08B0E996B83538";
+
+    /// RFC 6979 A.2.7, P-521, SHA-512, message "sample" (also reproduced
+    /// with python-ecdsa `sign_digest_deterministic`).
+    #[test]
+    fn deterministic_nonce_matches_rfc6979_vector() {
+        let h = Sha512::digest(b"sample");
+        let der = ecdsa_sign_p521_with_ad(&hex(X), &h, &[]).unwrap();
+        let sig = ecdsa::Signature::<p521::NistP521>::from_der(&der).unwrap();
+        let (r, s) = sig.split_bytes();
+        assert_eq!(
+            r.as_slice(),
+            hex("00C328FAFCBD79DD77850370C46325D987CB525569FB63C5D3BC53950E6D4C5F174E25A1EE9017B5D450606ADD152B534931D7D4E8455CC91F9B15BF05EC36E377FA")
+        );
+        assert_eq!(
+            s.as_slice(),
+            hex("00617CCE7CF5064806C467F678D3B4080D6F1CC50AF26CA209417308281B68AF282623EAA63E5B5C0723D8B8C37FF0777B1A20F8CCB1DCCC43997F1EE0E44DA4A67A")
+        );
+    }
+
+    #[test]
+    fn hedged_signatures_verify_and_differ() {
+        let h = Sha512::digest(b"sample");
+        let a = ecdsa_sign_p521(&hex(X), &h, &mut crate::protocol::sc_hsm::FwRng).unwrap();
+        let b = ecdsa_sign_p521(&hex(X), &h, &mut crate::protocol::sc_hsm::FwRng).unwrap();
+        assert_ne!(a, b, "fresh additional data per signature");
+        let public = SecretKey::<p521::NistP521>::from_slice(&hex(X))
+            .unwrap()
+            .public_key();
+        use elliptic_curve::sec1::ToEncodedPoint;
+        let sec1 = public.to_encoded_point(false);
+        for der in [a, b] {
+            assert_eq!(ecdsa_verify_p521(sec1.as_bytes(), &h, &der), Ok(true));
+        }
     }
 }

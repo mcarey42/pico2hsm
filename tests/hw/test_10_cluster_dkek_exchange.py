@@ -258,6 +258,27 @@ class TestGetDevicePublicKeyBothDevices:
 # Tests: Full V2 DKEK exchange protocol
 # ---------------------------------------------------------------------------
 
+
+@pytest.fixture(scope="module")
+def enrolled_peers(dkek_loaded_source, runner: CLIRunner) -> None:
+    """Enroll each device's static key on the other (SO-PIN, EXTRAS P1=0x3D).
+
+    The V2 exchange has no unauthenticated mode: both sides verify the
+    other's signatures against the enrolled key, and all steps need SO-PIN.
+    """
+    pubs = {}
+    for reader in (0, 1):
+        result = runner.send_apdu(SELECT_SC_HSM, APDU_GET_PUBKEY, reader=reader)
+        pubs[reader] = _parse_received_bytes(result.stdout)[-65:]
+    for reader, peer in ((0, 1), (1, 0)):
+        enroll = f"80543D0041{pubs[peer].hex()}"
+        result = runner.send_apdu(
+            SELECT_SC_HSM, VERIFY_SO_PIN, enroll,
+            reader=reader, save_as=f"10_enroll_peer_r{reader}",
+        )
+        assert _last_sw(result.stdout) == 0x9000, f"ENROLL on reader {reader} failed"
+
+
 class TestDkekExchangeV2:
     """End-to-end DKEK exchange: source device → encrypted channel → target device."""
 
@@ -272,13 +293,13 @@ class TestDkekExchangeV2:
         return f"8054{p1:02X}00{lc:02X}{data.hex()}"
 
     def test_noise_target_init_returns_161_bytes(
-        self, dkek_loaded_source, runner: CLIRunner
+        self, enrolled_peers, runner: CLIRunner
     ) -> None:
         """TARGET: NOISE_TARGET_INIT(source_static_pub) → 161 bytes."""
         source_pub = self._get_pubkey(runner, reader=0)
         apdu = self._apdu_with_lc_data(0x35, source_pub)
         result = runner.send_apdu(
-            SELECT_SC_HSM, VERIFY_PIN, apdu,
+            SELECT_SC_HSM, VERIFY_SO_PIN, apdu,
             reader=1, save_as="10_noise_target_init",
         )
         sws = _parse_sw(result.stdout)
@@ -295,29 +316,16 @@ class TestDkekExchangeV2:
         log.info("NOISE_TARGET_INIT OK — ephem_T=%s", ephem_T[:4].hex())
 
     def test_full_exchange_completes(
-        self, dkek_loaded_source, runner: CLIRunner
+        self, enrolled_peers, runner: CLIRunner
     ) -> None:
         """Full 4-step relay: SOURCE sends DKEK → TARGET receives and stores it."""
         source_pub = self._get_pubkey(runner, reader=0)
         target_pub = self._get_pubkey(runner, reader=1)
 
-        # Pre-step: SOURCE — NOISE_INITIATE (P1=0x31) on reader 0.
-        # Generates SOURCE ephemeral key pair and stores it in firmware state.
-        # NOISE_SOURCE_RESPOND (step 2) requires exchange_ephem_pub to be set.
-        APDU_NOISE_INITIATE = "8054310000"
-        result_31 = runner.send_apdu(
-            SELECT_SC_HSM, VERIFY_PIN, APDU_NOISE_INITIATE,
-            reader=0, save_as="10_step0_source_initiate",
-        )
-        assert _last_sw(result_31.stdout) == 0x9000, (
-            f"NOISE_INITIATE (pre-step) failed on reader 0: {result_31.stdout}"
-        )
-        log.info("Pre-step OK — SOURCE ephemeral key generated on reader 0")
-
         # Step 1: TARGET — NOISE_TARGET_INIT(source_static_pub) → 161B
         apdu_35 = self._apdu_with_lc_data(0x35, source_pub)
         result_35 = runner.send_apdu(
-            SELECT_SC_HSM, VERIFY_PIN, apdu_35,
+            SELECT_SC_HSM, VERIFY_SO_PIN, apdu_35,
             reader=1, save_as="10_step1_target_init",
         )
         assert _last_sw(result_35.stdout) == 0x9000, "Step 1 failed"
@@ -330,7 +338,7 @@ class TestDkekExchangeV2:
         payload_36 = ephem_T_pub + challenge + sig_T   # 161 bytes
         apdu_36 = self._apdu_with_lc_data(0x36, payload_36)
         result_36 = runner.send_apdu(
-            SELECT_SC_HSM, VERIFY_PIN, apdu_36,
+            SELECT_SC_HSM, VERIFY_SO_PIN, apdu_36,
             reader=0, save_as="10_step2_source_respond",
         )
         assert _last_sw(result_36.stdout) == 0x9000, f"Step 2 failed: {result_36.stdout}"
@@ -344,7 +352,7 @@ class TestDkekExchangeV2:
         payload_37 = ephem_T_pub + target_pub + challenge   # 162 bytes
         apdu_37 = self._apdu_with_lc_data(0x37, payload_37)
         result_37 = runner.send_apdu(
-            SELECT_SC_HSM, VERIFY_PIN, apdu_37,
+            SELECT_SC_HSM, VERIFY_SO_PIN, apdu_37,
             reader=0, save_as="10_step3_send_v2",
         )
         assert _last_sw(result_37.stdout) == 0x9000, f"Step 3 failed: {result_37.stdout}"
@@ -357,7 +365,7 @@ class TestDkekExchangeV2:
         payload_38 = ephem_S_pub + sig_S + enc_dkek   # 189 bytes
         apdu_38 = self._apdu_with_lc_data(0x38, payload_38)
         result_38 = runner.send_apdu(
-            SELECT_SC_HSM, VERIFY_PIN, apdu_38,
+            SELECT_SC_HSM, VERIFY_SO_PIN, apdu_38,
             reader=1, save_as="10_step4_recv_v2",
         )
         last = _last_sw(result_38.stdout)

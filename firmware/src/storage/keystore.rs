@@ -17,11 +17,12 @@
 
 use heapless::Vec;
 use pico2hsm_core::{
-    error::HsmError,
+    error::{HsmError, StorageError},
     key::{AppletId, KeyId},
 };
 
 use crate::security::key_management::KeyObject;
+use crate::storage::retry_counter::{CounterState, Credential, RetryCounterBackend};
 
 // ARM-only imports used by FlashKeyStore.
 #[cfg(target_arch = "arm")]
@@ -33,10 +34,7 @@ use crate::storage::StorageManager;
 #[cfg(target_arch = "arm")]
 use pico2hsm_core::flash::FlashChip;
 #[cfg(target_arch = "arm")]
-use pico2hsm_core::{
-    error::{CryptoError, StorageError},
-    key::KeyType as CoreKeyType,
-};
+use pico2hsm_core::{error::CryptoError, key::KeyType as CoreKeyType};
 #[cfg(target_arch = "arm")]
 use zeroize::Zeroizing;
 
@@ -75,16 +73,28 @@ pub trait KeyStore {
     /// iterate — avoids allocating even the 64-entry Vec on the stack.
     /// Uses `&mut dyn FnMut` instead of `impl FnMut` for dyn-compatibility.
     fn for_each_key(&self, f: &mut dyn FnMut(KeyId));
+
+    /// The credential retry-counter store (see `storage::retry_counter`),
+    /// or `None` if this store has none.  Without one every credential
+    /// check fails closed (6581) and credentials load blocked.
+    fn retry_counters(&mut self) -> Option<&mut dyn RetryCounterBackend> {
+        None
+    }
 }
 
 // ─── FlashKeyStore<Chip> ──────────────────────────────────────────────────────
 
 /// Concrete key store backed by a `StorageManager<Chip>` and protected by the
 /// Storage Master Key (`smk`).
+///
+/// With no storage key (unprovisioned release build) every save and fetch
+/// fails with `StorageError::NoStorageKey` instead of using a public key.
 #[cfg(target_arch = "arm")]
 pub struct FlashKeyStore<Chip: FlashChip> {
     storage: StorageManager<Chip>,
-    smk: Zeroizing<[u8; 32]>,
+    smk: Option<Zeroizing<[u8; 32]>>,
+    /// Retry-counter log on internal flash (every board, SD ones included).
+    counters: Option<crate::storage::BoardCounterLog>,
 }
 
 #[cfg(target_arch = "arm")]
@@ -93,8 +103,31 @@ impl<Chip: FlashChip> FlashKeyStore<Chip> {
     ///
     /// `storage` should already have chips added via `KeyFilesystem::add_chip`.
     /// Call [`init`] before any key operations.
-    pub fn new(storage: StorageManager<Chip>, smk: Zeroizing<[u8; 32]>) -> Self {
-        FlashKeyStore { storage, smk }
+    pub fn new(storage: StorageManager<Chip>, smk: Option<Zeroizing<[u8; 32]>>) -> Self {
+        FlashKeyStore {
+            storage,
+            smk,
+            counters: None,
+        }
+    }
+
+    /// Attach the retry-counter log (before the first key load).
+    pub fn attach_retry_counters(&mut self, log: crate::storage::BoardCounterLog) {
+        self.counters = Some(log);
+    }
+
+    /// One bounded step of `wipe_by_owner`: erase at most `max` of the
+    /// owner's objects; `Ok(true)` if more remain.
+    pub fn wipe_by_owner_step(&mut self, owner: AppletId, max: usize) -> Result<bool, HsmError> {
+        self.storage
+            .delete_where_step(&|k: KeyId| ((k.0 >> 16) & 0xFF) as u8 == owner as u8, max)
+            .map_err(HsmError::Storage)
+    }
+
+    fn smk(&self) -> Result<&[u8; 32], HsmError> {
+        self.smk
+            .as_deref()
+            .ok_or(HsmError::Storage(StorageError::NoStorageKey))
     }
 
     /// Initialise: scan chips, load directory, run WAL recovery.
@@ -106,48 +139,33 @@ impl<Chip: FlashChip> FlashKeyStore<Chip> {
 #[cfg(target_arch = "arm")]
 impl<Chip: FlashChip> KeyStore for FlashKeyStore<Chip> {
     fn save_key(&mut self, obj: &KeyObject) -> Result<(), HsmError> {
-        // --- 0. Increment the generation counter before writing. ---
-        // We cannot mutate `obj` (it's a shared reference), so we clone the
-        // relevant fields into a local copy with generation bumped.
-        let mut obj_copy = KeyObject::new(obj.key_type, obj.key_id, obj.owner, obj.algorithm);
-        obj_copy.key_domain = obj.key_domain;
-        obj_copy.use_count = obj.use_count;
-        obj_copy.generation = obj.generation.saturating_add(1);
-        obj_copy.key_flags = obj.key_flags;
-        obj_copy
-            .private_key
-            .extend_from_slice(&obj.private_key)
-            .map_err(|_| HsmError::Crypto(CryptoError::EncryptFailure))?;
-        obj_copy
-            .public_key
-            .extend_from_slice(&obj.public_key)
-            .map_err(|_| HsmError::Crypto(CryptoError::EncryptFailure))?;
-
+        self.smk()?;
+        // --- 0. The stored copy carries the next generation number. ---
         // --- 1. Generate a fresh 12-byte nonce from the hardware TRNG. ---
         let mut nonce = [0u8; 12];
         crate::crypto::rng::fill_random(&mut nonce).map_err(HsmError::Crypto)?;
 
         // --- 2. Encrypt the key object (with bumped generation). ---
-        let blob = obj_copy
-            .encrypt(&self.smk, &nonce)
+        let blob = obj
+            .encrypt_with_generation(self.smk()?, &nonce, obj.generation.saturating_add(1))
             .map_err(|_| HsmError::Crypto(CryptoError::EncryptFailure))?;
 
         // --- 3. Compute BLAKE2s-256 of the plaintext for integrity. ---
         // The plaintext that is hashed is the raw private key material.
         // This lets the storage layer verify integrity after decryption
         // without re-deriving the KEK.
-        let hash = compute_plaintext_blake2s(&obj_copy.private_key);
+        let hash = compute_plaintext_blake2s(&obj.private_key);
 
         // --- 4. Map AlgorithmId -> core KeyType. ---
-        let core_key_type = algo_to_core_key_type(obj_copy.algorithm);
+        let core_key_type = algo_to_core_key_type(obj.algorithm);
 
         // --- 5. Write to flash. ---
         let result = self
             .storage
-            .write_key(KeyId(obj_copy.key_id), core_key_type, &blob, &hash)
+            .write_key(KeyId(obj.key_id), core_key_type, &blob, &hash)
             .map_err(HsmError::Storage);
         if result.is_ok() {
-            crate::cdc_log!("FLASH save key=0x{:08x} ok", obj_copy.key_id);
+            crate::cdc_log!("FLASH save key=0x{:08x} ok", obj.key_id);
         }
         result
     }
@@ -158,11 +176,16 @@ impl<Chip: FlashChip> KeyStore for FlashKeyStore<Chip> {
         if !self.storage.key_exists(key_id) {
             return Ok(None);
         }
+        self.smk()?;
+        // Each load is a read + AES-GCM decrypt (tens of ms in debug
+        // builds); a full keystore load at boot / reload must keep the
+        // hardware watchdog fed (core0) or the heartbeat moving (core1).
+        crate::watchdog::progress();
 
         let blob = self.storage.read_key(key_id).map_err(HsmError::Storage)?;
 
         // Pass the u32 key_id to decrypt — decrypt uses the low byte for KEK derivation.
-        let obj = KeyObject::decrypt(&blob, key_id.0, &self.smk)
+        let obj = KeyObject::decrypt(&blob, key_id.0, self.smk()?)
             .map_err(|_| HsmError::Crypto(CryptoError::DecryptFailure))?;
 
         Ok(Some(obj))
@@ -184,13 +207,9 @@ impl<Chip: FlashChip> KeyStore for FlashKeyStore<Chip> {
     }
 
     fn wipe_by_owner(&mut self, owner: AppletId) -> Result<(), HsmError> {
-        let keys = self.storage.list_keys();
-        for k in keys {
-            if ((k.0 >> 16) & 0xFF) as u8 == owner as u8 {
-                self.storage.delete_key(k).map_err(HsmError::Storage)?;
-            }
-        }
-        Ok(())
+        self.storage
+            .delete_where(&|k: KeyId| ((k.0 >> 16) & 0xFF) as u8 == owner as u8)
+            .map_err(HsmError::Storage)
     }
 
     fn enumerate_keys(&self) -> Vec<KeyId, 64> {
@@ -203,6 +222,12 @@ impl<Chip: FlashChip> KeyStore for FlashKeyStore<Chip> {
 
     fn for_each_key(&self, f: &mut dyn FnMut(KeyId)) {
         self.storage.for_each_key(f);
+    }
+
+    fn retry_counters(&mut self) -> Option<&mut dyn RetryCounterBackend> {
+        self.counters
+            .as_mut()
+            .map(|c| c as &mut dyn RetryCounterBackend)
     }
 }
 
@@ -240,6 +265,27 @@ impl KeyStore for NullKeyStore {
 
     fn for_each_key(&self, _f: &mut dyn FnMut(KeyId)) {
         // No keys in the null store.
+    }
+
+    fn retry_counters(&mut self) -> Option<&mut dyn RetryCounterBackend> {
+        Some(self)
+    }
+}
+
+/// The null store keeps no counters either: reads find no entry, writes
+/// succeed without effect.
+impl RetryCounterBackend for NullKeyStore {
+    fn get(&mut self, _: Credential) -> Result<Option<CounterState>, StorageError> {
+        Ok(None)
+    }
+    fn put(&mut self, _: Credential, _: CounterState) -> Result<(), StorageError> {
+        Ok(())
+    }
+    fn needs_migration(&mut self) -> bool {
+        false
+    }
+    fn format(&mut self, _: &[(Credential, CounterState)]) -> Result<(), StorageError> {
+        Ok(())
     }
 }
 
@@ -328,9 +374,7 @@ impl<P: KeyStore, S: KeyStore> HybridKeyStore<P, S> {
 
         if any_failed {
             crate::cdc_warn!("HYBRID resync partial fail");
-            Err(HsmError::Storage(
-                pico2hsm_core::error::StorageError::WriteError,
-            ))
+            Err(HsmError::Storage(StorageError::WriteError))
         } else {
             self.degraded = false;
             self.flash_error = false;
@@ -528,6 +572,11 @@ impl<P: KeyStore, S: KeyStore> KeyStore for HybridKeyStore<P, S> {
     fn for_each_key(&self, f: &mut dyn FnMut(KeyId)) {
         // Primary is authoritative.
         self.primary.for_each_key(f);
+    }
+
+    fn retry_counters(&mut self) -> Option<&mut dyn RetryCounterBackend> {
+        // The counters are never mirrored to a removable card.
+        self.primary.retry_counters()
     }
 }
 

@@ -122,29 +122,45 @@ pub use embassy_usb::class::cdc_acm::{CdcAcmClass, State as CdcAcmState};
 /// Drops the line rather than blocking so the CCID loop is never stalled by
 /// an unread serial port.
 #[cfg(target_arch = "arm")]
+///
+/// Returns whether it is worth calling again: false once the queue is
+/// empty, no terminal is open, or a write timed out (a terminal that holds
+/// DTR but doesn't read would otherwise cost 50 ms per queued line).
 pub async fn drain_one<'d, D: embassy_usb::driver::Driver<'d>>(
     sender: &mut embassy_usb::class::cdc_acm::Sender<'d, D>,
-) {
+) -> bool {
     // Non-blocking peek: if nothing queued, return immediately.
     let line = match CDC_LOG_CHANNEL.try_receive() {
         Ok(line) => line,
-        Err(_) => return,
+        Err(_) => return false,
     };
 
     // Drop the line if no host terminal has the port open (DTR not asserted).
     // write_packet().await blocks until the host reads; without this check the
     // CCID loop stalls whenever /dev/ttyACMx is not being read.
     if !sender.dtr() {
-        return;
+        return false;
     }
 
     // Send in ≤63-byte chunks (never exact max_packet_size to avoid ZLP ambiguity).
+    // DTR only says a terminal has the port open, not that it is reading: a
+    // stalled reader would block write_packet — and the CCID loop with it —
+    // forever, so each chunk gets a deadline and the rest of the line is
+    // dropped on timeout.
+    use embassy_futures::select::{select, Either};
     let mut sent = 0usize;
     while sent < line.len() {
         let end = core::cmp::min(sent + 63, line.len());
-        if sender.write_packet(&line[sent..end]).await.is_err() {
-            break; // USB disconnected — drop remaining bytes
+        match select(
+            sender.write_packet(&line[sent..end]),
+            embassy_time::Timer::after_millis(50),
+        )
+        .await
+        {
+            Either::First(Ok(())) => sent = end,
+            // USB disconnected, or the host is not reading: drop the rest.
+            Either::First(Err(_)) | Either::Second(()) => return false,
         }
-        sent = end;
     }
+    true
 }

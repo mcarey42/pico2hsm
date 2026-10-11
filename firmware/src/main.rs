@@ -49,7 +49,9 @@ use pico2hsm_firmware::{serial_fmt, serial_print, serial_println};
 use core::ptr::addr_of_mut;
 #[cfg(target_arch = "arm")]
 extern "C" {
-    static __ebss: u8;
+    /// cortex-m-rt: lowest address the main stack may use — above .bss
+    /// *and* .uninit (where defmt-rtt keeps its buffer).
+    static _stack_end: u8;
 }
 #[cfg(target_arch = "arm")]
 use embassy_rp::multicore::{spawn_core1, Stack};
@@ -62,8 +64,10 @@ use static_cell::StaticCell;
 
 // ─── Core1 stack (ARM only) ──────────────────────────────────────────────────
 
-/// Stack for core1.  Measured peak usage ~65 KB (38 KB ScHsmState inline
-/// storage + 16 KB dispatch-chain temporaries).  128 KB gives ~2× headroom.
+/// Stack for core1.  Measured worst path (2026-10, pico2_4m debug, from the
+/// `sub sp` prologues): dispatcher_loop 16 KB → dispatch_with_store 8 KB →
+/// process_apdu_with_store 8 KB → route_with_store 4 KB → bip_slip 13 KB →
+/// fetch_key 12 KB → read_key 7 KB ≈ 70 KB, so 128 KB leaves ~58 KB.
 /// Do not reduce below 96 KB.
 ///
 /// Core1 runs a synchronous dispatch loop (no Embassy executor) — the
@@ -85,6 +89,14 @@ static RESP_CHANNEL: Channel<SpinlockRawMutex<30>, heapless::Vec<u8, 4098>, 1> =
 /// Uses RP2350 hardware spinlock 27.
 #[cfg(target_arch = "arm")]
 static FLASH_REQ: Channel<SpinlockRawMutex<27>, FlashOp, 1> = Channel::new();
+
+/// Objects erased per `FlashOp::WipeByOwnerStep` (~50 ms each on QMI flash).
+#[cfg(target_arch = "arm")]
+const WIPE_STEP_KEYS: usize = 4;
+
+/// Set by core0 after a `WipeByOwnerStep`: more of the applet's objects remain.
+#[cfg(target_arch = "arm")]
+static WIPE_MORE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 /// Core0 → Core1: flash operation results.
 /// Uses RP2350 hardware spinlock 26.
 #[cfg(target_arch = "arm")]
@@ -94,23 +106,44 @@ static FLASH_RESP: Channel<SpinlockRawMutex<26>, Result<(), pico2hsm_core::error
 /// Flash operation request — sent from core1 to core0 for flash persistence.
 ///
 /// Core1 cannot call `embassy_rp::flash` directly (the `in_ram()` function
-/// asserts `core_id == 0`).  Instead, the dispatcher queues flash ops and
-/// sends them to core0 via `FLASH_REQ` after each APDU dispatch completes.
+/// asserts `core_id == 0`).  Instead, `Core1KeyStore` sends each op to core0
+/// via `FLASH_REQ` and blocks on `FLASH_RESP` until it completes.
 #[cfg(target_arch = "arm")]
 enum FlashOp {
     /// Encrypt and persist a key object to flash.
-    SaveKey(pico2hsm_firmware::security::key_management::KeyObject),
+    ///
+    /// Points at core1's `KeyObject` rather than carrying a copy: core1 stays
+    /// blocked on `FLASH_RESP` until core0 has finished with it, so the
+    /// pointee outlives every use, and no plaintext copy of the key is left
+    /// behind in the channel slot.
+    SaveKey(*const pico2hsm_firmware::security::key_management::KeyObject),
     /// Delete a key from persistent storage.
     EraseKey(pico2hsm_core::key::KeyId),
     /// Wipe ALL keys. Called by INITIALIZE only.
     WipeAll,
     /// Wipe only keys owned by the given applet.
     WipeByOwner(pico2hsm_core::key::AppletId),
+    /// Erase a few of the applet's objects (see `WIPE_STEP_KEYS`); sets
+    /// `WIPE_MORE` if any remain.  Core1 loops on it so core0 gets back to
+    /// its loop — and its CCID time extensions — between steps.
+    WipeByOwnerStep(pico2hsm_core::key::AppletId),
     /// Reload keys from flash into the dispatcher (USB reconnect / reset).
     /// Core0 calls `dispatcher.load_keys_from_store(store)` via the raw
     /// pointer while core1 is awaiting the response.
     ReloadKeys,
+    /// Append a credential's retry-counter state to the counter log on
+    /// internal flash.  Always on core0, on every board: the log is never
+    /// on the SD card.
+    PutCounter(
+        pico2hsm_firmware::storage::retry_counter::Credential,
+        pico2hsm_firmware::storage::retry_counter::CounterState,
+    ),
 }
+
+// SAFETY: the only non-Send field is `SaveKey`'s pointer, which core0
+// dereferences only while core1 is blocked waiting for `FLASH_RESP`.
+#[cfg(target_arch = "arm")]
+unsafe impl Send for FlashOp {}
 
 /// A `KeyStore` implementation used by the core1 dispatcher during APDU
 /// processing.
@@ -123,32 +156,21 @@ enum FlashOp {
 ///
 /// **QMI flash boards** (all others):
 /// Reads go through `store_ptr` (XIP memory-mapped, safe from any core).
-/// Writes are queued as `FlashOp`s and drained to core0 after dispatch,
-/// because `embassy_rp::flash` asserts `core_id == 0` for erase/write.
+/// Writes are sent to core0 one at a time and complete before the call
+/// returns, because `embassy_rp::flash` asserts `core_id == 0`.  Being
+/// synchronous means callers see real write errors, later reads in the same
+/// APDU see earlier writes, and a PIN retry counter is on flash before the
+/// PIN is compared.
 #[cfg(target_arch = "arm")]
-struct FlashQueueKeyStore {
-    /// Queued flash ops — only used by QMI flash boards.
-    /// SD card boards leave this empty (writes go direct).
-    ops: heapless::Vec<FlashOp, 8>,
+struct Core1KeyStore {
     /// Raw pointer to the BoardKeyStore.
     store_ptr: *mut pico2hsm_firmware::storage::BoardKeyStore,
 }
 
-// SAFETY: FlashQueueKeyStore is only used by Core1's single dispatcher task.
 #[cfg(target_arch = "arm")]
-unsafe impl Send for FlashQueueKeyStore {}
-
-#[cfg(target_arch = "arm")]
-impl FlashQueueKeyStore {
+impl Core1KeyStore {
     fn new(store_ptr: *mut pico2hsm_firmware::storage::BoardKeyStore) -> Self {
-        FlashQueueKeyStore {
-            ops: heapless::Vec::new(),
-            store_ptr,
-        }
-    }
-
-    fn drain(&mut self) -> heapless::Vec<FlashOp, 8> {
-        core::mem::replace(&mut self.ops, heapless::Vec::new())
+        Core1KeyStore { store_ptr }
     }
 
     /// Whether this board uses direct SD card writes (no core0 channel needed).
@@ -158,42 +180,30 @@ impl FlashQueueKeyStore {
             feature = "waveshare_rp2350_lcd_sdcard",
         ))
     }
+
+    /// Run `op` on core0 and block until it reports the result.
+    fn on_core0(op: FlashOp) -> Result<(), pico2hsm_core::error::HsmError> {
+        blocking_send(&FLASH_REQ, op);
+        blocking_receive(&FLASH_RESP)
+    }
+
+    fn direct(&mut self) -> &mut pico2hsm_firmware::storage::BoardKeyStore {
+        // SAFETY: core0 touches the store only while core1 is blocked in
+        // `on_core0`, so this reference is never aliased by a live access.
+        unsafe { &mut *self.store_ptr }
+    }
 }
 
 #[cfg(target_arch = "arm")]
-impl pico2hsm_firmware::storage::KeyStore for FlashQueueKeyStore {
+impl pico2hsm_firmware::storage::KeyStore for Core1KeyStore {
     fn save_key(
         &mut self,
         obj: &pico2hsm_firmware::security::key_management::KeyObject,
     ) -> Result<(), pico2hsm_core::error::HsmError> {
-        CORE1_PROGRESS.store(70, core::sync::atomic::Ordering::Relaxed);
         if Self::is_direct_write() {
-            // SD card: write directly from core1 — no XIP involvement.
-            use pico2hsm_firmware::storage::KeyStore;
-            let store = unsafe { &mut *self.store_ptr };
-            let result = store.save_key(obj);
-            CORE1_PROGRESS.store(73, core::sync::atomic::Ordering::Relaxed);
-            return result;
+            return self.direct().save_key(obj);
         }
-        // QMI flash: queue for core0.
-        let mut copy = pico2hsm_firmware::security::key_management::KeyObject::new(
-            obj.key_type,
-            obj.key_id,
-            obj.owner,
-            obj.algorithm,
-        );
-        CORE1_PROGRESS.store(71, core::sync::atomic::Ordering::Relaxed);
-        copy.key_domain = obj.key_domain;
-        copy.key_flags = obj.key_flags;
-        copy.use_count = obj.use_count;
-        copy.generation = obj.generation;
-        copy.timestamp_ms = obj.timestamp_ms;
-        let _ = copy.private_key.extend_from_slice(&obj.private_key);
-        let _ = copy.public_key.extend_from_slice(&obj.public_key);
-        CORE1_PROGRESS.store(72, core::sync::atomic::Ordering::Relaxed);
-        let _ = self.ops.push(FlashOp::SaveKey(copy));
-        CORE1_PROGRESS.store(73, core::sync::atomic::Ordering::Relaxed);
-        Ok(())
+        Self::on_core0(FlashOp::SaveKey(obj))
     }
 
     fn fetch_key(
@@ -205,9 +215,7 @@ impl pico2hsm_firmware::storage::KeyStore for FlashQueueKeyStore {
     > {
         // Direct read — safe from any core.
         // For QMI flash this is XIP memory-mapped; for SD card it's SPI reads.
-        use pico2hsm_firmware::storage::KeyStore;
-        let store = unsafe { &mut *self.store_ptr };
-        store.fetch_key(key_id)
+        self.direct().fetch_key(key_id)
     }
 
     fn erase_key(
@@ -215,22 +223,16 @@ impl pico2hsm_firmware::storage::KeyStore for FlashQueueKeyStore {
         key_id: pico2hsm_core::key::KeyId,
     ) -> Result<(), pico2hsm_core::error::HsmError> {
         if Self::is_direct_write() {
-            use pico2hsm_firmware::storage::KeyStore;
-            let store = unsafe { &mut *self.store_ptr };
-            return store.erase_key(key_id);
+            return self.direct().erase_key(key_id);
         }
-        let _ = self.ops.push(FlashOp::EraseKey(key_id));
-        Ok(())
+        Self::on_core0(FlashOp::EraseKey(key_id))
     }
 
     fn wipe_all(&mut self) -> Result<(), pico2hsm_core::error::HsmError> {
         if Self::is_direct_write() {
-            use pico2hsm_firmware::storage::KeyStore;
-            let store = unsafe { &mut *self.store_ptr };
-            return store.wipe_all();
+            return self.direct().wipe_all();
         }
-        let _ = self.ops.push(FlashOp::WipeAll);
-        Ok(())
+        Self::on_core0(FlashOp::WipeAll)
     }
 
     fn wipe_by_owner(
@@ -238,18 +240,113 @@ impl pico2hsm_firmware::storage::KeyStore for FlashQueueKeyStore {
         owner: pico2hsm_core::key::AppletId,
     ) -> Result<(), pico2hsm_core::error::HsmError> {
         if Self::is_direct_write() {
-            use pico2hsm_firmware::storage::KeyStore;
-            let store = unsafe { &mut *self.store_ptr };
-            return store.wipe_by_owner(owner);
+            // SD: the wipe runs here on core1.  In steps, each counting as
+            // progress (as does every SD block write), so a slow card can't
+            // trip the 30 s stall reset halfway through.
+            while self.direct().wipe_by_owner_step(owner, WIPE_STEP_KEYS)? {
+                pico2hsm_firmware::watchdog::progress();
+            }
+            return Ok(());
         }
-        let _ = self.ops.push(FlashOp::WipeByOwner(owner));
-        Ok(())
+        // In bounded steps: one long flash op would starve core0's time
+        // extensions and let pcscd time out a large INITIALIZE.
+        loop {
+            Self::on_core0(FlashOp::WipeByOwnerStep(owner))?;
+            if !WIPE_MORE.load(core::sync::atomic::Ordering::Acquire) {
+                return Ok(());
+            }
+        }
     }
 
     fn enumerate_keys(&self) -> heapless::Vec<pico2hsm_core::key::KeyId, 64> {
         heapless::Vec::new()
     }
     fn for_each_key(&self, _f: &mut dyn FnMut(pico2hsm_core::key::KeyId)) {}
+
+    fn retry_counters(
+        &mut self,
+    ) -> Option<&mut dyn pico2hsm_firmware::storage::retry_counter::RetryCounterBackend> {
+        Some(self)
+    }
+}
+
+/// Counter reads come from core0's in-RAM index (core0 only changes it
+/// while core1 is blocked in `on_core0`); every write is a
+/// `FlashOp::PutCounter` on core0 — on the SD boards too, since the log is
+/// on internal flash, which only core0 may program.
+#[cfg(target_arch = "arm")]
+impl pico2hsm_firmware::storage::retry_counter::RetryCounterBackend for Core1KeyStore {
+    fn get(
+        &mut self,
+        cred: pico2hsm_firmware::storage::retry_counter::Credential,
+    ) -> Result<
+        Option<pico2hsm_firmware::storage::retry_counter::CounterState>,
+        pico2hsm_core::error::StorageError,
+    > {
+        use pico2hsm_firmware::storage::KeyStore as _;
+        match self.direct().retry_counters() {
+            Some(log) => log.get(cred),
+            None => Err(pico2hsm_core::error::StorageError::NotFormatted),
+        }
+    }
+
+    fn put(
+        &mut self,
+        cred: pico2hsm_firmware::storage::retry_counter::Credential,
+        state: pico2hsm_firmware::storage::retry_counter::CounterState,
+    ) -> Result<(), pico2hsm_core::error::StorageError> {
+        match Self::on_core0(FlashOp::PutCounter(cred, state)) {
+            Ok(()) => Ok(()),
+            Err(pico2hsm_core::error::HsmError::Storage(e)) => Err(e),
+            Err(_) => Err(pico2hsm_core::error::StorageError::WriteError),
+        }
+    }
+
+    fn needs_migration(&mut self) -> bool {
+        use pico2hsm_firmware::storage::KeyStore as _;
+        self.direct()
+            .retry_counters()
+            .is_some_and(|log| log.needs_migration())
+    }
+
+    fn format(
+        &mut self,
+        _: &[(
+            pico2hsm_firmware::storage::retry_counter::Credential,
+            pico2hsm_firmware::storage::retry_counter::CounterState,
+        )],
+    ) -> Result<(), pico2hsm_core::error::StorageError> {
+        // Migration runs at boot on core0 only (`init_retry_counters`).
+        Err(pico2hsm_core::error::StorageError::WriteError)
+    }
+}
+
+/// Attach the retry-counter log on internal flash to the keystore and run
+/// the one-time migration.  Boot only, on core0, before the first key load.
+#[cfg(target_arch = "arm")]
+fn init_retry_counters(store: &mut pico2hsm_firmware::storage::BoardKeyStore) {
+    use pico2hsm_firmware::storage::{
+        flash_chip::{QmiCounterFlash, QMI_FLASH_SIZE},
+        flash_layout::RETRY_COUNTER_SECTORS,
+        retry_counter::CounterLog,
+    };
+    // SAFETY: on the QMI boards the keystore's `QmiFlash` owns `p.FLASH`.
+    // The blocking driver holds no state, and both drivers are used only
+    // from core0, one operation at a time, so a second handle is sound.
+    let flash =
+        embassy_rp::flash::Flash::<_, embassy_rp::flash::Blocking, QMI_FLASH_SIZE>::new_blocking(
+            unsafe { embassy_rp::peripherals::FLASH::steal() },
+        );
+    store.attach_retry_counters(CounterLog::open(
+        QmiCounterFlash::new(flash),
+        RETRY_COUNTER_SECTORS,
+    ));
+    match pico2hsm_firmware::apdu::dispatcher::Dispatcher::migrate_retry_counters(store) {
+        Ok(true) => defmt::info!("retry counters: migrated from the PIN records"),
+        Ok(false) => {}
+        // Fail closed: credentials load blocked; retried at the next boot.
+        Err(_) => defmt::error!("retry counters: migration FAILED — credentials blocked"),
+    }
 }
 
 /// One-time initialised key store — lives for the duration of the firmware.
@@ -265,8 +362,6 @@ static KEY_COUNT: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::n
 /// Re-export for convenient access in this binary crate.
 #[cfg(target_arch = "arm")]
 use pico2hsm_firmware::CORE1_PROGRESS;
-#[cfg(target_arch = "arm")]
-use pico2hsm_firmware::{WATCHDOG_HEARTBEAT, WATCHDOG_STALL_LIMIT, WATCHDOG_SUPPRESS};
 
 /// Dispatcher — stored in BSS outside the async task state machine so that
 /// the `dispatcher_task` pool does not need to hold the full 50 KB Dispatcher
@@ -371,8 +466,20 @@ fn dispatcher_loop(ptr_wrapper: DispatcherPtr) -> ! {
     // lifetime of the firmware (backed by StaticCell in BSS).
     let dispatcher = unsafe { &mut *dispatcher_ptr };
 
+    let mut session = pico2hsm_firmware::SESSION_EPOCH.load(core::sync::atomic::Ordering::SeqCst);
     loop {
-        let apdu_bytes = blocking_receive(&APDU_CHANNEL);
+        let mut apdu_bytes = blocking_receive(&APDU_CHANNEL);
+        // A new host session (USB reset/deconfigure or card power cycle)
+        // must not inherit PIN/key authentication from the previous one.
+        // Key off the session the APDU was *sent in*, not the current one:
+        // a command queued before a reset belongs to the old session.
+        let tag = pico2hsm_firmware::APDU_EPOCH.load(core::sync::atomic::Ordering::SeqCst);
+        if tag != session {
+            dispatcher.clear_session();
+            session = tag;
+        }
+        let stale = !apdu_bytes.is_empty()
+            && pico2hsm_firmware::SESSION_EPOCH.load(core::sync::atomic::Ordering::SeqCst) != tag;
         // No defmt logging inside the receive loop.  All embassy_rp TRACE logs
         // from Core0 fill the RTT buffer rapidly; any defmt write from Core1
         // here would block on BLOCK_IF_FULL mode and deadlock both cores.
@@ -382,34 +489,40 @@ fn dispatcher_loop(ptr_wrapper: DispatcherPtr) -> ! {
             //
             // NOTE: must use `reset_in_place` (writes fields through a raw
             // pointer) rather than `*dispatcher = Dispatcher::new()`.  The
-            // Dispatcher struct is ~82 KB; in debug builds `Dispatcher::new()`
+            // Dispatcher struct is ~36 KB; in debug builds `Dispatcher::new()`
             // would place the full struct on the Core1 stack before copying
             // it into BSS, risking silent stack overflow on the second USB
-            // reconnect in a test session.  See
-            // .claude/projects/-home-mcarey-pico2hsm/memory/dispatcher_stack_overflow.md
+            // reconnect in a test session.  reset_in_place also zeroizes the
+            // old session's secrets (DKEK, PIN state, cached keys).
             dispatcher.reset_in_place();
-            if FlashQueueKeyStore::is_direct_write() {
+            if Core1KeyStore::is_direct_write() {
                 // SD card: reload directly on core1.
-                use pico2hsm_firmware::storage::KeyStore;
                 let store = unsafe { &mut *store_ptr };
                 dispatcher.load_keys_from_store(store);
             } else {
                 // QMI flash: ask core0 to reload (it holds the store).
-                blocking_send(&FLASH_REQ, FlashOp::ReloadKeys);
-                let _ = blocking_receive(&FLASH_RESP);
+                let _ = Core1KeyStore::on_core0(FlashOp::ReloadKeys);
             }
             blocking_send(&RESP_CHANNEL, heapless::Vec::new());
+        } else if stale {
+            // Its session ended while it was queued: never run it.  Core0
+            // drops the reply (tagged with the old epoch) as well.
+            zeroize::Zeroize::zeroize(&mut apdu_bytes[..]);
+            let mut sw = heapless::Vec::new();
+            let _ = sw.extend_from_slice(&[0x6F, 0x00]);
+            blocking_send(&RESP_CHANNEL, sw);
         } else {
             CORE1_PROGRESS.store(10, core::sync::atomic::Ordering::Relaxed);
-            let mut q = FlashQueueKeyStore::new(store_ptr);
-            let response = dispatcher.dispatch_with_store(&apdu_bytes, &mut q);
-            CORE1_PROGRESS.store(40, core::sync::atomic::Ordering::Relaxed);
-            // Drain queued flash ops (QMI flash boards only).
-            // SD card boards write directly during dispatch — queue is empty.
-            for op in q.drain() {
-                CORE1_PROGRESS.store(50, core::sync::atomic::Ordering::Relaxed);
-                blocking_send(&FLASH_REQ, op);
-                let _ = blocking_receive(&FLASH_RESP);
+            let mut ks = Core1KeyStore::new(store_ptr);
+            let response = dispatcher.dispatch_with_store(&apdu_bytes, &mut ks);
+            // The command may carry PINs or key material; don't leave it on the stack.
+            zeroize::Zeroize::zeroize(&mut apdu_bytes[..]);
+            // A reset during the command: whatever it authenticated belonged
+            // to the session that just ended.
+            let now = pico2hsm_firmware::SESSION_EPOCH.load(core::sync::atomic::Ordering::SeqCst);
+            if now != session {
+                dispatcher.clear_session();
+                session = now;
             }
             CORE1_PROGRESS.store(60, core::sync::atomic::Ordering::Relaxed);
             blocking_send(&RESP_CHANNEL, response);
@@ -467,7 +580,7 @@ const USB_PID: u16 = 0x27C0;
 
 #[cfg(target_arch = "arm")]
 #[embassy_executor::main]
-async fn main(_spawner: Spawner) {
+async fn main(spawner: Spawner) {
     // ── 1. Initialise RP2350 clocks and peripherals ─────────────────────────
     let p = embassy_rp::init(Default::default());
 
@@ -488,18 +601,14 @@ async fn main(_spawner: Spawner) {
     }
 
     // ── MSPLIM — hardware stack overflow detection for Core0 ──────────────────
-    // Core0 stack grows downward from 0x20082000; BSS ends at __ebss.
-    // MSPLIM set to __ebss — hardware UsageFault fires at the exact BSS
-    // boundary, preventing stack-into-BSS corruption with zero wasted stack
-    // space.  Also enable UsageFault so STKOF surfaces cleanly in probe-rs.
+    // Core0 stack grows downward from 0x20082000 to _stack_end, which lies
+    // above both .bss and .uninit.  (Using __ebss left the 4 KB defmt-rtt
+    // buffer in .uninit unprotected.)  Also enable UsageFault so STKOF
+    // surfaces cleanly in probe-rs.
     #[cfg(target_arch = "arm")]
     unsafe {
-        let ebss = core::ptr::addr_of!(__ebss) as u32;
-        // Core0 stack occupies the full gap between __ebss and 0x20082000 (520 KB SRAM end).
-        // MSPLIM at __ebss — hardware UsageFault fires at exact boundary, no guard waste.
-        // With 192 KB Core1 stack the gap is smaller but still sufficient for
-        // Embassy USB + CCID + init_in_place (~60 KB needed).
-        cortex_m::register::msplim::write(ebss);
+        let stack_end = core::ptr::addr_of!(_stack_end) as u32;
+        cortex_m::register::msplim::write(stack_end);
 
         // Enable UsageFault handler so STKOF fires as UsageFault, not HardFault.
         // SHCSR bit 18 = USGFAULTENA.
@@ -507,12 +616,18 @@ async fn main(_spawner: Spawner) {
             .shcsr
             .modify(|v| v | (1 << 18));
 
-        defmt::info!(
-            "core0: MSPLIM set to 0x{:08X} (__ebss=0x{:08X})",
-            ebss,
-            ebss
-        );
+        defmt::info!("core0: MSPLIM set to 0x{:08X} (_stack_end)", stack_end);
     }
+
+    // ── Hardware watchdog ────────────────────────────────────────────────────
+    // Armed before anything that can hang (security checks, OTP, storage,
+    // SD card, LCD, USB).  Boot code below runs synchronously until the
+    // first await, so it is kept fed by `watchdog::progress()` in every
+    // sector write/erase and key load; from the first await on, the feeder
+    // task does it.  Paused while a debugger halts either core.
+    let boot_report = pico2hsm_firmware::watchdog::boot_init();
+    log_boot_report(&boot_report);
+    spawner.spawn(watchdog_feeder().expect("watchdog feeder task"));
 
     defmt::info!("pico2hsm: peripherals initialised");
 
@@ -616,8 +731,14 @@ fn handle_flash_op(
     dispatcher_ptr: *mut pico2hsm_firmware::apdu::dispatcher::Dispatcher,
 ) -> Result<(), pico2hsm_core::error::HsmError> {
     use pico2hsm_firmware::storage::KeyStore;
+    // Flash work counts as progress for the core1 stall detector, and feeds
+    // the hardware watchdog (this blocks core0's executor; every sector
+    // erase/program inside feeds again).
+    pico2hsm_firmware::watchdog::progress();
     match op {
-        FlashOp::SaveKey(ref obj) => {
+        FlashOp::SaveKey(ptr) => {
+            // SAFETY: see `FlashOp::SaveKey` — core1 is blocked until we reply.
+            let obj = unsafe { &*ptr };
             let result = store.save_key(obj);
             defmt::info!(
                 "FLASH_SVC: save_key 0x{:08x} => {}",
@@ -643,6 +764,14 @@ fn handle_flash_op(
             defmt::info!("FLASH_SVC: wipe_by_owner {:?}", owner as u8);
             store.wipe_by_owner(owner)
         }
+        FlashOp::WipeByOwnerStep(owner) => {
+            let more = store.wipe_by_owner_step(owner, WIPE_STEP_KEYS);
+            WIPE_MORE.store(
+                matches!(more, Ok(true)),
+                core::sync::atomic::Ordering::Release,
+            );
+            more.map(|_| ())
+        }
         FlashOp::ReloadKeys => {
             defmt::info!("FLASH_SVC: reload_keys");
             // SAFETY: core1 is blocked on FLASH_RESP.receive() and will not
@@ -655,6 +784,256 @@ fn handle_flash_op(
             );
             Ok(())
         }
+        FlashOp::PutCounter(cred, state) => match store.retry_counters() {
+            Some(log) => log
+                .put(cred, state)
+                .map_err(pico2hsm_core::error::HsmError::Storage),
+            None => Err(pico2hsm_core::error::HsmError::Storage(
+                pico2hsm_core::error::StorageError::NotFormatted,
+            )),
+        },
+    }
+}
+
+/// Wait for core1's next `RESP_CHANNEL` message while servicing any
+/// `FLASH_REQ` it issues first.
+///
+/// Unbounded by design: a wedged core1 is caught by the hardware-watchdog
+/// feeder, which stops feeding after 30 s without progress.
+///
+/// Core1 may need core0 to perform flash operations before it can reply —
+/// key writes during a dispatch, or `ReloadKeys` after a USB-reconnect
+/// reset on QMI flash boards.  Waiting on `RESP_CHANNEL` alone in those paths
+/// deadlocks both cores (core1 blocks on `FLASH_RESP`, core0 on `RESP_CHANNEL`).
+#[cfg(target_arch = "arm")]
+async fn recv_core1_response(
+    store: &mut pico2hsm_firmware::storage::BoardKeyStore,
+    dispatcher_ptr: *mut pico2hsm_firmware::apdu::dispatcher::Dispatcher,
+) -> heapless::Vec<u8, 4098> {
+    use embassy_futures::select::{select, Either};
+    loop {
+        match select(RESP_CHANNEL.receive(), FLASH_REQ.receive()).await {
+            Either::First(r) => {
+                pico2hsm_firmware::watchdog::note_core1_response();
+                return r;
+            }
+            Either::Second(op) => {
+                let result = handle_flash_op(op, store, dispatcher_ptr);
+                FLASH_RESP.send(result).await;
+                cortex_m::asm::sev(); // wake core1 from WFE
+            }
+        }
+    }
+}
+
+/// Wait for core1's response to an APDU, keeping the host and core1 serviced.
+///
+/// - Services `FLASH_REQ` so core1's flash writes can complete.
+/// - Sends a CCID time extension every 1.5 s of wall-clock time.  The deadline
+///   is absolute, so a stream of flash ops (which block this executor) cannot
+///   push it back; an overdue extension goes out as soon as the op finishes.
+/// - Stall detector: if core1's heartbeat doesn't move for 30 s
+///   (`watchdog::Core1Monitor`, and stall detection is not suppressed),
+///   returns `None`; the caller must reset the device (see `watchdog_reset`).
+///
+/// On USB disconnect, drains core1's response and returns an empty Vec so the
+/// caller takes its normal disconnect path.  That drain (like the reset
+/// drains in the board loops) has no stall detector of its own: if core1 is
+/// wedged, the watchdog feeder stops feeding and the hardware watchdog
+/// resets the chip.
+#[cfg(target_arch = "arm")]
+async fn await_core1_response<'d, D: embassy_usb::driver::Driver<'d>>(
+    ccid: &mut pico2hsm_firmware::transport::CcidTransport<'d, D>,
+    store: &mut pico2hsm_firmware::storage::BoardKeyStore,
+    dispatcher_ptr: *mut pico2hsm_firmware::apdu::dispatcher::Dispatcher,
+) -> Option<heapless::Vec<u8, 4098>> {
+    use core::sync::atomic::Ordering::Relaxed;
+    use embassy_futures::select::{select3, Either3};
+    use embassy_time::{Duration, Instant};
+
+    use pico2hsm_firmware::watchdog::{Core1Activity, Core1Health, Core1Monitor};
+
+    const WTX_INTERVAL: Duration = Duration::from_millis(1500);
+    let mut deadline = Instant::now() + WTX_INTERVAL;
+    // Same stall rule as the hardware-watchdog feeder (30 s without
+    // heartbeat or reply); here it gets a 6F00 out before the reset.
+    let mut monitor = Core1Monitor::new(Instant::now().as_millis(), Core1Activity::sample());
+    loop {
+        match select3(
+            RESP_CHANNEL.receive(),
+            Timer::at(deadline),
+            FLASH_REQ.receive(),
+        )
+        .await
+        {
+            Either3::First(r) => {
+                pico2hsm_firmware::watchdog::note_core1_response();
+                return Some(r);
+            }
+            Either3::Second(()) => {
+                deadline = Instant::now() + WTX_INTERVAL;
+                let progress = CORE1_PROGRESS.load(Relaxed);
+                let activity = Core1Activity::sample();
+                let health = monitor.observe(Instant::now().as_millis(), activity);
+                defmt::warn!(
+                    "time ext: core1 progress={} heartbeat={} health={}",
+                    progress,
+                    activity.heartbeat,
+                    defmt::Debug2Format(&health)
+                );
+                if health == Core1Health::Stalled {
+                    return None;
+                }
+                if let Err(pico2hsm_firmware::transport::ccid::CcidError::UsbDisconnected) =
+                    ccid.send_time_extension().await
+                {
+                    let _ = recv_core1_response(store, dispatcher_ptr).await;
+                    return Some(heapless::Vec::new());
+                }
+            }
+            Either3::Third(op) => {
+                let result = handle_flash_op(op, store, dispatcher_ptr);
+                FLASH_RESP.send(result).await;
+                cortex_m::asm::sev(); // wake core1 from WFE
+            }
+        }
+    }
+}
+
+/// Send a response to the host, then wipe its data: responses can carry
+/// secrets (decrypted plaintext, ECDH output, wrapped keys).  Dropped
+/// unsent if the host session changed while the command ran.
+#[cfg(target_arch = "arm")]
+async fn send_and_wipe<'d, D: embassy_usb::driver::Driver<'d>>(
+    ccid: &mut pico2hsm_firmware::transport::CcidTransport<'d, D>,
+    response: &mut heapless::Vec<u8, 4098>,
+    epoch: u32,
+) -> Result<(), pico2hsm_firmware::transport::ccid::CcidError> {
+    // A response computed for a previous host session must not be delivered
+    // into the new one (it would answer the new session's first command).
+    let current = pico2hsm_firmware::SESSION_EPOCH.load(core::sync::atomic::Ordering::SeqCst);
+    let result = if current == epoch {
+        ccid.send_response(response).await
+    } else {
+        Ok(())
+    };
+    // Watchdog test hook (debug builds): block core0's executor for good.
+    #[cfg(feature = "debug")]
+    if pico2hsm_firmware::watchdog::DEBUG_WEDGE_CORE0.load(core::sync::atomic::Ordering::SeqCst) {
+        loop {
+            core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    // Keep the trailing SW (not secret): display boards show status from it.
+    let data_len = response.len().saturating_sub(2);
+    zeroize::Zeroize::zeroize(&mut response[..data_len]);
+    result
+}
+
+/// Ends the host session on USB bus reset or deconfiguration (see
+/// `SESSION_EPOCH`).  embassy-rp endpoints never report `Disabled`, so this
+/// is the only reliable signal that the host went away.
+#[cfg(target_arch = "arm")]
+struct UsbSessionHandler;
+
+/// The board's USB session handler (one board runner runs per boot).
+#[cfg(target_arch = "arm")]
+static USB_SESSION_HANDLER: StaticCell<UsbSessionHandler> = StaticCell::new();
+
+#[cfg(target_arch = "arm")]
+impl embassy_usb::Handler for UsbSessionHandler {
+    fn reset(&mut self) {
+        pico2hsm_firmware::bump_session_epoch();
+    }
+
+    fn configured(&mut self, configured: bool) {
+        if !configured {
+            pico2hsm_firmware::bump_session_epoch();
+        }
+    }
+}
+
+/// Core1 is stuck: tell the host (SW 6F00) and reset the whole chip.
+///
+/// Core1 cannot be safely abandoned — it would still own the dispatcher and
+/// its late response would be taken as the answer to the next APDU — so a
+/// full reset is the only state that is known to be consistent.
+///
+/// Feeding stops first, so if the 6F00 can't be sent (host gone, endpoint
+/// stuck) the hardware watchdog still fires within its timeout.  The reset
+/// itself is a watchdog trigger: both cores, USB and all peripherals.
+#[cfg(target_arch = "arm")]
+async fn watchdog_reset<'d, D: embassy_usb::driver::Driver<'d>>(
+    ccid: &mut pico2hsm_firmware::transport::CcidTransport<'d, D>,
+) -> ! {
+    use pico2hsm_firmware::watchdog::{reset_now, starve, ResetCause};
+    starve(ResetCause::Core1Stall);
+    defmt::error!("watchdog: core1 stuck — sending 6F00 and resetting");
+    let _ = ccid.send_response(&[0x6F, 0x00]).await;
+    Timer::after_millis(50).await;
+    reset_now(ResetCause::Core1Stall)
+}
+
+/// Hand core1 a request (an APDU, or an empty Vec = reset signal) and wake
+/// it.  Counted for the watchdog feeder before the send, so a core1 that
+/// never takes the request is caught as well.
+#[cfg(target_arch = "arm")]
+async fn send_to_core1(apdu: heapless::Vec<u8, 4096>) {
+    pico2hsm_firmware::watchdog::note_core1_request();
+    APDU_CHANNEL.send(apdu).await;
+    cortex_m::asm::sev(); // wake core1 from WFE
+}
+
+/// Feeds the hardware watchdog while the system is healthy (see the
+/// `watchdog` module).  That this task runs at all shows core0's executor
+/// is alive; it stops feeding once core1 has been stuck on a request for
+/// 30 s — on any path, including the USB-disconnect drain, which has no
+/// stall detector of its own.
+#[cfg(target_arch = "arm")]
+#[embassy_executor::task]
+async fn watchdog_feeder() {
+    use embassy_time::Instant;
+    use pico2hsm_firmware::watchdog::{
+        feed, reset_pending, should_feed, starve, Core1Activity, Core1Health, Core1Monitor,
+        ResetCause, FEED_INTERVAL_MS,
+    };
+    let mut monitor = Core1Monitor::new(Instant::now().as_millis(), Core1Activity::sample());
+    loop {
+        let health = monitor.observe(Instant::now().as_millis(), Core1Activity::sample());
+        if should_feed(health, reset_pending()) {
+            feed();
+        } else if health == Core1Health::Stalled && !reset_pending() {
+            defmt::error!(
+                "watchdog: core1 stuck on a request for 30 s — stop feeding, reset follows"
+            );
+            pico2hsm_firmware::cdc_error!("watchdog: core1 stuck, resetting");
+            starve(ResetCause::FeederCore1Stall);
+        }
+        Timer::after_millis(FEED_INTERVAL_MS).await;
+    }
+}
+
+/// Log why the previous run ended (defmt and the CDC log).
+#[cfg(target_arch = "arm")]
+fn log_boot_report(r: &pico2hsm_firmware::watchdog::BootReport) {
+    use pico2hsm_firmware::watchdog::{describe, LastReset};
+    let what = describe(r.last);
+    if r.last == LastReset::Other {
+        defmt::info!("reset: {} (CHIP_RESET=0x{:08X})", what, r.chip_reset);
+        pico2hsm_firmware::cdc_log!("reset: {} (CHIP_RESET=0x{:08X})", what, r.chip_reset);
+    } else {
+        defmt::warn!(
+            "reset: {} — watchdog resets in a row: {} (CHIP_RESET=0x{:08X})",
+            what,
+            r.wdt_resets,
+            r.chip_reset
+        );
+        pico2hsm_firmware::cdc_warn!(
+            "reset: {} - watchdog resets in a row: {} (CHIP_RESET=0x{:08X})",
+            what,
+            r.wdt_resets,
+            r.chip_reset
+        );
     }
 }
 
@@ -691,8 +1070,9 @@ async fn run_one_board(p: embassy_rp::Peripherals) {
     board.led().set_status(LedStatus::Busy);
 
     // ── Storage initialization (rp2350_one: internal QMI flash) ───────────────
-    let smk_bytes = pico2hsm_firmware::security::otp::derive_smk().unwrap_or([0u8; 32]);
-    let smk = zeroize::Zeroizing::new(smk_bytes);
+    // None on an unprovisioned release build: the keystore then refuses
+    // to store keys rather than use a public key (see otp::boot_storage_master_key).
+    let smk = pico2hsm_firmware::security::otp::boot_storage_master_key();
 
     let qmi_flash = embassy_rp::flash::Flash::<
         _,
@@ -744,6 +1124,7 @@ async fn run_one_board(p: embassy_rp::Peripherals) {
 
     // Register the CCID class — allocates bulk-OUT, bulk-IN, interrupt-IN
     // endpoints and embeds the 54-byte CCID class descriptor.
+    builder.handler(USB_SESSION_HANDLER.init(UsbSessionHandler));
     let mut ccid = CcidTransport::new(&mut builder);
 
     // CDC-ACM serial logger — /dev/ttyACMx for daemon diagnostics + debug.
@@ -764,6 +1145,7 @@ async fn run_one_board(p: embassy_rp::Peripherals) {
         pico2hsm_firmware::apdu::dispatcher::Dispatcher::init_in_place(DISPATCHER_CELL.uninit());
     {
         use pico2hsm_firmware::storage::KeyStore as _;
+        init_retry_counters(store);
         dispatcher_ref.load_keys_from_store(store);
     }
     KEY_COUNT.store(
@@ -805,98 +1187,43 @@ async fn run_one_board(p: embassy_rp::Peripherals) {
             loop {
                 match ccid.recv_apdu().await {
                     Ok(apdu_bytes) => {
+                        let epoch = ccid.apdu_epoch();
+                        pico2hsm_firmware::APDU_EPOCH
+                            .store(epoch, core::sync::atomic::Ordering::SeqCst);
                         board.led().set_status(LedStatus::Busy);
-                        let _ = APDU_CHANNEL.send(apdu_bytes).await;
-                        cortex_m::asm::sev(); // wake core1 from WFE
-                        let response = {
-                            use embassy_futures::select::{select3, Either3};
-                            let mut stall_count: u32 = 0;
-                            let mut last_heartbeat =
-                                WATCHDOG_HEARTBEAT.load(core::sync::atomic::Ordering::Relaxed);
-                            loop {
-                                match select3(
-                                    RESP_CHANNEL.receive(),
-                                    embassy_time::Timer::after_millis(1500),
-                                    FLASH_REQ.receive(),
-                                )
-                                .await
-                                {
-                                    Either3::First(r) => break r,
-                                    Either3::Second(_) => {
-                                        let progress = CORE1_PROGRESS
-                                            .load(core::sync::atomic::Ordering::Relaxed);
-                                        let heartbeat = WATCHDOG_HEARTBEAT
-                                            .load(core::sync::atomic::Ordering::Relaxed);
-                                        let suppress = WATCHDOG_SUPPRESS
-                                            .load(core::sync::atomic::Ordering::Relaxed);
-                                        if suppress {
-                                            // RSA keygen (or similar long pure-compute op)
-                                            // disarms the stall detector; heartbeat stops
-                                            // bumping because no RNG calls happen during
-                                            // Miller–Rabin. Reset counter and keep sending
-                                            // time extensions until keygen completes.
-                                            stall_count = 0;
-                                            last_heartbeat = heartbeat;
-                                        } else if heartbeat == last_heartbeat {
-                                            stall_count += 1;
-                                            defmt::warn!("time ext: core1 progress={} heartbeat={} STALL {}/{}", progress, heartbeat, stall_count, WATCHDOG_STALL_LIMIT);
-                                            if stall_count >= WATCHDOG_STALL_LIMIT {
-                                                defmt::error!(
-                                                    "watchdog: core1 stuck — aborting APDU"
-                                                );
-                                                // Return SW 6F00 (internal error) to unblock the host.
-                                                let mut err_resp = heapless::Vec::<u8, 4098>::new();
-                                                let _ = err_resp.push(0x6F);
-                                                let _ = err_resp.push(0x00);
-                                                break err_resp;
-                                            }
-                                        } else {
-                                            stall_count = 0;
-                                            last_heartbeat = heartbeat;
-                                            defmt::warn!(
-                                                "time ext: core1 progress={} heartbeat={}",
-                                                progress,
-                                                heartbeat
-                                            );
-                                        }
-                                        if let Err(CcidError::UsbDisconnected) =
-                                            ccid.send_time_extension().await
-                                        {
-                                            let _ = RESP_CHANNEL.receive().await;
-                                            break heapless::Vec::new();
-                                        }
-                                    }
-                                    Either3::Third(op) => {
-                                        let result = handle_flash_op(op, store, dispatcher_ptr);
-                                        FLASH_RESP.send(result).await;
-                                        cortex_m::asm::sev(); // wake core1 from WFE
-                                    }
-                                }
-                            }
-                        };
-                        match ccid.send_response(&response).await {
+                        send_to_core1(apdu_bytes).await;
+                        let mut response =
+                            match await_core1_response(&mut ccid, store, dispatcher_ptr).await {
+                                Some(r) => r,
+                                None => watchdog_reset(&mut ccid).await,
+                            };
+                        match send_and_wipe(&mut ccid, &mut response, epoch).await {
                             Ok(()) => {
                                 for _ in 0..16 {
-                                    pico2hsm_firmware::transport::cdc_serial::drain_one(
+                                    if !pico2hsm_firmware::transport::cdc_serial::drain_one(
                                         &mut cdc_sender,
                                     )
-                                    .await;
+                                    .await
+                                    {
+                                        break;
+                                    }
                                 }
                             }
                             Err(CcidError::UsbDisconnected) => {
-                                let _ = APDU_CHANNEL.send(heapless::Vec::new()).await;
-                                cortex_m::asm::sev(); // wake core1 from WFE
-                                let _ = RESP_CHANNEL.receive().await;
+                                send_to_core1(heapless::Vec::new()).await;
+                                let _ = recv_core1_response(store, dispatcher_ptr).await;
                                 break;
                             }
-                            Err(_) => {}
+                            Err(e) => defmt::error!(
+                                "CCID: response not sent: {:?}",
+                                defmt::Debug2Format(&e)
+                            ),
                         }
                         board.led().set_status(LedStatus::Ready);
                     }
                     Err(CcidError::UsbDisconnected) => {
-                        let _ = APDU_CHANNEL.send(heapless::Vec::new()).await;
-                        cortex_m::asm::sev(); // wake core1 from WFE
-                        let _ = RESP_CHANNEL.receive().await;
+                        send_to_core1(heapless::Vec::new()).await;
+                        let _ = recv_core1_response(store, dispatcher_ptr).await;
                         board.led().set_status(LedStatus::Ready);
                         break;
                     }
@@ -1033,6 +1360,7 @@ async fn run_geek_board(p: embassy_rp::Peripherals) {
 
     // ── CHECKPOINT 5 — CCID class registration ───────────────────────────────
     serial_println!("CCID class register...");
+    builder.handler(USB_SESSION_HANDLER.init(UsbSessionHandler));
     let mut ccid = CcidTransport::new(&mut builder);
     serial_println!("CCID class ok");
 
@@ -1048,8 +1376,9 @@ async fn run_geek_board(p: embassy_rp::Peripherals) {
     board.led().set_status(LedStatus::Ready);
 
     // ── Storage initialization ──────────────────────────────────────────────
-    let smk_bytes = pico2hsm_firmware::security::otp::derive_smk().unwrap_or([0u8; 32]);
-    let smk = zeroize::Zeroizing::new(smk_bytes);
+    // None on an unprovisioned release build: the keystore then refuses
+    // to store keys rather than use a public key (see otp::boot_storage_master_key).
+    let smk = pico2hsm_firmware::security::otp::boot_storage_master_key();
 
     // rp2350_geek_sdcard: SD card keystore on SPI0 (GPIO18/19/20, CS=GPIO23).
     #[cfg(feature = "rp2350_geek_sdcard")]
@@ -1078,11 +1407,7 @@ async fn run_geek_board(p: embassy_rp::Peripherals) {
             Mutex<
                 CriticalSectionRawMutex,
                 core::cell::RefCell<
-                    embassy_rp::spi::Spi<
-                        'static,
-                        embassy_rp::peripherals::SPI0,
-                        embassy_rp::spi::Blocking,
-                    >,
+                    Spi<'static, embassy_rp::peripherals::SPI0, embassy_rp::spi::Blocking>,
                 >,
             >,
         > = StaticCell::new();
@@ -1092,8 +1417,13 @@ async fn run_geek_board(p: embassy_rp::Peripherals) {
             embassy_embedded_hal::shared_bus::blocking::spi::SpiDevice::new(spi0_bus_ref, sd_cs);
 
         let delay = embassy_time::Delay;
+        // Card identification can take seconds at 400 kHz: start it with a
+        // full watchdog period.  No card → panic → watchdog reboot, which
+        // retries detection every ~8 s.
+        pico2hsm_firmware::watchdog::feed();
         let sd_chip = pico2hsm_firmware::storage::sdcard::SdCardFlash::new(spi_device, delay)
             .expect("SD card init failed — is a card inserted?");
+        pico2hsm_firmware::watchdog::feed();
         serial_println!("SD card detected");
 
         // Card identified — raise SPI clock from 400 kHz to 25 MHz for data transfers.
@@ -1150,6 +1480,7 @@ async fn run_geek_board(p: embassy_rp::Peripherals) {
     serial_println!("Loading keys...");
     {
         use pico2hsm_firmware::storage::KeyStore as _;
+        init_retry_counters(store);
         dispatcher_ref.load_keys_from_store(store);
     }
     KEY_COUNT.store(
@@ -1218,6 +1549,9 @@ async fn run_geek_board(p: embassy_rp::Peripherals) {
             loop {
                 match ccid.recv_apdu().await {
                     Ok(apdu_bytes) => {
+                        let epoch = ccid.apdu_epoch();
+                        pico2hsm_firmware::APDU_EPOCH
+                            .store(epoch, core::sync::atomic::Ordering::SeqCst);
                         let now = embassy_time::Instant::now();
                         if screensaver == ScreensaverState::Sleeping {
                             screensaver = ScreensaverState::Active;
@@ -1238,78 +1572,15 @@ async fn run_geek_board(p: embassy_rp::Peripherals) {
 
                         let apdu_ins = apdu_bytes.get(1).copied().unwrap_or(0);
                         let apdu_p1 = apdu_bytes.get(2).copied().unwrap_or(0);
-                        let _ = APDU_CHANNEL.send(apdu_bytes).await;
-                        cortex_m::asm::sev(); // wake core1 from WFE
+                        send_to_core1(apdu_bytes).await;
 
                         // Wait for core1 response (with time extensions every 1.5s)
-                        let response = {
-                            use embassy_futures::select::{select3, Either3};
-                            let mut stall_count: u32 = 0;
-                            let mut last_heartbeat =
-                                WATCHDOG_HEARTBEAT.load(core::sync::atomic::Ordering::Relaxed);
-                            loop {
-                                match select3(
-                                    RESP_CHANNEL.receive(),
-                                    embassy_time::Timer::after_millis(1500),
-                                    FLASH_REQ.receive(),
-                                )
-                                .await
-                                {
-                                    Either3::First(r) => break r,
-                                    Either3::Second(_) => {
-                                        let progress = CORE1_PROGRESS
-                                            .load(core::sync::atomic::Ordering::Relaxed);
-                                        let heartbeat = WATCHDOG_HEARTBEAT
-                                            .load(core::sync::atomic::Ordering::Relaxed);
-                                        let suppress = WATCHDOG_SUPPRESS
-                                            .load(core::sync::atomic::Ordering::Relaxed);
-                                        if suppress {
-                                            // RSA keygen (or similar long pure-compute op)
-                                            // disarms the stall detector; heartbeat stops
-                                            // bumping because no RNG calls happen during
-                                            // Miller–Rabin. Reset counter and keep sending
-                                            // time extensions until keygen completes.
-                                            stall_count = 0;
-                                            last_heartbeat = heartbeat;
-                                        } else if heartbeat == last_heartbeat {
-                                            stall_count += 1;
-                                            defmt::warn!("time ext: core1 progress={} heartbeat={} STALL {}/{}", progress, heartbeat, stall_count, WATCHDOG_STALL_LIMIT);
-                                            if stall_count >= WATCHDOG_STALL_LIMIT {
-                                                defmt::error!(
-                                                    "watchdog: core1 stuck — aborting APDU"
-                                                );
-                                                // Return SW 6F00 (internal error) to unblock the host.
-                                                let mut err_resp = heapless::Vec::<u8, 4098>::new();
-                                                let _ = err_resp.push(0x6F);
-                                                let _ = err_resp.push(0x00);
-                                                break err_resp;
-                                            }
-                                        } else {
-                                            stall_count = 0;
-                                            last_heartbeat = heartbeat;
-                                            defmt::warn!(
-                                                "time ext: core1 progress={} heartbeat={}",
-                                                progress,
-                                                heartbeat
-                                            );
-                                        }
-                                        if let Err(CcidError::UsbDisconnected) =
-                                            ccid.send_time_extension().await
-                                        {
-                                            let _ = RESP_CHANNEL.receive().await;
-                                            break heapless::Vec::new();
-                                        }
-                                    }
-                                    Either3::Third(op) => {
-                                        let result = handle_flash_op(op, store, dispatcher_ptr);
-                                        FLASH_RESP.send(result).await;
-                                        cortex_m::asm::sev(); // wake core1 from WFE
-                                    }
-                                }
-                            }
-                        };
-
-                        match ccid.send_response(&response).await {
+                        let mut response =
+                            match await_core1_response(&mut ccid, store, dispatcher_ptr).await {
+                                Some(r) => r,
+                                None => watchdog_reset(&mut ccid).await,
+                            };
+                        match send_and_wipe(&mut ccid, &mut response, epoch).await {
                             Ok(()) => {
                                 display_state.status = LedStatus::Ready;
                                 display_state.uptime_secs =
@@ -1396,27 +1667,31 @@ async fn run_geek_board(p: embassy_rp::Peripherals) {
                                     board.led().flush().await;
                                 }
                                 for _ in 0..16 {
-                                    pico2hsm_firmware::transport::cdc_serial::drain_one(
+                                    if !pico2hsm_firmware::transport::cdc_serial::drain_one(
                                         &mut cdc_sender,
                                     )
-                                    .await;
+                                    .await
+                                    {
+                                        break;
+                                    }
                                 }
                             }
                             Err(CcidError::UsbDisconnected) => {
-                                let _ = APDU_CHANNEL.send(heapless::Vec::new()).await;
-                                cortex_m::asm::sev(); // wake core1 from WFE
-                                let _ = RESP_CHANNEL.receive().await;
+                                send_to_core1(heapless::Vec::new()).await;
+                                let _ = recv_core1_response(store, dispatcher_ptr).await;
                                 display_state.status = LedStatus::Ready;
                                 break;
                             }
-                            Err(_) => {}
+                            Err(e) => defmt::error!(
+                                "CCID: response not sent: {:?}",
+                                defmt::Debug2Format(&e)
+                            ),
                         }
                     }
 
                     Err(CcidError::UsbDisconnected) => {
-                        let _ = APDU_CHANNEL.send(heapless::Vec::new()).await;
-                        cortex_m::asm::sev(); // wake core1 from WFE
-                        let _ = RESP_CHANNEL.receive().await;
+                        send_to_core1(heapless::Vec::new()).await;
+                        let _ = recv_core1_response(store, dispatcher_ptr).await;
                         display_state.status = LedStatus::Ready;
                         break;
                     }
@@ -1463,8 +1738,9 @@ async fn run_pico2_board(p: embassy_rp::Peripherals) {
     board.led().set_status(LedStatus::Busy);
 
     // ── Storage initialization (pico2_4m: RP2350 internal QMI flash) ─────────
-    let smk_bytes = pico2hsm_firmware::security::otp::derive_smk().unwrap_or([0u8; 32]); // degraded mode if OTP unprovisioned
-    let smk = zeroize::Zeroizing::new(smk_bytes);
+    // None on an unprovisioned release build: the keystore then refuses
+    // to store keys rather than use a public key (see otp::boot_storage_master_key).
+    let smk = pico2hsm_firmware::security::otp::boot_storage_master_key();
 
     let qmi_flash = embassy_rp::flash::Flash::<
         _,
@@ -1512,6 +1788,8 @@ async fn run_pico2_board(p: embassy_rp::Peripherals) {
         &mut control_buf,
     );
 
+    builder.handler(USB_SESSION_HANDLER.init(UsbSessionHandler));
+
     let mut ccid = CcidTransport::new(&mut builder);
 
     // CDC-ACM serial logger — /dev/ttyACMx for daemon diagnostics + debug.
@@ -1528,6 +1806,7 @@ async fn run_pico2_board(p: embassy_rp::Peripherals) {
         pico2hsm_firmware::apdu::dispatcher::Dispatcher::init_in_place(DISPATCHER_CELL.uninit());
     {
         use pico2hsm_firmware::storage::KeyStore as _;
+        init_retry_counters(store);
         dispatcher_ref.load_keys_from_store(store);
     }
     KEY_COUNT.store(
@@ -1571,101 +1850,46 @@ async fn run_pico2_board(p: embassy_rp::Peripherals) {
             loop {
                 match ccid.recv_apdu().await {
                     Ok(apdu_bytes) => {
+                        let epoch = ccid.apdu_epoch();
+                        pico2hsm_firmware::APDU_EPOCH
+                            .store(epoch, core::sync::atomic::Ordering::SeqCst);
                         board.led().set_status(LedStatus::Busy);
                         // No defmt logging here — the RTT buffer fills from trace-level
                         // embassy_rp USB logs; any defmt call here blocks Core0 before
                         // the APDU reaches Core1, causing a permanent hang.
-                        let _ = APDU_CHANNEL.send(apdu_bytes).await;
-                        cortex_m::asm::sev(); // wake core1 from WFE
-                        let response = {
-                            use embassy_futures::select::{select3, Either3};
-                            let mut stall_count: u32 = 0;
-                            let mut last_heartbeat =
-                                WATCHDOG_HEARTBEAT.load(core::sync::atomic::Ordering::Relaxed);
-                            loop {
-                                match select3(
-                                    RESP_CHANNEL.receive(),
-                                    embassy_time::Timer::after_millis(1500),
-                                    FLASH_REQ.receive(),
-                                )
-                                .await
-                                {
-                                    Either3::First(r) => break r,
-                                    Either3::Second(_) => {
-                                        let progress = CORE1_PROGRESS
-                                            .load(core::sync::atomic::Ordering::Relaxed);
-                                        let heartbeat = WATCHDOG_HEARTBEAT
-                                            .load(core::sync::atomic::Ordering::Relaxed);
-                                        let suppress = WATCHDOG_SUPPRESS
-                                            .load(core::sync::atomic::Ordering::Relaxed);
-                                        if suppress {
-                                            // RSA keygen (or similar long pure-compute op)
-                                            // disarms the stall detector; heartbeat stops
-                                            // bumping because no RNG calls happen during
-                                            // Miller–Rabin. Reset counter and keep sending
-                                            // time extensions until keygen completes.
-                                            stall_count = 0;
-                                            last_heartbeat = heartbeat;
-                                        } else if heartbeat == last_heartbeat {
-                                            stall_count += 1;
-                                            defmt::warn!("time ext: core1 progress={} heartbeat={} STALL {}/{}", progress, heartbeat, stall_count, WATCHDOG_STALL_LIMIT);
-                                            if stall_count >= WATCHDOG_STALL_LIMIT {
-                                                defmt::error!(
-                                                    "watchdog: core1 stuck — aborting APDU"
-                                                );
-                                                // Return SW 6F00 (internal error) to unblock the host.
-                                                let mut err_resp = heapless::Vec::<u8, 4098>::new();
-                                                let _ = err_resp.push(0x6F);
-                                                let _ = err_resp.push(0x00);
-                                                break err_resp;
-                                            }
-                                        } else {
-                                            stall_count = 0;
-                                            last_heartbeat = heartbeat;
-                                            defmt::warn!(
-                                                "time ext: core1 progress={} heartbeat={}",
-                                                progress,
-                                                heartbeat
-                                            );
-                                        }
-                                        if let Err(CcidError::UsbDisconnected) =
-                                            ccid.send_time_extension().await
-                                        {
-                                            let _ = RESP_CHANNEL.receive().await;
-                                            break heapless::Vec::new();
-                                        }
-                                    }
-                                    Either3::Third(op) => {
-                                        let result = handle_flash_op(op, store, dispatcher_ptr);
-                                        FLASH_RESP.send(result).await;
-                                        cortex_m::asm::sev(); // wake core1 from WFE
-                                    }
-                                }
-                            }
-                        };
-                        match ccid.send_response(&response).await {
+                        send_to_core1(apdu_bytes).await;
+                        let mut response =
+                            match await_core1_response(&mut ccid, store, dispatcher_ptr).await {
+                                Some(r) => r,
+                                None => watchdog_reset(&mut ccid).await,
+                            };
+                        match send_and_wipe(&mut ccid, &mut response, epoch).await {
                             Ok(()) => {
                                 for _ in 0..16 {
-                                    pico2hsm_firmware::transport::cdc_serial::drain_one(
+                                    if !pico2hsm_firmware::transport::cdc_serial::drain_one(
                                         &mut cdc_sender,
                                     )
-                                    .await;
+                                    .await
+                                    {
+                                        break;
+                                    }
                                 }
                             }
                             Err(CcidError::UsbDisconnected) => {
-                                let _ = APDU_CHANNEL.send(heapless::Vec::new()).await;
-                                cortex_m::asm::sev(); // wake core1 from WFE
-                                let _ = RESP_CHANNEL.receive().await;
+                                send_to_core1(heapless::Vec::new()).await;
+                                let _ = recv_core1_response(store, dispatcher_ptr).await;
                                 break;
                             }
-                            Err(_) => {}
+                            Err(e) => defmt::error!(
+                                "CCID: response not sent: {:?}",
+                                defmt::Debug2Format(&e)
+                            ),
                         }
                         board.led().set_status(LedStatus::Ready);
                     }
                     Err(CcidError::UsbDisconnected) => {
-                        let _ = APDU_CHANNEL.send(heapless::Vec::new()).await;
-                        cortex_m::asm::sev(); // wake core1 from WFE
-                        let _ = RESP_CHANNEL.receive().await;
+                        send_to_core1(heapless::Vec::new()).await;
+                        let _ = recv_core1_response(store, dispatcher_ptr).await;
                         board.led().set_status(LedStatus::Ready);
                         break;
                     }
@@ -1700,7 +1924,7 @@ fn init_sd_keystore(
     mosi: embassy_rp::Peri<'static, embassy_rp::peripherals::PIN_11>,
     miso: embassy_rp::Peri<'static, embassy_rp::peripherals::PIN_12>,
     cs_pin: embassy_rp::Peri<'static, embassy_rp::peripherals::PIN_15>,
-    smk: zeroize::Zeroizing<[u8; 32]>,
+    smk: Option<zeroize::Zeroizing<[u8; 32]>>,
 ) -> &'static mut pico2hsm_firmware::storage::BoardKeyStore {
     use embassy_rp::gpio::{Level, Output};
     use embassy_rp::spi::{Config as SpiConfig, Phase, Polarity, Spi};
@@ -1734,11 +1958,7 @@ fn init_sd_keystore(
         Mutex<
             CriticalSectionRawMutex,
             core::cell::RefCell<
-                embassy_rp::spi::Spi<
-                    'static,
-                    embassy_rp::peripherals::SPI1,
-                    embassy_rp::spi::Blocking,
-                >,
+                Spi<'static, embassy_rp::peripherals::SPI1, embassy_rp::spi::Blocking>,
             >,
         >,
     > = StaticCell::new();
@@ -1748,7 +1968,9 @@ fn init_sd_keystore(
         embassy_embedded_hal::shared_bus::blocking::spi::SpiDevice::new(spi1_bus_ref, sd_cs);
 
     // SD card probe — CMD0 warmup pre-transitions the card into SPI mode
-    // before embedded-sdmmc's acquire() sequence.
+    // before embedded-sdmmc's acquire() sequence.  Card identification can
+    // take seconds at 400 kHz: start it with a full watchdog period.
+    pico2hsm_firmware::watchdog::feed();
     let delay = embassy_time::Delay;
     let card = embedded_sdmmc::SdCard::new(spi_device, delay);
     {
@@ -1773,7 +1995,10 @@ fn init_sd_keystore(
             pico2hsm_firmware::storage::sdcard::SdCardFlash::from_initialized(card, capacity_bytes)
         }
         Err(_) => {
-            defmt::error!("SD card init FAILED — halting");
+            // Nothing feeds the watchdog here: it reboots the chip within
+            // ~8 s, which retries card detection (e.g. once a card is
+            // inserted).
+            defmt::error!("SD card init FAILED — waiting for the watchdog to retry");
             loop {
                 cortex_m::asm::wfi();
             }
@@ -1889,8 +2114,9 @@ async fn run_waveshare_lcd_board(p: embassy_rp::Peripherals) {
     // ── Storage initialisation ─────────────────────────────────────────────
 
     // Common: derive SMK from OTP.
-    let smk_bytes = pico2hsm_firmware::security::otp::derive_smk().unwrap_or([0u8; 32]);
-    let smk = zeroize::Zeroizing::new(smk_bytes);
+    // None on an unprovisioned release build: the keystore then refuses
+    // to store keys rather than use a public key (see otp::boot_storage_master_key).
+    let smk = pico2hsm_firmware::security::otp::boot_storage_master_key();
 
     // waveshare_rp2350_lcd_sdcard: single SD card keystore on SPI1.
     // Extracted to a separate function so SPI1 bus, SdCard driver, and
@@ -1954,6 +2180,8 @@ async fn run_waveshare_lcd_board(p: embassy_rp::Peripherals) {
         &mut control_buf,
     );
 
+    builder.handler(USB_SESSION_HANDLER.init(UsbSessionHandler));
+
     let mut ccid = CcidTransport::new(&mut builder);
 
     // CDC-ACM serial logger — /dev/ttyACMx for daemon diagnostics + debug.
@@ -1981,6 +2209,7 @@ async fn run_waveshare_lcd_board(p: embassy_rp::Peripherals) {
         pico2hsm_firmware::apdu::dispatcher::Dispatcher::init_in_place(DISPATCHER_CELL.uninit());
     {
         use pico2hsm_firmware::storage::KeyStore as _;
+        init_retry_counters(store);
         dispatcher_ref.load_keys_from_store(store);
     }
     KEY_COUNT.store(
@@ -2041,6 +2270,9 @@ async fn run_waveshare_lcd_board(p: embassy_rp::Peripherals) {
             loop {
                 match ccid.recv_apdu().await {
                     Ok(apdu_bytes) => {
+                        let epoch = ccid.apdu_epoch();
+                        pico2hsm_firmware::APDU_EPOCH
+                            .store(epoch, core::sync::atomic::Ordering::SeqCst);
                         let now = embassy_time::Instant::now();
                         if screensaver == ScreensaverState::Sleeping {
                             screensaver = ScreensaverState::Active;
@@ -2088,76 +2320,14 @@ async fn run_waveshare_lcd_board(p: embassy_rp::Peripherals) {
                         }
                         let apdu_ins = apdu_bytes.get(1).copied().unwrap_or(0);
                         let apdu_p1 = apdu_bytes.get(2).copied().unwrap_or(0);
-                        let _ = APDU_CHANNEL.send(apdu_bytes).await;
-                        cortex_m::asm::sev(); // wake core1 from WFE
-                                              // Wait for response with time-extension support.
-                        let response = {
-                            use embassy_futures::select::{select3, Either3};
-                            let mut stall_count: u32 = 0;
-                            let mut last_heartbeat =
-                                WATCHDOG_HEARTBEAT.load(core::sync::atomic::Ordering::Relaxed);
-                            loop {
-                                match select3(
-                                    RESP_CHANNEL.receive(),
-                                    embassy_time::Timer::after_millis(1500),
-                                    FLASH_REQ.receive(),
-                                )
-                                .await
-                                {
-                                    Either3::First(r) => break r,
-                                    Either3::Second(_) => {
-                                        let progress = CORE1_PROGRESS
-                                            .load(core::sync::atomic::Ordering::Relaxed);
-                                        let heartbeat = WATCHDOG_HEARTBEAT
-                                            .load(core::sync::atomic::Ordering::Relaxed);
-                                        let suppress = WATCHDOG_SUPPRESS
-                                            .load(core::sync::atomic::Ordering::Relaxed);
-                                        if suppress {
-                                            // RSA keygen (or similar long pure-compute op)
-                                            // disarms the stall detector; heartbeat stops
-                                            // bumping because no RNG calls happen during
-                                            // Miller–Rabin. Reset counter and keep sending
-                                            // time extensions until keygen completes.
-                                            stall_count = 0;
-                                            last_heartbeat = heartbeat;
-                                        } else if heartbeat == last_heartbeat {
-                                            stall_count += 1;
-                                            defmt::warn!("time ext: core1 progress={} heartbeat={} STALL {}/{}", progress, heartbeat, stall_count, WATCHDOG_STALL_LIMIT);
-                                            if stall_count >= WATCHDOG_STALL_LIMIT {
-                                                defmt::error!(
-                                                    "watchdog: core1 stuck — aborting APDU"
-                                                );
-                                                // Return SW 6F00 (internal error) to unblock the host.
-                                                let mut err_resp = heapless::Vec::<u8, 4098>::new();
-                                                let _ = err_resp.push(0x6F);
-                                                let _ = err_resp.push(0x00);
-                                                break err_resp;
-                                            }
-                                        } else {
-                                            stall_count = 0;
-                                            last_heartbeat = heartbeat;
-                                            defmt::warn!(
-                                                "time ext: core1 progress={} heartbeat={}",
-                                                progress,
-                                                heartbeat
-                                            );
-                                        }
-                                        if let Err(CcidError::UsbDisconnected) =
-                                            ccid.send_time_extension().await
-                                        {
-                                            let _ = RESP_CHANNEL.receive().await;
-                                            break heapless::Vec::new();
-                                        }
-                                    }
-                                    Either3::Third(op) => {
-                                        let result = handle_flash_op(op, store, dispatcher_ptr);
-                                        FLASH_RESP.send(result).await;
-                                        cortex_m::asm::sev(); // wake core1 from WFE
-                                    }
-                                }
-                            }
-                        };
-                        match ccid.send_response(&response).await {
+                        send_to_core1(apdu_bytes).await;
+                        // Wait for response with time-extension support.
+                        let mut response =
+                            match await_core1_response(&mut ccid, store, dispatcher_ptr).await {
+                                Some(r) => r,
+                                None => watchdog_reset(&mut ccid).await,
+                            };
+                        match send_and_wipe(&mut ccid, &mut response, epoch).await {
                             Ok(()) => {
                                 display_state.status = LedStatus::Ready;
                                 display_state.uptime_secs =
@@ -2248,26 +2418,30 @@ async fn run_waveshare_lcd_board(p: embassy_rp::Peripherals) {
                                     .await;
                                 }
                                 for _ in 0..16 {
-                                    pico2hsm_firmware::transport::cdc_serial::drain_one(
+                                    if !pico2hsm_firmware::transport::cdc_serial::drain_one(
                                         &mut cdc_sender,
                                     )
-                                    .await;
+                                    .await
+                                    {
+                                        break;
+                                    }
                                 }
                             }
                             Err(CcidError::UsbDisconnected) => {
-                                let _ = APDU_CHANNEL.send(heapless::Vec::new()).await;
-                                cortex_m::asm::sev(); // wake core1 from WFE
-                                let _ = RESP_CHANNEL.receive().await;
+                                send_to_core1(heapless::Vec::new()).await;
+                                let _ = recv_core1_response(store, dispatcher_ptr).await;
                                 display_state.status = LedStatus::Ready;
                                 break;
                             }
-                            Err(_) => {}
+                            Err(e) => defmt::error!(
+                                "CCID: response not sent: {:?}",
+                                defmt::Debug2Format(&e)
+                            ),
                         }
                     }
                     Err(CcidError::UsbDisconnected) => {
-                        let _ = APDU_CHANNEL.send(heapless::Vec::new()).await;
-                        cortex_m::asm::sev(); // wake core1 from WFE
-                        let _ = RESP_CHANNEL.receive().await;
+                        send_to_core1(heapless::Vec::new()).await;
+                        let _ = recv_core1_response(store, dispatcher_ptr).await;
                         display_state.status = LedStatus::Ready;
                         break;
                     }

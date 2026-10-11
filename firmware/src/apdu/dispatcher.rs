@@ -28,6 +28,10 @@ use pico2hsm_core::{
 
 use super::shared_buffer::SharedResponseBuffer;
 
+/// Most response data one CCID message carries: dwMaxCCIDMessageLength
+/// (4096) minus the 10-byte header and the 2-byte status word.
+pub const MAX_RESPONSE_DATA: usize = 4096 - 10 - 2;
+
 /// INS byte for GET RESPONSE (ISO 7816-4 §7.6.1).
 const INS_GET_RESPONSE: u8 = 0xC0;
 
@@ -82,10 +86,10 @@ impl Dispatcher {
     }
 
     /// Initialise a Dispatcher directly in the provided `MaybeUninit` slot,
-    /// avoiding an 82 KB stack temporary.
+    /// avoiding a ~36 KB stack temporary.
     ///
     /// In debug builds the compiler does not perform Named Return Value
-    /// Optimisation, so `Dispatcher::new()` would place the full ~82 KB
+    /// Optimisation, so `Dispatcher::new()` would place the full ~36 KB
     /// struct on the Core0 machine stack before `memcpy`-ing it to the
     /// destination.  With only ~113 KB of stack this overflows into BSS
     /// and corrupts wakers / async state.
@@ -133,39 +137,33 @@ impl Dispatcher {
     }
 
     /// Reset a live Dispatcher back to post-boot state **without** allocating
-    /// a full ~82 KB Dispatcher on the stack.
+    /// a full ~36 KB Dispatcher on the stack.
     ///
     /// Used by the Core1 dispatcher loop on USB-reconnect reset signals.
     /// In debug builds `Dispatcher::new()` (and therefore `*self = Self::new()`)
     /// materialises the entire struct on the Core1 stack before `memcpy`ing
     /// into place; on the 128 KB Core1 stack this risks silent overflow when
-    /// combined with the existing dispatch-chain temporaries.  See
-    /// `.claude/projects/-home-mcarey-pico2hsm/memory/dispatcher_stack_overflow.md`.
+    /// combined with the existing dispatch-chain temporaries.
     ///
-    /// This method rewrites each field directly through `addr_of_mut!` —
-    /// peak added stack usage is a few hundred bytes.  The caller is
-    /// responsible for reloading flash-backed keys afterwards via
-    /// `load_keys_from_store`; this method only resets in-memory state.
+    /// The old value is dropped in place first so that secret-bearing fields
+    /// (`DkekManager`, `PinState`, cached `KeyObject`s, the ephemeral exchange
+    /// key) run their zeroizing `Drop` impls — overwriting with `ptr::write`
+    /// alone would leave that material in SRAM.  The fresh state is then
+    /// written field-by-field via `init_in_place`, so peak added stack usage
+    /// stays at a few hundred bytes.
     ///
-    /// All fields are trivially-droppable (enums, `heapless::Vec` with inline
-    /// storage, fixed arrays), so overwriting them with `ptr::write` does
-    /// not leak anything.
+    /// The caller is responsible for reloading flash-backed keys afterwards
+    /// via `load_keys_from_store`; this method only resets in-memory state.
     #[inline(never)]
     pub fn reset_in_place(&mut self) {
         let ptr: *mut Self = self;
+        // SAFETY: `self` is a valid, initialised Dispatcher.  After
+        // `drop_in_place` the memory is logically uninitialised, and
+        // `init_in_place` fully re-initialises every field before `self` is
+        // used again.  None of the Drop impls or init helpers panic.
         unsafe {
-            core::ptr::addr_of_mut!((*ptr).active).write(ActiveProtocol::None);
-            ScHsm::init_in_place(core::ptr::addr_of_mut!((*ptr).sc_hsm));
-            Piv::init_in_place(core::ptr::addr_of_mut!((*ptr).piv));
-            Self::init_openpgp_in_place(core::ptr::addr_of_mut!((*ptr).openpgp));
-            {
-                let sb = core::ptr::addr_of_mut!((*ptr).shared_buf);
-                core::ptr::addr_of_mut!((*sb).data).write_bytes(0u8, 1);
-                core::ptr::addr_of_mut!((*sb).len).write(0);
-                core::ptr::addr_of_mut!((*sb).offset).write(0);
-                core::ptr::addr_of_mut!((*sb).state)
-                    .write(crate::apdu::shared_buffer::SharedBufState::Empty);
-            }
+            core::ptr::drop_in_place(ptr);
+            Self::init_in_place(&mut *ptr.cast::<core::mem::MaybeUninit<Self>>());
         }
     }
 
@@ -186,9 +184,19 @@ impl Dispatcher {
     /// preventing core0 stack overflow on display boards.
     #[inline(never)]
     pub fn load_keys_from_store(&mut self, store: &mut dyn crate::storage::KeyStore) {
-        let mut sc_hsm_ids: heapless::Vec<pico2hsm_core::key::KeyId, 64> = heapless::Vec::new();
+        // Room for every SC-HSM object the directory can hold (~1.4 KB of
+        // core0 stack); a 64-entry list silently skipped the rest.
+        let mut sc_hsm_ids: Vec<
+            pico2hsm_core::key::KeyId,
+            { crate::protocol::sc_hsm::MAX_KEY_INDEX },
+        > = Vec::new();
         store.for_each_key(&mut |kid| {
-            if kid.applet_byte() == 0 && kid.proto_ref() != 0xFF {
+            // Skip firmware records that are not keys: PIN record (0xFF),
+            // persisted DKEK (0xFD) and enrolled peer key (0xFC).  The
+            // device identity key (0xFE) is a real key and stays listed.
+            let is_ef = (kid.0 >> 8) & 0xFF != 0;
+            let record = !is_ef && matches!(kid.proto_ref(), 0xFC | 0xFD | 0xFF);
+            if kid.applet_byte() == 0 && !record {
                 let _ = sc_hsm_ids.push(kid);
             }
         });
@@ -218,6 +226,48 @@ impl Dispatcher {
         self.openpgp.load_from_store(store);
         ScHsm::load_pin_state_from_store(&mut self.sc_hsm.state, store);
         ScHsm::load_peer_pubkey_from_store(&mut self.sc_hsm.state, store);
+        ScHsm::load_dkek_from_store(&mut self.sc_hsm.state, store);
+    }
+
+    /// One-time migration of the PIN/PUK retry counts into the retry-counter
+    /// log (`storage::retry_counter`).  Boot only, on core0, before
+    /// [`Self::load_keys_from_store`].  `Ok(true)` if it ran.
+    ///
+    /// If the log is unformatted (first boot after the upgrade, or a blank
+    /// device), it is seeded from the counts in the applets' PIN records and
+    /// committed in one step; then those counts are zeroed in the records,
+    /// so no record ever again holds a usable count.  Until the commit
+    /// succeeds nothing changes on flash, every credential loads blocked
+    /// (the log is unreadable) and the migration runs again at the next
+    /// boot.  A failure while zeroing only leaves a legacy count behind,
+    /// which the log overrides.
+    #[inline(never)]
+    pub fn migrate_retry_counters(
+        store: &mut dyn crate::storage::KeyStore,
+    ) -> Result<bool, pico2hsm_core::error::HsmError> {
+        use crate::storage::retry_counter::{CounterState, Credential};
+        use pico2hsm_core::error::{HsmError, StorageError};
+
+        if !store
+            .retry_counters()
+            .is_some_and(|log| log.needs_migration())
+        {
+            return Ok(false);
+        }
+        let mut seeds: Vec<(Credential, CounterState), 8> = Vec::new();
+        ScHsm::legacy_retry_seeds(store, &mut seeds)?;
+        #[cfg(feature = "applet-piv")]
+        Piv::legacy_retry_seeds(store, &mut seeds)?;
+        OpenPgp::legacy_retry_seeds(store, &mut seeds)?;
+        store
+            .retry_counters()
+            .ok_or(HsmError::Storage(StorageError::NotFormatted))?
+            .format(&seeds)?;
+        ScHsm::clear_legacy_retry_counts(store)?;
+        #[cfg(feature = "applet-piv")]
+        Piv::clear_legacy_retry_counts(store)?;
+        OpenPgp::clear_legacy_retry_counts(store)?;
+        Ok(true)
     }
 
     /// Dispatch a raw APDU byte slice with access to persistent storage.
@@ -230,14 +280,9 @@ impl Dispatcher {
         store: &mut dyn crate::storage::KeyStore,
     ) -> Vec<u8, 4098> {
         // Parse the APDU
-        let cmd = match pico2hsm_core::apdu::ApduCommand::parse(raw_apdu) {
+        let cmd = match ApduCommand::parse(raw_apdu) {
             Ok(c) => c,
-            Err(_) => {
-                return pico2hsm_core::apdu::ApduResponse::err(
-                    pico2hsm_core::apdu::SW_INS_NOT_SUPPORTED,
-                )
-                .serialize()
-            }
+            Err(_) => return ApduResponse::err(SW_INS_NOT_SUPPORTED).serialize(),
         };
 
         // Intercept SELECT by AID before forwarding.
@@ -262,12 +307,7 @@ impl Dispatcher {
             ActiveProtocol::ScHsm => self.sc_hsm.process_apdu_with_store(raw_apdu, store),
             ActiveProtocol::Piv => self.piv.process_apdu_with_store(raw_apdu, store),
             ActiveProtocol::OpenPgp => self.openpgp.process_apdu_with_store(raw_apdu, store),
-            ActiveProtocol::None => {
-                return pico2hsm_core::apdu::ApduResponse::err(
-                    pico2hsm_core::apdu::SW_INS_NOT_SUPPORTED,
-                )
-                .serialize()
-            }
+            ActiveProtocol::None => return ApduResponse::err(SW_INS_NOT_SUPPORTED).serialize(),
         };
 
         // Apply Le-truncation with GET RESPONSE chaining.
@@ -310,7 +350,7 @@ impl Dispatcher {
         self.shared_buf.clear_if_not_get_response();
 
         // Forward to the active protocol.
-        let raw_resp: Vec<u8, 4096> = match self.active {
+        let raw_resp: Vec<u8, 4098> = match self.active {
             ActiveProtocol::ScHsm => self.sc_hsm.process_apdu(raw_apdu),
             ActiveProtocol::Piv => self.piv.process_apdu(raw_apdu),
             ActiveProtocol::OpenPgp => self.openpgp.process_apdu(raw_apdu),
@@ -326,10 +366,12 @@ impl Dispatcher {
 
     /// Handle GET RESPONSE (INS=0xC0): serve the next chunk from `shared_buf`.
     fn handle_get_response(&mut self, le: Option<u16>) -> ApduResponse {
+        // Capped like every response (see MAX_RESPONSE_DATA).  The parser
+        // already turns a short Le=00 into 256, so 0 here is an extended
+        // Le=0000: as much as fits.
         let max_len = match le {
-            None => 4096,   // no Le — return all remaining
-            Some(0) => 256, // short APDU Le=0x00 → 256
-            Some(n) => n as usize,
+            None | Some(0) => MAX_RESPONSE_DATA,
+            Some(n) => (n as usize).min(MAX_RESPONSE_DATA),
         };
         match self.shared_buf.get_response_chunk(max_len) {
             Some((chunk, more)) => {
@@ -354,7 +396,7 @@ impl Dispatcher {
     /// and the truncated response is returned with SW=0x61xx.
     ///
     /// `raw_resp` is the serialized response from the protocol (data + SW1 + SW2).
-    fn apply_le_truncation(&mut self, raw_resp: Vec<u8, 4096>, le: Option<u16>) -> Vec<u8, 4098> {
+    fn apply_le_truncation(&mut self, raw_resp: Vec<u8, 4098>, le: Option<u16>) -> Vec<u8, 4098> {
         // Deserialize: last 2 bytes are SW, rest is data.
         if raw_resp.len() < 2 {
             let mut out: Vec<u8, 4098> = Vec::new();
@@ -371,22 +413,15 @@ impl Dispatcher {
             return out;
         }
 
+        // Never more data than one CCID message can carry: the descriptor
+        // advertises dwMaxCCIDMessageLength 4096 (10-byte header + data +
+        // SW).  Larger responses used to overflow the transport buffer and
+        // were dropped, leaving the host waiting; the rest is now chained
+        // with 61xx / GET RESPONSE, even when the host asked for "all".
         let le_val = match le {
-            None => {
-                // No Le — no truncation.
-                let mut out: Vec<u8, 4098> = Vec::new();
-                let _ = out.extend_from_slice(&raw_resp);
-                return out;
-            }
-            Some(0) => {
-                // Extended APDUs: Le=0x0000 stored as 0, meaning 65536 — don't truncate.
-                // Short APDUs: Le=0x00 is pre-resolved to 256 by parser.
-                // If we get 0 here it's from extended APDU → return all.
-                let mut out: Vec<u8, 4098> = Vec::new();
-                let _ = out.extend_from_slice(&raw_resp);
-                return out;
-            }
-            Some(n) => n as usize,
+            // No Le, or extended Le = 0x0000 (65536): as much as fits.
+            None | Some(0) => MAX_RESPONSE_DATA,
+            Some(n) => (n as usize).min(MAX_RESPONSE_DATA),
         };
 
         if data_len <= le_val {
@@ -407,6 +442,40 @@ impl Dispatcher {
         let _ = out.push((sw_chained >> 8) as u8);
         let _ = out.push((sw_chained & 0xFF) as u8);
         out
+    }
+
+    /// End the host session: drop every applet's authentication state and the
+    /// selection, as a real card does on reset / power cycle.  Keys and
+    /// persisted state are untouched (no reload needed).
+    pub fn clear_session(&mut self) {
+        self.active = ActiveProtocol::None;
+        self.shared_buf.invalidate();
+        let sc = &mut self.sc_hsm.state;
+        sc.pin_verified = false;
+        sc.so_pin_verified = false;
+        sc.session_pin = None;
+        sc.challenge = None;
+        sc.current_key_id = None;
+        sc.current_algo = None;
+        sc.current_se_op = None;
+        sc.exchange_ephem_priv = None;
+        sc.exchange_ephem_pub = None;
+        sc.exchange_challenge = None;
+        sc.exchange_peer_ephem_pub = None;
+        sc.op_buf.invalidate();
+        #[cfg(feature = "applet-piv")]
+        {
+            let piv = &mut self.piv.state;
+            piv.pin_verified = false;
+            piv.pin_always_ok = false;
+            piv.pin_state.session_authenticated = false;
+            piv.mgmt_key_authenticated = false;
+            piv.mgmt_challenge = None;
+        }
+        let pgp = &mut self.openpgp.state;
+        pgp.pw1_verified_sign = false;
+        pgp.pw1_verified_other = false;
+        pgp.pw3_verified = false;
     }
 
     /// Route a SELECT-by-AID command and return the appropriate FCI response.
@@ -430,6 +499,7 @@ impl Dispatcher {
             #[cfg(feature = "applet-piv")]
             {
                 self.piv.state.pin_verified = false;
+                self.piv.state.pin_always_ok = false;
                 self.piv.state.mgmt_key_authenticated = false;
                 self.piv.state.mgmt_challenge = None;
             }
@@ -610,7 +680,7 @@ fn build_piv_fci() -> ApduResponse {
 ///   A5 xx
 ///     9F6E 04 03 04 00 00   — version 3.4
 /// ```
-fn build_openpgp_fci(openpgp: &mut crate::protocol::openpgp::OpenPgp) -> ApduResponse {
+fn build_openpgp_fci(openpgp: &mut OpenPgp) -> ApduResponse {
     use crate::protocol::openpgp::OPENPGP_AID;
 
     openpgp.state.reset_security_state();
@@ -637,4 +707,74 @@ fn build_openpgp_fci(openpgp: &mut crate::protocol::openpgp::OpenPgp) -> ApduRes
     let _ = fci.extend_from_slice(version);
 
     ApduResponse::ok(&fci)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reset_in_place_zeroizes_dkek() {
+        let mut slot = core::mem::MaybeUninit::<Dispatcher>::uninit();
+        let d = Dispatcher::init_in_place(&mut slot);
+        let pattern = [0xA5u8; 32];
+        d.sc_hsm.state.dkek.set_dkek_direct(&pattern);
+        assert!(d.sc_hsm.state.dkek.is_ready());
+
+        d.reset_in_place();
+
+        assert!(!d.sc_hsm.state.dkek.is_ready());
+        // The old DKEK bytes must not survive anywhere in the struct.
+        let bytes = unsafe {
+            core::slice::from_raw_parts(
+                (d as *const Dispatcher).cast::<u8>(),
+                core::mem::size_of::<Dispatcher>(),
+            )
+        };
+        assert!(!bytes.windows(32).any(|w| w == pattern));
+    }
+
+    #[test]
+    fn oversized_response_is_chained_not_dropped() {
+        let mut slot = core::mem::MaybeUninit::<Dispatcher>::uninit();
+        let d = Dispatcher::init_in_place(&mut slot);
+        let mut raw: Vec<u8, 4098> = Vec::new();
+        raw.resize(4096, 0xAB).unwrap();
+        raw.extend_from_slice(&[0x90, 0x00]).unwrap();
+        for le in [None, Some(0)] {
+            let out = d.apply_le_truncation(raw.clone(), le);
+            assert_eq!(out.len(), MAX_RESPONSE_DATA + 2, "fits one CCID message");
+            assert_eq!(
+                &out[out.len() - 2..],
+                &[0x61, 12],
+                "12 bytes left for GET RESPONSE"
+            );
+        }
+    }
+
+    #[test]
+    fn clear_session_drops_all_authentication() {
+        let mut slot = core::mem::MaybeUninit::<Dispatcher>::uninit();
+        let d = Dispatcher::init_in_place(&mut slot);
+        d.active = ActiveProtocol::ScHsm;
+        d.sc_hsm.state.pin_verified = true;
+        d.sc_hsm.state.so_pin_verified = true;
+        d.sc_hsm.state.session_pin = Some([1; 8]);
+        #[cfg(feature = "applet-piv")]
+        {
+            d.piv.state.pin_verified = true;
+            d.piv.state.mgmt_key_authenticated = true;
+        }
+        d.openpgp.state.pw1_verified_sign = true;
+        d.openpgp.state.pw3_verified = true;
+
+        d.clear_session();
+
+        assert_eq!(d.active, ActiveProtocol::None);
+        assert!(!d.sc_hsm.state.pin_verified && !d.sc_hsm.state.so_pin_verified);
+        assert!(d.sc_hsm.state.session_pin.is_none());
+        #[cfg(feature = "applet-piv")]
+        assert!(!d.piv.state.pin_verified && !d.piv.state.mgmt_key_authenticated);
+        assert!(!d.openpgp.state.pw1_verified_sign && !d.openpgp.state.pw3_verified);
+    }
 }

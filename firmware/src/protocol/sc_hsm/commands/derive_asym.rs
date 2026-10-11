@@ -1,8 +1,8 @@
-//! DERIVE ASYMMETRIC KEY command handler (INS = 0x62, P1 = 0x01).
+//! DERIVE ASYMMETRIC KEY command handler (INS = 0x62, P1 = 0x01, P2 = 0x00).
 //!
-//! Note: INS=0x62 is shared with DECIPHER. The P1 byte distinguishes:
-//! - P1=0x00 (default): Decipher → decrypt.rs handler
-//! - P1=0x01: Derive asymmetric key → this handler
+//! Note: INS=0x62 is shared with DECIPHER. Routing (in `ScHsm`) needs both
+//! bytes: P1=0x01 **and** P2=0x00 → this handler; anything else → DECIPHER
+//! (decrypt.rs), whose P1 is the key slot and P2 a non-zero algorithm code.
 //!
 //! Derives a new asymmetric key pair from a stored master key using
 //! a KDF-based deterministic derivation (X9.63 or HKDF).
@@ -50,15 +50,23 @@ pub fn handle(
     };
 
     // Load key material from flash
-    let key_obj = match store.fetch_key(pico2hsm_core::key::KeyId(full_key_id)) {
+    let mut key_obj = match store.fetch_key(pico2hsm_core::key::KeyId(full_key_id)) {
         Ok(Some(obj)) => obj,
         _ => return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
     };
 
     // Use private_key bytes (works for both EC and symmetric keys)
-    let mut key_bytes: heapless::Vec<u8, 66> = heapless::Vec::new();
+    let mut key_bytes = crate::security::zeroize::WipeOnDrop::<66>::new();
     if key_bytes.extend_from_slice(&key_obj.private_key).is_err() {
         return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED);
+    }
+
+    // HKDF output from a stored key has no SmartCard-HSM algorithm ID
+    // (CardContact's EC derive stores a new key, AES derive uses its own
+    // KDF): only a key without an algorithm list may be used; the use
+    // counter applies.
+    if let Err(sw) = crate::security::key_policy::authorize_use(store, &mut key_obj, None) {
+        return ApduResponse::err(sw);
     }
 
     let mut output = [0u8; 32];

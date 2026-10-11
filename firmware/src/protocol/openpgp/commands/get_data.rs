@@ -137,23 +137,36 @@ pub fn handle(state: &mut OpenPgpState, cmd: &ApduCommand<'_>) -> ApduResponse {
         // 7F21 — Cardholder Certificate (AUT key cert)
         0x7F21 => ApduResponse::ok(&state.cardholder_cert),
 
+        // 7F74 — General Feature Management (§4.1.3.2): 81 01 <features>.
+        // No display, biometric sensor, button, keypad, LED, loudspeaker,
+        // microphone or touchscreen is used by this application, so all
+        // bits are 0 — in particular no button for user interaction.
+        0x7F74 => ApduResponse::ok(&GENERAL_FEATURES),
+
+        // D6/D7/D8 — User Interaction Flags: not supported (no button);
+        // they fall through to 6A88 below, as for a card without UIF.
         _ => ApduResponse::err(SW_DO_NOT_FOUND),
     }
 }
 
+/// DO 7F74 content: `81 01 00` — no user-interaction hardware.
+const GENERAL_FEATURES: [u8; 3] = [0x81, 0x01, 0x00];
+
 /// Extended Capabilities (DO C0) — 10 bytes.
 fn extended_capabilities() -> [u8; 10] {
-    // Byte 0: feature flags (OpenPGP Card spec §4.4.3.7)
-    //   bit 0 (0x01) = Secure Messaging supported — NO
-    //   bit 1 (0x02) = GET CHALLENGE supports extended length — NO
-    //   bit 2 (0x04) = Algorithm attributes changeable — YES
-    //   bit 3 (0x08) = Private DOs supported — NO
-    //   bit 4 (0x10) = Key import (PUT DATA) supported — YES
-    //   bit 5 (0x20) = GET CHALLENGE (redundant with bit 6) — NO
-    //   bit 6 (0x40) = GET CHALLENGE supported — YES
-    //   bit 7 (0x80) = Secure Messaging using AES — NO
-    let byte0: u8 = 0x54; // ALG_ATTR_CHANGEABLE (0x04) | KEY_IMPORT (0x10) | GET_CHALLENGE (0x40)
-                          // Byte 1: 0x00 (no SM, no MSE, no PIN block 2)
+    // Byte 0: feature flags (OpenPGP Card 3.4 §4.4.3.7; as GnuPG reads them)
+    //   0x80 = Secure Messaging — NO
+    //   0x40 = GET CHALLENGE — YES
+    //   0x20 = Key import (PUT DATA 3FFF / 4D) — NO (not implemented)
+    //   0x10 = PW1 status byte changeable — YES (PUT DATA C4, PW3)
+    //   0x08 = Private DOs — NO
+    //   0x04 = Algorithm attributes changeable — YES
+    //   0x02 = PSO:DEC/ENC with AES — NO
+    //   0x01 = KDF-DO — NO
+    // (0x10 was advertised once by mistake under the name "key import",
+    // then cleared while C4 was read-only; it is now true.)
+    let byte0: u8 = 0x54;
+    // Byte 1: 0x00 (no SM, no MSE, no PIN block 2)
     let byte1: u8 = 0x00;
     // Bytes 2-3: max GET CHALLENGE length = 0x00FF (255 bytes)
     // Bytes 4-5: max certificate length = 0x0400 (1024 bytes, per cardholder_cert field size)
@@ -165,7 +178,7 @@ fn extended_capabilities() -> [u8; 10] {
 /// PW Status Bytes (DO C4) — 7 bytes.
 fn pw_status_bytes(state: &OpenPgpState) -> [u8; 7] {
     [
-        0x00,              // format: UTF-8 PINs
+        state.pw1_status,  // 00: PW1 valid for one PSO:CDS, 01: several
         0x7F,              // max PW1 length (127)
         0x7F,              // max Reset Code length (127)
         0x7F,              // max PW3 length (127)
@@ -288,6 +301,10 @@ fn build_application_related(state: &OpenPgpState) -> ApduResponse {
     let _ = content.push(0x52);
     let _ = content.push(hist_bytes.len() as u8);
     let _ = content.extend_from_slice(hist_bytes);
+
+    // 7F74 — General Feature Management: no button (nor other UI device).
+    let _ = content.extend_from_slice(&[0x7F, 0x74, GENERAL_FEATURES.len() as u8]);
+    let _ = content.extend_from_slice(&GENERAL_FEATURES);
 
     // 73 — Discretionary DOs
     let _ = content.push(0x73);

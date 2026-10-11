@@ -24,6 +24,9 @@ test = false
 
 [features]
 default = ["rp2350_one_4m", "rsa", "applet-piv", "applet-openpgp-curve25519"]
+# Let a release build use the fixed (public) development storage key on an
+# unprovisioned device.  Debug builds always allow it.  NEVER for deployment.
+insecure-dev-keystore = []
 rp2350_one_4m = ["uart-debug"]
 rp2350_geek_16m = ["uart-debug"]
 rp2350_geek_sdcard = ["uart-debug"]
@@ -81,6 +84,8 @@ k256 = { version = "0.13", default-features = false, features = ["ecdsa", "ecdh"
 
 # ECC trait crates — versions match those re-exported by p256/p384/p521/k256
 ecdsa = { version = "0.16", default-features = false, features = ["hazmat", "der"] }
+# RFC 6979 HMAC-DRBG for P-521 nonces (already a transitive dependency).
+rfc6979 = { version = "0.4", default-features = false }
 elliptic-curve = { version = "0.13", default-features = false, features = ["arithmetic", "sec1", "ecdh"] }
 rand_core = { version = "0.6", default-features = false }
 

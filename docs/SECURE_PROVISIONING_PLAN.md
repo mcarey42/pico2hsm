@@ -39,7 +39,7 @@ for flag registers.
 | `0x4B–0x4D` | BOOT_FLAGS1 (RBIT-3) | KEY_INVALID flags for boot key slots | Provisioning | Yes — write-lock | CONFIRMED (pico-sdk, rp-pac 7.0.0) |
 | `0x80–0x8F` | BOOTKEY0 (ECC) | SHA-256 hash of secp256k1 boot signing public key (32 bytes = 16 ECC rows) | Key provisioning | Yes — write-lock | CONFIRMED (pico-sdk, rp-pac 7.0.0) |
 | `0x100–0x11F` | pico2hsm storage key material (32 ECC rows = 64 bytes) | IKM for HKDF-SHA256 that derives the Storage Master Key (SMK). Per-device random bytes written once at provisioning. | Factory provisioning | Yes — read-lock + write-lock | CONFIRMED (defined in `security/otp.rs` `OTP_STORAGE_KEY_ROW_START = 0x100`) |
-| `0x110` | pico2hsm boot flags | bit 0 = JTAG_DISABLED (user-land record); bit 1 = PRODUCTION_MODE; bit 2 = PROVISIONED | After production mode set | Yes — write-lock after setting | CONFIRMED (defined in `security/otp.rs` `OTP_BOOT_FLAGS_ROW = 0x110`) |
+| `0x140` | pico2hsm boot flags | bit 0 = JTAG_DISABLED (user-land record); bit 1 = PRODUCTION_MODE; bit 2 = PROVISIONED | After production mode set | Yes — write-lock after setting | CONFIRMED (`security/otp_layout.rs` `BOOT_FLAGS_ROW = 0x140`; was 0x110, inside the IKM rows, before 2026-10) |
 | `0x120–0x12F` | Device identity key (16 ECC rows = 32 bytes) | Static Ed25519 device identity key for Noise_XX authentication (pico2hsm DKEK exchange protocol) | Factory provisioning | Yes — read-lock + write-lock | CONFIRMED (defined in `security/otp.rs` `OTP_DEVICE_ID_KEY_ROW_START = 0x120`) |
 | `0x130–0x137` | Device serial / unique ID (8 ECC rows = 16 bytes) | Per-device serial number used as HKDF `info` parameter in SMK derivation; provides key diversity across identical boards | Factory provisioning | Yes — write-lock (can remain readable) | ESTIMATED — row range chosen to fit in page 1; TBD by TRM |
 | `0x140–0x14F` | (Reserved for future expansion) | Spare rows for additional per-device data | — | — | TBD |
@@ -169,7 +169,7 @@ rp-pac 7.0.0, and the Raspberry Pi `rp2350_hacking_challenge/lock_chip.sh`.
   are all in CRIT1 (rows 0x40–0x47).
 
 The firmware's `disable_jtag_permanent()` function in `security/boot.rs` sets
-bit 0 of OTP row `0x110` — this is the **pico2hsm user-land bookkeeping flag**,
+bit 0 of OTP row `0x140` — this is the **pico2hsm user-land bookkeeping flag**,
 not the hardware JTAG fuse.
 
 ### 4.2 Timing in Provisioning Sequence
@@ -184,12 +184,12 @@ The recommended sequence is:
 1. Flash signed firmware
 2. Program all OTP key rows
 3. `picotool otp set OTP_DATA_CRIT1.SECURE_BOOT_ENABLE 1`
-4. Set PRODUCTION_MODE (pico2hsm OTP row 0x110 via firmware APDU)
+4. Set PRODUCTION_MODE (pico2hsm OTP row 0x140 via firmware APDU)
 5. **`picotool otp set OTP_DATA_CRIT1.DEBUG_DISABLE 1`** — point of no return
 6. `picotool otp set OTP_DATA_CRIT1.SECURE_DEBUG_DISABLE 1`
 7. `picotool otp set OTP_DATA_CRIT1.GLITCH_DETECTOR_ENABLE 1`
 8. `picotool otp set OTP_DATA_CRIT1.GLITCH_DETECTOR_SENS 3`
-9. Firmware sets bookkeeping flag (row 0x110 bit 0) at next boot
+9. Firmware sets bookkeeping flag (row 0x140 bit 0) at next boot
 
 ### 4.3 Point of No Return
 
@@ -208,7 +208,7 @@ for reliable RBIT-8 programming.
 
 The firmware does NOT write CRIT1 at runtime. The INS=0xF3 provisioning APDU is
 disabled (returns SW 6D00) because single-row writes cannot reliably program
-RBIT-8 fields. The firmware only sets the bookkeeping flag in row 0x110.
+RBIT-8 fields. The firmware only sets the bookkeeping flag in row 0x140.
 
 ---
 
@@ -283,7 +283,7 @@ to the device via SWD probe) must:
 4. Generate a device serial (16 bytes)
 5. Write serial to OTP rows `0x130–0x137`
 6. Write the boot signing public key hash to BOOTKEY0 (rows `0x80–0x8F`)
-7. Write PRODUCTION_MODE + PROVISIONED flags to row `0x110`
+7. Write PRODUCTION_MODE + PROVISIONED flags to row `0x140`
 8. `picotool otp set OTP_DATA_CRIT1.SECURE_BOOT_ENABLE 1`
 9. `picotool otp set OTP_DATA_CRIT1.DEBUG_DISABLE 1` (point of no return)
 10. `picotool otp set OTP_DATA_CRIT1.GLITCH_DETECTOR_ENABLE 1`
@@ -432,7 +432,7 @@ steps marked **[IRREVERSIBLE]** cannot be undone.
    - Read back and verify
    - Point of no return: signing key is now bound to this device
 
-7. **Set PRODUCTION_MODE flag in pico2hsm boot flags row (OTP row 0x110)** [IRREVERSIBLE]
+7. **Set PRODUCTION_MODE flag in pico2hsm boot flags row (OTP row 0x140)** [IRREVERSIBLE]
    - Call `Otp::set_production_mode()` via a provisioning APDU or provisioning firmware
    - This sets bits 1 (PRODUCTION_MODE) and 2 (PROVISIONED) simultaneously
    - After this step, the firmware will reject debug APDUs and will require signed operation
@@ -462,7 +462,7 @@ steps marked **[IRREVERSIBLE]** cannot be undone.
     - **This is the final, absolute point of no return. After this step, no debugger
       can ever connect to this device again.**
 
-11. **Set pico2hsm JTAG_DISABLED bookkeeping flag (OTP row 0x110 bit 0)** [IRREVERSIBLE]
+11. **Set pico2hsm JTAG_DISABLED bookkeeping flag (OTP row 0x140 bit 0)** [IRREVERSIBLE]
     - Records that hardware JTAG lockdown was performed
     - The firmware's `disable_jtag_permanent()` / `security_checks()` uses this to
       confirm the device is in the expected post-provisioning state

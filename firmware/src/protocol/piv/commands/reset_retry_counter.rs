@@ -27,19 +27,6 @@ fn sw_retry(remaining: u8) -> u16 {
     0x63C0 | (remaining as u16 & 0x0F)
 }
 
-/// Handle RESET RETRY COUNTER and persist updated PIN state to flash.
-pub fn handle_with_store(
-    state: &mut PivState,
-    store: &mut dyn crate::storage::KeyStore,
-    cmd: &ApduCommand<'_>,
-) -> ApduResponse {
-    let resp = handle(state, cmd);
-    if resp.sw == 0x9000 {
-        crate::protocol::piv::Piv::save_pin_to_store(state, store);
-    }
-    resp
-}
-
 /// Handle a RESET RETRY COUNTER APDU command.
 pub fn handle(state: &mut PivState, cmd: &ApduCommand<'_>) -> ApduResponse {
     if cmd.p1 != 0x00 {
@@ -55,6 +42,10 @@ pub fn handle(state: &mut PivState, cmd: &ApduCommand<'_>) -> ApduResponse {
         return ApduResponse::err(0x6700); // wrong length
     }
 
+    // A non-digit PIN would be stored and could never be verified.
+    if !super::change_reference_data::valid_new_pin(&cmd.data[8..16]) {
+        return ApduResponse::err(0x6A80);
+    }
     let puk = strip_pin_padding(&cmd.data[..8]);
     let new_pin = strip_pin_padding(&cmd.data[8..16]);
 
@@ -90,7 +81,7 @@ pub fn handle(state: &mut PivState, cmd: &ApduCommand<'_>) -> ApduResponse {
 fn fill_random_bytes(buf: &mut [u8]) {
     #[cfg(target_arch = "arm")]
     {
-        let _ = crate::crypto::rng::fill_random(buf);
+        crate::crypto::rng::fill_or_reset(buf);
     }
     #[cfg(not(target_arch = "arm"))]
     {

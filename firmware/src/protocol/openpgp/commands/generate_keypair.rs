@@ -144,9 +144,7 @@ pub fn handle(state: &mut OpenPgpState, cmd: &ApduCommand<'_>) -> ApduResponse {
             // have &mut state above; the borrow checker can't see through
             // the raw-pointer indirection but we know the slots are disjoint.)
             unsafe {
-                let mut priv_vec: heapless::Vec<u8, 66> = heapless::Vec::new();
-                let _ = priv_vec.extend_from_slice(&pair.private_key);
-                *priv_slot = Some(priv_vec);
+                crate::protocol::openpgp::set_key(&mut *priv_slot, &pair.private_key);
 
                 let mut pub_vec: heapless::Vec<u8, 133> = heapless::Vec::new();
                 let _ = pub_vec.extend_from_slice(&pair.public_key);
@@ -179,6 +177,25 @@ pub fn handle_with_store(
     store: &mut dyn crate::storage::KeyStore,
     cmd: &ApduCommand<'_>,
 ) -> ApduResponse {
+    // The slot's current key, so a failed save can put it back: flash
+    // still holds it, and RAM must match (it came back after a reboot).
+    let mut old_priv = crate::security::zeroize::WipeOnDrop::<66>::new();
+    let mut old_pub: Option<heapless::Vec<u8, 133>> = None;
+    let mut old_type = None;
+    if cmd.p1 == 0x80 {
+        let slot = match cmd.data.first() {
+            Some(0xB6) => Some((&state.sig_private, &state.sig_public, state.sig_key_type)),
+            Some(0xB8) => Some((&state.dec_private, &state.dec_public, state.dec_key_type)),
+            Some(0xA4) => Some((&state.auth_private, &state.auth_public, state.auth_key_type)),
+            _ => None,
+        };
+        if let Some((Some(pr), pu, kt)) = slot {
+            let _ = old_priv.0.extend_from_slice(pr);
+            old_pub = pu.clone();
+            old_type = kt;
+        }
+    }
+
     let resp = handle(state, cmd);
 
     // Only persist new key generation (P1=0x80) on success.
@@ -186,7 +203,7 @@ pub fn handle_with_store(
         return resp;
     }
 
-    if cmd.data.len() < 1 {
+    if cmd.data.is_empty() {
         return resp;
     }
     let crt_tag = cmd.data[0];
@@ -255,10 +272,38 @@ pub fn handle_with_store(
         timestamp_ms: 0,
         private_key: heapless::Vec::new(),
         public_key: heapless::Vec::new(),
+        policy: Default::default(),
     };
     let _ = obj.private_key.extend_from_slice(priv_bytes);
     let _ = obj.public_key.extend_from_slice(pub_bytes);
-    let _ = store.save_key(&obj);
+    if store.save_key(&obj).is_err() {
+        // The new key exists only in RAM: put back what flash still holds.
+        let (private, public, kt) = match slot {
+            SLOT_SIG => (
+                &mut state.sig_private,
+                &mut state.sig_public,
+                &mut state.sig_key_type,
+            ),
+            SLOT_DEC => (
+                &mut state.dec_private,
+                &mut state.dec_public,
+                &mut state.dec_key_type,
+            ),
+            _ => (
+                &mut state.auth_private,
+                &mut state.auth_public,
+                &mut state.auth_key_type,
+            ),
+        };
+        if old_priv.0.is_empty() {
+            crate::protocol::openpgp::wipe_key(private);
+        } else {
+            crate::protocol::openpgp::set_key(private, &old_priv.0);
+        }
+        *public = old_pub;
+        *kt = old_type;
+        return ApduResponse::err(pico2hsm_core::apdu::SW_MEMORY_FAILURE);
+    }
 
     resp
 }

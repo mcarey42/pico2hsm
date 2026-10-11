@@ -37,6 +37,16 @@ pub fn handle(state: &PivState, cmd: &ApduCommand<'_>) -> ApduResponse {
 
     let tag = &data[2..2 + tag_len];
 
+    // A stored object wins over the built-in defaults, for any tag.
+    if let Some(low) = super::put_data::object_tag_low(data) {
+        if !readable(state, low) {
+            return ApduResponse::err(0x6982);
+        }
+        if let Some(obj) = state.data_objects.iter().find(|o| o.tag_low == low) {
+            return ApduResponse::ok(&obj.data);
+        }
+    }
+
     match tag {
         // CHUID: 5FC102
         [0x5F, 0xC1, 0x02] => build_chuid(state),
@@ -69,7 +79,28 @@ pub fn handle(state: &PivState, cmd: &ApduCommand<'_>) -> ApduResponse {
 /// - Expiration Date (tag 0x35) - 8 bytes ASCII "YYYYMMDD"
 /// - Issuer Asymmetric Signature (tag 0x3E) - empty (no PKI)
 /// - Error Detection Code (tag 0xFE) - empty
-fn build_chuid(state: &PivState) -> ApduResponse {
+/// Per-device CHUID GUID: SHA-256("pico2hsm-piv-guid" || chip id), first
+/// 16 bytes, with RFC 4122 version-4/variant bits.  (Was `device_id`, which
+/// is all zeros on every device; `device_id` stays the PIN KDF context so
+/// stored PIV PINs keep verifying.)
+fn chuid_guid() -> [u8; 16] {
+    use sha2::{Digest, Sha256};
+    #[cfg(target_arch = "arm")]
+    let chip_id = embassy_rp::otp::get_chipid().unwrap_or(0);
+    #[cfg(not(target_arch = "arm"))]
+    let chip_id = 0u64;
+    let mut h = Sha256::new();
+    h.update(b"pico2hsm-piv-guid");
+    h.update(chip_id.to_be_bytes());
+    let digest = h.finalize();
+    let mut guid = [0u8; 16];
+    guid.copy_from_slice(&digest[..16]);
+    guid[6] = (guid[6] & 0x0F) | 0x40;
+    guid[8] = (guid[8] & 0x3F) | 0x80;
+    guid
+}
+
+fn build_chuid(_state: &PivState) -> ApduResponse {
     let mut resp = heapless::Vec::<u8, 256>::new();
 
     // Outer tag 0x53 (content wrapper)
@@ -92,10 +123,10 @@ fn build_chuid(state: &PivState) -> ApduResponse {
     ];
     let _ = resp.extend_from_slice(&fascn);
 
-    // GUID (tag 0x34) - 16 bytes from device_id
+    // GUID (tag 0x34) - 16 bytes, unique per device (hosts cache by CHUID)
     let _ = resp.push(0x34);
     let _ = resp.push(16);
-    let _ = resp.extend_from_slice(&state.device_id);
+    let _ = resp.extend_from_slice(&chuid_guid());
 
     // Expiration Date (tag 0x35) - 8 bytes ASCII "20301231"
     let _ = resp.push(0x35);
@@ -242,6 +273,12 @@ fn build_security_object() -> ApduResponse {
     resp[len_pos] = inner_len as u8;
 
     ApduResponse::ok(&resp)
+}
+
+/// Whether the object `5FC1<low>` may be read now: biometrics (03, 08,
+/// 21) and printed information (09) need the PIN (SP 800-73-4 Table 3).
+pub fn readable(state: &PivState, low: u8) -> bool {
+    !matches!(low, 0x03 | 0x08 | 0x09 | 0x21) || state.pin_verified
 }
 
 /// Retrieve a stored data object (certificate etc.) by its tag low byte.

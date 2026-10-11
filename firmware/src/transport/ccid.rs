@@ -175,6 +175,11 @@ impl CcidHeader {
 
 // ─── CcidError ────────────────────────────────────────────────────────────
 
+/// Longest a single bulk-IN packet may wait for the host to read it.  A
+/// host expecting a reply polls continuously, so this only trips when the
+/// host has gone away.
+const WRITE_TIMEOUT: embassy_time::Duration = embassy_time::Duration::from_secs(2);
+
 /// Errors returned by the CCID transport.
 #[derive(Debug)]
 pub enum CcidError {
@@ -212,6 +217,8 @@ pub struct CcidTransport<'d, D: Driver<'d>> {
     card_powered: bool,
     /// Sequence number from the last XfrBlock; echoed in the DataBlock response.
     pending_seq: u8,
+    /// `SESSION_EPOCH` the last complete message was read under.
+    msg_epoch: u32,
 }
 
 impl<'d, D: Driver<'d>> CcidTransport<'d, D> {
@@ -244,6 +251,7 @@ impl<'d, D: Driver<'d>> CcidTransport<'d, D> {
             intr_ep,
             card_powered: false,
             pending_seq: 0,
+            msg_epoch: 0,
         }
     }
 
@@ -301,6 +309,13 @@ impl<'d, D: Driver<'d>> CcidTransport<'d, D> {
     /// APDUs directly; no T=1 framing at the CCID layer.
     ///
     /// The returned `Vec` contains the raw APDU bytes (CLA INS P1 P2 ...).
+    /// The host session (`SESSION_EPOCH`) the APDU last returned by
+    /// [`recv_apdu`](Self::recv_apdu) belongs to.  Tag the APDU with this,
+    /// not a fresh load: the session may already have ended.
+    pub fn apdu_epoch(&self) -> u32 {
+        self.msg_epoch
+    }
+
     pub async fn recv_apdu(&mut self) -> Result<Vec<u8, 4096>, CcidError> {
         // Single receive buffer for multi-packet CCID messages.
         // After extracting the APDU payload from an XfrBlock, the 10-byte
@@ -355,14 +370,22 @@ impl<'d, D: Driver<'d>> CcidTransport<'d, D> {
                     // dwFeatures = 0x000400FE includes bit 0x00040000 (Short and
                     // Extended APDU level exchange). The host sends a raw APDU as
                     // the XfrBlock payload — no T=1 framing at the CCID layer.
-                    if raw.len() <= CCID_HEADER_LEN {
+                    if !self.card_powered {
+                        // No APDUs to an unpowered card: bmCommandStatus =
+                        // failed, bmICCStatus = present but inactive (0x41),
+                        // bError = ICC_MUTE (0xFE).
+                        let resp = self.build_slot_status(header.seq, 0x41, 0xFE);
+                        self.write_response(&resp).await?;
+                    } else if raw.len() <= CCID_HEADER_LEN {
                         let resp = self.build_slot_status(header.seq, 0x40, 0x00);
                         self.write_response(&resp).await?;
                     } else {
                         self.pending_seq = header.seq;
                         // Strip the 10-byte CCID header in-place: copy payload
                         // bytes down to the start of the buffer, then truncate.
-                        let payload_len = raw.len() - CCID_HEADER_LEN;
+                        // dwLength, not the bytes read: trailing bytes in the
+                        // last packet are not part of the APDU (B-07).
+                        let payload_len = header.length as usize;
                         raw.copy_within(CCID_HEADER_LEN.., 0);
                         raw.truncate(payload_len);
                         return Ok(raw);
@@ -387,6 +410,11 @@ impl<'d, D: Driver<'d>> CcidTransport<'d, D> {
     /// the host waits roughly 1–2 seconds per extension before retrying.
     /// Call this every ~1.5 s to stay well inside any reasonable host timeout.
     pub async fn send_time_extension(&mut self) -> Result<(), CcidError> {
+        // Only for the session that sent the command; a new session's host
+        // would read it as the answer to its own first message.
+        if crate::SESSION_EPOCH.load(core::sync::atomic::Ordering::SeqCst) != self.msg_epoch {
+            return Ok(());
+        }
         let msg = [
             RDR_TO_PC_DATABLOCK,
             0x00,
@@ -439,47 +467,110 @@ impl<'d, D: Driver<'d>> CcidTransport<'d, D> {
         buf: &mut Vec<u8, 4096>,
     ) -> Result<CcidHeader, CcidError> {
         let mut pkt = [0u8; 64];
+        // Packets from a previous host session must not be glued onto this
+        // one: restart the message whenever the session changes mid-read.
+        let mut epoch = crate::SESSION_EPOCH.load(core::sync::atomic::Ordering::SeqCst);
 
-        // Read packets until we have at least the 10-byte CCID header.
-        while buf.len() < CCID_HEADER_LEN {
-            let n = self.read_ep.read(&mut pkt).await?;
-            buf.extend_from_slice(&pkt[..n])
-                .map_err(|_| CcidError::BufferOverflow)?;
+        // `buf` arrives empty; on a restart it holds the new message's first packet.
+        'message: loop {
+            // Read packets until we have at least the 10-byte CCID header.
+            while buf.len() < CCID_HEADER_LEN {
+                let n = self.read_ep.read(&mut pkt).await?;
+                let now = crate::SESSION_EPOCH.load(core::sync::atomic::Ordering::SeqCst);
+                if now != epoch {
+                    buf.clear();
+                    epoch = now;
+                }
+                buf.extend_from_slice(&pkt[..n])
+                    .map_err(|_| CcidError::BufferOverflow)?;
+            }
+
+            let header = CcidHeader::from_bytes(buf).ok_or(CcidError::MalformedMessage)?;
+            let payload_len = header.length as usize;
+            let total = CCID_HEADER_LEN.saturating_add(payload_len);
+
+            if total > buf.capacity() {
+                // Too big to hold.  Consume the rest of this message (up to its
+                // declared end or a short packet) so the next read starts at a
+                // header — otherwise payload bytes would be parsed as headers
+                // and the bulk pipe would stay out of step — then fail it.
+                let mut consumed = buf.len();
+                while consumed < total {
+                    let n = self.read_ep.read(&mut pkt).await?;
+                    consumed += n;
+                    if n < pkt.len() {
+                        break;
+                    }
+                }
+                // bmCommandStatus = failed (0x40), bError = 0x01: offset of the
+                // offending dwLength field (CCID §6.2.6).
+                let resp = self.build_slot_status(header.seq, 0x40, 0x01);
+                self.write_response(&resp).await?;
+                return Err(CcidError::BufferOverflow);
+            }
+
+            // Read remaining packets until we have the full message.
+            while buf.len() < total {
+                let n = self.read_ep.read(&mut pkt).await?;
+                let now = crate::SESSION_EPOCH.load(core::sync::atomic::Ordering::SeqCst);
+                if now != epoch {
+                    // The session ended mid-message: this packet starts the
+                    // next session's first message, not the rest of this one.
+                    epoch = now;
+                    buf.clear();
+                    buf.extend_from_slice(&pkt[..n])
+                        .map_err(|_| CcidError::BufferOverflow)?;
+                    continue 'message;
+                }
+                buf.extend_from_slice(&pkt[..n])
+                    .map_err(|_| CcidError::BufferOverflow)?;
+            }
+            buf.truncate(total);
+            self.msg_epoch = epoch;
+            return Ok(header);
         }
-
-        let header = CcidHeader::from_bytes(buf).ok_or(CcidError::MalformedMessage)?;
-        let payload_len = header.length as usize;
-        let total = CCID_HEADER_LEN + payload_len;
-
-        // Read remaining packets until we have the full message.
-        while buf.len() < total {
-            let n = self.read_ep.read(&mut pkt).await?;
-            buf.extend_from_slice(&pkt[..n])
-                .map_err(|_| CcidError::BufferOverflow)?;
-        }
-
-        Ok(header)
     }
 
     /// Write `data` to the bulk-IN endpoint, chunked into max-packet-size pieces.
     async fn write_response(&mut self, data: &[u8]) -> Result<(), CcidError> {
         if data.is_empty() {
             // Zero-length packet
-            self.write_ep.write(&[]).await?;
-            return Ok(());
+            return self.write_packet(&[]).await;
         }
 
+        // Stop if the host session ends mid-message: the remaining packets
+        // would otherwise be read by the next session as its response.
+        let epoch = crate::SESSION_EPOCH.load(core::sync::atomic::Ordering::SeqCst);
         let mut offset = 0;
         while offset < data.len() {
+            if crate::SESSION_EPOCH.load(core::sync::atomic::Ordering::SeqCst) != epoch {
+                return Err(CcidError::UsbDisconnected);
+            }
             let end = (offset + BULK_MAX_PACKET_SIZE as usize).min(data.len());
-            self.write_ep.write(&data[offset..end]).await?;
+            self.write_packet(&data[offset..end]).await?;
             offset = end;
         }
         Ok(())
     }
 
+    /// Write one bulk-IN packet.  A host that stops reading would otherwise
+    /// block core0 here forever — no flash service for core1, no stall
+    /// check, not even the watchdog's reset.  Treat it as an abandoned
+    /// session: end it (so nothing it authenticated carries over) and fail.
+    async fn write_packet(&mut self, pkt: &[u8]) -> Result<(), CcidError> {
+        match embassy_time::with_timeout(WRITE_TIMEOUT, self.write_ep.write(pkt)).await {
+            Ok(r) => Ok(r?),
+            Err(_) => {
+                crate::bump_session_epoch();
+                Err(CcidError::UsbDisconnected)
+            }
+        }
+    }
+
     /// Handle `PC_TO_RDR_ICCPOWERON`: respond with ATR in a DataBlock.
     async fn handle_power_on(&mut self, seq: u8) -> Result<(), CcidError> {
+        // A card power cycle ends the session: no authentication survives it.
+        crate::bump_session_epoch();
         self.card_powered = true;
         let hdr = self.build_data_block_header(seq, ATR.len() as u32);
         // Header and ATR must be in one buffer so they go in a single USB bulk
@@ -495,6 +586,7 @@ impl<'d, D: Driver<'d>> CcidTransport<'d, D> {
 
     /// Handle `PC_TO_RDR_ICCPOWEROFF`: respond with SlotStatus.
     async fn handle_power_off(&mut self, seq: u8) -> Result<(), CcidError> {
+        crate::bump_session_epoch();
         self.card_powered = false;
         // bStatus = 0x01: ICC present but no longer active
         let resp = self.build_slot_status(seq, 0x01, ERROR_OK);
@@ -650,7 +742,7 @@ impl CcidHandler {
     /// Process one incoming CCID bulk message.
     ///
     /// Returns the response bytes to be sent on the bulk IN endpoint.
-    pub async fn process_message<'a>(&mut self, _msg: &'a [u8], _out: &mut Vec<u8, 512>) {
+    pub async fn process_message(&mut self, _msg: &[u8], _out: &mut Vec<u8, 512>) {
         // TODO: implement
     }
 }

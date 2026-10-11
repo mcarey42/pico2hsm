@@ -226,9 +226,14 @@ class TestGetGenerationV2:
 # ---------------------------------------------------------------------------
 
 class TestGetKeyManifest:
+    def test_requires_pin(self, initialized_device, runner: CLIRunner) -> None:
+        """The manifest lists every key, so it needs the user PIN (SW 6982)."""
+        result = runner.send_apdu(SELECT_SC_HSM, APDU_GET_MANIFEST, reader=0)
+        assert _last_sw(result.stdout) == 0x6982
+
     def test_sw_9000_before_keygen(self, initialized_device, runner: CLIRunner) -> None:
         """GET_KEY_MANIFEST must return SW=9000 even on a freshly initialized device."""
-        result = runner.send_apdu(SELECT_SC_HSM, APDU_GET_MANIFEST, reader=0)
+        result = runner.send_apdu(SELECT_SC_HSM, VERIFY_PIN, APDU_GET_MANIFEST, reader=0)
         sw = _last_sw(result.stdout)
         assert sw == 0x9000, f"SW={sw:04X}"
 
@@ -236,7 +241,7 @@ class TestGetKeyManifest:
         """On a freshly initialized device, manifest must be empty (0 bytes)."""
         # This test relies on ordering — init_reader0 was fresh.  If keys already
         # exist from earlier modules, skip.
-        result = runner.send_apdu(SELECT_SC_HSM, APDU_GET_MANIFEST, reader=0)
+        result = runner.send_apdu(SELECT_SC_HSM, VERIFY_PIN, APDU_GET_MANIFEST, reader=0)
         data = _parse_received_bytes(result.stdout)
         assert len(data) % 44 == 0, f"Manifest length {len(data)} not a multiple of 44"
 
@@ -244,18 +249,21 @@ class TestGetKeyManifest:
         self, initialized_device, provisioned_keys, runner: CLIRunner
     ) -> None:
         """After keygen, manifest must have 44 bytes × number of keys."""
-        result = runner.send_apdu(SELECT_SC_HSM, APDU_GET_MANIFEST, reader=0)
+        result = runner.send_apdu(SELECT_SC_HSM, VERIFY_PIN, APDU_GET_MANIFEST, reader=0)
         data = _parse_received_bytes(result.stdout)
+        # Other fixtures (the RSA keys) may have added keys too: every
+        # provisioned key must be listed, in whole 44-byte entries.
         n_keys = sum(1 for v in provisioned_keys.values() if v.get("generated"))
-        assert len(data) == 44 * n_keys, (
-            f"Expected {44 * n_keys} bytes for {n_keys} keys, got {len(data)}"
+        assert len(data) % 44 == 0, f"{len(data)} bytes is not whole 44-byte entries"
+        assert len(data) // 44 >= n_keys, (
+            f"Expected at least {n_keys} entries, got {len(data) // 44}"
         )
 
     def test_manifest_entry_format(
         self, initialized_device, provisioned_keys, runner: CLIRunner
     ) -> None:
         """Each manifest entry must have valid key_ref (1-254), non-zero algo, non-tombstone."""
-        result = runner.send_apdu(SELECT_SC_HSM, APDU_GET_MANIFEST, reader=0)
+        result = runner.send_apdu(SELECT_SC_HSM, VERIFY_PIN, APDU_GET_MANIFEST, reader=0)
         data = _parse_received_bytes(result.stdout)
         if len(data) == 0:
             pytest.skip("No keys present")
@@ -394,11 +402,22 @@ class TestSignEnrollment:
 # ---------------------------------------------------------------------------
 
 class TestNoiseTargetInit:
+    def test_requires_so_pin(self, initialized_device, runner: CLIRunner) -> None:
+        """The user PIN alone must not start a DKEK exchange (SW 6982)."""
+        r_pub = runner.send_apdu(SELECT_SC_HSM, APDU_GET_PUBKEY, reader=0)
+        source_pub_hex = _parse_received_bytes(r_pub.stdout).hex()
+        result = runner.send_apdu(
+            SELECT_SC_HSM, VERIFY_PIN, f"8054350041{source_pub_hex}",
+            reader=0, save_as="09_noise_target_init_user_pin",
+        )
+        assert _parse_sw(result.stdout)[-1] == 0x6982
+
     def test_requires_initialized_device(
         self, initialized_device, runner: CLIRunner
     ) -> None:
-        """NOISE_TARGET_INIT with a dummy source pubkey must return SW=9000 and 161 bytes."""
-        # Get the device's own static pub to use as the "source" pub (valid uncompressed point)
+        """NOISE_TARGET_INIT from an enrolled peer (SO-PIN) returns 161 bytes."""
+        # Use the device's own static pub as the "source" (a valid point) and
+        # enroll it: the exchange only talks to an enrolled peer.
         r_pub = runner.send_apdu(SELECT_SC_HSM, APDU_GET_PUBKEY, reader=0)
         source_pub_bytes = _parse_received_bytes(r_pub.stdout)
         assert len(source_pub_bytes) == 65
@@ -409,7 +428,8 @@ class TestNoiseTargetInit:
 
         result = runner.send_apdu(
             SELECT_SC_HSM,
-            VERIFY_PIN,
+            VERIFY_SO_PIN,
+            f"80543D00{lc}{source_pub_hex}",  # ENROLL_PEER_PUBKEY
             apdu_target_init,
             reader=0, save_as="09_noise_target_init",
         )

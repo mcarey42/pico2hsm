@@ -4,6 +4,13 @@ on: [push, pull_request]
 jobs:
   build:
     runs-on: ubuntu-latest
+    env:
+      # The shipped / hardware-tested configuration.  Without these the PIV and
+      # OpenPGP applets (and RSA) are never compiled or tested in CI.
+      APPLETS: rsa,applet-piv,applet-openpgp-curve25519
+      # The same applets in an EC-only build (no `rsa`, no heap allocator):
+      # object size limits must not depend on `rsa` (audit R2-11).
+      APPLETS_NO_RSA: applet-piv,applet-openpgp-curve25519
     strategy:
       fail-fast: false
       matrix:
@@ -34,7 +41,14 @@ jobs:
             ${{ runner.os }}-cargo-${{ matrix.feature }}-
             ${{ runner.os }}-cargo-
 
-      - name: Build firmware (${{ matrix.feature }})
+      - name: Build firmware (${{ matrix.feature }}, all applets)
+        run: cargo build --release -p pico2hsm-firmware --no-default-features --features ${{ matrix.feature }},$APPLETS --target thumbv8m.main-none-eabihf
+
+      - name: Build firmware (${{ matrix.feature }}, all applets, no RSA)
+        run: cargo build --release -p pico2hsm-firmware --no-default-features --features ${{ matrix.feature }},$APPLETS_NO_RSA --target thumbv8m.main-none-eabihf
+
+      - name: Build firmware (${{ matrix.feature }}, SC-HSM only)
+        # Keeps the feature-gated code compiling with the applets off.
         run: cargo build --release -p pico2hsm-firmware --no-default-features --features ${{ matrix.feature }} --target thumbv8m.main-none-eabihf
 
       - name: Test pico2hsm-core (host)
@@ -53,7 +67,39 @@ jobs:
             --manifest-path firmware/Cargo.toml \
             --lib \
             --no-default-features \
-            --features ${{ matrix.feature }} \
+            --features ${{ matrix.feature }},$APPLETS \
+            --target x86_64-unknown-linux-gnu
+
+      - name: Rust unit tests (firmware library, host target, no RSA)
+        run: |
+          cargo test \
+            --manifest-path firmware/Cargo.toml \
+            --lib \
+            --no-default-features \
+            --features ${{ matrix.feature }},$APPLETS_NO_RSA \
+            --target x86_64-unknown-linux-gnu
+
+      - name: Firmware integration tests (firmware/tests, host target)
+        # Board-independent library tests, so one board is enough.  (They also
+        # build main.rs for the host, which the Waveshare board code does not
+        # support.)
+        if: matrix.feature == 'pico2_4m'
+        run: |
+          cargo test \
+            --manifest-path firmware/Cargo.toml \
+            --test '*' \
+            --no-default-features \
+            --features ${{ matrix.feature }},$APPLETS \
+            --target x86_64-unknown-linux-gnu
+
+      - name: Firmware integration tests (firmware/tests, host target, no RSA)
+        if: matrix.feature == 'pico2_4m'
+        run: |
+          cargo test \
+            --manifest-path firmware/Cargo.toml \
+            --test '*' \
+            --no-default-features \
+            --features ${{ matrix.feature }},$APPLETS_NO_RSA \
             --target x86_64-unknown-linux-gnu
 
   lint:

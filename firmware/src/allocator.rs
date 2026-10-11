@@ -79,7 +79,7 @@ pub fn init() {
         [core::mem::MaybeUninit::uninit(); HEAP_SIZE];
 
     unsafe {
-        HEAP.init(HEAP_MEM.as_ptr() as usize, HEAP_SIZE);
+        HEAP.init(core::ptr::addr_of!(HEAP_MEM) as usize, HEAP_SIZE);
     }
 }
 

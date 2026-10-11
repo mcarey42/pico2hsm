@@ -8,29 +8,27 @@
 //! - P1=0x8E, P2=0x80: Compute Cryptographic Checksum (MAC)
 //! - P1=0x86, P2=0x80: Verify Cryptographic Checksum
 
-use sha2::Digest as _;
-
 use pico2hsm_core::apdu::{
     ApduCommand, ApduResponse, SW_CONDITIONS_NOT_SATISFIED, SW_DATA_INVALID, SW_FILE_NOT_FOUND,
-    SW_INS_NOT_SUPPORTED, SW_OK, SW_SECURITY_STATUS, SW_WRONG_DATA, SW_WRONG_LENGTH,
+    SW_SECURITY_STATUS, SW_WRONG_DATA, SW_WRONG_LENGTH,
 };
-use pico2hsm_core::key::{KeyId, KeyMaterial, KeyType};
+use pico2hsm_core::key::{KeyId, KeyMaterial};
 
-use crate::protocol::sc_hsm::{FwRng, ScHsmState};
+use crate::protocol::sc_hsm::ScHsmState;
+use crate::security::key_policy::{authorize_use, ALGO_AES_CMAC};
 use crate::storage::KeyStore;
 
 /// INS byte for PERFORM SECURITY OPERATION.
 pub const INS_PSO: u8 = 0x2A;
 
-/// Map the stored keygen algorithm byte to the core `KeyType` for EC keys.
-fn meta_algo_to_ec_key_type(algo: u8) -> Option<KeyType> {
-    match algo {
-        0x13 | 0x23 => Some(KeyType::EcPrivateP256),
-        0x15 | 0x25 => Some(KeyType::EcPrivateP384),
-        0x17 | 0x27 => Some(KeyType::EcPrivateP521),
-        0x19 | 0x29 => Some(KeyType::EcPrivateK256),
-        _ => None,
-    }
+/// MSE algorithm byte selecting HMAC-SHA256 for the checksum commands.
+const MSE_ALGO_HMAC: u8 = 0xA0;
+
+/// Policy algorithm ID of a checksum command: AES-CMAC is CardContact's
+/// `18`; HMAC-SHA256 has no SmartCard-HSM ID (`None`: only keys without
+/// an algorithm list may use it).
+fn checksum_policy_algo(state: &ScHsmState) -> Option<u8> {
+    (state.current_algo != Some(MSE_ALGO_HMAC)).then_some(ALGO_AES_CMAC)
 }
 
 /// Handle a PERFORM SECURITY OPERATION APDU command.
@@ -59,355 +57,54 @@ pub fn handle(
 
 /// PSO Compute Digital Signature (P1=0x9E, P2=0x9A).
 ///
-/// Delegates to the same ECDSA / RSA signing paths as INS=0x68 (sign.rs),
-/// but reads key_id and algo from the security environment set by MSE SET.
+/// Same signing path (and key usage policy) as INS=0x68 (sign.rs), with
+/// the key and algorithm from the security environment set by MSE SET.
 fn pso_compute_digital_signature(
     state: &mut ScHsmState,
     store: &mut dyn KeyStore,
     cmd: &ApduCommand<'_>,
 ) -> ApduResponse {
-    // Require MSE SET to have configured key and algorithm
-    let key_id_proto = match state.current_key_id {
-        Some(id) => id,
-        None => return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
-    };
-    let key_id = pico2hsm_core::key::KeyId::sc_hsm(0, key_id_proto).0; // u32 internal ID
-    let algo = match state.current_algo {
-        Some(a) => a,
-        None => return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
-    };
-
-    if cmd.data.is_empty() {
+    let (Some(key_ref), Some(algo)) = (state.current_key_id, state.current_algo) else {
         return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED);
-    }
-
-    // ---- RSA signing (feature-gated) ----------------------------------------
-    // RSA algorithm codes (from OpenSC card-sc-hsm.h):
-    //   0x20 = ALGO_RSA_RAW     — input is already PKCS#1-padded; raw RSA op
-    //   0x31 = ALGO_RSA_PKCS1_SHA256, 0x32 = SHA384, 0x33 = SHA512
-    //   0x34 = RSA-PSS SHA-256 (internal), 0x40 = ALGO_RSA_PSS — pre-hashed (32 B)
-    #[cfg(feature = "rsa")]
-    match algo {
-        0x20 | 0x31 | 0x32 | 0x33 | 0x34 | 0x40 => {
-            use crate::crypto::asymmetric::{
-                rsa_private_raw, rsa_sign_pkcs1v15, rsa_sign_pss, HashAlgorithm,
-            };
-
-            // Check metadata index for the key
-            let rsa_meta = match state.key_index.iter().find(|m| m.key_id == key_id) {
-                Some(m) => *m,
-                None => return ApduResponse::err(SW_FILE_NOT_FOUND),
-            };
-
-            // Load key material from flash
-            let key_obj = match store.fetch_key(pico2hsm_core::key::KeyId(key_id)) {
-                Ok(Some(obj)) => obj,
-                _ => return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
-            };
-
-            // Infer the core KeyType from the stored keygen algo byte
-            let key_type = match rsa_meta.algo {
-                0x05 => pico2hsm_core::key::KeyType::RsaPrivate2048,
-                0x06 => pico2hsm_core::key::KeyType::RsaPrivate3072,
-                0x07 => pico2hsm_core::key::KeyType::RsaPrivate4096,
-                _ => match key_obj.private_key.len() {
-                    n if n <= 1200 => pico2hsm_core::key::KeyType::RsaPrivate2048,
-                    n if n <= 1800 => pico2hsm_core::key::KeyType::RsaPrivate3072,
-                    _ => pico2hsm_core::key::KeyType::RsaPrivate4096,
-                },
-            };
-            let mut der_buf = [0u8; 2400];
-            let der_len = key_obj.private_key.len();
-            der_buf[..der_len].copy_from_slice(&key_obj.private_key);
-
-            let sig = match algo {
-                0x20 => {
-                    // ALGO_RSA_RAW: OpenSC pre-padded the data (PKCS#1 v1.5 block, 256 B).
-                    // Card performs raw RSA private key op: sig = input^d mod n.
-                    match rsa_private_raw(&der_buf[..der_len], cmd.data) {
-                        Ok(s) => s,
-                        Err(_) => return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
-                    }
-                }
-                0x34 | 0x40 => {
-                    // RSA-PSS: data is pre-hashed (32 bytes SHA-256). Card applies PSS + signs.
-                    match rsa_sign_pss(
-                        key_type,
-                        &der_buf[..der_len],
-                        cmd.data,
-                        HashAlgorithm::Sha256,
-                        32,
-                        &mut FwRng,
-                    ) {
-                        Ok(s) => s,
-                        Err(_) => return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
-                    }
-                }
-                _ => {
-                    let hash_algo = match algo {
-                        0x31 => HashAlgorithm::Sha256,
-                        0x32 => HashAlgorithm::Sha384,
-                        0x33 => HashAlgorithm::Sha512,
-                        _ => return ApduResponse::err(SW_INS_NOT_SUPPORTED),
-                    };
-                    match rsa_sign_pkcs1v15(
-                        key_type,
-                        &der_buf[..der_len],
-                        cmd.data,
-                        hash_algo,
-                        &mut FwRng,
-                    ) {
-                        Ok(s) => s,
-                        Err(_) => return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
-                    }
-                }
-            };
-
-            return ApduResponse::ok(&sig);
-        }
-        _ => {}
-    }
-
-    // ---- ECDSA path ---------------------------------------------------------
-    // 0x13/0x15/0x17/0x19/0x70 = pre-hashed path: command data is already the digest.
-    // 0x71–0x75 = card-hash path (OpenSC SC-HSM ALGO_EC_SHA* codes): command data
-    //             is the raw message; the card must compute the hash before signing.
-    match algo {
-        0x13 | 0x15 | 0x17 | 0x19 | 0x70 | 0x71 | 0x72 | 0x73 | 0x74 | 0x75 => {}
-        _ => return ApduResponse::err(SW_INS_NOT_SUPPORTED),
-    }
-
-    // Check metadata index for the key
-    let meta = match state.key_index.iter().find(|m| m.key_id == key_id) {
-        Some(m) => *m,
-        None => return ApduResponse::err(SW_FILE_NOT_FOUND),
     };
-
-    // Resolve the core KeyType from the stored keygen algorithm byte.
-    let key_type = match meta_algo_to_ec_key_type(meta.algo) {
-        Some(kt) => kt,
-        None => return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
-    };
-
-    // Load key material from flash
-    let key_obj = match store.fetch_key(pico2hsm_core::key::KeyId(key_id)) {
-        Ok(Some(obj)) => obj,
-        _ => return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
-    };
-
-    // Copy private key bytes to a local buffer
-    let mut priv_buf = [0u8; 66];
-    let priv_len = key_obj.private_key.len();
-    priv_buf[..priv_len].copy_from_slice(&key_obj.private_key);
-
-    // For card-hash algorithms (0x71–0x75) the host sends the raw message;
-    // we must hash it here before passing to the sign_prehash primitive.
-    // Use a fixed-size stack buffer large enough for SHA-512 (64 bytes).
-    let mut hash_buf = [0u8; 64];
-    let hash: &[u8] = match algo {
-        0x71 => {
-            // ALGO_EC_SHA1: SHA-1
-            let digest = crate::crypto::symmetric::sha1(cmd.data);
-            hash_buf[..20].copy_from_slice(&digest);
-            &hash_buf[..20]
-        }
-        0x72 => {
-            // ALGO_EC_SHA224: SHA-224
-            let digest = sha2::Sha224::digest(cmd.data);
-            hash_buf[..28].copy_from_slice(&digest);
-            &hash_buf[..28]
-        }
-        0x73 => {
-            // ALGO_EC_SHA256: SHA-256
-            let digest = sha2::Sha256::digest(cmd.data);
-            hash_buf[..32].copy_from_slice(&digest);
-            &hash_buf[..32]
-        }
-        0x74 => {
-            // ALGO_EC_SHA384: SHA-384
-            let digest = sha2::Sha384::digest(cmd.data);
-            hash_buf[..48].copy_from_slice(&digest);
-            &hash_buf[..48]
-        }
-        0x75 => {
-            // ALGO_EC_SHA512: SHA-512
-            let digest = sha2::Sha512::digest(cmd.data);
-            hash_buf[..64].copy_from_slice(&digest);
-            &hash_buf[..64]
-        }
-        _ => {
-            // 0x13/0x15/0x17/0x19/0x70: data is already the digest
-            cmd.data
-        }
-    };
-
-    let sig = match crate::crypto::asymmetric::ecdsa_sign(
-        key_type,
-        &priv_buf[..priv_len],
-        hash,
-        &mut FwRng,
-    ) {
-        Ok(s) => s,
-        Err(_) => return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
-    };
-
-    ApduResponse::ok(&sig)
-}
-
-/// Map an explicit ECDH AlgorithmId byte to the expected `KeyType`.
-///
-/// Returns `None` for unknown or non-ECDH algorithm codes, including the
-/// generic 0x80 "EC decipher" code that OpenSC sends — in that case the
-/// caller must infer the key type from the stored key record instead.
-fn algo_to_key_type(algo: u8) -> Option<KeyType> {
-    match algo {
-        0x23 => Some(KeyType::EcPrivateP256),
-        0x25 => Some(KeyType::EcPrivateP384),
-        0x27 => Some(KeyType::EcPrivateP521),
-        0x29 => Some(KeyType::EcPrivateK256),
-        _ => None,
-    }
-}
-
-/// Returns true if the given `KeyType` is an EC private key usable for ECDH.
-fn is_ec_private(kt: KeyType) -> bool {
-    matches!(
-        kt,
-        KeyType::EcPrivateP256
-            | KeyType::EcPrivateP384
-            | KeyType::EcPrivateP521
-            | KeyType::EcPrivateK256
-    )
+    super::sign::compute_signature(state, store, key_ref, algo, cmd.data)
 }
 
 /// PSO Decipher (P1=0x80, P2=0x86).
 ///
-/// Delegates to the same ECDH / RSA decryption paths as INS=0x62 (decrypt.rs),
-/// but reads key_id and algo from the security environment set by MSE SET.
+/// Same path (and key usage policy) as INS=0x62 (decrypt.rs), with the key
+/// and algorithm from the security environment set by MSE SET.
 fn pso_decipher(
     state: &mut ScHsmState,
     store: &mut dyn KeyStore,
     cmd: &ApduCommand<'_>,
 ) -> ApduResponse {
-    // Require MSE SET to have configured key and algorithm
-    let key_id_proto = match state.current_key_id {
-        Some(id) => id,
-        None => return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
-    };
-    let key_id = pico2hsm_core::key::KeyId::sc_hsm(0, key_id_proto).0; // u32 internal ID
-    let algo = match state.current_algo {
-        Some(a) => a,
-        None => return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
-    };
-
-    if cmd.data.is_empty() {
+    let (Some(key_ref), Some(algo)) = (state.current_key_id, state.current_algo) else {
         return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED);
-    }
-
-    // ---- RSA decryption (feature-gated) — checked BEFORE EC key lookup ------
-    // 0x21 = ALGO_RSA_DECRYPT: OpenSC sends ciphertext; card returns c^d mod n
-    //        (raw, no padding removal). OpenSC strips PKCS#1v1.5 or OAEP in software.
-    //        OpenSC uses P2=0x21 for BOTH CKM_RSA_PKCS and CKM_RSA_PKCS_OAEP.
-    // 0x22 = ALGO_RSA_OAEP (used by some OpenSC versions): same raw op.
-    #[cfg(feature = "rsa")]
-    match algo {
-        0x21 | 0x22 => {
-            use crate::crypto::asymmetric::rsa_private_raw;
-
-            // Check metadata index for the key
-            let _rsa_meta = match state.key_index.iter().find(|m| m.key_id == key_id) {
-                Some(m) => *m,
-                None => return ApduResponse::err(SW_FILE_NOT_FOUND),
-            };
-
-            // Load key material from flash
-            let key_obj = match store.fetch_key(pico2hsm_core::key::KeyId(key_id)) {
-                Ok(Some(obj)) => obj,
-                _ => return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
-            };
-
-            // RSA-2048 PKCS#1 DER is ≤1200 bytes; RSA-4096 is ≤2400 bytes.
-            let mut der_buf = [0u8; 2400];
-            let der_len = key_obj.private_key.len();
-            der_buf[..der_len].copy_from_slice(&key_obj.private_key);
-
-            // Raw RSA: result = ciphertext^d mod n. OpenSC handles all unpadding.
-            return match rsa_private_raw(&der_buf[..der_len], cmd.data) {
-                Ok(p) => ApduResponse::ok(&p),
-                Err(_) => ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
-            };
-        }
-        _ => {}
-    }
-
-    // ---- ECDH path — EC key lookup ------------------------------------------
-    // Check metadata index for the EC key. RSA keys (handled above) never reach here.
-    let meta = match state.key_index.iter().find(|m| m.key_id == key_id) {
-        Some(m) => *m,
-        None => return ApduResponse::err(SW_FILE_NOT_FOUND),
     };
-
-    // Resolve the core KeyType from meta.algo (set at keygen time).
-    let stored_key_type = match meta_algo_to_ec_key_type(meta.algo) {
-        Some(kt) => kt,
-        None => return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
-    };
-
-    // ---- ECDH path ----------------------------------------------------------
-    // Resolve the key type:
-    // - If the algo byte maps to an explicit ECDH algorithm (0x23/0x25/0x27/0x29),
-    //   validate it matches the stored key.
-    // - If the algo byte is 0x80 (OpenSC's ALGO_EC_DH), infer the key type from
-    //   the stored key metadata directly.
-    // - Anything else is unsupported.
-    let key_type = if let Some(expected) = algo_to_key_type(algo) {
-        if stored_key_type != expected {
-            return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED);
-        }
-        expected
-    } else if algo == 0x80 && is_ec_private(stored_key_type) {
-        stored_key_type
-    } else {
-        return ApduResponse::err(SW_INS_NOT_SUPPORTED);
-    };
-
-    // When OpenSC sends ALGO_EC_DH (algo=0x80) it expects the response to be
-    // prefixed with a `0x04` uncompressed-point marker byte, which it then
-    // strips internally (card-sc-hsm.c:sc_hsm_decipher → ALGO_EC_DH branch).
-    // Explicit ECDH algo codes (0x23/0x25/0x27/0x29) are returned as raw bytes.
-    let needs_04_prefix = algo == 0x80;
-
-    // Load key material from flash
-    let key_obj = match store.fetch_key(pico2hsm_core::key::KeyId(key_id)) {
-        Ok(Some(obj)) => obj,
-        _ => return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
-    };
-
-    let mut priv_buf = [0u8; 66];
-    let priv_len = key_obj.private_key.len();
-    priv_buf[..priv_len].copy_from_slice(&key_obj.private_key);
-
-    let shared =
-        match crate::crypto::asymmetric::ecdh_agree(key_type, &priv_buf[..priv_len], cmd.data) {
-            Ok(s) => s,
-            Err(_) => return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
-        };
-
-    if needs_04_prefix {
-        // Prepend 0x04 so OpenSC can strip it and get the exact field-size
-        // X-coordinate (32, 48, or 66 bytes depending on curve).
-        let mut resp: heapless::Vec<u8, 67> = heapless::Vec::new();
-        let _ = resp.push(0x04);
-        let _ = resp.extend_from_slice(&shared);
-        ApduResponse::ok(&resp)
-    } else {
-        ApduResponse::ok(&shared)
-    }
+    super::decrypt::decipher(state, store, key_ref, algo, cmd.data)
 }
 
 // ---------------------------------------------------------------------------
 // PSO Compute / Verify Cryptographic Checksum helpers
 // ---------------------------------------------------------------------------
+
+/// The selected key as symmetric key bytes, wiped on drop.  Only AES keys
+/// of 16/24/32 bytes: copying any other key into a 32-byte buffer used to
+/// fail silently, leaving an *empty* HMAC key — publicly computable tags.
+fn sym_key(
+    key_obj: &crate::security::key_management::KeyObject,
+) -> Option<crate::security::zeroize::WipeOnDrop<32>> {
+    use crate::security::key_management::KeyType as KmType;
+    if !matches!(key_obj.key_type, KmType::Aes)
+        || !matches!(key_obj.private_key.len(), 16 | 24 | 32)
+    {
+        return None;
+    }
+    let mut k = crate::security::zeroize::WipeOnDrop::new();
+    k.0.extend_from_slice(&key_obj.private_key).ok()?;
+    Some(k)
+}
 
 /// Build a `KeyMaterial` from raw symmetric key bytes.
 fn make_sym_key_material(key_id: u32, raw: &[u8]) -> Option<KeyMaterial> {
@@ -457,23 +154,28 @@ fn pso_compute_checksum(
     };
 
     // Load key material from flash
-    let key_obj = match store.fetch_key(pico2hsm_core::key::KeyId(full_key_id)) {
+    let mut key_obj = match store.fetch_key(KeyId(full_key_id)) {
         Ok(Some(obj)) => obj,
         _ => return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
     };
 
-    let mut raw_key: heapless::Vec<u8, 32> = heapless::Vec::new();
-    let _ = raw_key.extend_from_slice(&key_obj.private_key);
+    let Some(raw_key) = sym_key(&key_obj) else {
+        return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED);
+    };
+    let raw_key: &[u8] = &raw_key.0;
 
     // Determine MAC algorithm from current_algo:
     // 0xA0 = HMAC-SHA256; anything else (or None) defaults to AES-CMAC.
-    let use_hmac = state.current_algo == Some(0xA0);
+    let use_hmac = state.current_algo == Some(MSE_ALGO_HMAC);
+    if let Err(sw) = authorize_use(store, &mut key_obj, checksum_policy_algo(state)) {
+        return ApduResponse::err(sw);
+    }
 
     if use_hmac {
-        let tag = crate::crypto::kdf::hmac_sha256(&raw_key, cmd.data);
+        let tag = crate::crypto::kdf::hmac_sha256(raw_key, cmd.data);
         ApduResponse::ok(&tag)
     } else {
-        let km = match make_sym_key_material(full_key_id, &raw_key) {
+        let km = match make_sym_key_material(full_key_id, raw_key) {
             Some(k) => k,
             None => return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
         };
@@ -509,19 +211,24 @@ fn pso_verify_checksum(
     };
 
     // Load key material from flash
-    let key_obj = match store.fetch_key(pico2hsm_core::key::KeyId(full_key_id)) {
+    let mut key_obj = match store.fetch_key(KeyId(full_key_id)) {
         Ok(Some(obj)) => obj,
         _ => return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
     };
 
-    let mut raw_key: heapless::Vec<u8, 32> = heapless::Vec::new();
-    let _ = raw_key.extend_from_slice(&key_obj.private_key);
+    let Some(raw_key) = sym_key(&key_obj) else {
+        return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED);
+    };
+    let raw_key: &[u8] = &raw_key.0;
 
-    let use_hmac = state.current_algo == Some(0xA0);
+    let use_hmac = state.current_algo == Some(MSE_ALGO_HMAC);
     let tag_len: usize = if use_hmac { 32 } else { 16 };
 
     if cmd.data.len() < tag_len {
         return ApduResponse::err(SW_WRONG_LENGTH);
+    }
+    if let Err(sw) = authorize_use(store, &mut key_obj, checksum_policy_algo(state)) {
+        return ApduResponse::err(sw);
     }
 
     let msg_len = cmd.data.len() - tag_len;
@@ -529,8 +236,11 @@ fn pso_verify_checksum(
     let expected_tag = &cmd.data[msg_len..];
 
     if use_hmac {
-        let computed = crate::crypto::kdf::hmac_sha256(&raw_key, message);
-        if computed.as_ref() == expected_tag {
+        let computed = crate::crypto::kdf::hmac_sha256(raw_key, message);
+        if bool::from(subtle::ConstantTimeEq::ct_eq(
+            computed.as_ref(),
+            expected_tag,
+        )) {
             ApduResponse::ok(&[])
         } else {
             ApduResponse::err(SW_DATA_INVALID)
@@ -540,7 +250,7 @@ fn pso_verify_checksum(
             Ok(a) => a,
             Err(_) => return ApduResponse::err(SW_WRONG_LENGTH),
         };
-        match crate::crypto::symmetric::aes_cmac_verify(&raw_key, message, &expected) {
+        match crate::crypto::symmetric::aes_cmac_verify(raw_key, message, &expected) {
             Ok(true) => ApduResponse::ok(&[]),
             Ok(false) => ApduResponse::err(SW_DATA_INVALID),
             Err(_) => ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),

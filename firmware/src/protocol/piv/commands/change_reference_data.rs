@@ -22,22 +22,21 @@ fn strip_pin_padding(padded: &[u8]) -> &[u8] {
     &padded[..end]
 }
 
+/// A new PIV PIN (8 bytes, 0xFF-padded): 6–8 ASCII digits (FIPS 201-2
+/// §2.4.3).  Anything else could be stored but never verified.
+pub fn valid_new_pin(padded: &[u8]) -> bool {
+    let pin = strip_pin_padding(padded);
+    (6..=8).contains(&pin.len()) && pin.iter().all(u8::is_ascii_digit)
+}
+
+/// A new PUK (8 bytes, 0xFF-padded): 6–8 bytes, never empty.
+pub fn valid_new_puk(padded: &[u8]) -> bool {
+    (6..=8).contains(&strip_pin_padding(padded).len())
+}
+
 /// Build a retry-count status word: 0x63C0 | remaining.
 fn sw_retry(remaining: u8) -> u16 {
     0x63C0 | (remaining as u16 & 0x0F)
-}
-
-/// Handle CHANGE REFERENCE DATA and persist updated PIN/PUK state to flash.
-pub fn handle_with_store(
-    state: &mut PivState,
-    store: &mut dyn crate::storage::KeyStore,
-    cmd: &ApduCommand<'_>,
-) -> ApduResponse {
-    let resp = handle(state, cmd);
-    if resp.sw == 0x9000 {
-        crate::protocol::piv::Piv::save_pin_to_store(state, store);
-    }
-    resp
 }
 
 /// Handle a CHANGE REFERENCE DATA APDU command.
@@ -67,9 +66,7 @@ fn handle_change_pin(state: &mut PivState, cmd: &ApduCommand<'_>) -> ApduRespons
     let new_pin = strip_pin_padding(&cmd.data[8..16]);
 
     // FIPS 201-2 §2.4.3: PIV PIN must contain only numeric digits (0x30–0x39).
-    if old_pin.iter().any(|&b| !(0x30..=0x39).contains(&b))
-        || new_pin.iter().any(|&b| !(0x30..=0x39).contains(&b))
-    {
+    if !valid_new_pin(&cmd.data[..8]) || !valid_new_pin(&cmd.data[8..16]) {
         return ApduResponse::err(0x6A80); // wrong data — non-digit byte
     }
 
@@ -98,10 +95,13 @@ fn handle_change_puk(state: &mut PivState, cmd: &ApduCommand<'_>) -> ApduRespons
         return ApduResponse::err(0x6700);
     }
 
-    if state.pin_state.puk_blocked {
+    if state.pin_state.puk_blocked || state.pin_state.puk_retries_remaining == 0 {
         return ApduResponse::err(0x6983);
     }
 
+    if !valid_new_puk(&cmd.data[8..16]) {
+        return ApduResponse::err(0x6700);
+    }
     let old_puk = strip_pin_padding(&cmd.data[..8]);
     let new_puk = strip_pin_padding(&cmd.data[8..16]);
 
@@ -141,7 +141,7 @@ fn handle_change_puk(state: &mut PivState, cmd: &ApduCommand<'_>) -> ApduRespons
 fn fill_random_bytes(buf: &mut [u8]) {
     #[cfg(target_arch = "arm")]
     {
-        let _ = crate::crypto::rng::fill_random(buf);
+        crate::crypto::rng::fill_or_reset(buf);
     }
     #[cfg(not(target_arch = "arm"))]
     {

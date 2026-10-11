@@ -27,7 +27,30 @@ pub const INS_INITIALIZE: u8 = 0x50;
 
 /// Parse a BER-TLV primitive tag (single byte) from `data` starting at `pos`.
 /// Returns `(value_slice, new_pos)` or `None` if malformed / missing.
-fn find_tlv<'a>(data: &'a [u8], tag: u8) -> Option<&'a [u8]> {
+/// The SO-PIN (init code) carried by an INITIALIZE APDU, if well formed —
+/// i.e. whether a re-INITIALIZE would compare it.
+pub fn init_code<'a>(cmd: &ApduCommand<'a>) -> Option<&'a [u8]> {
+    if cmd.p1 != 0x00 || cmd.p2 != 0x00 {
+        return None;
+    }
+    find_tlv(cmd.data, 0x82).filter(|c| c.len() == 8)
+}
+
+/// Every field check `handle` makes before comparing the SO-PIN.  The
+/// retry wrapper charges only requests that pass, so a malformed request
+/// costs nothing and a correct SO-PIN is never charged for a later field
+/// error (five of those blocked the SO-PIN for good).
+pub fn well_formed(cmd: &ApduCommand<'_>) -> bool {
+    let d = cmd.data;
+    init_code(cmd).is_some()
+        && find_tlv(d, 0x81).map_or(true, |p| (6..=16).contains(&p.len()))
+        && find_tlv(d, 0x91)
+            .and_then(|v| v.first().copied())
+            .map_or(true, |r| (1..=15).contains(&r))
+        && find_tlv(d, 0x93).map_or(true, |p| (8..=16).contains(&p.len()))
+}
+
+fn find_tlv(data: &[u8], tag: u8) -> Option<&[u8]> {
     let mut i = 0;
     while i + 1 < data.len() {
         let t = data[i];
@@ -102,18 +125,6 @@ pub fn handle(
         return ApduResponse::err(SW_WRONG_LENGTH);
     }
 
-    // Re-initialization: the provided init code must match the stored hash.
-    // The real SmartCard-HSM authenticates re-init via the init code in the
-    // command itself — no prior VERIFY is required.
-    if state.initialized {
-        if let Some(stored_hash) = state.so_pin_hash {
-            let provided_hash = hash_pin_pbkdf2(init_code, &state.so_pin_salt);
-            if !bool::from(provided_hash.ct_eq(&stored_hash)) {
-                return ApduResponse::err(SW_SECURITY_STATUS);
-            }
-        }
-    }
-
     // Tag 0x81: User PIN (optional, 6–16 bytes).
     let user_pin = find_tlv(data, 0x81);
     if let Some(up) = user_pin {
@@ -131,15 +142,55 @@ pub fn handle(
         }
     });
 
-    // Tag 0x91: User PIN retry counter (optional).
+    // Tag 0x91: User PIN retry counter (optional).  1–15: the 63Cx status
+    // word reports it in four bits, and 0 would create a blocked PIN.
     let retry_counter = find_tlv(data, 0x91)
         .and_then(|v| v.first().copied())
         .unwrap_or(3);
+    if !(1..=15).contains(&retry_counter) {
+        return ApduResponse::err(SW_WRONG_DATA);
+    }
+
+    // Tag 0x93: PUK (optional, 8–16 bytes).  Validated with everything
+    // else, before any credential in RAM changes.
+    let puk = find_tlv(data, 0x93);
+    if let Some(p) = puk {
+        if p.len() < 8 || p.len() > 16 {
+            return ApduResponse::err(SW_WRONG_LENGTH);
+        }
+    }
 
     // Tag 0x92: DKEK share count (optional, 0 = no DKEK).
     let dkek_count = find_tlv(data, 0x92)
         .and_then(|v| v.first().copied())
         .unwrap_or(0);
+
+    // Re-initialization: the provided init code must match the stored hash
+    // (checked last, after every field — see `well_formed`).
+    // The real SmartCard-HSM authenticates re-init via the init code in the
+    // command itself — no prior VERIFY is required.
+    if state.initialized {
+        // The retry itself is spent on flash by ScHsm::with_persisted_attempt.
+        if state.so_pin_hash.is_some() && state.so_pin_retry_count == 0 {
+            return ApduResponse::err(pico2hsm_core::apdu::SW_AUTH_BLOCKED);
+        }
+        if let Some(stored_hash) = state.so_pin_hash {
+            let provided_hash = hash_pin_pbkdf2(init_code, &state.so_pin_salt);
+            if !bool::from(provided_hash.ct_eq(&stored_hash)) {
+                return ApduResponse::err(SW_SECURITY_STATUS);
+            }
+        }
+    }
+
+    // Wipe SC-HSM's keys from flash first, before any credential in RAM
+    // changes.  Old keys must really be gone, or they would reappear after
+    // a reset under the new PINs; and if the wipe fails, RAM still holds
+    // the old credentials — a later VERIFY must not persist new ones next
+    // to keys the wipe left behind.
+    crate::CORE1_PROGRESS.store(31, core::sync::atomic::Ordering::Relaxed);
+    if store.wipe_by_owner(AppletId::ScHsm).is_err() {
+        return ApduResponse::err(pico2hsm_core::apdu::SW_MEMORY_FAILURE);
+    }
 
     // Generate fresh random salts for all credentials.
     let so_salt = gen_salt();
@@ -151,17 +202,17 @@ pub fn handle(
     state.so_pin_hash = Some(hash_pin_pbkdf2(init_code, &so_salt));
 
     // Store User PIN hash if provided, using PBKDF2.
+    // Without one, the previous owner's PIN must not survive re-INITIALIZE.
     if let Some(up) = user_pin {
         state.user_pin_salt = user_salt;
         state.user_pin_hash = Some(hash_pin_pbkdf2(up, &user_salt));
-        state.pin_retry_count = retry_counter;
+    } else {
+        state.user_pin_hash = None;
     }
+    state.pin_retry_count = retry_counter;
 
     // Tag 0x93: PUK (optional, 8–16 bytes), using PBKDF2.
-    if let Some(puk) = find_tlv(data, 0x93) {
-        if puk.len() < 8 || puk.len() > 16 {
-            return ApduResponse::err(SW_WRONG_LENGTH);
-        }
+    if let Some(puk) = puk {
         state.puk_salt = puk_salt_bytes;
         state.puk_hash = Some(hash_puk_pbkdf2(puk, &puk_salt_bytes));
         state.puk_retry_count = 10;
@@ -175,6 +226,7 @@ pub fn handle(
     state.dkek_shares_imported = 0;
 
     // Reset auth state.
+    state.session_pin = None;
     state.pin_verified = false;
     state.so_pin_verified = false;
     state.so_pin_retry_count = 5;
@@ -207,15 +259,11 @@ pub fn handle(
     // Clear ephemeral exchange state.
     state.exchange_ephem_priv = None;
     state.exchange_ephem_pub = None;
+    state.exchange_challenge = None;
+    state.exchange_peer_ephem_pub = None;
 
-    // Clear enrolled peer pubkey and reset unauthenticated DKEK mode.
+    // Clear the enrolled peer pubkey (re-enroll with ENROLL_PEER_PUBKEY).
     state.noise_enrolled_peer_pubkey = None;
-    state.dkek_unauthenticated_allowed = true;
-
-    // Wipe only SC-HSM-owned keys from persistent flash keystore.
-    // Degraded flash does not fail the INITIALIZE command.
-    crate::CORE1_PROGRESS.store(31, core::sync::atomic::Ordering::Relaxed);
-    let _ = store.wipe_by_owner(AppletId::ScHsm); // best-effort; InvalidCore returns Ok(()) on Core1
 
     // Generate device identity P-256 keypair for DKEK exchange.
     // Stored at reserved slot 0xFE; public key written to EF 0x2F02.
@@ -242,7 +290,9 @@ pub fn handle(
                 let _ = key_obj.private_key.extend_from_slice(&pair.private_key);
                 let _ = key_obj.public_key.extend_from_slice(&pair.public_key);
                 crate::CORE1_PROGRESS.store(80, core::sync::atomic::Ordering::Relaxed);
-                let _ = store.save_key(&key_obj); // best-effort
+                if store.save_key(&key_obj).is_err() {
+                    return ApduResponse::err(pico2hsm_core::apdu::SW_MEMORY_FAILURE);
+                }
                 crate::CORE1_PROGRESS.store(81, core::sync::atomic::Ordering::Relaxed);
             }
 
@@ -259,7 +309,6 @@ pub fn handle(
             // Store public key in EF 0x2F02 (EF.C.DevAut) via flash + ef_cache.
             {
                 let ef_key_id = pico2hsm_core::key::KeyId::sc_hsm_ef(0, 0x2F, 0x02);
-                let _ = store.erase_key(ef_key_id);
                 let mut ef_obj = KeyObject::new(
                     KmType::Generic,
                     ef_key_id.0,
@@ -267,7 +316,9 @@ pub fn handle(
                     AlgorithmId::EcdsaP256,
                 );
                 let _ = ef_obj.private_key.extend_from_slice(&pair.public_key);
-                let _ = store.save_key(&ef_obj);
+                if store.save_key(&ef_obj).is_err() {
+                    return ApduResponse::err(pico2hsm_core::apdu::SW_MEMORY_FAILURE);
+                }
                 // Populate ef_cache so READ BINARY can serve this data.
                 state.ef_cache_put(ef_key_id.0, &pair.public_key);
                 // Push EfFile metadata to key_index.
@@ -285,7 +336,9 @@ pub fn handle(
 
     // Persist PIN/SO-PIN/PUK state to flash.
     crate::CORE1_PROGRESS.store(33, core::sync::atomic::Ordering::Relaxed);
-    crate::protocol::sc_hsm::ScHsm::save_pin_to_store(state, store);
+    if crate::protocol::sc_hsm::ScHsm::save_pin_to_store(state, store).is_err() {
+        return ApduResponse::err(pico2hsm_core::apdu::SW_MEMORY_FAILURE);
+    }
     crate::CORE1_PROGRESS.store(39, core::sync::atomic::Ordering::Relaxed);
 
     // cdc_log removed — CriticalSectionRawMutex is single-core only, unsafe on core1

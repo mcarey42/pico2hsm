@@ -2,10 +2,22 @@
 
 ## Build, flash, and debug
 
-Always use the debug script to build and flash firmware. Do not run `cargo build` directly.
+Use the debug script to flash firmware and stream RTT logs:
 
 ```sh
 ./build-all-debug.sh pico2_4m
+```
+
+Building with `cargo` directly is fine for compile checks, size analysis
+(`arm-none-eabi-nm -S --size-sort`, `objdump`), and host tests. Always pass
+`--no-default-features --features <board>,...` (see "Feature flags and default
+features" below), and set `DEFMT_LOG=trace` if the build will be flashed and you
+need full log output. Flash only via the script, which handles signing.
+
+```sh
+# From the repo root, -p is required (the workspace includes host-only test crates).
+cargo build -p pico2hsm-firmware --no-default-features --features pico2_4m,rsa,applet-piv,applet-openpgp-curve25519
+# ELF: target/thumbv8m.main-none-eabihf/debug/pico2hsm
 ```
 
 Valid board arguments: `pico2_4m`, `rp2350_one_4m`, `rp2350_geek_16m`, `rp2350_geek_sdcard`, `waveshare_rp2350_lcd_16m`, `waveshare_rp2350_lcd_sdcard`.
@@ -47,7 +59,7 @@ pkill -9 -f "probe-rs"
 ## Architecture overview
 
 **Concurrency model** (RP2350 dual-core):
-- **Core0** — Embassy async executor: USB device driver + CCID transport loop. Sends APDUs to core1 via `APDU_CHANNEL` and waits for responses on `RESP_CHANNEL`.
+- **Core0** — Embassy async executor: USB device driver + CCID transport loop, plus the hardware-watchdog feeder task. Sends APDUs to core1 via `APDU_CHANNEL` and waits for responses on `RESP_CHANNEL`.
 - **Core1** — Synchronous `dispatcher_loop()`: no Embassy executor.  Sleeps via ARM `wfe` (Wait For Event) while idle; woken by core0 via `sev` (Send Event) after each channel send.  Calls `blocking_receive()`/`blocking_send()` on the shared channels using `try_receive()`/`try_send()`.
 
 Both channels use RP2350 hardware spinlocks (29 and 30) for SMP-safe cross-core signalling.
@@ -170,28 +182,78 @@ Each board's LED/display driver is fully implemented (not stubbed):
 - Full 320×172 RGB444 framebuffer (83 KB in BSS); `ScreenLayout::waveshare_320x172()`.
 - Both LCD colour and WS2812B GRB are set simultaneously via `status_to_colors()`.
 
+## Security invariants
+
+Established by the October 2026 audit (`docs/AUDIT_2026-10.md`); keep them
+when changing the code.
+
+- **Credential retries are spent on flash before comparing.** VERIFY / CHANGE
+  PIN / PUK / re-INITIALIZE (SC-HSM), VERIFY / CHANGE / RESET (PIV), VERIFY /
+  CHANGE (OpenPGP) all go through `with_persisted_attempt`; only APDUs the
+  handler would actually compare count (`spent_by` mirrors the handler's
+  pre-checks). New credential checks must use the same wrapper.
+- **Storage errors fail closed.** `Core1KeyStore` is synchronous, so
+  `save_key` / `erase_key` / `wipe_*` results are real. Never `let _ =` them
+  in a handler: report 6581 and keep RAM consistent with flash.
+- **OTP layout lives in `security/otp_layout.rs`** (compile-time overlap
+  checks). Never hard-code OTP rows elsewhere; never write row 0x110.
+- **Reserved SC-HSM key refs 0xFC–0xFF** (peer record, DKEK, device key, PIN
+  record) are refused by every user key command (`targets_reserved_slot`).
+- **The DKEK** is persisted at 0xFD, only replaced by an authenticated,
+  SO-PIN, enrolled-peer exchange, never overwritten while set.
+- **Secrets are wiped in place.** Zeroize before moving or dropping; use
+  `security::zeroize::key_buf` for fixed key buffers; `mem::replace` /
+  assigning `None` does not wipe the old bytes.
+
 ## Known pitfalls
 
-### Core1 stack overflow (silent hang)
+### Core1 stack overflow
 
-**Symptom**: APDU is received and logged by core0 (`APDU XX XX XX XX len=N`), time extensions fire every 1.5 s, but no log lines from the command handler ever appear — not even the first `defmt::info!` at the top of the function. The command never completes.
+**Symptom**: APDU is received and logged by core0 (`APDU XX XX XX XX len=N`), time extensions fire every 1.5 s, but the command never completes; after ~30 s core0 sends 6F00 and resets the chip through the hardware watchdog (next boot logs `reset: WATCHDOG RESET: core1 stuck during an APDU`).
 
-**Cause**: `ScHsmState` holds `ef_files: Vec<EfEntry, 16>` where each `EfEntry` contains `Vec<u8, 2048>` inline — 32 KB of fixed EF storage alone. Combined with multiple `Vec<u8, 4096>` response buffers allocated as stack temporaries across the `Dispatcher → ScHsm::process_apdu → ScHsm::dispatch → handle()` call chain (~12–16 KB), the total easily exceeds the core1 stack limit. On Cortex-M33 without MPU guard pages this is a **silent** overflow: no panic, no fault, core1 just runs garbage.
+**Cause**: core1 runs the whole dispatch chain on its own 128 KB stack (`CORE1_STACK` in `firmware/src/main.rs`). Large stack temporaries — `Vec<u8, 4096>` response buffers, `KeyObject`s (~3 KB), 4 KB flash sector buffers, PKCS#1 DER buffers — add up across `dispatcher_loop → Dispatcher::dispatch_with_store → <protocol>::process_apdu_with_store → route_with_store → handler → store`. MSPLIM is set at the stack base, so an overflow faults (UsageFault) instead of silently corrupting memory, but core1 still stops. (The protocol *state*, e.g. `ScHsmState`, lives in BSS via `DISPATCHER_CELL`, not on this stack.)
 
-**Fix**: Set `CORE1_STACK` in `firmware/src/main.rs` to 128 KB.  Measured peak usage
-is ~65 KB (38 KB ScHsmState inline storage + 16 KB dispatch-chain temporaries),
-giving ~2× headroom:
-```rust
-// 128 KB — ~2× measured peak of ~65 KB.  Do not reduce below 96 KB.
-static mut CORE1_STACK: Stack<131072> = Stack::new();
+**Measured** (2026-10, debug, pico2_4m and SD boards, worst path): dispatcher_loop 20.6 KB → dispatch_with_store 8.2 KB → Piv::process_apdu_with_store 11.2 KB → route 7.1 KB → PIV put_data::handle_with_store 20.6 KB → save_key / fetch_key chain ~20 KB ≈ **89 KB of 128 KB**. Before the synchronous `Core1KeyStore` (which removed a queue of by-value `KeyObject`s) it was ~123 KB.
+
+**Re-measure** after adding large locals or a deeper call path:
+```sh
+cargo build -p pico2hsm-firmware --no-default-features --features pico2_4m,rsa,applet-piv,applet-openpgp-curve25519
+arm-none-eabi-objdump -d --no-show-raw-insn -C target/thumbv8m.main-none-eabihf/debug/pico2hsm \
+  | grep -A6 '<pico2hsm::dispatcher_loop>:' | grep 'sub.*sp'   # frame size per function
 ```
-
-**Rule of thumb**: Any time a new large static allocation is added to `ScHsmState` (keys, files, buffers), re-evaluate core1 stack headroom. The RP2350 has 520 KB SRAM total; current BSS is ~332 KB (rp2350_geek_16m with all applets, after removing Embassy executor from core1).
+Keep heavy buffers off the stack (`Zeroizing` helpers like `security::zeroize::key_buf` keep secrets wiped but still use stack), and never queue `KeyObject`s by value.
 
 **Core1 synchronous loop**: Core1 no longer runs an Embassy executor — it uses a
 synchronous `dispatcher_loop()` with `wfe`/`sev` for cooperative sleep/wake.
 This eliminated ~61 KB of async state machine BSS overhead, giving core0 ~188 KB
 of stack space (ample for the ~67 KB debug-build poll frame).
+
+### Hardware watchdog
+
+`firmware/src/watchdog.rs`; armed in `main()` right after `embassy_rp::init`
+(8 s, paused while a debugger halts either core).  Only core0 feeds: the
+`watchdog_feeder` task every 1 s while core1 is idle, making progress
+(heartbeat or request/reply counters moved within 30 s) or under
+`WatchdogSuppressGuard`; and `watchdog::progress()` in every flash/SD sector
+write/erase and key load, for blocking storage work on core0.
+
+- Code on core0 that blocks the executor for more than a few seconds must
+  call `watchdog::progress()` as it goes (or the chip resets ~8 s in).
+- Core1 work longer than 30 s must bump `WATCHDOG_HEARTBEAT` (RNG calls and
+  storage ops do) or hold a `WatchdogSuppressGuard`.
+- Send work to core1 only via `send_to_core1()`, and count each reply
+  (`note_core1_response`), or the feeder's busy/idle accounting drifts.
+- Reset with `watchdog::reset_now(cause)`, not `SCB::sys_reset()` (on
+  RP2350 only a processor warm reset); don't use
+  `embassy_rp::watchdog::Watchdog::start` (RP2040 `PSM.WDSEL` layout, leaves
+  both cores out on RP2350).
+- The boot log's first lines say why the last reset happened.  A watchdog
+  reset also restarts the debug logic, so the probe-rs RTT stream may stop:
+  re-run `build-all-debug.sh`.  If probe-rs exits while RTT is in blocking
+  mode and core0 stalls on a full RTT buffer, the watchdog now reboots the
+  board instead of it hanging.
+- `debug`-feature test hooks (SC-HSM selected): `80 FE 10 00` wedges core1,
+  `80 FE 11 00` wedges core0 after replying, `80 FE 12 00` resets now.
 
 ### CCID timeout on long operations (P-384 / P-521 / K-256 sign)
 

@@ -36,27 +36,16 @@ fn strip_pin_padding(padded: &[u8]) -> &[u8] {
     &padded[..end]
 }
 
-/// Handle VERIFY and persist PIN state to flash if the retry counter changed
-/// or the PIN was successfully authenticated.
-pub fn handle_with_store(
-    state: &mut PivState,
-    store: &mut dyn crate::storage::KeyStore,
-    cmd: &ApduCommand<'_>,
-) -> ApduResponse {
-    let retries_before = state.pin_state.pin_retries_remaining;
-    let resp = handle(state, cmd);
-    // Save if retry counter changed (wrong PIN) or session was authenticated.
-    if state.pin_state.pin_retries_remaining != retries_before
-        || state.pin_state.session_authenticated
-        || state.pin_verified
-    {
-        crate::protocol::piv::Piv::save_pin_to_store(state, store);
-    }
-    resp
-}
-
 /// Handle a VERIFY APDU command.
 pub fn handle(state: &mut PivState, cmd: &ApduCommand<'_>) -> ApduResponse {
+    // SP 800-73-4 Part 2 §3.2.1: P1 = FF with no data resets the security
+    // status of the reference (the PIN is no longer verified).
+    if cmd.p1 == 0xFF && cmd.p2 == P2_PIV_PIN && cmd.data.is_empty() {
+        state.pin_verified = false;
+        state.pin_always_ok = false;
+        state.pin_state.session_authenticated = false;
+        return ApduResponse::ok(&[]);
+    }
     if cmd.p1 != 0x00 {
         return ApduResponse::err(0x6A86); // incorrect P1/P2
     }
@@ -68,8 +57,9 @@ pub fn handle(state: &mut PivState, cmd: &ApduCommand<'_>) -> ApduResponse {
                 if state.pin_state.pin_blocked {
                     return ApduResponse::err(0x6983); // auth blocked
                 }
-                // If already authenticated in this session, return 90 00
-                if state.pin_state.session_authenticated {
+                // Verified in this session — the same flag GENERAL
+                // AUTHENTICATE checks, so the answer matches what will work.
+                if state.pin_verified {
                     return ApduResponse::err(SW_OK);
                 }
                 return ApduResponse::err(sw_retry(state.pin_state.pin_retries_remaining));
@@ -87,15 +77,18 @@ pub fn handle(state: &mut PivState, cmd: &ApduCommand<'_>) -> ApduResponse {
             // Strip 0xFF padding to get the actual PIN
             let pin = strip_pin_padding(cmd.data);
 
-            // FIPS 201-2 §2.4.3: PIV PIN must contain only numeric digits (0x30–0x39).
-            if pin.iter().any(|&b| !(0x30..=0x39).contains(&b)) {
-                return ApduResponse::err(0x6A80); // wrong data — non-digit byte
+            // FIPS 201-2 §2.4.3: 6–8 ASCII digits — the only PINs that can
+            // match.  Refused before the compare (and `spent_by` doesn't
+            // charge a retry for them).
+            if !super::change_reference_data::valid_new_pin(cmd.data) {
+                return ApduResponse::err(0x6A80);
             }
 
             // Verify against PinState
             match state.pin_state.verify_pin(pin, &state.device_id, None) {
                 Ok(PinVerifyResult::Success) => {
                     state.pin_verified = true;
+                    state.pin_always_ok = true;
                     ApduResponse::ok(&[])
                 }
                 Ok(PinVerifyResult::WrongPin { retries_remaining }) => {

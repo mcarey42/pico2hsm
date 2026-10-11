@@ -70,18 +70,28 @@ pub fn handle(
         None => return ApduResponse::err(SW_FILE_NOT_FOUND),
     };
 
-    let key_obj = match store.fetch_key(KeyId(full_key_id)) {
+    let mut key_obj = match store.fetch_key(KeyId(full_key_id)) {
         Ok(Some(obj)) => obj,
         _ => return ApduResponse::err(SW_FILE_NOT_FOUND),
     };
+
+    // The response is a private key (the child, or the master itself for an
+    // empty path), so this is an export: honour NO_EXPORT, and never hand
+    // back the master key.
+    if key_obj.key_flags & super::export_key::NO_EXPORT_BIT != 0 {
+        return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED);
+    }
+    if cmd.data.is_empty() {
+        return ApduResponse::err(SW_WRONG_DATA);
+    }
 
     let key_type = match key_type_from_u8(meta.key_type) {
         Some(kt) => kt,
         None => return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
     };
 
-    let raw_key: heapless::Vec<u8, 66> = {
-        let mut v: heapless::Vec<u8, 66> = heapless::Vec::new();
+    let raw_key = {
+        let mut v = crate::security::zeroize::WipeOnDrop::<66>::new();
         if v.extend_from_slice(&key_obj.private_key).is_err() {
             return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED);
         }
@@ -114,6 +124,18 @@ pub fn handle(
         key_id: KeyId(full_key_id),
         raw: master_raw,
     };
+
+    if !matches!(
+        key_type,
+        KeyType::Bip32Master | KeyType::EcPrivateK256 | KeyType::EcPrivateP256
+    ) {
+        return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED);
+    }
+    // HD derivation has no CardContact algorithm ID: only a key without an
+    // algorithm list may be used; the use counter applies.
+    if let Err(sw) = crate::security::key_policy::authorize_use(store, &mut key_obj, None) {
+        return ApduResponse::err(sw);
+    }
 
     // Dispatch to BIP32 or SLIP-0010 based on key type
     let derived = match key_type {
@@ -360,27 +382,27 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_bip_slip_empty_path() {
-        // Empty path: should return the master key material unchanged (64 bytes)
+    fn test_bip_slip_empty_path_refused() {
+        // An empty path would return the master private key itself.
         let (mut state, mut store) = make_state_tv1(0x01);
         let raw = bip_apdu(0x01, &[]);
         let cmd = pico2hsm_core::apdu::ApduCommand::parse(&raw).unwrap();
         let resp = handle(&mut state, &mut store, &cmd);
-        assert_eq!(resp.sw, SW_OK);
-        assert_eq!(
-            resp.data.len(),
-            64,
-            "response must be 64 bytes (key || chain_code)"
-        );
+        assert_eq!(resp.sw, SW_WRONG_DATA);
+        assert!(resp.data.is_empty());
+    }
 
-        // Verify the bytes match the original master
-        let (k, c) = slip10_tv1_master();
-        assert_eq!(&resp.data[..32], &k, "first 32 bytes must be master key");
-        assert_eq!(
-            &resp.data[32..],
-            &c,
-            "last 32 bytes must be master chain code"
-        );
+    #[test]
+    fn test_bip_slip_honours_no_export() {
+        let (mut state, mut store) = make_state_tv1(0x01);
+        for k in store.keys.iter_mut() {
+            k.key_flags |= super::super::export_key::NO_EXPORT_BIT;
+        }
+        let raw = bip_apdu(0x01, &0x8000_0000u32.to_be_bytes());
+        let cmd = pico2hsm_core::apdu::ApduCommand::parse(&raw).unwrap();
+        let resp = handle(&mut state, &mut store, &cmd);
+        assert_eq!(resp.sw, SW_CONDITIONS_NOT_SATISFIED);
+        assert!(resp.data.is_empty());
     }
 
     #[test]

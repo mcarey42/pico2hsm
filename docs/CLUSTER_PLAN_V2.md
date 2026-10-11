@@ -3,6 +3,8 @@
 *Second iteration incorporating penetration test, protocol hardening review, network sync design, and implementation security review.*
 *Supersedes `CLUSTER_PLAN.md`. Date: 2026-04-08*
 
+> **Superseded in part by `CLUSTER_PLAN_V3.md`** (domains, multi-member enrollment, sync records, tombstones). The §1 DKEK exchange is kept there.
+
 ---
 
 ## What Changed from V1

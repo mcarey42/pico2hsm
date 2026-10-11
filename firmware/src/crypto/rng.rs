@@ -149,8 +149,8 @@ impl Rng {
         if self.adc_sample_count >= ADC_POOL_SAMPLES {
             // Hash the accumulated samples.
             let mut hasher = Sha256::new();
-            hasher.update(&self.adc_accumulator);
-            hasher.update(&self.adc_pool); // chain previous pool
+            hasher.update(self.adc_accumulator);
+            hasher.update(self.adc_pool); // chain previous pool
             let digest = hasher.finalize();
 
             // XOR digest into the pool.
@@ -162,7 +162,8 @@ impl Rng {
             self.adc_sample_count = 0;
             self.adc_accumulator = [0u8; ADC_POOL_SAMPLES];
 
-            defmt::debug!("RNG: ADC entropy pool refreshed");
+            // Not defmt: this runs on core1, which must not block on RTT.
+            crate::cdc_log!("RNG: ADC entropy pool refreshed");
         }
     }
 }
@@ -267,8 +268,8 @@ pub fn fill_random(buf: &mut [u8]) -> Result<(), CryptoError> {
     if prev % RESEED_INTERVAL == 0 && prev != 0 {
         // Best-effort: log on failure but do not propagate the error so that
         // callers are not broken by a transient TRNG timeout.
-        if let Err(_) = reseed() {
-            defmt::warn!("RNG: periodic reseed failed — continuing with existing CSPRNG state");
+        if reseed().is_err() {
+            crate::cdc_warn!("RNG: periodic reseed failed — continuing with existing CSPRNG state");
         }
     }
 
@@ -285,6 +286,23 @@ pub fn fill_random(buf: &mut [u8]) -> Result<(), CryptoError> {
         pac_fill_bytes(buf)?;
     }
     Ok(())
+}
+
+/// Fill `buf` from the CSPRNG, or reset the chip if the TRNG has failed.
+///
+/// For callers that cannot propagate an error (`RngCore::fill_bytes`,
+/// challenge/nonce helpers).  Handing out a zero or predictable buffer as a
+/// nonce, salt or key is never acceptable on an HSM, and a panic is not
+/// enough: with `panic = abort` RAII guards such as `WatchdogSuppressGuard`
+/// never run, so the stall detector could stay disarmed.  A full reset is the
+/// only state known to be safe.
+pub fn fill_or_reset(buf: &mut [u8]) {
+    if fill_random(buf).is_err() {
+        // No log: core1 must not block on RTT, and a queued CDC line would
+        // never be sent before the reset.  Through the watchdog: a full
+        // chip reset from either core, with the cause kept for the boot log.
+        crate::watchdog::reset_now(crate::watchdog::ResetCause::RngFailure);
+    }
 }
 
 /// Generate `n` random bytes and return them in a heapless Vec.

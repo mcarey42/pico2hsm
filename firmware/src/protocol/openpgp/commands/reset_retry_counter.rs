@@ -21,9 +21,18 @@ pub fn handle_with_store(
     store: &mut dyn crate::storage::KeyStore,
     cmd: &ApduCommand<'_>,
 ) -> ApduResponse {
+    let hash_before = zeroize::Zeroizing::new(state.pw1_hash); // wiped on drop
     let resp = handle(state, cmd);
-    if resp.sw == 0x9000 {
-        crate::protocol::openpgp::OpenPgp::save_pw1_to_store(state, store);
+    if resp.sw == 0x9000
+        && crate::protocol::openpgp::OpenPgp::save_pw1_to_store(state, store).is_err()
+    {
+        // Keep RAM what flash holds: the new PW1 must not work until
+        // reboot, and the counters are what the log says.
+        state.pw1_hash = *hash_before;
+        crate::protocol::openpgp::OpenPgp::load_counters(state, store, false);
+        state.pw1_verified_sign = false;
+        state.pw1_verified_other = false;
+        return ApduResponse::err(pico2hsm_core::apdu::SW_MEMORY_FAILURE);
     }
     resp
 }
@@ -59,7 +68,7 @@ pub fn handle(state: &mut OpenPgpState, cmd: &ApduCommand<'_>) -> ApduResponse {
             if cmd.data.len() < 6 || cmd.data.len() > 127 {
                 return ApduResponse::err(SW_WRONG_LENGTH);
             }
-            state.pw1_hash = Some(OpenPgpState::hash_pin(cmd.data));
+            state.pw1_hash = Some(crate::protocol::openpgp::pw::PwHash::new(cmd.data));
             state.pw1_retries = PW1_MAX_RETRIES;
             state.pw1_verified_sign = false;
             state.pw1_verified_other = false;

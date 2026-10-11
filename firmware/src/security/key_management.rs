@@ -17,6 +17,8 @@
 //! [N]   private_key      raw private key scalar / symmetric key
 //! [2]   pub_len          big-endian u16 (0 if no public key)
 //! [M]   public_key       raw public key bytes (may be 0 bytes)
+//! [P]   policy           `P2KP` only: the key's usage policy, `A5 L {..}`
+//!                        (see `key_policy`); absent in `P2K4`
 //! ---  (header = first 21 bytes, used as GCM AAD; payload encrypted in-place)
 //! [16]  GCM tag          appended by AES-256-GCM encrypt
 //! [12]  nonce            appended after tag
@@ -77,6 +79,15 @@ pub const KEY_MAGIC_V2: [u8; 4] = *b"P2K2";
 /// Legacy magic header (v3) — accepted on read with key_flags=0.
 pub const KEY_MAGIC_V3: [u8; 4] = *b"P2K3";
 
+/// `P2K4` layout plus a usage policy after the public key (audit S-10).
+///
+/// Written only for a key that has a policy; every other object keeps the
+/// `P2K4` magic, byte for byte what earlier firmware wrote and reads.  A
+/// separate magic (rather than trailing bytes in a `P2K4` blob, which older
+/// firmware would ignore) makes a downgraded firmware refuse a restricted
+/// key instead of using it without its restrictions.
+pub const KEY_MAGIC_POLICY: [u8; 4] = *b"P2KP";
+
 /// Maximum number of key slots (key_id 0x01–0xFF).
 pub const MAX_KEYS: usize = 255;
 
@@ -95,8 +106,13 @@ const P2K4_HEADER_SIZE: usize = 21;
 /// Maximum plaintext payload inside a P2K4 encrypted blob.
 ///
 /// Layout: `[opt 2-byte priv_len] || priv_key || pub_len(2) || pub_key`.
-/// The 2-byte priv_len prefix is added when `priv_key.len() > 255` (RSA).
-pub const MAX_PLAINTEXT_SIZE: usize = 2 + MAX_PRIVATE_KEY_SIZE + 2 + MAX_PUBLIC_KEY_SIZE;
+/// The 2-byte priv_len prefix is added when `priv_key.len() > 255` (RSA
+/// keys and data objects).
+pub const MAX_PLAINTEXT_SIZE: usize = 2
+    + MAX_OBJECT_DATA_SIZE
+    + 2
+    + MAX_PUBLIC_KEY_SIZE
+    + crate::security::key_policy::MAX_POLICY_EXT;
 
 /// Maximum encrypted blob size (P2K4 format).
 ///
@@ -109,14 +125,28 @@ const DKEK_MAX_PAYLOAD: usize = 1 + 2 + MAX_PRIVATE_KEY_SIZE + 7;
 /// Maximum DKEK-wrapped blob: nonce(12) + payload + tag(16).
 const DKEK_MAX_BLOB: usize = NONCE_SIZE + DKEK_MAX_PAYLOAD + TAG_SIZE;
 
-/// Maximum private key size.
+/// Maximum private key size (key material only: bounds DKEK export/import).
 ///
 /// RSA-2048 PKCS#1 DER private keys are ~1192 bytes; RSA-4096 are ~2350 bytes.
-/// Sized to 2400 bytes to cover both RSA key sizes and all EC curves.
+/// Sized to 2400 bytes to cover both RSA key sizes and all EC curves.  Without
+/// RSA the largest key is far below 512 bytes (P-521 scalar, AES-256).
 #[cfg(feature = "rsa")]
 pub const MAX_PRIVATE_KEY_SIZE: usize = 2400;
 #[cfg(not(feature = "rsa"))]
 pub const MAX_PRIVATE_KEY_SIZE: usize = 512;
+
+/// Maximum size of the secret payload of a stored object
+/// ([`KeyObject::private_key`]): a private key, or the content of a data
+/// object (PIV `5FC1xx` objects, OpenPGP DOs such as the `7F21` cardholder
+/// certificate, SC-HSM `CExx` / `C4xx` EFs and PIN records).
+///
+/// Independent of the `rsa` feature (audit R2-11): an EC-only build stores
+/// certificates and data objects of the same size as an RSA build.  The
+/// protocol layers cap their objects below this (PIV 2048, OpenPGP 7F21
+/// 1024, SC-HSM EFs by APDU length).
+pub const MAX_OBJECT_DATA_SIZE: usize = 2400;
+
+const _: () = assert!(MAX_PRIVATE_KEY_SIZE <= MAX_OBJECT_DATA_SIZE);
 
 /// Maximum public key size.
 ///
@@ -279,10 +309,15 @@ pub struct KeyObject {
     pub key_flags: u8,
     /// Daemon-assigned HLC timestamp (ms since epoch), 0 for legacy/locally-generated keys.
     pub timestamp_ms: u64,
-    /// Raw private key scalar or symmetric key bytes (zeroized on drop).
-    pub private_key: heapless::Vec<u8, MAX_PRIVATE_KEY_SIZE>,
+    /// Raw private key scalar or symmetric key bytes, or a data object's
+    /// content (zeroized on drop).
+    pub private_key: heapless::Vec<u8, MAX_OBJECT_DATA_SIZE>,
     /// Optional raw public key (uncompressed EC point, or RSA public key DER).
     pub public_key: heapless::Vec<u8, MAX_PUBLIC_KEY_SIZE>,
+    /// Usage policy (use counter, allowed algorithms, PIV PIN policy).
+    /// Default = no restriction, which is what every `P2K4` and older
+    /// object loads with.
+    pub policy: crate::security::key_policy::KeyPolicy,
 }
 
 impl Zeroize for KeyObject {
@@ -296,6 +331,7 @@ impl Zeroize for KeyObject {
         self.key_id = 0;
         self.owner.zeroize();
         self.key_domain = 0;
+        self.policy = crate::security::key_policy::KeyPolicy::default();
     }
 }
 
@@ -320,6 +356,7 @@ impl KeyObject {
             timestamp_ms: 0,
             private_key: heapless::Vec::new(),
             public_key: heapless::Vec::new(),
+            policy: crate::security::key_policy::KeyPolicy::default(),
         }
     }
 
@@ -333,7 +370,11 @@ impl KeyObject {
     ///   magic(4) | key_type(1) | key_id(4) | algorithm(1) |
     ///   key_size(1) | key_domain(1) | use_count(4) | generation(4) | key_flags(1)
     fn write_header(&self, buf: &mut [u8; 21]) {
-        buf[0..4].copy_from_slice(&KEY_MAGIC);
+        buf[0..4].copy_from_slice(if self.policy.is_unrestricted() {
+            &KEY_MAGIC
+        } else {
+            &KEY_MAGIC_POLICY
+        });
         buf[4] = self.key_type as u8;
         buf[5..9].copy_from_slice(&self.key_id.to_le_bytes());
         buf[9] = self.algorithm as u8;
@@ -367,21 +408,39 @@ impl KeyObject {
         smk: &[u8; 32],
         nonce: &[u8; NONCE_SIZE],
     ) -> Result<heapless::Vec<u8, MAX_BLOB_SIZE>, KeyError> {
+        self.encrypt_with_generation(smk, nonce, self.generation)
+    }
+
+    /// [`KeyObject::encrypt`] with `generation` written to the header instead
+    /// of `self.generation` — lets the keystore bump the counter without
+    /// copying the whole object (and its private key) first.
+    pub fn encrypt_with_generation(
+        &self,
+        smk: &[u8; 32],
+        nonce: &[u8; NONCE_SIZE],
+        generation: u32,
+    ) -> Result<heapless::Vec<u8, MAX_BLOB_SIZE>, KeyError> {
         // Derive per-key encryption key using the low-byte proto_ref.
         let kek = derive_key_encryption_key(smk, (self.key_id & 0xFF) as u8)?;
 
         // Build AAD = header bytes.
         let mut header = [0u8; P2K4_HEADER_SIZE];
         self.write_header(&mut header);
+        header[16..20].copy_from_slice(&generation.to_be_bytes());
 
         // Build plaintext:
-        //   EC  keys (priv ≤ 255): priv_key || pub_len(2) || pub_key
-        //   RSA keys (priv > 255): priv_len_le16(2) || priv_key || pub_len(2) || pub_key
+        //   EC  keys (priv ≤ 255): priv_key || pub_len(2) || pub_key [|| policy]
+        //   RSA keys (priv > 255): priv_len_le16(2) || priv_key || pub_len(2) || pub_key [|| policy]
+        let mut policy: heapless::Vec<u8, { crate::security::key_policy::MAX_POLICY_EXT }> =
+            heapless::Vec::new();
+        self.policy
+            .encode(&mut policy)
+            .map_err(|_| KeyError::KeyTooLarge)?;
         let priv_len = self.private_key.len();
         let pub_len = self.public_key.len();
         let inline_len = priv_len > 255;
         let prefix_len = if inline_len { 2 } else { 0 };
-        let pt_len = prefix_len + priv_len + 2 + pub_len;
+        let pt_len = prefix_len + priv_len + 2 + pub_len + policy.len();
         if pt_len > MAX_PLAINTEXT_SIZE {
             return Err(KeyError::KeyTooLarge);
         }
@@ -407,6 +466,9 @@ impl KeyObject {
             .map_err(|_| KeyError::BufferTooSmall)?;
         ct_buf
             .extend_from_slice(&self.public_key)
+            .map_err(|_| KeyError::BufferTooSmall)?;
+        ct_buf
+            .extend_from_slice(&policy)
             .map_err(|_| KeyError::BufferTooSmall)?;
 
         // Encrypt the payload portion (everything after the header) in-place.
@@ -452,7 +514,8 @@ impl KeyObject {
         }
 
         // Determine header version from the magic bytes.
-        let is_v4 = bool::from(blob[0..4].ct_eq(&KEY_MAGIC));
+        let is_policy = bool::from(blob[0..4].ct_eq(&KEY_MAGIC_POLICY));
+        let is_v4 = is_policy || bool::from(blob[0..4].ct_eq(&KEY_MAGIC));
         let is_v3 = bool::from(blob[0..4].ct_eq(&KEY_MAGIC_V3));
         let is_v2 = bool::from(blob[0..4].ct_eq(&KEY_MAGIC_V2));
         if !is_v4 && !is_v3 && !is_v2 {
@@ -555,6 +618,15 @@ impl KeyObject {
         if ct_payload.len() < total_needed {
             return Err(KeyError::InvalidFormat);
         }
+        // `P2KP`: the policy fills the rest of the plaintext; it must parse
+        // (a restricted key never loads as unrestricted).  Older magics
+        // carry none.
+        let policy = if is_policy {
+            crate::security::key_policy::KeyPolicy::decode(&pt_buf[total_needed..ct_payload.len()])
+                .map_err(|_| KeyError::InvalidFormat)?
+        } else {
+            crate::security::key_policy::KeyPolicy::default()
+        };
 
         // Determine owner from applet byte (bits 23-16) of key_id.
         let owner = match ((key_id >> 16) & 0xFF) as u8 {
@@ -575,6 +647,7 @@ impl KeyObject {
             timestamp_ms: 0,
             private_key: heapless::Vec::new(),
             public_key: heapless::Vec::new(),
+            policy,
         };
 
         obj.private_key
@@ -726,6 +799,7 @@ impl KeyObject {
             timestamp_ms: 0,
             private_key: heapless::Vec::new(),
             public_key: heapless::Vec::new(),
+            policy: crate::security::key_policy::KeyPolicy::default(),
         };
 
         obj.private_key
@@ -1004,5 +1078,59 @@ mod tests {
         assert!(domain.record_use()); // third use triggers rotation hint
         domain.reset_use_count();
         assert!(!domain.record_use()); // reset clears counter
+    }
+
+    #[test]
+    fn policy_round_trips_under_its_own_magic() {
+        let smk = test_smk();
+        let mut obj = KeyObject::new(KeyType::Ec, 0x09, AppletId::ScHsm, AlgorithmId::EcdsaP256);
+        obj.private_key.extend_from_slice(&[0x31u8; 32]).unwrap();
+        obj.public_key.extend_from_slice(&[0x04u8; 65]).unwrap();
+        obj.policy.use_counter = Some(17);
+        obj.policy
+            .algorithms
+            .extend_from_slice(&[0x73, 0x92])
+            .unwrap();
+        let blob = obj.encrypt(&smk, &test_nonce()).unwrap();
+        assert_eq!(&blob[..4], b"P2KP");
+        let back = KeyObject::decrypt(&blob, 0x09, &smk).unwrap();
+        assert_eq!(back.policy, obj.policy);
+        assert_eq!(back.public_key.as_slice(), &[0x04u8; 65]);
+        // Older firmware knows only P2K2..P2K4 and refuses this blob,
+        // rather than loading the key without its restrictions.
+        assert!(blob[..4] != KEY_MAGIC && blob[..4] != KEY_MAGIC_V3);
+    }
+
+    #[test]
+    fn legacy_p2k4_blob_loads_unrestricted() {
+        // An unrestricted object is written exactly as before (P2K4, no
+        // trailing bytes), so this is also what every existing key is.
+        let smk = test_smk();
+        let mut obj = KeyObject::new(KeyType::Rsa, 0x0A, AppletId::ScHsm, AlgorithmId::RsaDecrypt);
+        obj.private_key.extend_from_slice(&[0x55u8; 600]).unwrap();
+        let blob = obj.encrypt(&smk, &test_nonce()).unwrap();
+        assert_eq!(&blob[..4], b"P2K4");
+        assert_eq!(blob.len(), 21 + 2 + 600 + 2 + 16 + 12);
+        let back = KeyObject::decrypt(&blob, 0x0A, &smk).unwrap();
+        assert!(back.policy.is_unrestricted());
+        // The magic is authenticated: relabelling P2KP as P2K4 fails.
+        obj.policy.use_counter = Some(1);
+        let mut blob = obj.encrypt(&smk, &test_nonce()).unwrap();
+        blob[..4].copy_from_slice(b"P2K4");
+        assert!(KeyObject::decrypt(&blob, 0x0A, &smk).is_err());
+    }
+
+    #[test]
+    fn encrypt_with_generation_round_trips() {
+        let smk = [0x11u8; 32];
+        let mut obj = KeyObject::new(KeyType::Ec, 0x05, AppletId::ScHsm, AlgorithmId::EcdsaP256);
+        obj.private_key.extend_from_slice(&[0x22u8; 32]).unwrap();
+        obj.generation = 6;
+        let blob = obj
+            .encrypt_with_generation(&smk, &[0u8; NONCE_SIZE], 7)
+            .unwrap();
+        let back = KeyObject::decrypt(&blob, 0x05, &smk).unwrap();
+        assert_eq!(back.generation, 7);
+        assert_eq!(&back.private_key[..], &[0x22u8; 32]);
     }
 }

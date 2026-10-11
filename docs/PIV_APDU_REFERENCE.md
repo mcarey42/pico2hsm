@@ -947,3 +947,52 @@ GUID: any 16 random bytes.
 Objects can be up to 12710 bytes (NIST 800-73-4 maximum). A P-384 certificate with chain easily reaches 2–4 KB. Use GET RESPONSE chaining or extended APDU Le.
 
 The existing `Vec<u8, 4096>` response buffer in the dispatcher is adequate for most objects. For larger objects (compressed certificates), consider extended APDUs or implementing the `61 xx` / `C0` chaining mechanism.
+
+### 10.6 Key usage and PIN policy as implemented (2026-10, audit S-10)
+
+**Slots.** GENERATE KEY PAIR (management key) accepts 9A, 9C, 9D, 9E and
+the retired key management slots 82–95; ECC P-256 (`11`) and P-384 (`14`)
+only (no RSA, no Ed25519/X25519 in PIV).
+
+**Key use per slot** (SP 800-73-4 Part 2 §3.2.4, SP 800-78-4):
+
+| Slot | GENERAL AUTHENTICATE |
+|---|---|
+| 9A, 9C, 9E | Signature only: `7C { 82 00, 81 <hash> }` → `7C { 82 <DER sig> }` |
+| 9D, 82–95 | Key establishment only (ECC CDH): `7C { 82 00, 85 <04‖X‖Y> }` → `7C { 82 <x-coordinate> }` |
+
+The other operation is refused with `6A80` (a key management key does not
+sign; a signature key does not agree keys).  Unlike a YubiKey, which signs
+with any slot.
+
+**PIN policy.** The Yubico tag `AA` in the `AC` template (00 default, 01
+never, 02 once, 03 always) is stored with the key (encrypted key object,
+`P2KP`) and enforced.  Default = SP 800-73-4 access rule of the slot:
+
+| Slot | Default |
+|---|---|
+| 9A, 9D, 82–95 | PIN once per session |
+| 9C | PIN always: a VERIFY right before each use |
+| 9E | None |
+
+"PIN always" is used up by the next GENERAL AUTHENTICATE of **any** slot
+(VERIFY → 9A signature → 9C signature is refused).  `AA 04`/`05`
+(biometric match) are refused (`6A80`).
+
+**Touch policy.** No button: `AB 00` (default) and `AB 01` (never) are
+accepted, `AB 02` (always) and `AB 03` (cached) are refused with `6A80`, so
+ykman reports the error.  Metadata always reports touch "never".
+
+**VERIFY P1=FF** (no data) resets the PIN status (SP 800-73-4 §3.2.1).
+
+**GET METADATA (F7)** is implemented: key slots return `01` algorithm, `02`
+effective PIN policy + touch `01`, `03` origin `01` (generated; IMPORT is
+not implemented), `04` = `86 L <point>`; `80`/`81` return `01 FF`, `05`
+default flag, `06` total/remaining retries; `9B` returns `01 03` (3DES),
+`02 01 01`, `05` default flag.  Empty slots answer `6A88`.  (ykman only
+issues F7 after GET VERSION reports ≥ 5.3, which this applet does not
+implement — see deviations.)
+
+**Deviations still open:** no Yubico IMPORT (`FE`), ATTEST (`F9`), GET
+VERSION (`FD`) or SET PIN RETRIES; no AES management key; no command
+chaining (`CLA 10`); no RSA keys.

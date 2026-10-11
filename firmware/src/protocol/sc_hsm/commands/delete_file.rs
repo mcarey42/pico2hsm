@@ -21,6 +21,9 @@ use crate::protocol::sc_hsm::ScHsmState;
 /// INS byte for DELETE FILE.
 pub const INS_DELETE_FILE: u8 = 0xE4;
 
+/// File-ID high byte of key objects (OpenSC `KEY_PREFIX`).
+const KEY_PREFIX: u8 = 0xCC;
+
 /// Handle a DELETE FILE APDU command.
 pub fn handle(
     state: &mut ScHsmState,
@@ -45,31 +48,54 @@ pub fn handle(
         _ => return ApduResponse::err(SW_WRONG_DATA),
     };
 
-    let hi = file_id >> 8;
-    let key_id_proto = (file_id & 0xFF) as u8;
-    let full_key_id = pico2hsm_core::key::KeyId::sc_hsm(0, key_id_proto).0; // u32 internal ID
+    let hi = (file_id >> 8) as u8;
+    let lo = (file_id & 0xFF) as u8;
 
     // Remove from key_index: check for both crypto keys and EfFile entries.
     let before_idx = state.key_index.len();
 
-    if hi == 0xCE {
-        // CE xx EF files: look up by EfFile KeyId encoding.
-        let ef_key_id = pico2hsm_core::key::KeyId::sc_hsm_ef(0, hi as u8, key_id_proto).0;
-        state
-            .key_index
-            .retain(|m| !(m.key_type == 16 && m.key_id == ef_key_id));
-        // Erase from flash and clear cache.
-        if state.key_index.len() < before_idx {
-            let _ = store.erase_key(pico2hsm_core::key::KeyId(ef_key_id));
-            state.ef_cache_remove(ef_key_id);
+    if hi == KEY_PREFIX {
+        // CC xx: the private/secret key itself (OpenSC KEY_PREFIX).
+        if lo >= crate::protocol::sc_hsm::RESERVED_KEY_REF_MIN {
+            return ApduResponse::err(SW_FILE_NOT_FOUND);
+        }
+        let full_key_id = pico2hsm_core::key::KeyId::sc_hsm(0, lo).0;
+        let present = state.key_index.iter().any(|m| m.key_id == full_key_id);
+        // Erase from flash first: an entry dropped from RAM but still in
+        // flash would come back after a reset.
+        if present {
+            if store
+                .erase_key(pico2hsm_core::key::KeyId(full_key_id))
+                .is_err()
+            {
+                return ApduResponse::err(pico2hsm_core::apdu::SW_MEMORY_FAILURE);
+            }
+            state.key_index.retain(|m| m.key_id != full_key_id);
+            state.generation = state.generation.wrapping_add(1);
         }
     } else {
-        // C4/CC xx crypto key entries.
-        state.key_index.retain(|m| m.key_id != full_key_id);
-        // Erase from flash.
-        if state.key_index.len() < before_idx {
-            let _ = store.erase_key(pico2hsm_core::key::KeyId(full_key_id));
-            state.generation = state.generation.wrapping_add(1);
+        // Any other FID is an EF stored under its full file ID — C4 (PrKD),
+        // CD/CF (data objects), CE/CA (certificates), 2F xx.  These used to
+        // be mapped to key slot xx: deleting a PrKD deleted the key.
+        let Some(ef_key_id) = pico2hsm_core::key::KeyId::sc_hsm_ef_checked(0, hi, lo) else {
+            return ApduResponse::err(SW_FILE_NOT_FOUND);
+        };
+        let ef_key_id = ef_key_id.0;
+        let present = state
+            .key_index
+            .iter()
+            .any(|m| m.key_type == 16 && m.key_id == ef_key_id);
+        if present {
+            if store
+                .erase_key(pico2hsm_core::key::KeyId(ef_key_id))
+                .is_err()
+            {
+                return ApduResponse::err(pico2hsm_core::apdu::SW_MEMORY_FAILURE);
+            }
+            state
+                .key_index
+                .retain(|m| !(m.key_type == 16 && m.key_id == ef_key_id));
+            state.ef_cache_remove(ef_key_id);
         }
     }
 
@@ -79,5 +105,43 @@ pub fn handle(
         ApduResponse::ok(&[])
     } else {
         ApduResponse::err(SW_FILE_NOT_FOUND)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::sc_hsm::KeyMeta;
+    use pico2hsm_core::key::KeyId;
+
+    fn meta(key_id: u32, key_type: u8) -> KeyMeta {
+        KeyMeta {
+            key_id,
+            key_type,
+            algo: 0,
+            key_flags: 0,
+        }
+    }
+
+    #[test]
+    fn deleting_prkd_keeps_the_key() {
+        let mut state = ScHsmState::new();
+        state.pin_verified = true;
+        let key = KeyId::sc_hsm(0, 0x05).0;
+        let prkd = KeyId::sc_hsm_ef(0, 0xC4, 0x05).0;
+        state.key_index.push(meta(key, 1)).unwrap();
+        state.key_index.push(meta(prkd, 16)).unwrap();
+        let mut store = crate::storage::NullKeyStore;
+
+        let apdu = [0x00, 0xE4, 0x02, 0x00, 0x02, 0xC4, 0x05];
+        let cmd = ApduCommand::parse(&apdu).unwrap();
+        assert_eq!(handle(&mut state, &mut store, &cmd).sw, SW_OK);
+        assert!(state.key_index.iter().any(|m| m.key_id == key), "key kept");
+        assert!(!state.key_index.iter().any(|m| m.key_id == prkd));
+
+        let apdu = [0x00, 0xE4, 0x02, 0x00, 0x02, 0xCC, 0x05];
+        let cmd = ApduCommand::parse(&apdu).unwrap();
+        assert_eq!(handle(&mut state, &mut store, &cmd).sw, SW_OK);
+        assert!(state.key_index.is_empty());
     }
 }

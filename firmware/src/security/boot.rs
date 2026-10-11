@@ -20,7 +20,10 @@
 //! 1. Verify OTP provisioning status flag is set
 //! 2. Verify JTAG disable flag is set (record in pico2hsm boot flags)
 //! 3. Check for debugger attachment (SWD active) — halt if found in production
-//! 4. Arm the hardware watchdog
+//!
+//! The hardware watchdog is armed before these checks, by `main` (see
+//! `crate::watchdog`); a halt here therefore turns into a watchdog reset
+//! loop, which never gets past the checks either.
 //!
 //! # RP2350 OTP references (verified against pico-sdk otp_data.h + rp-pac 7.0.0)
 //!
@@ -35,7 +38,7 @@
 //! - **BOOT_FLAGS0** (rows 0x48–0x4A, RBIT-3): boot path control (NOT secure boot enable)
 //! - **BOOT_FLAGS1** (rows 0x4B–0x4D, RBIT-3): KEY_INVALID flags
 //! - **BOOTKEY0** (rows 0x80–0x8F, ECC): SHA-256 hash of secp256k1 signing public key
-//! - The pico2hsm application boot flags are in OTP row 0x110 (see otp.rs)
+//! - The pico2hsm application boot flags row is defined in otp_layout.rs
 //!
 //! # Hardware JTAG disable (CRIT1.DEBUG_DISABLE)
 //!
@@ -48,15 +51,6 @@
 //!
 //! Row 0x18 is NUM_GPIOS, NOT CRIT0.  Previous code incorrectly wrote
 //! to row 0x18 believing it was CRIT0 — that was a no-op at best.
-
-use embassy_rp::watchdog::Watchdog;
-use embassy_time::Duration;
-
-/// Watchdog feed period in milliseconds.
-///
-/// The watchdog must be fed at least this often to prevent a reset.
-/// Set to 5000ms (5 seconds); main loop feeds every ~1000ms.
-pub const WATCHDOG_PERIOD_MS: u32 = 5000;
 
 /// Perform all boot-time security checks.
 ///
@@ -78,7 +72,7 @@ pub fn security_checks() {
         Err(()) => {
             // OTP read failure — security state is unknowable. Hard reset.
             // Do NOT log or proceed: a glitch may have caused this.
-            cortex_m::peripheral::SCB::sys_reset();
+            crate::watchdog::reset_now(crate::watchdog::ResetCause::BootCheck);
         }
     };
 
@@ -113,10 +107,10 @@ pub fn security_checks() {
                 // Production mode set but secure boot not active — inconsistency.
                 // This may indicate incomplete provisioning or a hardware fault.
                 // Hard reset: do not boot in this state.
-                cortex_m::peripheral::SCB::sys_reset();
+                crate::watchdog::reset_now(crate::watchdog::ResetCause::BootCheck);
             }
 
-            // Record JTAG-disabled bookkeeping flag in OTP row 0x110 bit 0.
+            // Record the JTAG-disabled bookkeeping bit in the boot flags row.
             // Hardware JTAG disable (CRIT1.DEBUG_DISABLE) must be set via
             // picotool during provisioning — see docs/PROVISIONING.md Phase 8.
             disable_jtag_permanent();
@@ -132,7 +126,7 @@ pub fn security_checks() {
     }
 }
 
-/// Read the pico2hsm production-mode flag from OTP row 0x110.
+/// Read the pico2hsm production-mode flag from the boot flags row.
 ///
 /// Returns `Ok(true)` if bit 1 (BOOT_FLAG_PRODUCTION_MODE) is set.
 /// Returns `Ok(false)` if the bit is clear OR the row is blank (0xFFFF_FFFF,
@@ -141,36 +135,38 @@ pub fn security_checks() {
 ///
 /// # Why direct OTP read instead of embassy-rp
 /// `embassy_rp::otp::read_raw_word()` treats 0xFFFF_FFFF as
-/// `Err(InvalidPermissions)`, but for user-space OTP rows (0x110+) this
+/// `Err(InvalidPermissions)`, but for user-space OTP rows this
 /// value simply means "blank / unprogrammed fuses".  Reading the raw
 /// OTP_DATA_RAW address directly lets us distinguish blank rows from
 /// actual access errors and avoids a reboot loop on unprovisioned boards.
 ///
 /// P1-3 hardening is preserved: the only error path is an out-of-range
 /// row index (compile-time constant, so this cannot be fault-injected).
-/// A glitch that flips fuse bits to all-ones would clear the production
-/// flag — but that's correct behavior (no production protections apply
-/// if the fuse state is indeterminate).
+/// An indeterminate read (all-ones, or two reads that disagree) counts as
+/// production mode: a glitch must not be able to switch protections off.
 fn is_production_mode_otp() -> Result<bool, ()> {
     const OTP_DATA_RAW_BASE: *const u32 = 0x4013_4000 as *const u32;
     const OTP_NUM_ROWS: usize = 4096;
-    const OTP_BOOT_FLAGS_ROW: usize = 0x110;
-    const BOOT_FLAG_PRODUCTION_MODE: u32 = 1 << 1;
+    const OTP_BOOT_FLAGS_ROW: usize = crate::security::otp_layout::BOOT_FLAGS_ROW as usize;
+    const BOOT_FLAG_PRODUCTION_MODE: u32 = crate::security::otp_layout::BOOT_FLAG_PRODUCTION_MODE;
 
     if OTP_BOOT_FLAGS_ROW >= OTP_NUM_ROWS {
         return Err(()); // should never happen — compile-time constant
     }
 
     // SAFETY: OTP_DATA_RAW is a memory-mapped read-only register block.
-    // Row 0x110 is within the valid range (checked above).
-    let value = unsafe { OTP_DATA_RAW_BASE.add(OTP_BOOT_FLAGS_ROW).read() };
+    // The boot flags row is within the valid range (checked above).
+    let read = || unsafe { core::ptr::read_volatile(OTP_DATA_RAW_BASE.add(OTP_BOOT_FLAGS_ROW)) };
+    let first = read();
+    let second = read();
 
-    if value == 0xFFFF_FFFF {
-        // Blank / unprogrammed OTP — device is not provisioned.
-        Ok(false)
-    } else {
-        Ok(value & BOOT_FLAG_PRODUCTION_MODE != 0)
+    // Fail closed.  Unprogrammed fuses read 0, so all-ones is an access
+    // error or a glitch, not "blank"; and a single read is one glitch away
+    // from turning production protections off.  Either way: production.
+    if first != second || first == 0xFFFF_FFFF {
+        return Ok(true);
     }
+    Ok(first & BOOT_FLAG_PRODUCTION_MODE != 0)
 }
 
 /// Check if the RP2350 is running in secure boot mode.
@@ -205,7 +201,7 @@ pub fn is_secure_boot_enabled() -> bool {
 
 /// Record JTAG-disabled status in the pico2hsm application boot flags.
 ///
-/// Sets bit 0 of OTP row 0x110 as a user-land bookkeeping marker that
+/// Sets bit 0 of the boot flags row as a user-land bookkeeping marker that
 /// JTAG has been disabled.  This does NOT disable JTAG at the hardware
 /// level — that requires writing CRIT1.DEBUG_DISABLE (OTP rows 0x40–0x47,
 /// RBIT-8), which must be done via `picotool otp set OTP_DATA_CRIT1.DEBUG_DISABLE 1`
@@ -227,7 +223,7 @@ pub fn is_secure_boot_enabled() -> bool {
 /// Only callable when production mode is active.
 pub fn disable_jtag_permanent() {
     use embassy_rp::otp;
-    const OTP_BOOT_FLAGS_ROW: usize = 0x110;
+    const OTP_BOOT_FLAGS_ROW: usize = crate::security::otp_layout::BOOT_FLAGS_ROW as usize;
     const BOOT_FLAG_JTAG_DISABLED: u32 = 1 << 0;
     const BOOT_FLAG_PRODUCTION_MODE: u32 = 1 << 1;
 
@@ -256,7 +252,7 @@ pub fn disable_jtag_permanent() {
     }
 
     // Burn the JTAG_DISABLED flag bit (0 → 1, irreversible).
-    // SAFETY: Writing to OTP_BOOT_FLAGS_ROW (0x110) is a pico2hsm
+    // SAFETY: Writing to OTP_BOOT_FLAGS_ROW is a pico2hsm
     // application-layer OTP row in the user-accessible OTP range
     // (rows 0x100–0x17F). The write uses the embassy-rp `otp::write_raw_word`
     // wrapper, which calls the RP2350 ROM `otp_access` function with
@@ -264,7 +260,9 @@ pub fn disable_jtag_permanent() {
     let new_flags = current | BOOT_FLAG_JTAG_DISABLED;
     match otp::write_raw_word(OTP_BOOT_FLAGS_ROW, new_flags) {
         Ok(()) => {
-            defmt::warn!("boot: JTAG disable bookkeeping flag set in OTP row 0x110 — IRREVERSIBLE");
+            defmt::warn!(
+                "boot: JTAG disable bookkeeping flag set in OTP boot flags row — IRREVERSIBLE"
+            );
             defmt::warn!(
                 "boot: hardware JTAG disable (CRIT1.DEBUG_DISABLE) must be set via picotool"
             );
@@ -273,41 +271,6 @@ pub fn disable_jtag_permanent() {
             defmt::error!("boot: failed to set JTAG disable OTP flag");
         }
     }
-}
-
-/// Feed the hardware watchdog with the standard period.
-///
-/// Must be called at least once per `WATCHDOG_PERIOD_MS` milliseconds.
-/// Wraps `Watchdog::feed(Duration)` with the constant period.
-///
-/// # Note on embassy-rp 0.10 API
-/// In embassy-rp 0.10, `Watchdog::feed()` takes a `Duration` argument
-/// (unlike rp-hal which is stateless). The period must be passed on every
-/// feed call. This design allows varying the timeout dynamically; we always
-/// use the constant `WATCHDOG_PERIOD_MS`.
-pub fn watchdog_feed(wd: &mut Watchdog) {
-    wd.feed(Duration::from_millis(WATCHDOG_PERIOD_MS as u64));
-}
-
-/// Arm the hardware watchdog timer.
-///
-/// After this call the processor must call `watchdog_feed()` at least
-/// once every `period_ms` milliseconds, or the RP2350 will reset.
-///
-/// # RP2350 Watchdog limits
-/// The RP2350 watchdog counter is 24 bits and counts in microseconds.
-/// Maximum period = 0xFF_FFFF µs ≈ 16.77 seconds (RP2350 datasheet §7.4).
-/// The `embassy_rp::watchdog::Watchdog::start()` method enforces this
-/// limit and will panic if exceeded.
-///
-/// # Implementation note
-/// Calls `Watchdog::start(Duration)` which:
-/// 1. Disables the watchdog
-/// 2. Configures the PSM reset mask (resets everything except ROSC/XOSC)
-/// 3. Loads the timeout counter
-/// 4. Enables the watchdog
-pub fn arm_watchdog(wd: &mut Watchdog, period_ms: u32) {
-    wd.start(Duration::from_millis(period_ms as u64));
 }
 
 /// Check whether a debugger is currently attached via SWD/JTAG.

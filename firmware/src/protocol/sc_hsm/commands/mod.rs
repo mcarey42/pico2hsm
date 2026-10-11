@@ -19,7 +19,6 @@ pub mod decrypt;
 pub mod delete_file;
 pub mod derive_asym;
 pub mod export_key;
-pub mod external_auth;
 pub mod extras;
 pub mod general_auth;
 pub mod generate_key;

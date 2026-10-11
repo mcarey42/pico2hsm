@@ -527,10 +527,13 @@ def dkek_import(ctx: click.Context, share_file: str, passphrase: str, pin: str) 
 @click.option("--port", default=7890, show_default=True, help="TCP port (for tcp-server mode)")
 @click.option("--target-reader", default=1, show_default=True, type=int,
               help="Reader index for target HSM (usb-local mode)")
-@click.option("--pin", prompt="User PIN", hide_input=True, help="User PIN")
+@click.option("--so-pin", prompt="SO-PIN", hide_input=True, help="SO-PIN (the exchange requires it on both HSMs)")
 @click.pass_context
-def dkek_exchange(ctx: click.Context, mode: str, peer: Optional[str], port: int, target_reader: int, pin: str) -> None:
-    """Exchange DKEK with another HSM (Noise_XX protocol)."""
+def dkek_exchange(ctx: click.Context, mode: str, peer: Optional[str], port: int, target_reader: int, so_pin: str) -> None:
+    """Exchange DKEK with another HSM (V2 mutual-auth protocol).
+
+    Both HSMs must already have each other's device key enrolled (enroll-peer).
+    """
     exchange = DkekExchange()
 
     if mode == "usb-local":
@@ -539,18 +542,18 @@ def dkek_exchange(ctx: click.Context, mode: str, peer: Optional[str], port: int,
         with Pico2HSM(reader_index=source_reader, debug=ctx.obj["debug"]) as source:
             source.connect()
             source.select_applet()
-            source.transmit(proto.build_verify_pin(pin))
+            source.transmit(proto.build_verify_so_pin(so_pin))
             with Pico2HSM(reader_index=target_reader, debug=ctx.obj["debug"]) as target:
                 target.connect()
                 target.select_applet()
-                target.transmit(proto.build_verify_pin(pin))
+                target.transmit(proto.build_verify_so_pin(so_pin))
                 exchange.exchange_local_usb(source, target)
         click.echo("DKEK exchanged successfully.")
 
     elif mode == "tcp-server":
         with _open_hsm(ctx) as source:
             source.select_applet()
-            source.transmit(proto.build_verify_pin(pin))
+            source.transmit(proto.build_verify_so_pin(so_pin))
             click.echo(f"Waiting for peer on port {port}…")
             exchange.exchange_tcp_server(source, port=port)
         click.echo("DKEK sent to remote peer.")
@@ -563,7 +566,7 @@ def dkek_exchange(ctx: click.Context, mode: str, peer: Optional[str], port: int,
         peer_port = int(port_str) if port_str else 7890
         with _open_hsm(ctx) as target:
             target.select_applet()
-            target.transmit(proto.build_verify_pin(pin))
+            target.transmit(proto.build_verify_so_pin(so_pin))
             click.echo(f"Connecting to {host}:{peer_port}…")
             exchange.exchange_tcp_client(target, server_host=host, server_port=peer_port)
         click.echo("DKEK received and imported.")
