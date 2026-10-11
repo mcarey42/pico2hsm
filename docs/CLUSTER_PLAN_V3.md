@@ -1,0 +1,360 @@
+# pico2hsm Domains and Multi-Way Sync: Design Plan V3
+
+*Supersedes the domain, enrollment and sync parts of `CLUSTER_PLAN_V2.md`. The V2 DKEK exchange (§1) is kept and generalised. Date: 2026-10-11. Status: draft for owner review. No firmware changes have been made against it yet.*
+
+---
+
+## 0. Summary
+
+A **domain** is a set of pico2hsm devices that share one DKEK. Devices join a domain through an authenticated enrollment. The new device may be enrolled against any existing member, so a device enrolled through another one is trusted by every member. Once in a domain, members keep their SC-HSM key sets in sync over any link: a USB hub, a LAN, a WAN, or files carried by hand. Each synced object is a signed, versioned record. Deletions are signed tombstones. Every device checks every record itself, so the daemon and the network are only couriers and are not trusted.
+
+The design keeps **SmartCard-HSM / OpenSC compatibility**:
+- The DKEK is still made from `sc-hsm-tool` shares.
+- Wrapped keys use the CardContact wrap format, so `sc-hsm-tool --unwrap-key` and a real SmartCard-HSM can import them (§3).
+- Sync metadata travels next to the standard blob, never inside it.
+
+The production daemon is a new `pico2hsm-syncd` crate in the `pico2hsm-tool` repository (§10). The Python daemon in `tools/python` becomes the test harness and reference.
+
+### Decisions this plan relies on
+
+| Decision | Source |
+|---|---|
+| The device has no button; designs needing physical presence are excluded | Owner, 2026-10-11 (BOOTSEL shares an SPI line) |
+| Rollback protection (S-15) is out of scope; disabling picoboot is future engineering | Owner, 2026-10-11 |
+| The device must stay compatible with SmartCard-HSM / OpenSC | Owner, 2026-10-11 |
+| The target is homelab first, small business next | Owner |
+
+---
+
+## 1. Where things stand (firmware at `fix/reset-deadlock-and-zeroize`)
+
+| Piece | State |
+|---|---|
+| DKEK from shares (`KEY DOMAIN` P1=00, raw 32-byte share) | Works with `sc-hsm-tool --import-dkek-share`. Needs no PIN (A-01). The DKEK is persisted at key ref 0xFD and never overwritten while it is set. |
+| Device identity | A static P-256 key derived from the OTP identity key (`HKDF(otp_identity, "pico2hsm-noise-static-v1")`). Readable with `0x54/P1=30`. |
+| Device-to-device DKEK transfer (`0x54/P1=35–38`) | Mutually authenticated. Uses ephemeral ECDH, signatures over a challenge from the target, and AES-GCM with AAD = the target's static key. Needs the SO-PIN on both devices. |
+| Peer enrollment (`0x54/P1=3D`) | **One** peer slot (0xFC). |
+| Generation counter | `u64` held **in RAM only**; it is reset on every boot. |
+| `GET_KEY_MANIFEST` (`0x54/P1=39`) | At most 32 entries; needs the user PIN. |
+| `GET_STATE_HASH` (`0x54/P1=3A`) | A SHA-256 root over the keys; no on-device signature. |
+| WRAP / UNWRAP (`0x72` / `0x74`) | **Not CardContact format.** It uses a pico2hsm encrypt-then-MAC format (KCV = CMAC over zeros, version byte 0x02, HMAC-SHA256 tag). Real SmartCard-HSM and `sc-hsm-tool` blobs don't import, and ours don't export to them. |
+| Tombstones | Designed in V2 §2d but not implemented. |
+| Per-key policy (algorithm list 0x91, use counter 0x90) | In progress on branch `feat/key-usage-policy`. |
+| Host side | Python daemon and library in `tools/python` (TCP/TLS, USB auto-sync, health checks). Rust `pico2hsm-tool` is a CLI and library with no sync code yet. |
+
+## 2. Goals, non-goals, threat model
+
+**Goals**
+1. Enroll a new device into an existing domain securely, against the original device or any member.
+2. Keep SC-HSM keys, and their certificates and PKCS#15 descriptors, in sync across any number of members.
+3. Make deletion permanent: no resurrection after a partition, and no resurrection by a member coming back from long downtime.
+4. Work over short-haul links (same host, LAN) and long-haul links (WAN, intermittent, store-and-forward).
+5. Stay interoperable with `sc-hsm-tool` / OpenSC and real SmartCard-HSMs for DKEK shares and wrapped keys.
+
+**Non-goals for this plan**
+- Rollback protection (S-15, on hold).
+- Quorum or M-of-N approval of operations. This is a later small-business feature; see §12.
+- Syncing PIV and OpenPGP applet keys. Their key slots are per-device by design, and their specs have no wrap format. Revisit after SC-HSM sync works.
+- Syncing PINs, retry counters, device identity or OTP state. These are always per-device.
+- DKEK rotation inside a domain. Rotation means migrating to a new domain (§9).
+
+**Threat model**
+
+| Actor | Assumed capability | What the design guarantees |
+|---|---|---|
+| Network or relay (including a compromised daemon) | Reads, drops, reorders, replays and injects messages | It can delay or block sync. It cannot forge, alter or resurrect objects, learn key material, or enroll a device. |
+| Someone with USB access, no PINs | Sends any APDU | Can read public metadata (§7.4). Cannot export key material, mint records, enroll devices or delete. |
+| Holder of the user PIN | Uses keys | Can create and delete keys on the device it holds; those changes sync domain-wide. |
+| Holder of the SO-PIN | Administers the device | Can enroll and revoke members. |
+| Compromised member device | Holds the DKEK and a member key | Can mint records and tombstones until revoked. Mitigations: revocation and the optional delete grace period (§6.4). |
+| Physical attacker with flash access | Out of scope | See S-15. |
+
+## 3. Compatibility layer: build this first
+
+Everything else depends on this layer, and it is also the main gap against the owner's compatibility requirement.
+
+1. **CardContact wrap format for WRAP KEY (0x72) and UNWRAP KEY (0x74).**
+   - Implement the SmartCard-HSM key-backup blob:
+     - KCV = the first 8 bytes of SHA-256(DKEK);
+     - key type;
+     - key OID, allowed-algorithm list and access conditions, as length-prefixed fields;
+     - AES-256-CBC encryption with K_enc derived from the DKEK;
+     - CMAC with K_mac derived from the DKEK.
+   - **Verify the exact layout against OpenSC `src/tools/sc-hsm-tool.c` (wrap and unwrap) and the CardContact documentation before coding.** Add known-answer tests from blobs produced by `sc-hsm-tool` and, if one is available, a real SmartCard-HSM.
+   - The current pico2hsm-format blobs (version 0x02) stay importable for one release, with an UNWRAP compatibility path, then they are dropped. WRAP only produces the CardContact format.
+   - The per-key policy from S-10 (allowed algorithms, use counter where the format allows it) travels in the blob's own fields, so backup and restore keeps the policy.
+2. **KCV everywhere.** Use CardContact's KCV, the first 8 bytes of SHA-256(DKEK), in `KEY DOMAIN` responses and status, so `sc-hsm-tool` prints a check value the owner can compare across devices.
+3. **DKEK shares.** The current behaviour stays: `sc-hsm-tool` decrypts the password-protected share file on the host and sends the raw 32-byte share. Shares combine as in the SmartCard-HSM specification; check whether that is XOR or a sum against `sc-hsm-tool`.
+
+**Acceptance test:**
+1. Create shares with `sc-hsm-tool --create-dkek-share`.
+2. Initialise two pico2hsm devices from them and check that the KCVs match.
+3. Wrap a key on device A with `sc-hsm-tool --wrap-key` and unwrap it on device B with `--unwrap-key`.
+4. Do the same with blobs taken from, and sent to, a real SmartCard-HSM if one is available.
+
+## 4. Domain identity and membership
+
+### 4.1 Domain key
+Every member derives the same **domain signing key** from the DKEK:
+
+```
+seed      = HKDF-SHA256(ikm = DKEK, salt = "pico2hsm-domain-v1", info = "sign")
+d_domain  = hash-to-scalar(seed)        # P-256; RFC 9380 hash_to_field, or retry on out-of-range
+Q_domain  = d_domain · G
+domain_id = SHA-256(Q_domain)[0..16]
+```
+
+- Any member can issue domain signatures. Anyone holding `Q_domain` can verify them.
+- `domain_id` names the domain. Devices with different DKEKs can never agree on it by accident.
+- The domain key never leaves a device. It is re-derived after each boot, as the DKEK is.
+
+### 4.2 Member identity
+Each device's member key is the existing static identity key, `HKDF(otp_identity, "pico2hsm-noise-static-v1")`. On an unprovisioned debug board it comes from the development identity, and the device reports that it is in development mode.
+
+### 4.3 Member certificate
+A member certificate is a fixed-format record; X.509 is not needed:
+
+```
+MemberCert {
+  version        u8      = 1
+  domain_id      [16]
+  member_pub     [65]    // uncompressed P-256
+  member_serial  u32     // per-domain sequence number, assigned by the sponsor
+  sponsor_pub    [65]    // the member that enrolled it
+  issued_lamport u64     // see §6.1
+  flags          u8      // bit0 = may sponsor others
+  sig_domain     [64]    // ECDSA(d_domain) over SHA-256 of all preceding fields
+}
+```
+
+Because the certificate is signed with the **domain** key, a device enrolled through B is accepted by A without A ever having seen B's enrollment.
+
+### 4.4 Member list on the device
+- Replace the single peer slot 0xFC with a **member list**: up to 32 certificates at about 260 bytes each, stored as one keystore object in the reserved range.
+- Revoked members stay in the list, marked as tombstoned (§6.4).
+- `ENROLL_PEER_PUBKEY` (P1=3D) remains for operator-pinned bootstrap only (§5.2).
+
+## 5. Enrollment
+
+### 5.1 First device: forming the domain
+- **Option A:** `sc-hsm-tool --initialize --dkek-shares N`, then `--import-dkek-share` ×N. This is the standard path and keeps the shares as the offline backup.
+- **Option B:** `pico2hsm-tool domain create` generates the DKEK on the device and requires the operator to export N shares in the `sc-hsm-tool` share-file format before the domain becomes usable. The firmware support for this would be new.
+
+Either way, the device then issues its own member certificate (serial 1) and reports `domain_id` and the KCV.
+
+### 5.2 Joining a device (sponsor S, joiner J)
+1. The operator authenticates with the SO-PIN on both devices.
+2. Each daemon reads its device's member key. The operator compares a **short authentication string** of six words or digits derived from SHA-256(S_pub ‖ J_pub). Both CLIs display it.
+   - This is the out-of-band check that replaces a button.
+   - For long-haul enrollment, read the string over the phone.
+3. Each device pins the other device's key for this one exchange (P1=3D, single use).
+4. The V2 exchange (P1=35–38) carries the DKEK. Nothing changes here except that step 3 replaces the permanent peer slot.
+5. J derives `Q_domain` and checks that it matches the `domain_id` S announced. The KCV gives the same check.
+6. S issues J's `MemberCert` (new APDU) and the record is synced to everyone.
+7. J pulls the member list and then the full object set (§7).
+
+### 5.3 Fallback joining through shares
+A device can also join from the DKEK shares alone (standard `sc-hsm-tool` import). It then derives the same domain key and asks any member for a member certificate. That request still needs SO authentication on the member and the short-string check. This path is how a domain is recovered when no member is reachable.
+
+### 5.4 A-01 once domains exist
+After a device holds a DKEK and a member certificate, raw share import stays refused, as it is today: the DKEK is never replaced. The open window, right after an SO-authorised INITIALIZE, is unchanged for compatibility. Documented mitigations:
+- compare the KCV after import;
+- do the import in one sitting;
+- optional: `pico2hsm-tool` runs INITIALIZE and the share imports in a single card session.
+
+## 6. Object model
+
+### 6.1 Versions
+- Each device keeps a **persisted Lamport counter** (`u64`), which replaces the RAM-only generation counter. It is stored in the retry-counter log region or in its own small log, written before the change it numbers.
+- On any local change: `counter = max(counter, highest version seen) + 1`.
+- Version = (counter, member_serial); the member serial breaks ties.
+- Wall-clock time is never used for ordering. Only the daemon uses it, for garbage-collection timers.
+
+### 6.2 Global object ID
+- **Asymmetric keys:** SHA-256 of the public key, truncated to 20 bytes. This matches how OpenSC derives CKA_ID, so a key keeps the same CKA_ID on every member.
+- **Symmetric keys and plain files (certificates, data objects):** a random 16-byte ID assigned when the object is created.
+- The one-byte SC-HSM key reference stays local to each device: an importing device picks any free slot and keeps CKA_ID and label in the PKCS#15 descriptor. Two members that each create "slot 3" never collide.
+
+### 6.3 Sync record
+```
+SyncRecord {
+  version        u8 = 1
+  domain_id      [16]
+  object_id      [20]
+  kind           u8       // 1 = key (with certificate/CD/PRKD), 2 = file/EF, 3 = member cert
+  obj_version    (u64 lamport, u32 member_serial)
+  origin_serial  u32      // member that minted this version
+  meta_len u16, meta      // label, PKCS#15 descriptors, policy summary (public)
+  blob_len u16, blob      // CardContact wrapped key (kind 1) or plain file content (kind 2)
+  sig_member     [64]     // ECDSA(origin member key) over SHA-256(all preceding fields)
+}
+```
+
+**Import rules, enforced on the device:**
+- `domain_id` must match.
+- The origin must be a member and not revoked as of this version.
+- The signature must verify.
+- The version must be higher than the one held for `object_id`.
+- No tombstone may outrank it (§6.4).
+- The blob must unwrap under the DKEK.
+
+Imports are idempotent. Equal versions with equal hashes are a no-op. Equal versions with different hashes cannot happen from honest members; such a record is refused and logged.
+
+### 6.4 Tombstones
+```
+Tombstone {
+  version u8 = 1, domain_id [16], object_id [20],
+  del_version   (u64, u32)    // must be higher than the version it deletes
+  origin_serial u32
+  sig_member    [64]
+}
+```
+
+**Rules:**
+- **Delete wins:** a tombstone beats every record whose version is lower than it.
+- The object can come back only as a *new* record with a higher version. That happens only through an explicit re-create on some member.
+- **Member revocation** is a tombstone of kind 3. It needs the SO-PIN on the issuing member. A revoked member's records with versions above its revocation are refused everywhere.
+- **Retention:** the daemon tracks which members have acknowledged each tombstone (`GET_STATE` per member).
+  - A tombstone may be compacted once every non-revoked member has acknowledged it **and** a TTL (default 90 days) has passed.
+  - A member that has been silent longer than the TTL is **fenced**. Its daemon must run a full pull before it may push, and records it minted with versions below the fence are refused. This is what stops a long-dead device from resurrecting deleted keys.
+- **Optional, small-business:** a *delete grace period*. The tombstone is applied immediately, but the wrapped key is kept for N hours, during which an SO can mint a countermanding record. This limits the damage a compromised member's mass delete can do.
+
+### 6.5 Where sync state lives on the device
+- Each synced key gains a small sidecar object in the keystore: object_id, version, origin and the record hash, about 64 bytes.
+- The signed record is reconstructed when it is exported (§7.4), so wrapped blobs are not stored twice.
+  - **Snag:** the origin's signature must be kept, because only the origin can produce it. So the sidecar also stores `sig_member`, making it about 130 bytes.
+- Tombstones and member certificates are keystore objects in their own `KeyId` namespace (new applet ID 0x10 = domain). That needs no format change: the A/B directory and blob encryption already handle it.
+
+## 7. Anti-entropy sync
+
+### 7.1 State summary
+- The device keeps a two-level hash tree: 256 buckets keyed by the first byte of `object_id`. Each bucket hash is SHA-256 over its sorted (object_id, version, record_hash) entries, tombstones included. The root is SHA-256 over the bucket hashes.
+- `GET_STATE` returns `domain_id ‖ lamport ‖ root ‖ sig_member(…)`, signed on the device as V2 §2e asked for.
+
+### 7.2 Protocol between two peers, transport-agnostic
+1. Exchange signed `GET_STATE` results. If the roots are equal, stop.
+2. Exchange the 256 bucket hashes, about 8 KB, and find the buckets that differ.
+3. For each differing bucket, exchange (object_id, version) lists.
+4. For every object where the peer is newer, fetch its record or tombstone and import it on the device.
+5. Repeat until the roots match. Both directions run independently.
+
+Each step is idempotent, so an interrupted sync simply runs again. Over N members, pairwise sync spreads changes like gossip; no coordinator is needed.
+
+### 7.3 Transports, all carrying the same messages
+| Link | Transport |
+|---|---|
+| Same host (several devices on one USB hub) | The daemon talks to each device over PC/SC directly |
+| LAN / WAN | TCP with mutual TLS (rustls); each daemon's TLS key is bound to its device by `SIGN_ENROLLMENT` (V2 §5) |
+| Both ends behind NAT | Outbound connections to a dumb relay that forwards TLS ciphertext and holds no secrets (V2 §6 Model C) |
+| Intermittent or air-gapped | **Bundles:** a file holding the sender's signed state, then records and tombstones. Carry it by any means (USB stick, email, git); the receiver imports it and writes a reply bundle. |
+
+All payloads are signed and the keys inside them are wrapped, so transport security only adds confidentiality of metadata and protection against denial of service. Integrity never depends on it.
+
+### 7.4 What each operation needs
+| Operation | Authentication | Why |
+|---|---|---|
+| `GET_STATE`, bucket hashes, (id, version) lists | none | Public metadata. Optionally require the user PIN with a domain setting; this would need an unattended daemon to hold the PIN. |
+| Export a sync record or tombstone | none | The blob is wrapped under the DKEK, which only members hold. This is a deliberate departure from SC-HSM WRAP (0x72), which needs the PIN. 0x72 itself is unchanged. |
+| Import a record or tombstone | none (the device checks the member signature) | The authority is the origin member's signature, minted while a PIN-authenticated user made the change on that device. The daemon never holds a PIN. |
+| Mint a record (local create, import or change) | user PIN | Happens as part of the normal key operation on the originating device |
+| Mint a key tombstone | user PIN | Part of DELETE |
+| Issue or revoke a member certificate | SO-PIN | Enrollment |
+
+The decision behind importing without a PIN (open question Q1): a fully unattended daemon is only possible if imports are authorised by signatures rather than PINs. The cost is that USB access is enough to *apply* validly signed changes, which already came from a member, and nothing more.
+
+## 8. Firmware APDU surface (vendor, `INS 0x54`)
+
+| P1 | Name | Auth |
+|---|---|---|
+| 40 | DOMAIN_STATUS: domain_id, KCV, Q_domain, member serial, lamport, mode | none |
+| 41 | GET_STATE (signed root) | none |
+| 42 | GET_BUCKETS / GET_BUCKET(n) | none |
+| 43 | EXPORT_RECORD(object_id), returns a SyncRecord or Tombstone | none |
+| 44 | IMPORT_RECORD (chained or extended APDU) | signature checked on the device |
+| 45 | ISSUE_MEMBER_CERT(member_pub, flags) | SO-PIN, plus a pinned peer from the enrollment just completed |
+| 46 | REVOKE_MEMBER(serial) | SO-PIN |
+| 47 | GET_MEMBERS | none |
+| 48 | DOMAIN_CREATE (optional Option B: generate DKEK, export shares) | SO-PIN, right after INITIALIZE |
+| 3A/3C/39/34 | Legacy V1 and V2 calls | Kept for one release, then removed |
+
+All of these must be bounds-checked (V2 §8). Responses use the dispatcher's GET RESPONSE chaining and stay within `MAX_RESPONSE_DATA`. Large buffers must stay off the core1 stack (CLAUDE.md, core1 stack pitfall).
+
+## 9. DKEK rotation = domain migration
+The CardContact format ties each blob to one DKEK, so rotation is a migration:
+1. Form a new domain (new shares) on one device.
+2. Enroll the other devices into it.
+3. On each key's home device, re-wrap it into the new domain: a new record in the new domain, with a tombstone in the old one.
+4. Retire the old domain by revoking all its members.
+
+`pico2hsm-tool domain migrate` automates this. The V2 epoch field (§2c) and the per-device "effective DKEK" (§2b) are **dropped**. Both break blob compatibility, and migration covers the same need.
+
+## 10. Production daemon (`pico2hsm-tool` repository)
+
+The workspace grows to:
+
+```
+crates/
+  libpico2hsm/       existing: PC/SC transport and SC-HSM ops; add the domain/sync APDUs (§8)
+  pico2hsm-proto/    new: SyncRecord / Tombstone / MemberCert / bundle codecs, no I/O,
+                     fuzz targets, test vectors shared with the firmware tests
+  pico2hsm-syncd/    new: the daemon
+  pico2hsm-cli/      existing: add `domain create|status|enroll|revoke|migrate`,
+                     `sync now|status`, `bundle export|import`
+```
+
+**Daemon design:**
+- **Runtime:** tokio. PC/SC calls run on one dedicated blocking thread per device (pcsc handles are not `Send` everywhere), with timeouts. Devices are detected with `SCardGetStatusChange`.
+- **State:** devices are the source of truth. The daemon keeps only a cache (peer addresses, last-seen roots, tombstone acknowledgements, fencing timers) in `~/.local/state/pico2hsm/` with mode 0700/0600 and atomic writes. Losing the cache costs one full resync, never correctness. That is why V2 §2f's HMAC'd state file is no longer critical; it is kept as cheap hardening.
+- **Peers:**
+  - Configured in TOML.
+  - mTLS via rustls, with TLS keys pinned through `SIGN_ENROLLMENT`.
+  - Connection limits, frame cap (64 KB), idle timeouts, rate limits (V2 §8 checklist).
+  - Message structs zeroized where they hold blobs.
+- **Modes:**
+  - `serve` (systemd user unit, launchd agent);
+  - `sync-once` for cron;
+  - `bundle` for air-gapped links.
+- **Observability:**
+  - structured logs;
+  - `pico2hsm-cli sync status`, showing per-peer root, lag and fenced members;
+  - optional Prometheus text endpoint, local-only.
+- **Platforms:** Linux first, then macOS and Windows; CI already builds all three.
+- **Python daemon:** frozen as the reference implementation and test harness. It is removed from user docs once `pico2hsm-syncd` reaches parity.
+
+## 11. Implementation phases (each ends with host tests plus a hardware run)
+
+| Phase | Firmware | Host | Done when |
+|---|---|---|---|
+| **P0 Compatibility** | CardContact wrap format and KCV (§3); compatibility UNWRAP for v0x02 | `pico2hsm-proto` known-answer vectors | `sc-hsm-tool` wrap/unwrap round trip across two devices |
+| **P1 Foundations** | Persisted Lamport counter; global IDs and PKCS#15 CKA_ID kept on import; domain key; member list replacing 0xFC; DOMAIN_STATUS | libpico2hsm APDUs; `domain status` | Two devices from the same shares report the same domain_id |
+| **P2 Enrollment** | ISSUE/REVOKE member cert; single-use pinned peer for the existing exchange | `domain enroll` with the short string; `domain revoke` | Enroll C through B, then A accepts C's records |
+| **P3 Records** | Sidecars, EXPORT/IMPORT_RECORD, tombstones, signed GET_STATE, buckets | proto codecs and fuzzing | Create, delete and re-create converge across 3 devices on one host |
+| **P4 Daemon** | (none) | `pico2hsm-syncd` USB mode, then TCP/mTLS, then bundles | 3 devices, one on another host, one sync by bundle only, all converge; partition and heal tests |
+| **P5 Hardening** | Fencing and TTL enforcement; optional delete grace period | Relay (Model C), metrics, packaging | Chaos tests (kill mid-sync, reorder, replay); external review |
+
+P0 is useful on its own, since it delivers the compatibility goal, and can ship before the rest.
+
+## 12. Open questions for the owner
+
+1. **Import without a PIN:** accept signature-authorised import with no PIN, so the daemon is fully unattended (§7.4)? Recommended: yes.
+2. **Metadata privacy:** should `GET_STATE` and the bucket lists need the user PIN, which would mean an unattended daemon must hold the PIN? Recommended: no, leave them open, with a domain flag to tighten later.
+3. **Who may sponsor:** may every member enroll new devices, or only those whose certificate has the "may sponsor" flag (for example, the first device)? Recommended: a flag, defaulting to on for homelab.
+4. **Tombstone TTL and fencing period:** the default proposed is 90 days.
+5. **Delete grace period (§6.4):** build it in P5 or leave it out?
+6. **Real SmartCard-HSM as a passive member:** a real card can import our wrapped blobs (P0) but can't run sync. Is manual `sc-hsm-tool` import enough for that case?
+7. **Scope of PIV / OpenPGP sync:** confirm it stays out of scope.
+
+## 13. What carries over from V2
+
+| V2 item | V3 status |
+|---|---|
+| §1 5-step DKEK exchange | **Kept**, with the peer pinned for one exchange instead of a permanent 0xFC slot |
+| §2a salted wrap_hash | Replaced by the record hash in signed records (no confirmable plaintext hash) |
+| §2b per-device effective DKEK | **Dropped** (breaks compatibility) |
+| §2c epoch in wrapped blob | **Dropped**; rotation is domain migration (§9) |
+| §2d tombstones | **Kept**, redefined (§6.4), with member-acknowledged retention and fencing |
+| §2e signed state attestation | **Kept** (GET_STATE signed on the device) |
+| §2f HMAC'd state file | Downgraded to hardening; daemon state is a rebuildable cache |
+| §5 mTLS enrollment, SIGN_ENROLLMENT | **Kept** for transport authentication |
+| §6 NAT models | **Kept**, plus bundles for store-and-forward |
+| §7 N ≤ 2 limit | **Lifted**; gossip anti-entropy works for any N. Quorum is still deferred. |
