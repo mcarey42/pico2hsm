@@ -626,8 +626,20 @@ impl<Chip: FlashChip> KeyFilesystem<Chip> {
             flags: 0,
             _pad: [0],
         };
+        // The entry being replaced, if any (live entries only).
+        let superseded = self
+            .directory
+            .find(key_id)
+            .map(|e| (e.chip_index as usize, e.sector_index, e.sector_count as u32));
         self.directory.insert(new_entry)?;
         self.flush_directory()?;
+        // Only once the new copy is what the directory points at: erase the
+        // old one, so a replaced key's ciphertext doesn't linger in a free
+        // sector.  The save itself already succeeded; a failed erase here
+        // leaves only unreferenced ciphertext.
+        if let Some((chip, sector, count)) = superseded {
+            let _ = self.erase_data_sectors(chip, sector, count);
+        }
         Ok(())
     }
 

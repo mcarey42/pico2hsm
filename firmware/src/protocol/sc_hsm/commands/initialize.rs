@@ -279,7 +279,6 @@ pub fn handle(
             // Store public key in EF 0x2F02 (EF.C.DevAut) via flash + ef_cache.
             {
                 let ef_key_id = pico2hsm_core::key::KeyId::sc_hsm_ef(0, 0x2F, 0x02);
-                let _ = store.erase_key(ef_key_id);
                 let mut ef_obj = KeyObject::new(
                     KmType::Generic,
                     ef_key_id.0,
