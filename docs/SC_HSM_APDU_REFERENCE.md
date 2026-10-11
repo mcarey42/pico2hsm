@@ -140,6 +140,16 @@ Selects an EF or DF in the SC-HSM virtual PKCS#15 filesystem. When the SC-HSM ap
 | `0xCCxx` | Key container slot `xx` (presence flag for LIST KEYS) |
 | `0xCExx` | EE certificate EF for key slot `xx` |
 
+**Key file FCP (`CCxx`, P2 ≠ 0x0C):** as a SmartCard-HSM does, the FCP of a
+key file carries the key's usage policy (§3.31) in a proprietary `A5` part:
+
+```
+62 L 80 02 .. 82 01 01 83 02 CC xx
+     A5 L 90 04 <uses left | FFFFFFFF>  [91 n <algorithm IDs>]  [92 01 <key domain>]
+```
+
+`90 04 FFFFFFFF` = no use counter; `91` only for a key with an algorithm list.
+
 **pico2hsm notes:** `CExx` files exist only if written via WRITE DATA (0xD7). `CCxx` files exist if the corresponding key is in the keystore. `C4xx` files exist if an EC key is in the keystore, an RSA key is in the keystore (feature `rsa`), or an EF was written via WRITE DATA. SELECT updates `state.current_file` for subsequent READ BINARY ODD operations.
 
 ---
@@ -700,6 +710,15 @@ Generates an asymmetric key pair (EC or RSA) on-device. Requires User PIN. Retur
 | `42` | Key reference label (optional) |
 | `7F 49` | Public key template; contains curve domain params or RSA modulus-size |
 | `5F 20` | CA reference (optional) |
+| `D4` | pico2hsm key flags (bit 3 = NO_EXPORT) |
+| `90` | Key use counter, 4 bytes BE (CardContact; §3.31) |
+| `91` | Algorithm list: allowed algorithm IDs (CardContact; §3.31) |
+| `92` | Key domain, 1 byte; only `00` exists (CardContact; §3.31) |
+
+The command data is parsed as BER-TLV (1- and 2-byte tags, lengths up to
+`82 xx xx`); a structure that does not parse is refused with `6A80` rather
+than stored without its attributes (OpenSC's P-521 request has a 2-byte
+`7F49` length before `90`/`91`).
 
 **Algorithm inference from `7F49` content:**
 
@@ -744,8 +763,10 @@ Generates an asymmetric key pair (EC or RSA) on-device. Requires User PIN. Retur
 |---|---|
 | `9000` | Success |
 | `6982` | PIN not verified |
-| `6A80` | Missing algorithm byte or unknown algorithm |
+| `6A80` | Missing algorithm byte or unknown algorithm; malformed TLV or key attribute |
+| `6A88` | Key domain (`92`) other than 0 |
 | `6985` | Keystore full |
+| `6581` | The key could not be stored |
 
 ---
 
@@ -760,8 +781,8 @@ Generates an AES key from the on-chip TRNG and stores it in the in-memory symmet
 | CLA | `0x00` |
 | INS | `0x48` |
 | P1 | Key slot ID (`0x01–0xFE`) |
-| P2 | `0x00` |
-| Data | 1 byte: algorithm tag (`0x82`=AES-128, `0x83`=AES-192, `0x84`=AES-256) |
+| P2 | SmartCard-HSM form: `0xB0` / `0xB1` / `0xB2` = AES-128 / 192 / 256; or `0x00` (pico2hsm form) |
+| Data | P2 = B0–B2: optional key attributes `90` / `91` / `92` (§3.31). P2 = 00: 1 byte size tag (`0x82`=AES-128, `0x83`=AES-192, `0x84`=AES-256), then the same optional attributes |
 
 **Status words:**
 
@@ -769,8 +790,9 @@ Generates an AES key from the on-chip TRNG and stores it in the in-memory symmet
 |---|---|
 | `9000` | Success |
 | `6982` | PIN not verified |
-| `6A80` | Invalid key ID or unknown algorithm tag |
-| `6985` | Flash write failed |
+| `6A80` | Invalid key ID, unknown size tag, malformed attribute |
+| `6A88` | Key domain other than 0 |
+| `6581` | Flash write failed (was `6985`) |
 
 ---
 
@@ -797,11 +819,16 @@ Computes an ECDSA or RSA digital signature. The key reference and algorithm are 
 | `0x17` | ECDSA P-521 (pre-hashed) | 64-byte SHA-512 digest | |
 | `0x19` | ECDSA K-256 (pre-hashed) | 32-byte SHA-256 digest | |
 | `0x20` | RSA RAW | 256- or 512-byte PKCS#1-padded block | Host pre-pads; card does raw `m^d mod n` |
-| `0x31` | RSA PKCS#1v1.5 + SHA-256 | Raw message | Card hashes; `rsa` feature required |
-| `0x32` | RSA PKCS#1v1.5 + SHA-384 | Raw message | `rsa` feature required |
-| `0x33` | RSA PKCS#1v1.5 + SHA-512 | Raw message | `rsa` feature required |
-| `0x34` | RSA-PSS + SHA-256 (internal) | 32-byte SHA-256 digest | `rsa` feature required |
-| `0x40` | RSA-PSS + SHA-256 | 32-byte SHA-256 digest | `rsa` feature required |
+| `0x31` | RSA PKCS#1v1.5 + SHA-1 | Raw message | Card hashes; `rsa` feature required |
+| `0x32` | RSA PKCS#1v1.5 + SHA-224 | Raw message | Card hashes |
+| `0x33` | RSA PKCS#1v1.5 + SHA-256 | Raw message | Card hashes |
+| `0x34` | RSA PKCS#1v1.5 + SHA-384 | Raw message | Card hashes |
+| `0x35` | RSA PKCS#1v1.5 + SHA-512 | Raw message | Card hashes |
+| `0x40` | RSA-PSS, external hash | 32-byte SHA-256 digest only | Other digest lengths `6A80` |
+
+Since 2026-10 the RSA codes are the CardContact ones (OpenSC
+`card-sc-hsm.h`). Before, `31`/`32`/`33` signed a host digest as
+SHA-256/384/512 and `34` was PSS; OpenSC never sent them.
 | `0x70` | ECDSA EC-RAW (pre-hashed) | Any digest | Passes directly to sign primitive |
 | `0x71` | ECDSA + SHA-1 | Raw message | Card computes SHA-1 |
 | `0x72` | ECDSA + SHA-224 | Raw message | Card computes SHA-224 |
@@ -817,9 +844,15 @@ Computes an ECDSA or RSA digital signature. The key reference and algorithm are 
 |---|---|
 | `9000` | Success |
 | `6982` | PIN not verified |
-| `6985` | Empty data field |
+| `6985` | Empty data field; algorithm not in the key's list (`91`) |
+| `6A84` | Key use counter (`90`) exhausted |
 | `6A82` | Key not found |
 | `6D00` | Unknown algorithm byte |
+| `6581` | The spent use could not be written |
+
+The key's usage policy (§3.31) is checked against P2 — the per-curve
+codes `13`/`15`/`17`/`19` as `70` — and one use is written to flash before
+the signature is computed.
 
 ---
 
@@ -851,13 +884,20 @@ reach the derive handler.
 
 | P2 | Operation | Input | Response |
 |---|---|---|---|
-| `0x21` | RSA decrypt (PKCS#1 or OAEP) | RSA ciphertext (`c`) | Raw `c^d mod n`; host strips padding |
-| `0x22` | RSA decrypt (OAEP variant) | Same as 0x21 | Same |
+| `0x21` | RSA decrypt (raw) | RSA ciphertext (`c`) | Raw `c^d mod n`; host strips padding |
+| `0x22` | RSA decrypt, card removes PKCS#1 v1.5 padding | — | **Refused (`6D00`)** before the key is touched |
 | `0x23` | ECDH P-256 | `04 \|\| Qx \|\| Qy` (65 bytes) | Raw X-coordinate (32 bytes) |
 | `0x25` | ECDH P-384 | `04 \|\| Qx \|\| Qy` (97 bytes) | Raw X-coordinate (48 bytes) |
 | `0x27` | ECDH P-521 | `04 \|\| Qx \|\| Qy` (133 bytes) | Raw X-coordinate (66 bytes) |
 | `0x29` | ECDH K-256 | `04 \|\| Qx \|\| Qy` (65 bytes) | Raw X-coordinate (32 bytes) |
 | `0x80` | ECDH generic (ALGO_EC_DH) | `04 \|\| Qx \|\| Qy` | `04 \|\| X-coord` (OpenSC strips the 0x04 prefix) |
+
+`0x22` used to run the raw operation of `0x21`; card-side unpadding would
+answer bad padding differently from good (a Bleichenbacher oracle), so
+`0x22` and `0x23` (OAEP, on an RSA key) are not supported. OpenSC sends
+`0x21` only. For the usage policy every ECDH code counts as `0x80`
+(`ALGO_EC_DH`); `0x23` is CardContact's RSA-OAEP ID and is never looked up
+as such for an EC key.
 
 **Response notes:** For `P2 = 0x80`, pico2hsm prepends `0x04` to the X-coordinate. OpenSC's `sc_hsm_decipher` strips this prefix to recover the field-size X bytes. For explicit ECDH codes (`0x23/0x25/0x27/0x29`), the raw X-coordinate is returned without the prefix.
 
@@ -954,7 +994,7 @@ Performs symmetric encryption or decryption. Key must be selected by a preceding
 
 | P2 | Mode | Input format | Response |
 |---|---|---|---|
-| `0x02` | AES-CBC | `[IV: 16 bytes][plaintext or ciphertext]` | CBC-encrypted or decrypted payload |
+| `0x02` | AES-CBC | `[IV: 16 bytes][whole blocks]` | Same number of blocks; **no padding** either way (host pads) |
 | `0x03` | AES-CTR | `[nonce: 16 bytes][data]` | XOR-keystream applied (encrypt=decrypt) |
 | `0x05` | AES-GCM | `[nonce: 12 bytes][aad_len: 2 BE][aad][payload]` | Encrypt: `ct \|\| tag(16)`; Decrypt: plaintext |
 | `0x06` | AES-CMAC | `[message]` | 16-byte CMAC tag (P1 ignored) |
@@ -962,7 +1002,12 @@ Performs symmetric encryption or decryption. Key must be selected by a preceding
 **Constraints:**
 - AES-CTR: AES-256 only (32-byte key). Payload max 4080 bytes.
 - AES-GCM decrypt: payload must include the 16-byte authentication tag appended to ciphertext.
-- AES-CBC: plaintext/ciphertext must be block-aligned (16-byte boundary).
+- AES-CBC: data must be one or more whole blocks (`6700` otherwise). Since
+  2026-10 there is no PKCS#7 padding: encrypt added and decrypt stripped it,
+  and decrypt answered bad padding with `6985` — a CBC padding oracle.
+- Usage policy (§3.31): CBC encrypt = `0x10`, CBC decrypt = `0x11`, CMAC =
+  `0x18`; CTR and GCM have no CardContact ID and are refused for a key with
+  an algorithm list.
 
 **Status words:**
 
@@ -997,6 +1042,14 @@ The MAC is verified (constant time) before any decryption, so every forged
 or altered blob fails the same way (`6A80`). Version-1 blobs (no version
 byte, no MAC) are refused: they made IMPORT KEY a CBC padding oracle.
 
+**Version 3** (byte 8 = `0x03`) carries the key's usage policy (§3.31):
+plaintext `key || A5 L {..} || L+2 || algo || flags || PKCS#7`. It is
+written only for a key that has a policy (others stay version 2, which
+earlier firmware imports); the version byte is under the MAC. IMPORT
+restores the policy (algorithm list, key domain, and a use counter if the
+blob has one). This is still the pico2hsm format, not CardContact's
+(whose wrap format carries the algorithm list in its own field).
+
 **Status words:** `9000` imported; `6A80` bad/forged blob or wrong key
 length; `6A86` reserved slot; `6982` PIN not verified; `6985` no DKEK;
 `6581` the key could not be stored.
@@ -1009,6 +1062,12 @@ Exports the key in slot P1 wrapped under the DKEK (format as in §3.25).
 User PIN and a ready DKEK are required; keys generated or imported with the
 NO_EXPORT flag (bit 3 of tag `D4`) are refused with `6985`, as are reserved
 slots `0xFC`–`0xFF` (`6A86`).
+
+Usage policy (§3.31): a key with an algorithm list must list `0x92`
+(`ALGO_WRAP`), else `6985`. A key with a **use counter is not exportable**
+(`6985`): every unwrap of a wrapped copy (into other slots, or back over
+the original after use) would start again from the exported count.
+Wrapping does not spend a use.
 
 ---
 
@@ -1156,6 +1215,54 @@ Dumps a region of RAM, flash, or OTP memory. Currently a stub returning `SW = 0x
 
 ---
 
+### 3.31 Key usage policy (CardContact key attributes)
+
+Since 2026-10 (audit S-10). A key may be created with:
+
+| Tag | Length | Meaning |
+|---|---|---|
+| `90` | 4 | Key use counter: uses left (BE). `0` = unusable |
+| `91` | 1–32 | Algorithm list: the algorithm IDs (CardContact, OpenSC `card-sc-hsm.h`) the key may be used with |
+| `92` | 1 | Key domain; only domain `00` exists (one DKEK) — others `6A88` |
+
+Without `91` every algorithm valid for the key type is allowed; without
+`90` there is no limit. Keys created before this firmware load with no
+restriction (that is what the spec gives a key generated without the
+tags). An empty `91` counts as absent.
+
+**Enforcement.** Every use checks the operation's algorithm ID against the
+list, then, for a key with a counter, writes the decremented counter to
+flash **before** the operation (like the PIN retry counters): a result never
+leaves the device without its use on flash, and a malformed request (bad
+P2, empty data, wrong key type, CBC length) is refused before anything is
+spent. Errors: `6A84` counter exhausted, `6985` algorithm not allowed,
+`6581` the counter could not be written.
+
+| Operation | Algorithm ID checked |
+|---|---|
+| COMPUTE DIGITAL SIGNATURE, PSO:CDS | P2 / MSE algorithm (`13`/`15`/`17`/`19` as `70`) |
+| DECIPHER, PSO:DECIPHER | RSA: `21`; ECDH (any code): `80` |
+| GENERAL AUTHENTICATE (ECDSA over SHA-256 of the challenge) | `73` |
+| PSO checksum AES-CMAC (compute or verify) | `18` |
+| CIPHER CBC encrypt / decrypt / CMAC | `10` / `11` / `18` |
+| WRAP KEY (export) | `92` (no use spent; counted keys refused) |
+| CIPHER CTR / GCM, PSO HMAC, DERIVE (HKDF, `62 01 00`), BIP/SLIP | none in CardContact's list: only keys **without** a list |
+
+**Who sets it.** OpenSC's default key generation (pkcs11-tool,
+pkcs15-init) sends none of the tags. `sc-hsm-tool --generate-key
+--key-use-counter N --key-domain D` sends `90` (and `92` = D−1); no OpenSC
+tool sends `91` — use a raw GENERATE KEY PAIR (see `tests/hw/test_17_key_policy.py`)
+or CardContact's own tooling.
+
+**Storage.** The policy is part of the encrypted key object (magic `P2KP`
+= `P2K4` + policy; keys without a policy keep `P2K4`, so firmware before
+2026-10 refuses a restricted key rather than use it unrestricted). It is
+reported in the key file's FCP (§3.1) and carried by WRAP / UNWRAP (wrap
+format version 3, §3.25). A key created by DERIVE gets no policy (none is
+stored by this firmware's derive commands, which return data).
+
+---
+
 ## 4. TLV Tag Glossary
 
 Common BER-TLV tags used across SC-HSM commands.
@@ -1205,16 +1312,17 @@ SC-HSM AlgorithmId bytes used in MSE SET (tag `0x80`) and directly in INS=0x68 P
 | `0x19` | ECDSA K-256 (pre-hashed) | `EcPrivateK256` | secp256k1 |
 | `0x20` | RSA RAW | `RsaPrivate2048/4096` | Host pre-pads; card does `m^d mod n` |
 | `0x21` | RSA decrypt (PKCS#1/OAEP) | `RsaPrivate2048/4096` | Raw `c^d mod n`; host unpadding |
-| `0x22` | RSA decrypt (OAEP variant) | `RsaPrivate2048/4096` | Same raw op |
+| `0x22` | RSA decrypt, PKCS#1 unpadding on card | — | Refused (`6D00`): padding oracle |
 | `0x23` | ECDH P-256 | `EcPrivateP256` | Decipher; returns raw X |
 | `0x25` | ECDH P-384 | `EcPrivateP384` | |
 | `0x27` | ECDH P-521 | `EcPrivateP521` | |
 | `0x29` | ECDH K-256 | `EcPrivateK256` | |
-| `0x31` | RSA PKCS#1v1.5 + SHA-256 | `RsaPrivate*` | Card hashes |
-| `0x32` | RSA PKCS#1v1.5 + SHA-384 | `RsaPrivate*` | |
-| `0x33` | RSA PKCS#1v1.5 + SHA-512 | `RsaPrivate*` | |
-| `0x34` | RSA-PSS + SHA-256 (internal) | `RsaPrivate*` | Pre-hashed (32-byte input) |
-| `0x40` | RSA-PSS + SHA-256 | `RsaPrivate*` | Pre-hashed (32-byte input) |
+| `0x31` | RSA PKCS#1v1.5 + SHA-1 | `RsaPrivate*` | Card hashes |
+| `0x32` | RSA PKCS#1v1.5 + SHA-224 | `RsaPrivate*` | Card hashes |
+| `0x33` | RSA PKCS#1v1.5 + SHA-256 | `RsaPrivate*` | Card hashes |
+| `0x34` | RSA PKCS#1v1.5 + SHA-384 | `RsaPrivate*` | Card hashes |
+| `0x35` | RSA PKCS#1v1.5 + SHA-512 | `RsaPrivate*` | Card hashes |
+| `0x40` | RSA-PSS, external SHA-256 digest | `RsaPrivate*` | 32-byte input only |
 | `0x70` | ECDSA EC-RAW (pre-hashed) | Any EC | Generic; digest passed directly |
 | `0x71` | ECDSA + SHA-1 | Any EC | Card hashes; 20-byte digest |
 | `0x72` | ECDSA + SHA-224 | Any EC | Card hashes; 28-byte digest |
@@ -1222,6 +1330,9 @@ SC-HSM AlgorithmId bytes used in MSE SET (tag `0x80`) and directly in INS=0x68 P
 | `0x74` | ECDSA + SHA-384 | Any EC | Card hashes; 48-byte digest |
 | `0x75` | ECDSA + SHA-512 | Any EC | Card hashes; 64-byte digest |
 | `0x80` | ECDH generic (ALGO_EC_DH) | Any EC | OpenSC generic; response has `0x04` prefix |
+| `0x10` / `0x11` | AES-CBC encrypt / decrypt | AES | Usage-policy IDs (CIPHER P2 is pico2hsm's own) |
+| `0x18` | AES-CMAC | AES | Usage-policy ID |
+| `0x92` | WRAP | Any | Usage-policy ID for EXPORT KEY |
 | `0x82` | AES-128 keygen | Symmetric | GENERATE SYMMETRIC KEY only |
 | `0x83` | AES-192 keygen | Symmetric | |
 | `0x84` | AES-256 keygen | Symmetric | |
@@ -1269,7 +1380,8 @@ SC-HSM key slot ID conventions and corresponding internal types.
 | `6985` | Conditions of use not satisfied | No challenge outstanding; MSE not set; slot full |
 | `6A80` | Incorrect parameters in the command data field | Malformed TLV; unknown P1/P2 |
 | `6A82` | File or application not found | Key not in store; EF not found |
-| `6A88` | Referenced data not found | Unknown PIN reference P2 |
+| `6A84` | Not enough memory space in the file | Key use counter (`90`) exhausted |
+| `6A88` | Referenced data not found | Unknown PIN reference P2; key domain other than 0 |
 | `6D00` | Instruction code not supported or invalid | Unknown INS; not-yet-implemented command |
 
 ---
@@ -1320,6 +1432,15 @@ MF  (3F00)
 9. **EXTERNAL AUTHENTICATE:** not supported (removed 2026-10; see §3.17).
 
 10. **DEBUG DUMP (INS=0xFE):** Only compiled in `#[cfg(feature = "debug")]` builds. The stub currently returns `SW_WRONG_DATA`. Never enable the `debug` feature in production.
+
+12. **Usage-policy gaps (§3.31):** RSA-PSS only with an external SHA-256
+    digest (`41`–`45` unsupported); `30` (DigestInfo input) and RSA
+    decrypt with card-side unpadding (`22`, `23`) unsupported; the
+    pico2hsm ECDH (`23`/`25`/`27`/`29`) and pre-hashed ECDSA
+    (`13`/`15`/`17`/`19`) codes are extensions; CIPHER uses its own P1/P2
+    (direction / mode), not CardContact's P1 = key, P2 = algorithm; only
+    key domain 0; no XKEK / `ALGO_EC_DH_XKEK`. Algorithms without a
+    CardContact ID are refused for a key with an algorithm list.
 
 11. **ECDH1-COFACTOR-DERIVE:** For all supported curves the cofactor h=1, making COFACTOR-DERIVE and plain DERIVE identical at the APDU level. OpenSC 0.25's SC-HSM driver rejects COFACTOR-DERIVE for P-256 at the PKCS#11 layer; tests use `ECDH1-DERIVE` to avoid this driver-side restriction.
 

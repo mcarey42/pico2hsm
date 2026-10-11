@@ -1082,9 +1082,10 @@ PW1 (the user PIN) has two verification modes with different persistence:
 ### Mode 81 — Signing PIN (one-shot)
 
 - **P2 = `0x81`** in VERIFY
-- Authorises **one** PSO:CDS call
-- The verified flag is **automatically cleared after each PSO:CDS** completes (success or failure)
-- Subsequent PSO:CDS requires re-verification
+- Authorises PSO:CDS: **one** call when PW1 status byte 1 (DO `C4`) is
+  `00` (the default), **several** when it is `01`
+- With `C4` = `00` the verified flag is cleared after each signature
+- `C4` byte 1 is written with PUT DATA `C4` (PW3)
 - This is the default mode GnuPG uses for signing
 
 ### Mode 82 — Session PIN (persistent)
@@ -1092,13 +1093,13 @@ PW1 (the user PIN) has two verification modes with different persistence:
 - **P2 = `0x82`** in VERIFY
 - Stays verified for the **entire session** (until SELECT, power cycle, or explicit reset)
 - Required for PSO:DECIPHER, INTERNAL AUTHENTICATE, and other non-signing operations
-- Also authorises PSO:CDS (so if mode 82 is verified, signing also works without mode 81)
+- Does **not** authorise PSO:CDS (OpenPGP Card 3.4 §7.2.10; pico2hsm since 2026-10, audit S-14)
 
 ### Which commands require which mode:
 
 | Command | PW1-81 sufficient | PW1-82 required |
 |---|---|---|
-| PSO:CDS | Yes (one-shot) | Yes (if set, also works) |
+| PSO:CDS | Yes (one-shot, or several with `C4` = `01`) | No — mode 82 never signs |
 | PSO:DECIPHER | No | Yes |
 | INTERNAL AUTHENTICATE | No | Yes |
 | GET DATA (protected) | No | Yes |
@@ -1410,6 +1411,23 @@ functional:
 9. **PUT DATA** for writeable DOs (name, fingerprints, URL)
 10. **TERMINATE DF** + **ACTIVATE FILE**
 11. Ed25519/X25519 (behind `applet-openpgp-curve25519`)
+
+---
+
+## 16. pico2hsm key usage policy as implemented (2026-10, audit S-10)
+
+| Rule | Behaviour |
+|---|---|
+| Key roles | SIG key only for PSO:CDS; DEC key only for PSO:DECIPHER; AUT key only for INTERNAL AUTHENTICATE (no MSE key redirection) |
+| PW1 modes | PSO:CDS needs mode 81; DECIPHER and INTERNAL AUTHENTICATE need mode 82 |
+| PW1 status (`C4` byte 1) | `00` one signature per VERIFY (default), `01` several; PUT DATA `C4` (PW3) with 1 byte (or 7, first used); other values `6A80`; persisted; extended capability `C0` bit `10` set |
+| Signature counter (`93` in `7A`) | +1 per PSO:CDS, written to flash **before** the signature is returned (`6581` and no signature otherwise), survives reset, reset to 0 when a new SIG key is generated, saturates at `FFFFFF` |
+| Algorithm attributes | `C1`/`C3`: ECDSA (`13`) P-256/384/521 or EdDSA (`16`) Ed25519; `C2`: ECDH (`12`) P-256/384/521 or X25519. Optional trailing format byte `00`/`FF`. Anything else (RSA, a key-agreement algorithm for a signing role, unknown curve) `6A80` |
+| General feature management `7F74` | `81 01 00` (no display, button, keypad, LED, …), also inside `6E` |
+| UIF `D6`/`D7`/`D8` | Not supported: GET and PUT DATA answer `6A88` (no button) |
+
+Not implemented: key import (`DB 3FFF`), MSE, KDF-DO, reset code, RSA,
+private DOs.
 
 ---
 

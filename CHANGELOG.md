@@ -58,7 +58,38 @@ Security and robustness release from the October 2026 audit
   credential blocked".  A PIN record without a counter entry (e.g. the
   counter sectors erased on their own) also loads blocked.
 
+- **SC-HSM CIPHER (INS 0x78) AES-CBC no longer pads**: encrypt and
+  decrypt work on whole blocks (the host pads), as CardContact's
+  `ALGO_AES_CBC_ENCRYPT`/`_DECRYPT`.  Decrypt stripped PKCS#7 and answered
+  bad padding with 6985 — a padding oracle.  Other lengths are 6700.
+- **SC-HSM DECIPHER P2=0x22 is refused (6D00)**: it ran the raw RSA
+  operation of 0x21; card-side unpadding would be a Bleichenbacher oracle.
+  OpenSC sends 0x21 only.
+- **SC-HSM RSA PKCS#1 v1.5 signature IDs follow the CardContact spec**:
+  0x31–0x35 = SHA-1/224/256/384/512 hashed by the card (they were
+  SHA-256/384/512 over a host digest, and 0x34 was PSS).  OpenSC uses 0x20.
+- **PIV 9D and the retired slots 82–95 no longer sign** (key establishment
+  only, ECC CDH with tag 85); 9A/9C/9E no longer accept tag 85
+  (SP 800-73-4 / SP 800-78-4).
+- **OpenPGP algorithm attributes must match the key role**: C1/C3 ECDSA or
+  EdDSA, C2 ECDH; other values (and RSA) are 6A80.
+- **Keys with a usage policy use the new object magic `P2KP`**: firmware
+  before this release refuses them (keys without a policy stay `P2K4`).
+  WRAP of a key with a policy produces wrap format version 3, which older
+  firmware cannot import.
+
 ### Security
+- **Per-key usage policy (audit S-10).** SC-HSM keys take the CardContact
+  attributes 90 (use counter), 91 (algorithm list) and 92 (key domain) at
+  generation and unwrap; every use is checked against the list and spends
+  the counter on flash before the operation (6A84 when exhausted, 6985 when
+  the algorithm is not allowed); SELECT CCxx reports them; WRAP/UNWRAP
+  carry the list and domain, keys with a counter are not exportable.  PIV
+  stores and enforces the Yubico PIN policy (AA) with the SP 800-73-4 slot
+  defaults, accepts touch policy only default/never (no button), and "PIN
+  always" is used up by the next GENERAL AUTHENTICATE of any slot.
+  OpenPGP: PW1 status byte (C4) writable and enforced, signature counter
+  (DO 93) persisted before each signature leaves the card.
 - PIN / SO-PIN / PUK retry counters (SC-HSM, PIV, OpenPGP) are written to
   flash before the credential is compared; a reset no longer restores
   guesses. Re-INITIALIZE counts against the SO-PIN.
@@ -86,6 +117,11 @@ Security and robustness release from the October 2026 audit
 - Secrets wiped in place: reset, DKEK copies, key buffers, response buffers.
 
 ### Added
+- SC-HSM GENERATE SYMMETRIC KEY accepts the SmartCard-HSM form (P2 =
+  B0/B1/B2, data = key attributes); storage errors are 6581.
+- PIV: retired key management slots 82–95; GET METADATA (INS F7); VERIFY
+  P1=FF resets the PIN status.
+- OpenPGP: PUT DATA C4; GET DATA 7F74 (no button) and 7F74 in 6E.
 - **Hardware watchdog armed on every board** (8 s timeout, paused while a
   debugger halts either core).  Core0 feeds it from an executor task only
   while core1 is idle, making progress, or under the RSA-keygen
