@@ -87,6 +87,12 @@ pub static WATCHDOG_SUPPRESS: core::sync::atomic::AtomicBool =
 /// older one instead of sending it into the new session.
 pub static SESSION_EPOCH: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
+/// The session the APDU currently in `APDU_CHANNEL` belongs to.  Core0
+/// stores it before each send; core1 refuses an APDU whose session has
+/// already ended, so a command from the old host can't run in (and
+/// authenticate) the new one.
+pub static APDU_EPOCH: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
 /// Start a new host session (see [`SESSION_EPOCH`]).
 pub fn bump_session_epoch() {
     SESSION_EPOCH.fetch_add(1, core::sync::atomic::Ordering::SeqCst);

@@ -212,6 +212,8 @@ pub struct CcidTransport<'d, D: Driver<'d>> {
     card_powered: bool,
     /// Sequence number from the last XfrBlock; echoed in the DataBlock response.
     pending_seq: u8,
+    /// `SESSION_EPOCH` the last complete message was read under.
+    msg_epoch: u32,
 }
 
 impl<'d, D: Driver<'d>> CcidTransport<'d, D> {
@@ -244,6 +246,7 @@ impl<'d, D: Driver<'d>> CcidTransport<'d, D> {
             intr_ep,
             card_powered: false,
             pending_seq: 0,
+            msg_epoch: 0,
         }
     }
 
@@ -301,6 +304,13 @@ impl<'d, D: Driver<'d>> CcidTransport<'d, D> {
     /// APDUs directly; no T=1 framing at the CCID layer.
     ///
     /// The returned `Vec` contains the raw APDU bytes (CLA INS P1 P2 ...).
+    /// The host session (`SESSION_EPOCH`) the APDU last returned by
+    /// [`recv_apdu`](Self::recv_apdu) belongs to.  Tag the APDU with this,
+    /// not a fresh load: the session may already have ended.
+    pub fn apdu_epoch(&self) -> u32 {
+        self.msg_epoch
+    }
+
     pub async fn recv_apdu(&mut self) -> Result<Vec<u8, 4096>, CcidError> {
         // Single receive buffer for multi-packet CCID messages.
         // After extracting the APDU payload from an XfrBlock, the 10-byte
@@ -368,7 +378,9 @@ impl<'d, D: Driver<'d>> CcidTransport<'d, D> {
                         self.pending_seq = header.seq;
                         // Strip the 10-byte CCID header in-place: copy payload
                         // bytes down to the start of the buffer, then truncate.
-                        let payload_len = raw.len() - CCID_HEADER_LEN;
+                        // dwLength, not the bytes read: trailing bytes in the
+                        // last packet are not part of the APDU (B-07).
+                        let payload_len = header.length as usize;
                         raw.copy_within(CCID_HEADER_LEN.., 0);
                         raw.truncate(payload_len);
                         return Ok(raw);
@@ -393,6 +405,11 @@ impl<'d, D: Driver<'d>> CcidTransport<'d, D> {
     /// the host waits roughly 1–2 seconds per extension before retrying.
     /// Call this every ~1.5 s to stay well inside any reasonable host timeout.
     pub async fn send_time_extension(&mut self) -> Result<(), CcidError> {
+        // Only for the session that sent the command; a new session's host
+        // would read it as the answer to its own first message.
+        if crate::SESSION_EPOCH.load(core::sync::atomic::Ordering::SeqCst) != self.msg_epoch {
+            return Ok(());
+        }
         let msg = [
             RDR_TO_PC_DATABLOCK,
             0x00,
@@ -449,6 +466,8 @@ impl<'d, D: Driver<'d>> CcidTransport<'d, D> {
         // one: restart the message whenever the session changes mid-read.
         let mut epoch = crate::SESSION_EPOCH.load(core::sync::atomic::Ordering::SeqCst);
 
+        // `buf` arrives empty; on a restart it holds the new message's first packet.
+        'message: loop {
         // Read packets until we have at least the 10-byte CCID header.
         while buf.len() < CCID_HEADER_LEN {
             let n = self.read_ep.read(&mut pkt).await?;
@@ -488,11 +507,23 @@ impl<'d, D: Driver<'d>> CcidTransport<'d, D> {
         // Read remaining packets until we have the full message.
         while buf.len() < total {
             let n = self.read_ep.read(&mut pkt).await?;
+            let now = crate::SESSION_EPOCH.load(core::sync::atomic::Ordering::SeqCst);
+            if now != epoch {
+                // The session ended mid-message: this packet starts the
+                // next session's first message, not the rest of this one.
+                epoch = now;
+                buf.clear();
+                buf.extend_from_slice(&pkt[..n])
+                    .map_err(|_| CcidError::BufferOverflow)?;
+                continue 'message;
+            }
             buf.extend_from_slice(&pkt[..n])
                 .map_err(|_| CcidError::BufferOverflow)?;
         }
-
-        Ok(header)
+        buf.truncate(total);
+        self.msg_epoch = epoch;
+        return Ok(header);
+        }
     }
 
     /// Write `data` to the bulk-IN endpoint, chunked into max-packet-size pieces.

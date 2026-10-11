@@ -356,11 +356,15 @@ fn dispatcher_loop(ptr_wrapper: DispatcherPtr) -> ! {
         let mut apdu_bytes = blocking_receive(&APDU_CHANNEL);
         // A new host session (USB reset/deconfigure or card power cycle)
         // must not inherit PIN/key authentication from the previous one.
-        let now = pico2hsm_firmware::SESSION_EPOCH.load(core::sync::atomic::Ordering::SeqCst);
-        if now != session {
+        // Key off the session the APDU was *sent in*, not the current one:
+        // a command queued before a reset belongs to the old session.
+        let tag = pico2hsm_firmware::APDU_EPOCH.load(core::sync::atomic::Ordering::SeqCst);
+        if tag != session {
             dispatcher.clear_session();
-            session = now;
+            session = tag;
         }
+        let stale = !apdu_bytes.is_empty()
+            && pico2hsm_firmware::SESSION_EPOCH.load(core::sync::atomic::Ordering::SeqCst) != tag;
         // No defmt logging inside the receive loop.  All embassy_rp TRACE logs
         // from Core0 fill the RTT buffer rapidly; any defmt write from Core1
         // here would block on BLOCK_IF_FULL mode and deadlock both cores.
@@ -385,12 +389,26 @@ fn dispatcher_loop(ptr_wrapper: DispatcherPtr) -> ! {
                 let _ = Core1KeyStore::on_core0(FlashOp::ReloadKeys);
             }
             blocking_send(&RESP_CHANNEL, heapless::Vec::new());
+        } else if stale {
+            // Its session ended while it was queued: never run it.  Core0
+            // drops the reply (tagged with the old epoch) as well.
+            zeroize::Zeroize::zeroize(&mut apdu_bytes[..]);
+            let mut sw = heapless::Vec::new();
+            let _ = sw.extend_from_slice(&[0x6F, 0x00]);
+            blocking_send(&RESP_CHANNEL, sw);
         } else {
             CORE1_PROGRESS.store(10, core::sync::atomic::Ordering::Relaxed);
             let mut ks = Core1KeyStore::new(store_ptr);
             let response = dispatcher.dispatch_with_store(&apdu_bytes, &mut ks);
             // The command may carry PINs or key material; don't leave it on the stack.
             zeroize::Zeroize::zeroize(&mut apdu_bytes[..]);
+            // A reset during the command: whatever it authenticated belonged
+            // to the session that just ended.
+            let now = pico2hsm_firmware::SESSION_EPOCH.load(core::sync::atomic::Ordering::SeqCst);
+            if now != session {
+                dispatcher.clear_session();
+                session = now;
+            }
             CORE1_PROGRESS.store(60, core::sync::atomic::Ordering::Relaxed);
             blocking_send(&RESP_CHANNEL, response);
             CORE1_PROGRESS.store(0, core::sync::atomic::Ordering::Relaxed);
@@ -945,8 +963,9 @@ async fn run_one_board(p: embassy_rp::Peripherals) {
             loop {
                 match ccid.recv_apdu().await {
                     Ok(apdu_bytes) => {
-                        let epoch = pico2hsm_firmware::SESSION_EPOCH
-                            .load(core::sync::atomic::Ordering::SeqCst);
+                        let epoch = ccid.apdu_epoch();
+                        pico2hsm_firmware::APDU_EPOCH
+                            .store(epoch, core::sync::atomic::Ordering::SeqCst);
                         board.led().set_status(LedStatus::Busy);
                         let _ = APDU_CHANNEL.send(apdu_bytes).await;
                         cortex_m::asm::sev(); // wake core1 from WFE
@@ -1297,8 +1316,9 @@ async fn run_geek_board(p: embassy_rp::Peripherals) {
             loop {
                 match ccid.recv_apdu().await {
                     Ok(apdu_bytes) => {
-                        let epoch = pico2hsm_firmware::SESSION_EPOCH
-                            .load(core::sync::atomic::Ordering::SeqCst);
+                        let epoch = ccid.apdu_epoch();
+                        pico2hsm_firmware::APDU_EPOCH
+                            .store(epoch, core::sync::atomic::Ordering::SeqCst);
                         let now = embassy_time::Instant::now();
                         if screensaver == ScreensaverState::Sleeping {
                             screensaver = ScreensaverState::Active;
@@ -1593,8 +1613,9 @@ async fn run_pico2_board(p: embassy_rp::Peripherals) {
             loop {
                 match ccid.recv_apdu().await {
                     Ok(apdu_bytes) => {
-                        let epoch = pico2hsm_firmware::SESSION_EPOCH
-                            .load(core::sync::atomic::Ordering::SeqCst);
+                        let epoch = ccid.apdu_epoch();
+                        pico2hsm_firmware::APDU_EPOCH
+                            .store(epoch, core::sync::atomic::Ordering::SeqCst);
                         board.led().set_status(LedStatus::Busy);
                         // No defmt logging here — the RTT buffer fills from trace-level
                         // embassy_rp USB logs; any defmt call here blocks Core0 before
@@ -2003,8 +2024,9 @@ async fn run_waveshare_lcd_board(p: embassy_rp::Peripherals) {
             loop {
                 match ccid.recv_apdu().await {
                     Ok(apdu_bytes) => {
-                        let epoch = pico2hsm_firmware::SESSION_EPOCH
-                            .load(core::sync::atomic::Ordering::SeqCst);
+                        let epoch = ccid.apdu_epoch();
+                        pico2hsm_firmware::APDU_EPOCH
+                            .store(epoch, core::sync::atomic::Ordering::SeqCst);
                         let now = embassy_time::Instant::now();
                         if screensaver == ScreensaverState::Sleeping {
                             screensaver = ScreensaverState::Active;
