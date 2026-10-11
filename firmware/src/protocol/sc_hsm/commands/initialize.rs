@@ -144,10 +144,23 @@ pub fn handle(
         }
     });
 
-    // Tag 0x91: User PIN retry counter (optional).
+    // Tag 0x91: User PIN retry counter (optional).  1–15: the 63Cx status
+    // word reports it in four bits, and 0 would create a blocked PIN.
     let retry_counter = find_tlv(data, 0x91)
         .and_then(|v| v.first().copied())
         .unwrap_or(3);
+    if !(1..=15).contains(&retry_counter) {
+        return ApduResponse::err(pico2hsm_core::apdu::SW_WRONG_DATA);
+    }
+
+    // Tag 0x93: PUK (optional, 8–16 bytes).  Validated with everything
+    // else, before any credential in RAM changes.
+    let puk = find_tlv(data, 0x93);
+    if let Some(p) = puk {
+        if p.len() < 8 || p.len() > 16 {
+            return ApduResponse::err(SW_WRONG_LENGTH);
+        }
+    }
 
     // Tag 0x92: DKEK share count (optional, 0 = no DKEK).
     let dkek_count = find_tlv(data, 0x92)
@@ -171,10 +184,7 @@ pub fn handle(
     }
 
     // Tag 0x93: PUK (optional, 8–16 bytes), using PBKDF2.
-    if let Some(puk) = find_tlv(data, 0x93) {
-        if puk.len() < 8 || puk.len() > 16 {
-            return ApduResponse::err(SW_WRONG_LENGTH);
-        }
+    if let Some(puk) = puk {
         state.puk_salt = puk_salt_bytes;
         state.puk_hash = Some(hash_puk_pbkdf2(puk, &puk_salt_bytes));
         state.puk_retry_count = 10;

@@ -678,6 +678,13 @@ impl ScHsm {
         if self.state.dkek.is_ready() != had_dkek
             && Self::save_dkek_to_store(&self.state, store).is_err()
         {
+            // A DKEK flash doesn't hold must not be used: anything wrapped
+            // under it this session could never be unwrapped after a
+            // reboot.  (A cleared DKEK stays cleared — the stricter side.)
+            if self.state.dkek.is_ready() {
+                self.state.dkek.clear();
+                self.state.dkek_shares_imported = 0;
+            }
             return ApduResponse::err(SW_MEMORY_FAILURE);
         }
         resp

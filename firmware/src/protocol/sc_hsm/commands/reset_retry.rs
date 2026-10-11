@@ -38,10 +38,14 @@ pub fn handle_with_store(
     store: &mut dyn crate::storage::KeyStore,
     cmd: &ApduCommand<'_>,
 ) -> ApduResponse {
+    let before = (state.user_pin_salt, state.user_pin_hash, state.pin_retry_count);
     let resp = handle(state, cmd);
     if resp.sw == pico2hsm_core::apdu::SW_OK
         && crate::protocol::sc_hsm::ScHsm::save_pin_to_store(state, store).is_err()
     {
+        // Keep RAM what flash holds: no new PIN or reset counter that a
+        // reboot would silently undo.
+        (state.user_pin_salt, state.user_pin_hash, state.pin_retry_count) = before;
         return ApduResponse::err(pico2hsm_core::apdu::SW_MEMORY_FAILURE);
     }
     resp
