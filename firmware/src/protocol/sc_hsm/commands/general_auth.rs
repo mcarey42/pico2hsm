@@ -74,8 +74,9 @@ pub fn handle(
     store: &mut dyn KeyStore,
     cmd: &ApduCommand<'_>,
 ) -> ApduResponse {
-    // Require PIN authentication.
-    if !state.pin_verified && !state.so_pin_verified {
+    // Private-key use needs the user PIN; the SO-PIN administers the card
+    // but must not be able to use the user's keys.
+    if !state.pin_verified {
         return ApduResponse::err(SW_SECURITY_STATUS);
     }
 
