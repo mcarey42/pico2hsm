@@ -22,6 +22,7 @@ use pico2hsm_core::{
 };
 
 use crate::security::key_management::KeyObject;
+use crate::storage::retry_counter::{CounterState, Credential, RetryCounterBackend};
 
 // ARM-only imports used by FlashKeyStore.
 #[cfg(target_arch = "arm")]
@@ -72,6 +73,13 @@ pub trait KeyStore {
     /// iterate — avoids allocating even the 64-entry Vec on the stack.
     /// Uses `&mut dyn FnMut` instead of `impl FnMut` for dyn-compatibility.
     fn for_each_key(&self, f: &mut dyn FnMut(KeyId));
+
+    /// The credential retry-counter store (see `storage::retry_counter`),
+    /// or `None` if this store has none.  Without one every credential
+    /// check fails closed (6581) and credentials load blocked.
+    fn retry_counters(&mut self) -> Option<&mut dyn RetryCounterBackend> {
+        None
+    }
 }
 
 // ─── FlashKeyStore<Chip> ──────────────────────────────────────────────────────
@@ -85,6 +93,8 @@ pub trait KeyStore {
 pub struct FlashKeyStore<Chip: FlashChip> {
     storage: StorageManager<Chip>,
     smk: Option<Zeroizing<[u8; 32]>>,
+    /// Retry-counter log on internal flash (every board, SD ones included).
+    counters: Option<crate::storage::BoardCounterLog>,
 }
 
 #[cfg(target_arch = "arm")]
@@ -94,7 +104,16 @@ impl<Chip: FlashChip> FlashKeyStore<Chip> {
     /// `storage` should already have chips added via `KeyFilesystem::add_chip`.
     /// Call [`init`] before any key operations.
     pub fn new(storage: StorageManager<Chip>, smk: Option<Zeroizing<[u8; 32]>>) -> Self {
-        FlashKeyStore { storage, smk }
+        FlashKeyStore {
+            storage,
+            smk,
+            counters: None,
+        }
+    }
+
+    /// Attach the retry-counter log (before the first key load).
+    pub fn attach_retry_counters(&mut self, log: crate::storage::BoardCounterLog) {
+        self.counters = Some(log);
     }
 
     /// One bounded step of `wipe_by_owner`: erase at most `max` of the
@@ -204,6 +223,12 @@ impl<Chip: FlashChip> KeyStore for FlashKeyStore<Chip> {
     fn for_each_key(&self, f: &mut dyn FnMut(KeyId)) {
         self.storage.for_each_key(f);
     }
+
+    fn retry_counters(&mut self) -> Option<&mut dyn RetryCounterBackend> {
+        self.counters
+            .as_mut()
+            .map(|c| c as &mut dyn RetryCounterBackend)
+    }
 }
 
 // ─── NullKeyStore (host-side tests) ──────────────────────────────────────────
@@ -240,6 +265,27 @@ impl KeyStore for NullKeyStore {
 
     fn for_each_key(&self, _f: &mut dyn FnMut(KeyId)) {
         // No keys in the null store.
+    }
+
+    fn retry_counters(&mut self) -> Option<&mut dyn RetryCounterBackend> {
+        Some(self)
+    }
+}
+
+/// The null store keeps no counters either: reads find no entry, writes
+/// succeed without effect.
+impl RetryCounterBackend for NullKeyStore {
+    fn get(&mut self, _: Credential) -> Result<Option<CounterState>, StorageError> {
+        Ok(None)
+    }
+    fn put(&mut self, _: Credential, _: CounterState) -> Result<(), StorageError> {
+        Ok(())
+    }
+    fn needs_migration(&mut self) -> bool {
+        false
+    }
+    fn format(&mut self, _: &[(Credential, CounterState)]) -> Result<(), StorageError> {
+        Ok(())
     }
 }
 
@@ -526,6 +572,11 @@ impl<P: KeyStore, S: KeyStore> KeyStore for HybridKeyStore<P, S> {
     fn for_each_key(&self, f: &mut dyn FnMut(KeyId)) {
         // Primary is authoritative.
         self.primary.for_each_key(f);
+    }
+
+    fn retry_counters(&mut self) -> Option<&mut dyn RetryCounterBackend> {
+        // The counters are never mirrored to a removable card.
+        self.primary.retry_counters()
     }
 }
 

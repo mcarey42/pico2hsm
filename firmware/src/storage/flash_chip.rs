@@ -408,11 +408,13 @@ where
 // ─── QmiFlash — RP2350 built-in flash (pico2_4m) ─────────────────────────────
 
 /// Byte offset from flash start where the keystore partition begins.
-/// The first 2 MB is firmware (XIP-executable). Never touch below this.
-pub const QMI_KEYSTORE_OFFSET: u32 = 0x0020_0000;
+/// The first 2 MB is firmware (XIP-executable) and, at its top, the
+/// retry-counter log.  Never touch below this.  See `flash_layout`.
+pub const QMI_KEYSTORE_OFFSET: u32 = super::flash_layout::QMI_KEYSTORE_OFFSET;
 
-/// Total physical flash size for the pico2_4m board.
-pub const QMI_FLASH_SIZE: usize = 0x0040_0000; // 4 MB
+/// Flash size the QMI driver is instantiated with (4 MB; the 16 MB boards
+/// use only the same lower 4 MB).
+pub const QMI_FLASH_SIZE: usize = super::flash_layout::QMI_FLASH_SIZE as usize;
 
 /// The RP2350 built-in QMI flash chip, restricted to the keystore partition.
 ///
@@ -548,6 +550,78 @@ impl FlashChip for QmiFlash {
             self.degraded = true;
         }
         Ok(())
+    }
+}
+
+// ─── QmiCounterFlash — the retry-counter log region ──────────────────────────
+
+/// The retry-counter log region on internal flash
+/// (`flash_layout::RETRY_COUNTER_OFFSET`, every board).
+///
+/// Offsets are relative to the region; anything outside it is refused, so
+/// the log can never reach the firmware image or the keystore.  Writes
+/// and erases go through the bootrom (`embassy_rp::flash`), which only
+/// works on core0 — on core1 they fail with an error, never a panic.
+pub struct QmiCounterFlash {
+    flash: embassy_rp::flash::Flash<
+        'static,
+        embassy_rp::peripherals::FLASH,
+        embassy_rp::flash::Blocking,
+        QMI_FLASH_SIZE,
+    >,
+}
+
+impl QmiCounterFlash {
+    /// Wrap a blocking flash driver.  On QMI boards the keystore's
+    /// `QmiFlash` owns `p.FLASH`, so this one is built from a stolen
+    /// handle: the driver is stateless and both are used only from core0,
+    /// one operation at a time (`handle_flash_op` / boot).
+    pub fn new(
+        flash: embassy_rp::flash::Flash<
+            'static,
+            embassy_rp::peripherals::FLASH,
+            embassy_rp::flash::Blocking,
+            QMI_FLASH_SIZE,
+        >,
+    ) -> Self {
+        QmiCounterFlash { flash }
+    }
+
+    fn absolute(offset: u32, len: usize) -> Result<u32, StorageError> {
+        use super::flash_layout::{RETRY_COUNTER_OFFSET, RETRY_COUNTER_SIZE};
+        let end = offset
+            .checked_add(len as u32)
+            .ok_or(StorageError::WriteError)?;
+        if end > RETRY_COUNTER_SIZE {
+            return Err(StorageError::WriteError);
+        }
+        Ok(RETRY_COUNTER_OFFSET + offset)
+    }
+}
+
+impl super::retry_counter::CounterFlash for QmiCounterFlash {
+    fn read(&mut self, offset: u32, buf: &mut [u8]) -> Result<(), StorageError> {
+        let at = Self::absolute(offset, buf.len()).map_err(|_| StorageError::ReadError)?;
+        self.flash
+            .blocking_read(at, buf)
+            .map_err(|_| StorageError::ReadError)
+    }
+
+    fn program(&mut self, offset: u32, data: &[u8]) -> Result<(), StorageError> {
+        let at = Self::absolute(offset, data.len())?;
+        // embassy pads partial pages with 0xFF, which programs nothing.
+        self.flash
+            .blocking_write(at, data)
+            .map_err(|_| StorageError::WriteError)
+    }
+
+    fn erase_sector(&mut self, sector: u32) -> Result<(), StorageError> {
+        let size = super::flash_layout::SECTOR;
+        let from =
+            Self::absolute(sector * size, size as usize).map_err(|_| StorageError::EraseError)?;
+        self.flash
+            .blocking_erase(from, from + size)
+            .map_err(|_| StorageError::EraseError)
     }
 }
 

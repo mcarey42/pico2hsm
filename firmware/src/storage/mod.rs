@@ -37,7 +37,9 @@
 //! same type for all type parameters.  For mixed boards (e.g. SDCard + SPI
 //! flash) use the `AnyChip` enum or a board-specific concrete type.
 
+pub mod flash_layout;
 pub mod keystore;
+pub mod retry_counter;
 pub use keystore::HybridKeyStore;
 pub use keystore::KeyStore;
 
@@ -72,6 +74,10 @@ pub use board_chips::BoardChip;
 pub use board_chips::BoardKeyStore;
 #[cfg(target_arch = "arm")]
 pub use keystore::FlashKeyStore;
+
+/// The retry-counter log on internal flash, as every board uses it.
+#[cfg(target_arch = "arm")]
+pub type BoardCounterLog = retry_counter::CounterLog<flash_chip::QmiCounterFlash>;
 
 #[cfg(target_arch = "arm")]
 use filesystem::{Directory, KeyFilesystem, ScrubReport};
