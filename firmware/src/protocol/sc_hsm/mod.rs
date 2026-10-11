@@ -32,6 +32,7 @@ use pico2hsm_core::{
 use zeroize::Zeroizing;
 
 use crate::security::dkek::DkekManager;
+use crate::storage::retry_counter::{self, CounterState, Credential, RetryCounterBackend};
 
 use commands::*;
 
@@ -92,6 +93,17 @@ impl RetryCounter {
             Self::Puk => &mut state.puk_retry_count,
         }
     }
+
+    /// Its entry in the retry-counter log.
+    fn credential(self) -> Credential {
+        match self {
+            Self::UserPin => Credential::ScHsmUserPin,
+            Self::SoPin => Credential::ScHsmSoPin,
+            Self::Puk => Credential::ScHsmPuk,
+        }
+    }
+
+    const ALL: [Self; 3] = [Self::UserPin, Self::SoPin, Self::Puk];
 }
 
 /// Local no-op `KeyStore` used by the legacy `dispatch()` path.
@@ -124,6 +136,35 @@ impl crate::storage::KeyStore for LocalNullStore {
         Vec::new()
     }
     fn for_each_key(&self, _f: &mut dyn FnMut(KeyId)) {}
+    fn retry_counters(&mut self) -> Option<&mut dyn RetryCounterBackend> {
+        Some(self)
+    }
+}
+
+/// No counters either: reads find no entry, writes succeed without effect.
+impl RetryCounterBackend for LocalNullStore {
+    fn get(
+        &mut self,
+        _: Credential,
+    ) -> Result<Option<CounterState>, pico2hsm_core::error::StorageError> {
+        Ok(None)
+    }
+    fn put(
+        &mut self,
+        _: Credential,
+        _: CounterState,
+    ) -> Result<(), pico2hsm_core::error::StorageError> {
+        Ok(())
+    }
+    fn needs_migration(&mut self) -> bool {
+        false
+    }
+    fn format(
+        &mut self,
+        _: &[(Credential, CounterState)],
+    ) -> Result<(), pico2hsm_core::error::StorageError> {
+        Ok(())
+    }
 }
 
 /// AID for SmartCard-HSM (pico2hsm variant).
@@ -701,43 +742,65 @@ impl ScHsm {
     /// Spend one retry of `counter` on flash, run the command, then persist
     /// the outcome.
     ///
-    /// The decremented counter is written *before* the handler compares the
-    /// credential, so cutting power (or resetting USB) once the result is
-    /// known cannot undo a failed guess.  The RAM counter is restored before
-    /// the handler runs so its own retry logic is unchanged; afterwards a
-    /// failed command can never leave the counter above the spent value.
+    /// The failure is appended to the retry-counter log *before* the
+    /// handler compares the credential, so cutting power (or resetting USB)
+    /// once the result is known cannot undo a failed guess.  The handler
+    /// runs with the un-spent RAM counter so its own retry logic is
+    /// unchanged; afterwards a failed command can never leave the counter
+    /// above the spent value.
     ///
-    /// A failed pre-write refuses the attempt (SW 6581), failing closed.
+    /// A success costs one more counter record — the PIN record and the
+    /// keystore directory are rewritten only when the command changed a
+    /// credential (CHANGE PIN).  A failed pre-write refuses the attempt
+    /// (SW 6581), failing closed.
     fn with_persisted_attempt(
         &mut self,
         counter: RetryCounter,
         cmd: &ApduCommand<'_>,
         store: &mut dyn crate::storage::KeyStore,
     ) -> ApduResponse {
-        let before = *counter.get(&mut self.state);
-        if before == 0 {
+        let ram = *counter.get(&mut self.state);
+        if ram == 0 {
             // Blocked: the handler reports it without comparing anything.
             return self.route_with_store(cmd, store);
         }
-        let spent = before - 1;
-        *counter.get(&mut self.state) = spent;
-        if Self::save_pin_to_store(&self.state, store).is_err() {
-            return ApduResponse::err(SW_MEMORY_FAILURE);
-        }
+        let before = match retry_counter::spend(store, counter.credential(), ram) {
+            Ok(available) => available.min(ram),
+            Err(_) => return ApduResponse::err(SW_MEMORY_FAILURE),
+        };
         *counter.get(&mut self.state) = before;
+        if before == 0 {
+            // The log says blocked: nothing was spent, nothing is compared.
+            return self.route_with_store(cmd, store);
+        }
+        let spent = before - 1;
+        let record_before = Self::pin_record(&self.state);
 
         let resp = self.route_with_store(cmd, store);
 
         let after = counter.get(&mut self.state);
-        if resp.sw != SW_OK && *after > spent {
-            *after = spent;
+        if resp.sw != SW_OK {
+            if *after > spent {
+                *after = spent;
+            }
+            // The failure is on flash already.  Whatever else a failed
+            // handler touched in RAM goes back to what flash holds.
+            Self::reload_counters(&mut self.state, store);
+            return resp;
         }
-        if *after != spent && Self::save_pin_to_store(&self.state, store).is_err() {
-            // Flash still holds the spent counter and the old credentials.
+        // INITIALIZE persists its own record (and counters).
+        let changed = cmd.ins != initialize::INS_INITIALIZE
+            && *Self::pin_record(&self.state) != *record_before;
+        let persisted = if changed {
+            Self::save_pin_to_store(&self.state, store)
+        } else {
+            Self::sync_counters(&self.state, store)
+        };
+        if persisted.is_err() {
+            // Flash may hold the spent counter and the old credentials.
             // Make RAM match it rather than report a change that a reset
             // would silently undo, and fail closed.
             Self::restore_pin_record(&mut self.state, store);
-            *counter.get(&mut self.state) = spent;
             self.state.pin_verified = false;
             self.state.so_pin_verified = false;
             return ApduResponse::err(SW_MEMORY_FAILURE);
@@ -918,26 +981,57 @@ impl ScHsm {
         KeyId::sc_hsm(0, 0xFF)
     }
 
-    /// Serialize and persist the SC-HSM PIN/SO-PIN/PUK state to flash.
+    /// Serialize the SC-HSM PIN/SO-PIN/PUK record.
     ///
-    /// Stored as a Generic key object at `KeyId::sc_hsm(0, 0xFF)`.
     /// Layout (149 bytes total — PBKDF2 + per-credential 16-byte salts):
     ///   [0..32]    user_pin_hash (PBKDF2, all zeros if None)
     ///   [32..48]   user_pin_salt (16 bytes)
-    ///   [48]       pin_retry_count
+    ///   [48]       0 (was pin_retry_count)
     ///   [49..81]   so_pin_hash (PBKDF2, all zeros if None)
     ///   [81..97]   so_pin_salt (16 bytes)
-    ///   [97]       so_pin_retry_count
+    ///   [97]       0 (was so_pin_retry_count)
     ///   [98..130]  puk_hash (PBKDF2, all zeros if None)
     ///   [130..146] puk_salt (16 bytes)
-    ///   [146]      puk_retry_count
+    ///   [146]      0 (was puk_retry_count)
     ///   [147]      initialized (1 = true, 0 = false)
     ///   [148]      reserved (0)
     ///
-    /// NOTE: Format changed from 101-byte (bare SHA-256, no salts) to 149-byte
-    /// (PBKDF2 + per-credential salts).  Old flash blobs are ≤101 bytes and will
-    /// be rejected by the length check in `load_pin_state_from_store`, requiring
-    /// re-INITIALIZE.  This is intentional and acceptable for pre-production devices.
+    /// The retry counters live in the retry-counter log
+    /// (`storage::retry_counter`).  Records from before it held them in
+    /// [48]/[97]/[146]; the boot migration copies them into the log and
+    /// zeroes them, so a record never again carries a usable count — if
+    /// the log is ever lost, these credentials load blocked.
+    fn pin_record(state: &ScHsmState) -> Zeroizing<Vec<u8, 160>> {
+        let mut buf: Zeroizing<Vec<u8, 160>> = Zeroizing::new(Vec::new());
+        let _ = buf.extend_from_slice(state.user_pin_hash.as_ref().unwrap_or(&[0u8; 32]));
+        let _ = buf.extend_from_slice(&state.user_pin_salt);
+        let _ = buf.push(0);
+        let _ = buf.extend_from_slice(state.so_pin_hash.as_ref().unwrap_or(&[0u8; 32]));
+        let _ = buf.extend_from_slice(&state.so_pin_salt);
+        let _ = buf.push(0);
+        let _ = buf.extend_from_slice(state.puk_hash.as_ref().unwrap_or(&[0u8; 32]));
+        let _ = buf.extend_from_slice(&state.puk_salt);
+        let _ = buf.push(0);
+        let _ = buf.push(state.initialized as u8);
+        let _ = buf.push(0); // reserved (was EXTERNAL AUTHENTICATE failures)
+        buf
+    }
+
+    /// Byte offsets of the legacy retry counts in a PIN record.
+    const LEGACY_COUNT_AT: [(RetryCounter, usize); 3] = [
+        (RetryCounter::UserPin, 48),
+        (RetryCounter::SoPin, 97),
+        (RetryCounter::Puk, 146),
+    ];
+
+    /// Persist the SC-HSM credentials: the retry counters first, then the
+    /// PIN record at `KeyId::sc_hsm(0, 0xFF)`.
+    ///
+    /// Counters go first because every counter change made here was
+    /// authorised (a verified old PIN, the SO-PIN or the PUK): if the
+    /// record write then fails, the old credentials merely keep the reset
+    /// counts they were entitled to.  The other order could leave a new
+    /// PIN on flash with a stale count.
     pub fn save_pin_to_store(
         state: &ScHsmState,
         store: &mut dyn crate::storage::KeyStore,
@@ -946,21 +1040,7 @@ impl ScHsm {
         use pico2hsm_core::key::AppletId;
 
         crate::CORE1_PROGRESS.store(34, core::sync::atomic::Ordering::Relaxed);
-        let mut buf: Vec<u8, 256> = Vec::new();
-        let user_hash = state.user_pin_hash.unwrap_or([0u8; 32]);
-        let _ = buf.extend_from_slice(&user_hash);
-        let _ = buf.extend_from_slice(&state.user_pin_salt);
-        let _ = buf.push(state.pin_retry_count);
-        let so_hash = state.so_pin_hash.unwrap_or([0u8; 32]);
-        let _ = buf.extend_from_slice(&so_hash);
-        let _ = buf.extend_from_slice(&state.so_pin_salt);
-        let _ = buf.push(state.so_pin_retry_count);
-        let puk_hash = state.puk_hash.unwrap_or([0u8; 32]);
-        let _ = buf.extend_from_slice(&puk_hash);
-        let _ = buf.extend_from_slice(&state.puk_salt);
-        let _ = buf.push(state.puk_retry_count);
-        let _ = buf.push(state.initialized as u8);
-        let _ = buf.push(0); // reserved (was EXTERNAL AUTHENTICATE failures)
+        Self::sync_counters(state, store)?;
 
         crate::CORE1_PROGRESS.store(35, core::sync::atomic::Ordering::Relaxed);
         let kid = Self::sc_hsm_pin_key_id();
@@ -971,11 +1051,50 @@ impl ScHsm {
             AlgorithmId::AesGcm,
         );
         crate::CORE1_PROGRESS.store(36, core::sync::atomic::Ordering::Relaxed);
-        let _ = obj.private_key.extend_from_slice(&buf);
+        let _ = obj.private_key.extend_from_slice(&Self::pin_record(state));
         crate::CORE1_PROGRESS.store(37, core::sync::atomic::Ordering::Relaxed);
         let result = store.save_key(&obj);
         crate::CORE1_PROGRESS.store(38, core::sync::atomic::Ordering::Relaxed);
         result
+    }
+
+    /// Write every SC-HSM counter whose RAM value differs from the log.
+    fn sync_counters(
+        state: &ScHsmState,
+        store: &mut dyn crate::storage::KeyStore,
+    ) -> Result<(), HsmError> {
+        for (cred, n) in [
+            (Credential::ScHsmUserPin, state.pin_retry_count),
+            (Credential::ScHsmSoPin, state.so_pin_retry_count),
+            (Credential::ScHsmPuk, state.puk_retry_count),
+        ] {
+            retry_counter::set(store, cred, n)?;
+        }
+        Ok(())
+    }
+
+    /// Set the RAM counters from the log.  `record_exists`: the PIN record
+    /// is on flash, so a missing entry means blocked (see
+    /// `retry_counter::load`); otherwise the RAM value stands.
+    fn load_counters(
+        state: &mut ScHsmState,
+        store: &mut dyn crate::storage::KeyStore,
+        record_exists: bool,
+    ) {
+        for c in RetryCounter::ALL {
+            let fresh = *c.get(state);
+            *c.get(state) = retry_counter::load(store, c.credential(), record_exists, fresh);
+        }
+    }
+
+    /// Runtime: make the RAM counters what the log holds.  A credential the
+    /// log has no entry for yet keeps its RAM count (boot loading already
+    /// failed closed where an entry was missing).
+    pub(crate) fn reload_counters(
+        state: &mut ScHsmState,
+        store: &mut dyn crate::storage::KeyStore,
+    ) {
+        Self::load_counters(state, store, false);
     }
 
     /// Load PIN/SO-PIN/PUK state from flash into `state`.
@@ -998,17 +1117,22 @@ impl ScHsm {
             }
         });
         match store.fetch_key(pin_kid) {
-            Ok(Some(obj)) if Self::apply_pin_record(state, &obj.private_key) => {}
-            Ok(None) if !has_content => {}
+            Ok(Some(obj)) if Self::apply_pin_record(state, &obj.private_key) => {
+                Self::load_counters(state, store, true);
+            }
+            Ok(None) if !has_content => Self::load_counters(state, store, false),
             _ => Self::lock_out(state),
         }
     }
 
-    /// Runtime rollback after a failed PIN-record save: put RAM back to the
-    /// record on flash, or lock out if it can't be read.
+    /// Runtime rollback after a failed save: put RAM back to the record and
+    /// counters on flash, or lock out if the record can't be read.
     fn restore_pin_record(state: &mut ScHsmState, store: &mut dyn crate::storage::KeyStore) {
         match store.fetch_key(Self::sc_hsm_pin_key_id()) {
-            Ok(Some(obj)) if Self::apply_pin_record(state, &obj.private_key) => {}
+            Ok(Some(obj)) if Self::apply_pin_record(state, &obj.private_key) => {
+                Self::load_counters(state, store, false);
+            }
+            Ok(None) if !state.initialized => Self::load_counters(state, store, false),
             _ => Self::lock_out(state),
         }
     }
@@ -1027,7 +1151,8 @@ impl ScHsm {
     }
 
     /// Decode a PIN record (149-byte PBKDF2+salt format) into `state`.
-    /// Shorter (legacy bare-SHA-256) records are refused.
+    /// Shorter (legacy bare-SHA-256) records are refused.  The counters
+    /// come from the retry-counter log, not from the record.
     fn apply_pin_record(state: &mut ScHsmState, b: &[u8]) -> bool {
         if b.len() < 149 {
             return false;
@@ -1035,15 +1160,52 @@ impl ScHsm {
         let nonzero = |h: [u8; 32]| (h != [0u8; 32]).then_some(h);
         state.user_pin_hash = nonzero(b[0..32].try_into().unwrap_or([0u8; 32]));
         state.user_pin_salt = b[32..48].try_into().unwrap_or([0u8; 16]);
-        state.pin_retry_count = b[48];
         state.so_pin_hash = nonzero(b[49..81].try_into().unwrap_or([0u8; 32]));
         state.so_pin_salt = b[81..97].try_into().unwrap_or([0u8; 16]);
-        state.so_pin_retry_count = b[97];
         state.puk_hash = nonzero(b[98..130].try_into().unwrap_or([0u8; 32]));
         state.puk_salt = b[130..146].try_into().unwrap_or([0u8; 16]);
-        state.puk_retry_count = b[146];
         state.initialized = b[147] != 0;
         true
+    }
+
+    /// Migration: the retry counts a pre-counter-log PIN record carries, as
+    /// seeds for the log.  No record: nothing to seed.  A record that
+    /// exists but can't be read aborts the migration (it runs again next
+    /// boot) rather than seeding a log that would lock it out for good;
+    /// a malformed one seeds 0 (it loads locked out anyway).
+    pub fn legacy_retry_seeds(
+        store: &mut dyn crate::storage::KeyStore,
+        seeds: &mut Vec<(Credential, CounterState), 8>,
+    ) -> Result<(), HsmError> {
+        let Some(obj) = store.fetch_key(Self::sc_hsm_pin_key_id())? else {
+            return Ok(());
+        };
+        let b = &obj.private_key;
+        for (c, at) in Self::LEGACY_COUNT_AT {
+            let n = if b.len() >= 149 { b[at] } else { 0 };
+            seeds
+                .push((c.credential(), CounterState::fresh(n)))
+                .map_err(|_| HsmError::InvalidInput)?;
+        }
+        Ok(())
+    }
+
+    /// Migration, after the log is committed: zero the retry counts in the
+    /// PIN record so it never again holds a usable count.
+    pub fn clear_legacy_retry_counts(
+        store: &mut dyn crate::storage::KeyStore,
+    ) -> Result<(), HsmError> {
+        let Some(mut obj) = store.fetch_key(Self::sc_hsm_pin_key_id())? else {
+            return Ok(());
+        };
+        let b = &mut obj.private_key;
+        if b.len() < 149 || Self::LEGACY_COUNT_AT.iter().all(|&(_, at)| b[at] == 0) {
+            return Ok(());
+        }
+        for (_, at) in Self::LEGACY_COUNT_AT {
+            b[at] = 0;
+        }
+        store.save_key(&obj)
     }
 
     /// KeyId for the persisted DKEK.
@@ -1196,12 +1358,14 @@ impl HsmProtocol for ScHsm {
 mod retry_persistence_tests {
     use super::*;
     use crate::security::key_management::{AlgorithmId, KeyObject, KeyType as KmKeyType};
+    use crate::storage::retry_counter::MemCounters;
     use pico2hsm_core::apdu::SW_AUTH_BLOCKED;
 
-    /// Records every PIN-record write; optionally fails the next one.
+    /// Keeps every PIN-record write (the last one is "on flash") and the
+    /// retry-counter log; either can be made to fail.
     struct PinStore {
+        counters: MemCounters,
         saves: heapless::Vec<heapless::Vec<u8, 160>, 32>,
-        fail_next: bool,
         /// Fail the PIN-record write attempt with this index (0-based).
         fail_attempt: Option<usize>,
         attempts: usize,
@@ -1210,19 +1374,23 @@ mod retry_persistence_tests {
     impl PinStore {
         fn new() -> Self {
             PinStore {
+                counters: MemCounters::default(),
                 saves: heapless::Vec::new(),
-                fail_next: false,
                 fail_attempt: None,
                 attempts: 0,
             }
         }
-        /// (user, so, puk, ext-auth failures) from the record write `i`.
-        fn counters(&self, i: usize) -> (u8, u8, u8, u8) {
-            let b = &self.saves[i];
-            (b[48], b[97], b[146], b[148])
+        fn left(&self, cred: Credential) -> Option<u8> {
+            self.counters.remaining(cred)
         }
-        fn last(&self) -> (u8, u8, u8, u8) {
-            self.counters(self.saves.len() - 1)
+        /// Remaining-count history of `cred` in the counter log.
+        fn history(&self, cred: Credential) -> heapless::Vec<u8, 64> {
+            self.counters
+                .puts
+                .iter()
+                .filter(|(c, _)| *c == cred)
+                .map(|(_, s)| s.remaining())
+                .collect()
         }
     }
 
@@ -1233,7 +1401,7 @@ mod retry_persistence_tests {
             }
             let attempt = self.attempts;
             self.attempts += 1;
-            if core::mem::take(&mut self.fail_next) || self.fail_attempt == Some(attempt) {
+            if self.fail_attempt == Some(attempt) {
                 return Err(HsmError::NotSupported);
             }
             let mut b = heapless::Vec::new();
@@ -1269,10 +1437,15 @@ mod retry_persistence_tests {
             heapless::Vec::new()
         }
         fn for_each_key(&self, _: &mut dyn FnMut(KeyId)) {}
+        fn retry_counters(&mut self) -> Option<&mut dyn RetryCounterBackend> {
+            Some(&mut self.counters)
+        }
     }
 
     const USER_PIN: &[u8] = b"648219";
     const SO_PIN: &[u8] = b"57621880";
+    const USER: Credential = Credential::ScHsmUserPin;
+    const SO: Credential = Credential::ScHsmSoPin;
 
     fn apdu(cla: u8, ins: u8, p1: u8, p2: u8, data: &[u8]) -> heapless::Vec<u8, 300> {
         let mut v = heapless::Vec::new();
@@ -1295,14 +1468,19 @@ mod retry_persistence_tests {
         d
     }
 
-    fn initialized() -> (ScHsm, PinStore) {
+    /// An initialized device; the counter-log history and the record count
+    /// are where tests start measuring.
+    fn initialized() -> (ScHsm, PinStore, usize) {
         let mut hsm = ScHsm::new();
         let mut store = PinStore::new();
         let r =
             hsm.process_apdu_with_store(&apdu(0x80, 0x50, 0, 0, &init_data(SO_PIN)), &mut store);
         assert_eq!(sw(&r), SW_OK);
-        store.saves.clear();
-        (hsm, store)
+        assert_eq!(store.left(USER), Some(3), "INITIALIZE sets the log");
+        assert_eq!(store.left(SO), Some(5));
+        store.counters.puts.clear();
+        let records = store.saves.len();
+        (hsm, store, records)
     }
 
     fn verify(hsm: &mut ScHsm, store: &mut PinStore, p2: u8, pin: &[u8]) -> u16 {
@@ -1310,26 +1488,29 @@ mod retry_persistence_tests {
     }
 
     #[test]
-    fn failed_verify_is_on_flash_before_and_after() {
-        let (mut hsm, mut store) = initialized();
+    fn failed_verify_is_one_counter_record_and_no_pin_record() {
+        let (mut hsm, mut store, records) = initialized();
         assert_eq!(verify(&mut hsm, &mut store, 0x81, b"000000"), 0x63C2);
-        // Exactly one write, already carrying the spent retry.
-        assert_eq!(store.saves.len(), 1);
-        assert_eq!(store.last().0, 2);
+        assert_eq!(&store.history(USER)[..], &[2], "spent before comparing");
+        assert_eq!(store.saves.len(), records, "PIN record untouched");
     }
 
     #[test]
-    fn successful_verify_spends_then_restores() {
-        let (mut hsm, mut store) = initialized();
+    fn successful_verify_spends_then_restores_without_pin_record() {
+        let (mut hsm, mut store, records) = initialized();
         assert_eq!(verify(&mut hsm, &mut store, 0x81, USER_PIN), SW_OK);
-        assert_eq!(store.saves.len(), 2);
-        assert_eq!(store.counters(0).0, 2, "retry spent before comparing");
-        assert_eq!(store.counters(1).0, 3, "restored after success");
+        assert_eq!(
+            &store.history(USER)[..],
+            &[2, 3],
+            "spent before comparing, restored after"
+        );
+        assert_eq!(store.counters.puts.len(), 2, "two counter records in all");
+        assert_eq!(store.saves.len(), records, "no keystore write (R2-4)");
     }
 
     #[test]
     fn retries_survive_a_reset() {
-        let (mut hsm, mut store) = initialized();
+        let (mut hsm, mut store, _) = initialized();
         verify(&mut hsm, &mut store, 0x81, b"000000");
         verify(&mut hsm, &mut store, 0x81, b"000000");
         // Power cycle / USB reset: fresh state reloaded from flash.
@@ -1348,67 +1529,165 @@ mod retry_persistence_tests {
     }
 
     #[test]
+    fn pin_record_never_carries_a_usable_count() {
+        let (_, store, _) = initialized();
+        let b = store.saves.last().unwrap();
+        assert_eq!((b[48], b[97], b[146]), (0, 0, 0));
+    }
+
+    #[test]
+    fn record_without_counter_entry_loads_blocked() {
+        let (_, mut store, _) = initialized();
+        // The log lost the entries (the record is still there).
+        store.counters.entries = Default::default();
+        let mut fresh = ScHsm::new();
+        ScHsm::load_pin_state_from_store(&mut fresh.state, &mut store);
+        assert!(fresh.state.initialized);
+        assert_eq!(
+            (
+                fresh.state.pin_retry_count,
+                fresh.state.so_pin_retry_count,
+                fresh.state.puk_retry_count
+            ),
+            (0, 0, 0)
+        );
+    }
+
+    #[test]
+    fn unreadable_log_loads_blocked() {
+        let (_, mut store, _) = initialized();
+        store.counters.unformatted = true;
+        let mut fresh = ScHsm::new();
+        ScHsm::load_pin_state_from_store(&mut fresh.state, &mut store);
+        assert_eq!(fresh.state.pin_retry_count, 0);
+        assert_eq!(fresh.state.so_pin_retry_count, 0);
+    }
+
+    #[test]
     fn failed_pre_write_refuses_attempt() {
-        let (mut hsm, mut store) = initialized();
-        store.fail_next = true;
+        let (mut hsm, mut store, _) = initialized();
+        store.counters.fail_put = Some(store.counters.attempts);
         assert_eq!(
             verify(&mut hsm, &mut store, 0x81, USER_PIN),
             SW_MEMORY_FAILURE
         );
         assert!(!hsm.state.pin_verified);
+        assert_eq!(store.left(USER), Some(3));
+    }
+
+    #[test]
+    fn failed_restore_after_success_fails_closed() {
+        let (mut hsm, mut store, _) = initialized();
+        // The spend lands, the restore doesn't.
+        store.counters.fail_put = Some(store.counters.attempts + 1);
+        assert_eq!(
+            verify(&mut hsm, &mut store, 0x81, USER_PIN),
+            SW_MEMORY_FAILURE
+        );
+        assert!(!hsm.state.pin_verified);
+        assert_eq!(hsm.state.pin_retry_count, 2, "RAM follows the log");
+        assert_eq!(store.left(USER), Some(2));
     }
 
     #[test]
     fn wrong_change_pin_spends_retry() {
-        let (mut hsm, mut store) = initialized();
+        let (mut hsm, mut store, records) = initialized();
         let mut data: heapless::Vec<u8, 32> = heapless::Vec::new();
         data.extend_from_slice(b"000000").unwrap();
         data.extend_from_slice(b"111111").unwrap();
         let r = hsm.process_apdu_with_store(&apdu(0x00, 0x24, 0, 0x81, &data), &mut store);
         assert_ne!(sw(&r), SW_OK);
-        assert_eq!(store.last().0, 2);
+        assert_eq!(store.left(USER), Some(2));
+        assert_eq!(store.saves.len(), records);
+    }
+
+    #[test]
+    fn change_pin_rewrites_the_record_once() {
+        let (mut hsm, mut store, records) = initialized();
+        let mut data: heapless::Vec<u8, 32> = heapless::Vec::new();
+        data.extend_from_slice(USER_PIN).unwrap();
+        data.extend_from_slice(b"111111").unwrap();
+        let r = hsm.process_apdu_with_store(&apdu(0x00, 0x24, 0, 0x81, &data), &mut store);
+        assert_eq!(sw(&r), SW_OK);
+        assert_eq!(store.saves.len(), records + 1);
+        let mut fresh = ScHsm::new();
+        ScHsm::load_pin_state_from_store(&mut fresh.state, &mut store);
+        assert_eq!(verify(&mut fresh, &mut store, 0x81, b"111111"), SW_OK);
     }
 
     #[test]
     fn reinitialize_spends_so_retry_and_honours_block() {
-        let (mut hsm, mut store) = initialized();
+        let (mut hsm, mut store, _) = initialized();
         let wrong = init_data(b"00000000");
         for left in (0..5u8).rev() {
             let r = hsm.process_apdu_with_store(&apdu(0x80, 0x50, 0, 0, &wrong), &mut store);
             assert_ne!(sw(&r), SW_OK);
-            assert_eq!(store.last().1, left);
+            assert_eq!(store.left(SO), Some(left));
         }
         // Blocked: even the correct SO-PIN can no longer re-initialize.
         let r =
             hsm.process_apdu_with_store(&apdu(0x80, 0x50, 0, 0, &init_data(SO_PIN)), &mut store);
         assert_eq!(sw(&r), SW_AUTH_BLOCKED);
+        // ...and a reset doesn't change that.
+        let mut fresh = ScHsm::new();
+        ScHsm::load_pin_state_from_store(&mut fresh.state, &mut store);
+        assert_eq!(fresh.state.so_pin_retry_count, 0);
+    }
+
+    #[test]
+    fn reinitialize_resets_every_counter() {
+        let (mut hsm, mut store, _) = initialized();
+        verify(&mut hsm, &mut store, 0x81, b"000000");
+        let r =
+            hsm.process_apdu_with_store(&apdu(0x80, 0x50, 0, 0, &init_data(SO_PIN)), &mut store);
+        assert_eq!(sw(&r), SW_OK);
+        assert_eq!(store.left(USER), Some(3));
+        assert_eq!(store.left(SO), Some(5));
     }
 
     #[test]
     fn change_pin_with_failed_final_write_keeps_old_pin() {
-        let (mut hsm, mut store) = initialized();
-        // Attempt 0 = spend-before-compare, attempt 1 = persist the new PIN.
-        store.fail_attempt = Some(store.attempts + 1);
+        let (mut hsm, mut store, _) = initialized();
+        // The record write for the new PIN fails.
+        store.fail_attempt = Some(store.attempts);
         let mut data: heapless::Vec<u8, 32> = heapless::Vec::new();
         data.extend_from_slice(USER_PIN).unwrap();
         data.extend_from_slice(b"111111").unwrap();
         let r = hsm.process_apdu_with_store(&apdu(0x00, 0x24, 0, 0x81, &data), &mut store);
         assert_eq!(sw(&r), SW_MEMORY_FAILURE);
         // RAM matches flash: the old PIN still works, the new one does not.
+        // (The old PIN was verified, so its counter reset stands.)
+        assert_eq!(hsm.state.pin_retry_count, 3);
+        assert_eq!(verify(&mut hsm, &mut store, 0x81, b"111111"), 0x63C2);
+        assert_eq!(verify(&mut hsm, &mut store, 0x81, USER_PIN), SW_OK);
+    }
+
+    #[test]
+    fn change_pin_with_failed_counter_write_keeps_old_pin() {
+        let (mut hsm, mut store, records) = initialized();
+        // The spend lands; resetting the counter for the new PIN fails.
+        store.counters.fail_put = Some(store.counters.attempts + 1);
+        let mut data: heapless::Vec<u8, 32> = heapless::Vec::new();
+        data.extend_from_slice(USER_PIN).unwrap();
+        data.extend_from_slice(b"111111").unwrap();
+        let r = hsm.process_apdu_with_store(&apdu(0x00, 0x24, 0, 0x81, &data), &mut store);
+        assert_eq!(sw(&r), SW_MEMORY_FAILURE);
+        assert_eq!(store.saves.len(), records, "record not written");
+        assert_eq!(hsm.state.pin_retry_count, 2);
         assert_eq!(verify(&mut hsm, &mut store, 0x81, b"111111"), 0x63C1);
         assert_eq!(verify(&mut hsm, &mut store, 0x81, USER_PIN), SW_OK);
     }
 
     #[test]
     fn short_user_pin_rejected() {
-        let (mut hsm, mut store) = initialized();
+        let (mut hsm, mut store, _) = initialized();
         assert_eq!(verify(&mut hsm, &mut store, 0x81, b"1234"), 0x6700);
     }
 
     #[test]
     fn malformed_attempts_spend_nothing() {
         // The hardware fuzz suite (test_16) blocked both PINs this way.
-        let (mut hsm, mut store) = initialized();
+        let (mut hsm, mut store, records) = initialized();
         let malformed: [&[u8]; 8] = [
             &[0x00, 0x20, 0x00, 0x81, 0x01, 0x41], // 1-byte PIN
             &[
@@ -1430,11 +1709,104 @@ mod retry_persistence_tests {
             let r = hsm.process_apdu_with_store(a, &mut store);
             assert_ne!(sw(&r), SW_OK, "{a:02X?}");
         }
-        assert!(store.saves.is_empty(), "no retry spent on malformed APDUs");
+        assert!(
+            store.counters.puts.is_empty(),
+            "no retry spent on malformed APDUs"
+        );
+        assert_eq!(store.saves.len(), records);
         assert_eq!(
             (hsm.state.pin_retry_count, hsm.state.so_pin_retry_count),
             (3, 5)
         );
+    }
+
+    /// A PIN record as firmware before the counter log wrote it.
+    fn legacy_store(user: u8, so: u8, puk: u8) -> PinStore {
+        let (hsm, mut store, _) = initialized();
+        let mut rec = ScHsm::pin_record(&hsm.state);
+        (rec[48], rec[97], rec[146]) = (user, so, puk);
+        store.saves.clear();
+        store.saves.push(rec.iter().copied().collect()).unwrap();
+        store.counters = MemCounters {
+            unformatted: true,
+            ..MemCounters::default()
+        };
+        store
+    }
+
+    #[test]
+    fn migration_seeds_the_log_from_the_pin_record() {
+        let mut store = legacy_store(1, 4, 9);
+        let ran = crate::apdu::dispatcher::Dispatcher::migrate_retry_counters(&mut store);
+        assert_eq!(ran, Ok(true));
+        assert_eq!(store.left(USER), Some(1));
+        assert_eq!(store.left(SO), Some(4));
+        assert_eq!(store.left(Credential::ScHsmPuk), Some(9));
+        // The record no longer holds a count.
+        let b = store.saves.last().unwrap();
+        assert_eq!((b[48], b[97], b[146]), (0, 0, 0));
+        // Loading after the migration gives the migrated counts.
+        let mut hsm = ScHsm::new();
+        ScHsm::load_pin_state_from_store(&mut hsm.state, &mut store);
+        assert_eq!(
+            (hsm.state.pin_retry_count, hsm.state.so_pin_retry_count),
+            (1, 4)
+        );
+        assert_eq!(verify(&mut hsm, &mut store, 0x81, USER_PIN), SW_OK);
+        // Runs once.
+        let again = crate::apdu::dispatcher::Dispatcher::migrate_retry_counters(&mut store);
+        assert_eq!(again, Ok(false));
+    }
+
+    #[test]
+    fn unmigrated_log_loads_blocked_and_migrates_next_time() {
+        let mut store = legacy_store(3, 5, 10);
+        // Migration did not run (or its commit failed): fail closed.
+        let mut hsm = ScHsm::new();
+        ScHsm::load_pin_state_from_store(&mut hsm.state, &mut store);
+        assert_eq!(hsm.state.pin_retry_count, 0);
+        assert_eq!(
+            verify(&mut hsm, &mut store, 0x81, USER_PIN),
+            SW_AUTH_BLOCKED
+        );
+        assert_eq!(store.saves.last().unwrap()[48], 3, "record untouched");
+        // Next boot.
+        assert_eq!(
+            crate::apdu::dispatcher::Dispatcher::migrate_retry_counters(&mut store),
+            Ok(true)
+        );
+        assert_eq!(store.left(USER), Some(3));
+    }
+
+    #[test]
+    fn migrated_record_with_lost_log_stays_blocked() {
+        // After migration the record holds zeros: if the log is ever wiped,
+        // a re-migration seeds 0, never the old counts.
+        let mut store = legacy_store(3, 5, 10);
+        crate::apdu::dispatcher::Dispatcher::migrate_retry_counters(&mut store).unwrap();
+        store.counters = MemCounters {
+            unformatted: true,
+            ..MemCounters::default()
+        };
+        crate::apdu::dispatcher::Dispatcher::migrate_retry_counters(&mut store).unwrap();
+        assert_eq!(store.left(USER), Some(0));
+        assert_eq!(store.left(SO), Some(0));
+    }
+
+    #[test]
+    fn blank_device_migrates_to_an_empty_log() {
+        let mut store = PinStore::new();
+        store.counters.unformatted = true;
+        assert_eq!(
+            crate::apdu::dispatcher::Dispatcher::migrate_retry_counters(&mut store),
+            Ok(true)
+        );
+        assert!(!store.counters.unformatted);
+        assert!(store.counters.entries.iter().all(Option::is_none));
+        let mut hsm = ScHsm::new();
+        ScHsm::load_pin_state_from_store(&mut hsm.state, &mut store);
+        assert!(!hsm.state.initialized);
+        assert_eq!(hsm.state.so_pin_retry_count, 5, "fresh device defaults");
     }
 }
 
@@ -1445,6 +1817,7 @@ mod reserved_slot_and_dkek_tests {
 
     /// Minimal in-memory store: keeps each record's private bytes by KeyId.
     struct MemStore {
+        counters: retry_counter::MemCounters,
         records: heapless::Vec<(KeyId, heapless::Vec<u8, 160>), 16>,
     }
 
@@ -1489,11 +1862,15 @@ mod reserved_slot_and_dkek_tests {
                 f(*k);
             }
         }
+        fn retry_counters(&mut self) -> Option<&mut dyn RetryCounterBackend> {
+            Some(&mut self.counters)
+        }
     }
 
     #[test]
     fn missing_pin_record_next_to_keys_locks_out() {
         let mut store = MemStore {
+            counters: Default::default(),
             records: heapless::Vec::new(),
         };
         store
@@ -1517,6 +1894,7 @@ mod reserved_slot_and_dkek_tests {
     #[test]
     fn empty_store_is_a_fresh_device() {
         let mut store = MemStore {
+            counters: Default::default(),
             records: heapless::Vec::new(),
         };
         let mut hsm = ScHsm::new();
@@ -1541,6 +1919,7 @@ mod reserved_slot_and_dkek_tests {
     fn key_commands_cannot_touch_reserved_slots() {
         let mut hsm = logged_in();
         let mut store = MemStore {
+            counters: Default::default(),
             records: heapless::Vec::new(),
         };
         for p1 in [0xFC, 0xFD, 0xFE] {
@@ -1570,6 +1949,7 @@ mod reserved_slot_and_dkek_tests {
     fn dkek_from_shares_survives_reset() {
         let mut hsm = logged_in();
         let mut store = MemStore {
+            counters: Default::default(),
             records: heapless::Vec::new(),
         };
         hsm.state.dkek.init_shares(2);

@@ -229,6 +229,47 @@ impl Dispatcher {
         ScHsm::load_dkek_from_store(&mut self.sc_hsm.state, store);
     }
 
+    /// One-time migration of the PIN/PUK retry counts into the retry-counter
+    /// log (`storage::retry_counter`).  Boot only, on core0, before
+    /// [`Self::load_keys_from_store`].  `Ok(true)` if it ran.
+    ///
+    /// If the log is unformatted (first boot after the upgrade, or a blank
+    /// device), it is seeded from the counts in the applets' PIN records and
+    /// committed in one step; then those counts are zeroed in the records,
+    /// so no record ever again holds a usable count.  Until the commit
+    /// succeeds nothing changes on flash, every credential loads blocked
+    /// (the log is unreadable) and the migration runs again at the next
+    /// boot.  A failure while zeroing only leaves a legacy count behind,
+    /// which the log overrides.
+    #[inline(never)]
+    pub fn migrate_retry_counters(
+        store: &mut dyn crate::storage::KeyStore,
+    ) -> Result<bool, pico2hsm_core::error::HsmError> {
+        use crate::storage::retry_counter::{CounterState, Credential};
+        use pico2hsm_core::error::{HsmError, StorageError};
+
+        if !store
+            .retry_counters()
+            .is_some_and(|log| log.needs_migration())
+        {
+            return Ok(false);
+        }
+        let mut seeds: Vec<(Credential, CounterState), 8> = Vec::new();
+        ScHsm::legacy_retry_seeds(store, &mut seeds)?;
+        #[cfg(feature = "applet-piv")]
+        Piv::legacy_retry_seeds(store, &mut seeds)?;
+        OpenPgp::legacy_retry_seeds(store, &mut seeds)?;
+        store
+            .retry_counters()
+            .ok_or(HsmError::Storage(StorageError::NotFormatted))?
+            .format(&seeds)?;
+        ScHsm::clear_legacy_retry_counts(store)?;
+        #[cfg(feature = "applet-piv")]
+        Piv::clear_legacy_retry_counts(store)?;
+        OpenPgp::clear_legacy_retry_counts(store)?;
+        Ok(true)
+    }
+
     /// Dispatch a raw APDU byte slice with access to persistent storage.
     ///
     /// Centralizes GET RESPONSE (INS=0xC0) interception and Le-truncation

@@ -54,7 +54,37 @@ pub fn handle_terminate_with_store(
     {
         return ApduResponse::err(pico2hsm_core::apdu::SW_MEMORY_FAILURE);
     }
-    handle_terminate(state, cmd)
+    let resp = handle_terminate(state, cmd);
+    // After a reset the card comes up factory-fresh, so its retry counters
+    // go back to the factory allowance too — only now that the old
+    // passwords and keys are gone.  RAM keeps 0 until ACTIVATE.
+    use crate::protocol::openpgp::{PW1_MAX_RETRIES, PW3_MAX_RETRIES};
+    use crate::storage::retry_counter::{set, Credential};
+    if set(store, Credential::OpenPgpPw1, PW1_MAX_RETRIES).is_err()
+        || set(store, Credential::OpenPgpPw3, PW3_MAX_RETRIES).is_err()
+    {
+        // Terminated and wiped all the same; a later TERMINATE (allowed
+        // while PW3 is blocked) or ACTIVATE retries the reset.
+        return ApduResponse::err(pico2hsm_core::apdu::SW_MEMORY_FAILURE);
+    }
+    resp
+}
+
+/// ACTIVATE FILE with persistence: the factory counters go to the log too.
+pub fn handle_activate_with_store(
+    state: &mut OpenPgpState,
+    store: &mut dyn crate::storage::KeyStore,
+    cmd: &ApduCommand<'_>,
+) -> ApduResponse {
+    let resp = handle_activate(state, cmd);
+    if resp.sw == pico2hsm_core::apdu::SW_OK
+        && crate::protocol::openpgp::OpenPgp::sync_counters(state, store).is_err()
+    {
+        // RAM follows the log rather than promising tries flash lacks.
+        crate::protocol::openpgp::OpenPgp::load_counters(state, store, false);
+        return ApduResponse::err(pico2hsm_core::apdu::SW_MEMORY_FAILURE);
+    }
+    resp
 }
 
 /// Handle TERMINATE DF — mark card as terminated, wipe keys and PINs.

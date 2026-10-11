@@ -256,7 +256,20 @@ impl PivRetryCounter {
             Self::Puk => (&mut ps.puk_retries_remaining, &mut ps.puk_blocked),
         }
     }
+
+    /// Its entry in the retry-counter log.
+    fn credential(self) -> Credential {
+        match self {
+            Self::Pin => Credential::PivPin,
+            Self::Puk => Credential::PivPuk,
+        }
+    }
+
+    const ALL: [Self; 2] = [Self::Pin, Self::Puk];
 }
+
+#[cfg(feature = "applet-piv")]
+use crate::storage::retry_counter::{self, CounterState, Credential};
 
 impl Piv {
     /// Create a new PIV protocol instance.
@@ -397,19 +410,48 @@ impl Piv {
         store.save_key(&obj)
     }
 
-    /// Serialize and persist the PIV PIN/PUK state to flash.
+    /// Serialize the PIV PIN/PUK record.
     ///
     /// Stored as a Generic key object at `KeyId::piv(0xFF)`.
     /// Layout (101 bytes total):
     ///   [0..32]  pin_hash
     ///   [32..48] pin_salt
-    ///   [48]     pin_retries_remaining
+    ///   [48]     0 (was pin_retries_remaining)
     ///   [49]     pin_max_retries
-    ///   [50]     pin_blocked as u8
+    ///   [50]     1 (was pin_blocked)
     ///   [51..83] puk_hash
     ///   [83..99] puk_salt
-    ///   [99]     puk_retries_remaining
-    ///   [100]    puk_blocked as u8
+    ///   [99]     0 (was puk_retries_remaining)
+    ///   [100]    1 (was puk_blocked)
+    ///
+    /// The retry counters live in the retry-counter log
+    /// (`storage::retry_counter`); records from before it are migrated and
+    /// zeroed at boot, so a record never carries a usable count.
+    #[cfg(feature = "applet-piv")]
+    fn pin_record(state: &PivState) -> zeroize::Zeroizing<Vec<u8, 128>> {
+        let ps = &state.pin_state;
+        let mut buf: zeroize::Zeroizing<Vec<u8, 128>> = zeroize::Zeroizing::new(Vec::new());
+        let _ = buf.extend_from_slice(&ps.pin_hash);
+        let _ = buf.extend_from_slice(&ps.pin_salt);
+        let _ = buf.push(0);
+        let _ = buf.push(ps.pin_max_retries);
+        let _ = buf.push(1);
+        let _ = buf.extend_from_slice(&ps.puk_hash);
+        let _ = buf.extend_from_slice(&ps.puk_salt);
+        let _ = buf.push(0);
+        let _ = buf.push(1);
+        buf
+    }
+
+    /// Byte offsets of the legacy (count, blocked flag) pairs in a record.
+    #[cfg(feature = "applet-piv")]
+    const LEGACY_COUNT_AT: [(PivRetryCounter, usize, usize); 2] = [
+        (PivRetryCounter::Pin, 48, 50),
+        (PivRetryCounter::Puk, 99, 100),
+    ];
+
+    /// Persist the PIV PIN/PUK state: the retry counters first, then the
+    /// record (see `ScHsm::save_pin_to_store` for the order).
     #[cfg(feature = "applet-piv")]
     pub fn save_pin_to_store(
         state: &PivState,
@@ -418,20 +460,7 @@ impl Piv {
         use crate::security::key_management::{AlgorithmId, KeyObject, KeyType as KmKeyType};
         use pico2hsm_core::key::AppletId;
 
-        let ps = &state.pin_state;
-        let mut buf: Vec<u8, 128> = Vec::new();
-        let _ = buf.extend_from_slice(&ps.pin_hash);
-        let _ = buf.extend_from_slice(&ps.pin_salt);
-        let _ = buf.push(ps.pin_retries_remaining);
-        let _ = buf.push(ps.pin_max_retries);
-        // Blocked is derived from the counter too: the last wrong guess
-        // spends the counter to 0 on flash before the handler sets the flag.
-        let _ = buf.push((ps.pin_blocked || ps.pin_retries_remaining == 0) as u8);
-        let _ = buf.extend_from_slice(&ps.puk_hash);
-        let _ = buf.extend_from_slice(&ps.puk_salt);
-        let _ = buf.push(ps.puk_retries_remaining);
-        let _ = buf.push((ps.puk_blocked || ps.puk_retries_remaining == 0) as u8);
-
+        Self::sync_counters(state, store)?;
         let mut obj = KeyObject {
             key_type: KmKeyType::Generic,
             key_id: Self::piv_pin_key_id().0,
@@ -445,8 +474,34 @@ impl Piv {
             private_key: Vec::new(),
             public_key: Vec::new(),
         };
-        let _ = obj.private_key.extend_from_slice(&buf);
+        let _ = obj.private_key.extend_from_slice(&Self::pin_record(state));
         store.save_key(&obj)
+    }
+
+    /// Write the PIN and PUK counters where RAM differs from the log.
+    #[cfg(feature = "applet-piv")]
+    fn sync_counters(
+        state: &PivState,
+        store: &mut dyn crate::storage::KeyStore,
+    ) -> Result<(), pico2hsm_core::error::HsmError> {
+        let ps = &state.pin_state;
+        retry_counter::set(store, Credential::PivPin, ps.pin_retries_remaining)?;
+        retry_counter::set(store, Credential::PivPuk, ps.puk_retries_remaining)
+    }
+
+    /// Set the RAM counters (and blocked flags) from the log; see
+    /// `retry_counter::load` for `record_exists`.
+    #[cfg(feature = "applet-piv")]
+    fn load_counters(
+        state: &mut PivState,
+        store: &mut dyn crate::storage::KeyStore,
+        record_exists: bool,
+    ) {
+        for c in PivRetryCounter::ALL {
+            let (n, blocked) = c.get(state);
+            *n = retry_counter::load(store, c.credential(), record_exists, *n);
+            *blocked = *n == 0;
+        }
     }
 
     /// Load PIN/PUK and management key from flash into `state` (boot and
@@ -486,16 +541,28 @@ impl Piv {
         if let Ok(Some(obj)) = pin {
             Self::apply_pin_record(state, &obj.private_key);
         }
+        Self::load_counters(state, store, pin_ok);
     }
 
-    /// Runtime rollback after a failed PIN-record save: put RAM back to
-    /// what flash holds.  Only the PIN record — the management key is
-    /// untouched — and if it can't be read, PIN and PUK are blocked rather
-    /// than left at whatever the failed command put in RAM.
+    /// Runtime rollback after a failed save: put RAM back to what flash
+    /// holds.  Only the PIN record and counters — the management key is
+    /// untouched.  If the record can't be read, PIN and PUK are blocked
+    /// rather than left at whatever the failed command put in RAM.
     #[cfg(feature = "applet-piv")]
     fn restore_pin_record(state: &mut PivState, store: &mut dyn crate::storage::KeyStore) {
         match store.fetch_key(Self::piv_pin_key_id()) {
-            Ok(Some(obj)) if Self::apply_pin_record(state, &obj.private_key) => {}
+            Ok(Some(obj)) if Self::apply_pin_record(state, &obj.private_key) => {
+                Self::load_counters(state, store, false);
+            }
+            Ok(None) if !state.credentials_persisted => {
+                // Never persisted: flash holds the factory credentials.
+                let d = default_pin_state();
+                let ps = &mut state.pin_state;
+                (ps.pin_hash, ps.pin_salt) = (d.pin_hash, d.pin_salt);
+                (ps.puk_hash, ps.puk_salt) = (d.puk_hash, d.puk_salt);
+                ps.pin_max_retries = d.pin_max_retries;
+                Self::load_counters(state, store, false);
+            }
             _ => {
                 let ps = &mut state.pin_state;
                 ps.pin_retries_remaining = 0;
@@ -506,7 +573,8 @@ impl Piv {
         }
     }
 
-    /// Decode a PIN record (layout: `save_pin_to_store`) into `state`.
+    /// Decode a PIN record (layout: `pin_record`) into `state`.  The
+    /// counters come from the retry-counter log, not from the record.
     #[cfg(feature = "applet-piv")]
     fn apply_pin_record(state: &mut PivState, b: &[u8]) -> bool {
         if b.len() < 101 {
@@ -515,14 +583,58 @@ impl Piv {
         let ps = &mut state.pin_state;
         ps.pin_hash.copy_from_slice(&b[0..32]);
         ps.pin_salt.copy_from_slice(&b[32..48]);
-        ps.pin_retries_remaining = b[48];
         ps.pin_max_retries = b[49];
-        ps.pin_blocked = b[50] != 0 || ps.pin_retries_remaining == 0;
         ps.puk_hash.copy_from_slice(&b[51..83]);
         ps.puk_salt.copy_from_slice(&b[83..99]);
-        ps.puk_retries_remaining = b[99];
-        ps.puk_blocked = b[100] != 0 || ps.puk_retries_remaining == 0;
         true
+    }
+
+    /// Migration: seeds for the retry-counter log from a pre-log PIN
+    /// record (see `ScHsm::legacy_retry_seeds`).
+    #[cfg(feature = "applet-piv")]
+    pub fn legacy_retry_seeds(
+        store: &mut dyn crate::storage::KeyStore,
+        seeds: &mut Vec<(Credential, CounterState), 8>,
+    ) -> Result<(), pico2hsm_core::error::HsmError> {
+        let Some(obj) = store.fetch_key(Self::piv_pin_key_id())? else {
+            return Ok(());
+        };
+        let b = &obj.private_key;
+        for (c, at, blocked_at) in Self::LEGACY_COUNT_AT {
+            let n = if b.len() >= 101 && b[blocked_at] == 0 {
+                b[at]
+            } else {
+                0
+            };
+            seeds
+                .push((c.credential(), CounterState::fresh(n)))
+                .map_err(|_| pico2hsm_core::error::HsmError::InvalidInput)?;
+        }
+        Ok(())
+    }
+
+    /// Migration, after the log is committed: zero the record's counts.
+    #[cfg(feature = "applet-piv")]
+    pub fn clear_legacy_retry_counts(
+        store: &mut dyn crate::storage::KeyStore,
+    ) -> Result<(), pico2hsm_core::error::HsmError> {
+        let Some(mut obj) = store.fetch_key(Self::piv_pin_key_id())? else {
+            return Ok(());
+        };
+        let b = &mut obj.private_key;
+        let cleared = |b: &[u8]| {
+            Self::LEGACY_COUNT_AT
+                .iter()
+                .all(|&(_, at, blocked_at)| b[at] == 0 && b[blocked_at] == 1)
+        };
+        if b.len() < 101 || cleared(b) {
+            return Ok(());
+        }
+        for (_, at, blocked_at) in Self::LEGACY_COUNT_AT {
+            b[at] = 0;
+            b[blocked_at] = 1;
+        }
+        store.save_key(&obj)
     }
 
     /// Dispatch a parsed APDU using the store-aware path for mutations.
@@ -555,34 +667,53 @@ impl Piv {
         cmd: &ApduCommand<'_>,
         store: &mut dyn crate::storage::KeyStore,
     ) -> ApduResponse {
-        let before = *counter.get(&mut self.state).0;
-        if before == 0 {
+        let ram = *counter.get(&mut self.state).0;
+        if ram == 0 {
             // No retries left: blocked, whatever the flag says.  Never reach
             // a compare that would not be paid for.
             return ApduResponse::err(0x6983);
         }
-        let spent = before - 1;
-        *counter.get(&mut self.state).0 = spent;
-        if Self::save_pin_to_store(&self.state, store).is_err() {
-            return ApduResponse::err(pico2hsm_core::apdu::SW_MEMORY_FAILURE);
+        let before = match retry_counter::spend(store, counter.credential(), ram) {
+            Ok(available) => available.min(ram),
+            Err(_) => return ApduResponse::err(pico2hsm_core::apdu::SW_MEMORY_FAILURE),
+        };
+        if before == 0 {
+            // The log says blocked: nothing spent, nothing compared.
+            let (n, blocked) = counter.get(&mut self.state);
+            (*n, *blocked) = (0, true);
+            return ApduResponse::err(0x6983);
         }
         *counter.get(&mut self.state).0 = before;
+        let spent = before - 1;
+        let record_before = Self::pin_record(&self.state);
 
         let resp = self.route_with_store(cmd, store);
 
-        let (after, blocked) = counter.get(&mut self.state);
-        if resp.sw != pico2hsm_core::apdu::SW_OK && *after > spent {
-            *after = spent;
+        if resp.sw != pico2hsm_core::apdu::SW_OK {
+            // The failure is on flash already; RAM follows the log.
+            Self::load_counters(&mut self.state, store, false);
+            let (after, blocked) = counter.get(&mut self.state);
+            if *after > spent {
+                *after = spent;
+            }
+            *blocked = *after == 0;
+            return resp;
         }
+        let (after, blocked) = counter.get(&mut self.state);
         if *after == 0 {
             *blocked = true;
         }
-        if *after != spent && Self::save_pin_to_store(&self.state, store).is_err() {
+        let persisted = if *Self::pin_record(&self.state) != *record_before {
+            Self::save_pin_to_store(&self.state, store)
+        } else {
+            Self::sync_counters(&self.state, store)
+        };
+        if persisted.is_err() {
             // Keep RAM consistent with flash (spent counter, old PIN) and
             // fail closed; see ScHsm::with_persisted_attempt.
             Self::restore_pin_record(&mut self.state, store);
-            *counter.get(&mut self.state).0 = spent;
             self.state.pin_verified = false;
+            self.state.pin_always_ok = false;
             self.state.pin_state.session_authenticated = false;
             return ApduResponse::err(pico2hsm_core::apdu::SW_MEMORY_FAILURE);
         }
@@ -699,6 +830,14 @@ impl Piv {
         st.key_index.clear();
         st.data_objects.clear();
         st.credentials_persisted = false;
+        // Counters last: only once the old PIN and PUK are gone may their
+        // blocked counters go back to the factory allowance.
+        if Self::sync_counters(&self.state, store).is_err() {
+            // Wiped, but still blocked on flash: say so in RAM too; the
+            // reset can simply be repeated.
+            Self::load_counters(&mut self.state, store, false);
+            return ApduResponse::err(pico2hsm_core::apdu::SW_MEMORY_FAILURE);
+        }
         ApduResponse::ok(&[])
     }
 
@@ -836,6 +975,7 @@ mod retry_persistence_tests {
 
     /// Records every PIV PIN-record write.
     struct PinStore {
+        counters: retry_counter::MemCounters,
         saves: heapless::Vec<heapless::Vec<u8, 128>, 16>,
     }
 
@@ -876,6 +1016,9 @@ mod retry_persistence_tests {
             heapless::Vec::new()
         }
         fn for_each_key(&self, _: &mut dyn FnMut(KeyId)) {}
+        fn retry_counters(&mut self) -> Option<&mut dyn retry_counter::RetryCounterBackend> {
+            Some(&mut self.counters)
+        }
     }
 
     fn verify(piv: &mut Piv, store: &mut PinStore, pin: &[u8]) -> u16 {
@@ -894,22 +1037,95 @@ mod retry_persistence_tests {
     fn piv_wrong_pin_is_spent_on_flash_and_survives_reset() {
         let mut piv = Piv::new();
         let mut store = PinStore {
+            counters: Default::default(),
             saves: heapless::Vec::new(),
         };
         let max = piv.state.pin_state.pin_retries_remaining;
+        let pin = |s: &PinStore| -> heapless::Vec<u8, 16> {
+            s.counters
+                .puts
+                .iter()
+                .filter(|(c, _)| *c == Credential::PivPin)
+                .map(|(_, st)| st.remaining())
+                .collect()
+        };
 
         assert_ne!(verify(&mut piv, &mut store, b"999999"), 0x9000);
-        assert_eq!(store.saves.len(), 1, "one write, before the compare");
-        assert_eq!(store.saves[0][48], max - 1);
+        assert_eq!(
+            &pin(&store)[..],
+            &[max - 1],
+            "one record, before the compare"
+        );
+        assert!(store.saves.is_empty(), "no PIN-record write");
 
+        // Reset: a fresh applet (no PIN record) takes its count from the log.
         let mut fresh = Piv::new();
-        Piv::restore_pin_record(&mut fresh.state, &mut store);
+        Piv::load_credentials_from_store(&mut fresh.state, &mut store);
         assert_eq!(fresh.state.pin_state.pin_retries_remaining, max - 1);
 
         assert_eq!(verify(&mut fresh, &mut store, DEFAULT_PIV_PIN), 0x9000);
-        let n = store.saves.len();
-        assert_eq!(store.saves[n - 2][48], max - 2, "spent before the compare");
-        assert_eq!(store.saves[n - 1][48], max, "restored after success");
+        assert_eq!(
+            &pin(&store)[..],
+            &[max - 1, max - 2, max],
+            "spent before the compare, restored after success"
+        );
+        assert!(store.saves.is_empty(), "still no PIN-record write");
+    }
+
+    #[test]
+    fn piv_record_never_carries_a_usable_count() {
+        let mut piv = Piv::new();
+        let mut store = PinStore {
+            counters: Default::default(),
+            saves: heapless::Vec::new(),
+        };
+        Piv::save_pin_to_store(&piv.state, &mut store).unwrap();
+        let b = &store.saves[0];
+        assert_eq!((b[48], b[50], b[99], b[100]), (0, 1, 0, 1));
+        // Loaded with its counters from the log.
+        let mut fresh = Piv::new();
+        Piv::load_credentials_from_store(&mut fresh.state, &mut store);
+        assert_eq!(
+            fresh.state.pin_state.pin_retries_remaining,
+            piv.state.pin_state.pin_retries_remaining
+        );
+        // ...and blocked if the log loses the entry.
+        store.counters.entries = Default::default();
+        Piv::load_credentials_from_store(&mut piv.state, &mut store);
+        assert!(piv.state.pin_state.pin_blocked);
+        assert!(piv.state.pin_state.puk_blocked);
+    }
+
+    #[test]
+    fn piv_migration_seeds_from_legacy_record() {
+        let piv = Piv::new();
+        let mut store = PinStore {
+            counters: retry_counter::MemCounters {
+                unformatted: true,
+                ..Default::default()
+            },
+            saves: heapless::Vec::new(),
+        };
+        // A pre-log record: PIN 2 left, PUK blocked.
+        let mut rec = Piv::pin_record(&piv.state);
+        (rec[48], rec[50], rec[99], rec[100]) = (2, 0, 1, 1);
+        store.saves.push(rec.iter().copied().collect()).unwrap();
+        assert_eq!(
+            crate::apdu::dispatcher::Dispatcher::migrate_retry_counters(&mut store),
+            Ok(true)
+        );
+        assert_eq!(store.counters.remaining(Credential::PivPin), Some(2));
+        assert_eq!(
+            store.counters.remaining(Credential::PivPuk),
+            Some(0),
+            "blocked flag wins over the count"
+        );
+        let b = store.saves.last().unwrap();
+        assert_eq!((b[48], b[50], b[99], b[100]), (0, 1, 0, 1), "zeroed");
+        let mut fresh = Piv::new();
+        Piv::load_credentials_from_store(&mut fresh.state, &mut store);
+        assert_eq!(fresh.state.pin_state.pin_retries_remaining, 2);
+        assert!(fresh.state.pin_state.puk_blocked);
     }
 
     #[test]
@@ -925,6 +1141,7 @@ mod retry_persistence_tests {
         }
         let mut piv = Piv::new();
         let mut store = PinStore {
+            counters: Default::default(),
             saves: heapless::Vec::new(),
         };
         for _ in 0..crate::security::pin::MAX_PUK_RETRIES {
@@ -941,6 +1158,7 @@ mod retry_persistence_tests {
     fn mgmt_key_change_requires_mgmt_auth() {
         let mut piv = Piv::new();
         let mut store = PinStore {
+            counters: Default::default(),
             saves: heapless::Vec::new(),
         };
         let new_key = [0x42u8; 24];
@@ -967,6 +1185,7 @@ mod retry_persistence_tests {
     fn generate_requires_mgmt_key_not_pin() {
         let mut piv = Piv::new();
         let mut store = PinStore {
+            counters: Default::default(),
             saves: heapless::Vec::new(),
         };
         assert_eq!(verify(&mut piv, &mut store, DEFAULT_PIV_PIN), 0x9000);
@@ -987,6 +1206,7 @@ mod data_object_tests {
     use pico2hsm_core::key::{AppletId, KeyId};
 
     struct MemStore {
+        counters: retry_counter::MemCounters,
         records: heapless::Vec<(KeyId, heapless::Vec<u8, 2100>), 10>,
     }
 
@@ -1032,6 +1252,9 @@ mod data_object_tests {
                 f(*k);
             }
         }
+        fn retry_counters(&mut self) -> Option<&mut dyn retry_counter::RetryCounterBackend> {
+            Some(&mut self.counters)
+        }
     }
 
     /// Extended-length PUT DATA for tag 5FC1<low> with `content`.
@@ -1060,6 +1283,7 @@ mod data_object_tests {
         let mut piv = Piv::new();
         piv.state.mgmt_key_authenticated = true;
         let mut store = MemStore {
+            counters: Default::default(),
             records: heapless::Vec::new(),
         };
         let cert = [0xC3u8; 300];
@@ -1084,6 +1308,7 @@ mod data_object_tests {
         let mut piv = Piv::new();
         piv.state.mgmt_key_authenticated = true;
         let mut store = MemStore {
+            counters: Default::default(),
             records: heapless::Vec::new(),
         };
         // 2046 bytes of content + 4-byte 53 wrapper > 2048.
@@ -1098,6 +1323,7 @@ mod data_object_tests {
         let mut piv = Piv::new();
         piv.state.mgmt_key_authenticated = true;
         let mut store = MemStore {
+            counters: Default::default(),
             records: heapless::Vec::new(),
         };
         let get = |low: u8| {
@@ -1139,6 +1365,7 @@ mod data_object_tests {
         let mut piv = Piv::new();
         piv.state.mgmt_key_authenticated = true;
         let mut store = MemStore {
+            counters: Default::default(),
             records: heapless::Vec::new(),
         };
         for low in [0x00u8, 0x24, 0x7E, 0xFF] {
@@ -1156,6 +1383,7 @@ mod data_object_tests {
         let mut piv = Piv::new();
         piv.state.mgmt_key_authenticated = true;
         let mut store = MemStore {
+            counters: Default::default(),
             records: heapless::Vec::new(),
         };
         assert_eq!(
@@ -1178,6 +1406,7 @@ mod data_object_tests {
         let mut piv = Piv::new();
         piv.state.mgmt_key_authenticated = true;
         let mut store = MemStore {
+            counters: Default::default(),
             records: heapless::Vec::new(),
         };
         piv.process_apdu_with_store(&put_data(0x05, &[1u8; 10]), &mut store);
@@ -1194,6 +1423,7 @@ mod data_object_tests {
     #[test]
     fn empty_applet_loads_factory_defaults() {
         let mut store = MemStore {
+            counters: Default::default(),
             records: heapless::Vec::new(),
         };
         let mut fresh = Piv::new();
@@ -1207,6 +1437,7 @@ mod data_object_tests {
         let mut piv = Piv::new();
         piv.state.mgmt_key_authenticated = true;
         let mut store = MemStore {
+            counters: Default::default(),
             records: heapless::Vec::new(),
         };
         piv.process_apdu_with_store(&put_data(0x05, &[1u8; 10]), &mut store);
@@ -1219,6 +1450,73 @@ mod data_object_tests {
         assert!(store.records.is_empty(), "applet wiped");
         assert_eq!(piv.state.mgmt_key, DEFAULT_MGMT_KEY);
         assert!(piv.state.data_objects.is_empty());
+    }
+
+    fn verify(piv: &mut Piv, store: &mut MemStore, pin: &[u8]) -> u16 {
+        let mut apdu: heapless::Vec<u8, 16> = heapless::Vec::new();
+        apdu.extend_from_slice(&[0x00, 0x20, 0x00, 0x80, 0x08])
+            .unwrap();
+        apdu.extend_from_slice(pin).unwrap();
+        for _ in pin.len()..8 {
+            apdu.push(0xFF).unwrap();
+        }
+        sw(&piv.process_apdu_with_store(&apdu, store))
+    }
+
+    #[test]
+    fn piv_reset_restores_the_counters_on_flash() {
+        let mut piv = Piv::new();
+        piv.state.mgmt_key_authenticated = true;
+        let mut store = MemStore {
+            counters: Default::default(),
+            records: heapless::Vec::new(),
+        };
+        piv.process_apdu_with_store(&put_data(0x05, &[1u8; 10]), &mut store);
+        // Block the PIN and the PUK the hard way.
+        while piv.state.pin_state.pin_retries_remaining > 0 {
+            verify(&mut piv, &mut store, b"999999");
+        }
+        let mut change_puk = [0u8; 21];
+        change_puk[..5].copy_from_slice(&[0x00, 0x24, 0x00, 0x81, 16]);
+        change_puk[5..13].copy_from_slice(b"00000000");
+        change_puk[13..].copy_from_slice(b"87654321");
+        while piv.state.pin_state.puk_retries_remaining > 0 {
+            piv.process_apdu_with_store(&change_puk, &mut store);
+        }
+        assert_eq!(store.counters.remaining(Credential::PivPin), Some(0));
+        assert_eq!(store.counters.remaining(Credential::PivPuk), Some(0));
+
+        let reset = [0x00, 0xFB, 0x00, 0x00];
+        assert_eq!(sw(&piv.process_apdu_with_store(&reset, &mut store)), 0x9000);
+        let max = crate::security::pin::MAX_PIN_RETRIES;
+        assert_eq!(store.counters.remaining(Credential::PivPin), Some(max));
+        // After a power cycle the applet is factory-fresh and usable.
+        let mut fresh = Piv::new();
+        fresh.load_from_store(&mut store);
+        assert_eq!(fresh.state.pin_state.pin_retries_remaining, max);
+        assert_eq!(verify(&mut fresh, &mut store, DEFAULT_PIV_PIN), 0x9000);
+    }
+
+    #[test]
+    fn piv_reset_with_failed_counter_write_stays_blocked() {
+        let mut piv = Piv::new();
+        let mut store = MemStore {
+            counters: Default::default(),
+            records: heapless::Vec::new(),
+        };
+        piv.state.lock_out();
+        store.counters.fail_all = true;
+        let reset = [0x00, 0xFB, 0x00, 0x00];
+        assert_eq!(sw(&piv.process_apdu_with_store(&reset, &mut store)), 0x6581);
+        // Fresh applet without entries: the RAM defaults stand only if the
+        // log has nothing to say; a blocked entry would win.
+        store.counters.fail_all = false;
+        retry_counter::set(&mut store, Credential::PivPin, 0).unwrap();
+        store.counters.fail_all = true;
+        piv.state.lock_out();
+        assert_eq!(sw(&piv.process_apdu_with_store(&reset, &mut store)), 0x6581);
+        assert_eq!(piv.state.pin_state.pin_retries_remaining, 0);
+        assert!(piv.state.pin_state.pin_blocked);
     }
 
     #[test]

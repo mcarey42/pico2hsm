@@ -131,6 +131,13 @@ enum FlashOp {
     /// Core0 calls `dispatcher.load_keys_from_store(store)` via the raw
     /// pointer while core1 is awaiting the response.
     ReloadKeys,
+    /// Append a credential's retry-counter state to the counter log on
+    /// internal flash.  Always on core0, on every board: the log is never
+    /// on the SD card.
+    PutCounter(
+        pico2hsm_firmware::storage::retry_counter::Credential,
+        pico2hsm_firmware::storage::retry_counter::CounterState,
+    ),
 }
 
 // SAFETY: the only non-Send field is `SaveKey`'s pointer, which core0
@@ -255,6 +262,91 @@ impl pico2hsm_firmware::storage::KeyStore for Core1KeyStore {
         heapless::Vec::new()
     }
     fn for_each_key(&self, _f: &mut dyn FnMut(pico2hsm_core::key::KeyId)) {}
+
+    fn retry_counters(
+        &mut self,
+    ) -> Option<&mut dyn pico2hsm_firmware::storage::retry_counter::RetryCounterBackend> {
+        Some(self)
+    }
+}
+
+/// Counter reads come from core0's in-RAM index (core0 only changes it
+/// while core1 is blocked in `on_core0`); every write is a
+/// `FlashOp::PutCounter` on core0 — on the SD boards too, since the log is
+/// on internal flash, which only core0 may program.
+#[cfg(target_arch = "arm")]
+impl pico2hsm_firmware::storage::retry_counter::RetryCounterBackend for Core1KeyStore {
+    fn get(
+        &mut self,
+        cred: pico2hsm_firmware::storage::retry_counter::Credential,
+    ) -> Result<
+        Option<pico2hsm_firmware::storage::retry_counter::CounterState>,
+        pico2hsm_core::error::StorageError,
+    > {
+        use pico2hsm_firmware::storage::KeyStore as _;
+        match self.direct().retry_counters() {
+            Some(log) => log.get(cred),
+            None => Err(pico2hsm_core::error::StorageError::NotFormatted),
+        }
+    }
+
+    fn put(
+        &mut self,
+        cred: pico2hsm_firmware::storage::retry_counter::Credential,
+        state: pico2hsm_firmware::storage::retry_counter::CounterState,
+    ) -> Result<(), pico2hsm_core::error::StorageError> {
+        match Self::on_core0(FlashOp::PutCounter(cred, state)) {
+            Ok(()) => Ok(()),
+            Err(pico2hsm_core::error::HsmError::Storage(e)) => Err(e),
+            Err(_) => Err(pico2hsm_core::error::StorageError::WriteError),
+        }
+    }
+
+    fn needs_migration(&mut self) -> bool {
+        use pico2hsm_firmware::storage::KeyStore as _;
+        self.direct()
+            .retry_counters()
+            .is_some_and(|log| log.needs_migration())
+    }
+
+    fn format(
+        &mut self,
+        _: &[(
+            pico2hsm_firmware::storage::retry_counter::Credential,
+            pico2hsm_firmware::storage::retry_counter::CounterState,
+        )],
+    ) -> Result<(), pico2hsm_core::error::StorageError> {
+        // Migration runs at boot on core0 only (`init_retry_counters`).
+        Err(pico2hsm_core::error::StorageError::WriteError)
+    }
+}
+
+/// Attach the retry-counter log on internal flash to the keystore and run
+/// the one-time migration.  Boot only, on core0, before the first key load.
+#[cfg(target_arch = "arm")]
+fn init_retry_counters(store: &mut pico2hsm_firmware::storage::BoardKeyStore) {
+    use pico2hsm_firmware::storage::{
+        flash_chip::{QmiCounterFlash, QMI_FLASH_SIZE},
+        flash_layout::RETRY_COUNTER_SECTORS,
+        retry_counter::CounterLog,
+    };
+    // SAFETY: on the QMI boards the keystore's `QmiFlash` owns `p.FLASH`.
+    // The blocking driver holds no state, and both drivers are used only
+    // from core0, one operation at a time, so a second handle is sound.
+    let flash =
+        embassy_rp::flash::Flash::<_, embassy_rp::flash::Blocking, QMI_FLASH_SIZE>::new_blocking(
+            unsafe { embassy_rp::peripherals::FLASH::steal() },
+        );
+    store.attach_retry_counters(CounterLog::open(
+        QmiCounterFlash::new(flash),
+        RETRY_COUNTER_SECTORS,
+    ));
+    match pico2hsm_firmware::apdu::dispatcher::Dispatcher::migrate_retry_counters(store) {
+        Ok(true) => defmt::info!("retry counters: migrated from the PIN records"),
+        Ok(false) => {}
+        // Fail closed: credentials load blocked; retried at the next boot.
+        Err(_) => defmt::error!("retry counters: migration FAILED — credentials blocked"),
+    }
 }
 
 /// One-time initialised key store — lives for the duration of the firmware.
@@ -692,6 +784,14 @@ fn handle_flash_op(
             );
             Ok(())
         }
+        FlashOp::PutCounter(cred, state) => match store.retry_counters() {
+            Some(log) => log
+                .put(cred, state)
+                .map_err(pico2hsm_core::error::HsmError::Storage),
+            None => Err(pico2hsm_core::error::HsmError::Storage(
+                pico2hsm_core::error::StorageError::NotFormatted,
+            )),
+        },
     }
 }
 
@@ -1045,6 +1145,7 @@ async fn run_one_board(p: embassy_rp::Peripherals) {
         pico2hsm_firmware::apdu::dispatcher::Dispatcher::init_in_place(DISPATCHER_CELL.uninit());
     {
         use pico2hsm_firmware::storage::KeyStore as _;
+        init_retry_counters(store);
         dispatcher_ref.load_keys_from_store(store);
     }
     KEY_COUNT.store(
@@ -1379,6 +1480,7 @@ async fn run_geek_board(p: embassy_rp::Peripherals) {
     serial_println!("Loading keys...");
     {
         use pico2hsm_firmware::storage::KeyStore as _;
+        init_retry_counters(store);
         dispatcher_ref.load_keys_from_store(store);
     }
     KEY_COUNT.store(
@@ -1704,6 +1806,7 @@ async fn run_pico2_board(p: embassy_rp::Peripherals) {
         pico2hsm_firmware::apdu::dispatcher::Dispatcher::init_in_place(DISPATCHER_CELL.uninit());
     {
         use pico2hsm_firmware::storage::KeyStore as _;
+        init_retry_counters(store);
         dispatcher_ref.load_keys_from_store(store);
     }
     KEY_COUNT.store(
@@ -2106,6 +2209,7 @@ async fn run_waveshare_lcd_board(p: embassy_rp::Peripherals) {
         pico2hsm_firmware::apdu::dispatcher::Dispatcher::init_in_place(DISPATCHER_CELL.uninit());
     {
         use pico2hsm_firmware::storage::KeyStore as _;
+        init_retry_counters(store);
         dispatcher_ref.load_keys_from_store(store);
     }
     KEY_COUNT.store(
