@@ -16,8 +16,10 @@ pub(crate) struct BlobStore {
             u32,
             heapless::Vec<u8, { crate::security::key_management::MAX_BLOB_SIZE }>,
         ),
-        8,
+        24,
     >,
+    /// Retry counters (PIN / PUK / PW1 / PW3).
+    pub counters: crate::storage::retry_counter::MemCounters,
     /// Number of successful saves.
     pub saves: usize,
     /// Fail every save.
@@ -28,6 +30,7 @@ impl BlobStore {
     pub fn new() -> Self {
         BlobStore {
             blobs: heapless::Vec::new(),
+            counters: Default::default(),
             saves: 0,
             fail_saves: false,
         }
@@ -77,6 +80,9 @@ impl crate::storage::KeyStore for BlobStore {
         for (k, _) in self.blobs.iter() {
             f(KeyId(*k));
         }
+    }
+    fn retry_counters(&mut self) -> Option<&mut dyn RetryCounterBackend> {
+        Some(&mut self.counters)
     }
 }
 

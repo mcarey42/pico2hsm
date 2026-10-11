@@ -38,6 +38,14 @@ fn strip_pin_padding(padded: &[u8]) -> &[u8] {
 
 /// Handle a VERIFY APDU command.
 pub fn handle(state: &mut PivState, cmd: &ApduCommand<'_>) -> ApduResponse {
+    // SP 800-73-4 Part 2 §3.2.1: P1 = FF with no data resets the security
+    // status of the reference (the PIN is no longer verified).
+    if cmd.p1 == 0xFF && cmd.p2 == P2_PIV_PIN && cmd.data.is_empty() {
+        state.pin_verified = false;
+        state.pin_always_ok = false;
+        state.pin_state.session_authenticated = false;
+        return ApduResponse::ok(&[]);
+    }
     if cmd.p1 != 0x00 {
         return ApduResponse::err(0x6A86); // incorrect P1/P2
     }

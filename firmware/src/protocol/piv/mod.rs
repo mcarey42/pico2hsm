@@ -32,7 +32,7 @@ pub const PIV_AID: &[u8] = &[
 ];
 
 /// Maximum number of in-memory PIV key slots.
-pub const MAX_PIV_KEYS: usize = 4;
+pub const MAX_PIV_KEYS: usize = 24;
 
 /// Maximum number of stored PIV data objects (certificates, CHUID, CCC, etc.).
 /// Reduced from 8 to 4 to save ~8 KB BSS (each object contains a 2048-byte
@@ -653,10 +653,18 @@ impl Piv {
         {
             self.state.pin_always_ok = false;
         }
-        match PivRetryCounter::spent_by(cmd) {
+        let resp = match PivRetryCounter::spent_by(cmd) {
             Some(counter) => self.with_persisted_attempt(counter, cmd, store),
             None => self.route_with_store(cmd, store),
+        };
+        // ...and is used up by the GENERAL AUTHENTICATE that follows,
+        // whatever slot it addressed or however it ended: a VERIFY, then a
+        // signature with another key, then a 9C signature is not "PIN
+        // right before the use".
+        if cmd.ins == commands::general_authenticate::INS_GENERAL_AUTHENTICATE {
+            self.state.pin_always_ok = false;
         }
+        resp
     }
 
     /// Spend one PIN/PUK retry on flash before the handler compares the
@@ -783,6 +791,7 @@ impl Piv {
                 generate_keypair::handle_with_store(&mut self.state, store, cmd)
             }
             INS_PIV_RESET => self.reset_applet(cmd, store),
+            metadata::INS_GET_METADATA => metadata::handle_with_store(&self.state, store, cmd),
             general_authenticate::INS_GENERAL_AUTHENTICATE => {
                 general_authenticate::handle_with_store(&mut self.state, store, cmd)
             }
@@ -872,7 +881,7 @@ impl Piv {
             Self::load_credentials_from_store(&mut self.state, store);
 
             // Load key objects for PIV slots.
-            let mut piv_ids: Vec<pico2hsm_core::key::KeyId, 16> = Vec::new();
+            let mut piv_ids: Vec<pico2hsm_core::key::KeyId, MAX_PIV_KEYS> = Vec::new();
             let mut object_ids: Vec<pico2hsm_core::key::KeyId, MAX_PIV_DATA_OBJECTS> = Vec::new();
             store.for_each_key(&mut |kid| {
                 if kid.applet_byte() != AppletId::Piv as u8 {
@@ -926,7 +935,7 @@ impl Piv {
                         key_id: kid.0,
                         key_type: key_type as u8,
                         algo: alg_id,
-                        key_flags: 0,
+                        key_flags: commands::generate_keypair::policy_flags(&obj.policy),
                     };
                     let _ = self.state.key_index.push(meta);
                 }
@@ -1546,3 +1555,6 @@ mod data_object_tests {
         assert_eq!(computed.puk_hash, DEFAULT_PUK_HASH);
     }
 }
+
+#[cfg(all(test, feature = "applet-piv"))]
+mod policy_tests;
