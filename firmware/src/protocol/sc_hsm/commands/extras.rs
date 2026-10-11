@@ -14,7 +14,7 @@
 //! - P1=0x36: NOISE_SOURCE_RESPOND (V2, SO-PIN)
 //! - P1=0x37: NOISE_FINALIZE_SEND_V2 (SO-PIN)
 //! - P1=0x38: NOISE_FINALIZE_RECV_V2 (SO-PIN)
-//! - P1=0x39: GET_KEY_MANIFEST
+//! - P1=0x39: GET_KEY_MANIFEST (user PIN)
 //! - P1=0x3A: GET_STATE_HASH
 //! - P1=0x3B: SIGN_ENROLLMENT
 //! - P1=0x3C: GET_GENERATION_V2
@@ -44,7 +44,6 @@ pub fn handle(
         // No-PIN sub-commands.
         0x30 => handle_get_device_public_key(state, store, cmd),
         0x34 => handle_get_generation(state, cmd),
-        0x39 => handle_get_key_manifest(state, store, cmd),
         0x3A => handle_get_state_hash(state, store, cmd),
         0x3C => handle_get_generation_v2(state, cmd),
 
@@ -80,6 +79,8 @@ pub fn handle(
                 return ApduResponse::err(SW_SECURITY_STATUS);
             }
             match cmd.p1 {
+                // Lists every key (ids, algorithms, flags, public-key hashes).
+                0x39 => handle_get_key_manifest(state, store, cmd),
                 0x01 => hkdf_extract(cmd.data),
                 0x02 => hkdf_expand(cmd.data),
                 0x03 => pbkdf2(cmd.data),

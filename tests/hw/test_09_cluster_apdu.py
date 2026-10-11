@@ -226,9 +226,14 @@ class TestGetGenerationV2:
 # ---------------------------------------------------------------------------
 
 class TestGetKeyManifest:
+    def test_requires_pin(self, initialized_device, runner: CLIRunner) -> None:
+        """The manifest lists every key, so it needs the user PIN (SW 6982)."""
+        result = runner.send_apdu(SELECT_SC_HSM, APDU_GET_MANIFEST, reader=0)
+        assert _last_sw(result.stdout) == 0x6982
+
     def test_sw_9000_before_keygen(self, initialized_device, runner: CLIRunner) -> None:
         """GET_KEY_MANIFEST must return SW=9000 even on a freshly initialized device."""
-        result = runner.send_apdu(SELECT_SC_HSM, APDU_GET_MANIFEST, reader=0)
+        result = runner.send_apdu(SELECT_SC_HSM, VERIFY_PIN, APDU_GET_MANIFEST, reader=0)
         sw = _last_sw(result.stdout)
         assert sw == 0x9000, f"SW={sw:04X}"
 
@@ -236,7 +241,7 @@ class TestGetKeyManifest:
         """On a freshly initialized device, manifest must be empty (0 bytes)."""
         # This test relies on ordering — init_reader0 was fresh.  If keys already
         # exist from earlier modules, skip.
-        result = runner.send_apdu(SELECT_SC_HSM, APDU_GET_MANIFEST, reader=0)
+        result = runner.send_apdu(SELECT_SC_HSM, VERIFY_PIN, APDU_GET_MANIFEST, reader=0)
         data = _parse_received_bytes(result.stdout)
         assert len(data) % 44 == 0, f"Manifest length {len(data)} not a multiple of 44"
 
@@ -244,7 +249,7 @@ class TestGetKeyManifest:
         self, initialized_device, provisioned_keys, runner: CLIRunner
     ) -> None:
         """After keygen, manifest must have 44 bytes × number of keys."""
-        result = runner.send_apdu(SELECT_SC_HSM, APDU_GET_MANIFEST, reader=0)
+        result = runner.send_apdu(SELECT_SC_HSM, VERIFY_PIN, APDU_GET_MANIFEST, reader=0)
         data = _parse_received_bytes(result.stdout)
         n_keys = sum(1 for v in provisioned_keys.values() if v.get("generated"))
         assert len(data) == 44 * n_keys, (
@@ -255,7 +260,7 @@ class TestGetKeyManifest:
         self, initialized_device, provisioned_keys, runner: CLIRunner
     ) -> None:
         """Each manifest entry must have valid key_ref (1-254), non-zero algo, non-tombstone."""
-        result = runner.send_apdu(SELECT_SC_HSM, APDU_GET_MANIFEST, reader=0)
+        result = runner.send_apdu(SELECT_SC_HSM, VERIFY_PIN, APDU_GET_MANIFEST, reader=0)
         data = _parse_received_bytes(result.stdout)
         if len(data) == 0:
             pytest.skip("No keys present")
