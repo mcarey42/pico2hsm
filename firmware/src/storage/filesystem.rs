@@ -53,8 +53,10 @@ const DIR_HEADER_SIZE: usize = 8;
 const DIR_ENTRY_SIZE: usize = 12;
 /// Maximum number of directory entries in one sector.
 const DIR_MAX_ENTRIES: usize = (SECTOR_SIZE - DIR_HEADER_SIZE) / DIR_ENTRY_SIZE;
-/// Maximum entries tracked in the in-RAM `Directory`.
-const MAX_DIRECTORY_ENTRIES: usize = 512;
+/// Maximum entries tracked in the in-RAM `Directory` — exactly what one
+/// directory sector can hold, so RAM can never accept an entry that
+/// `serialize` would then fail to persist (was 512 vs. 340 on flash).
+const MAX_DIRECTORY_ENTRIES: usize = DIR_MAX_ENTRIES;
 
 // ─── Directory ────────────────────────────────────────────────────────────────
 
@@ -99,10 +101,16 @@ impl Directory {
             self.dirty = true;
             return Ok(());
         }
-        // Append new entry.
-        self.entries
-            .push(entry)
-            .map_err(|_| StorageError::KeystoreFull)?;
+        // Append, or reuse a tombstoned slot (tombstones are not written to
+        // flash, so they must not use up capacity).
+        if let Err(entry) = self.entries.push(entry) {
+            let slot = self
+                .entries
+                .iter_mut()
+                .find(|e| (e.flags & 0x01) != 0)
+                .ok_or(StorageError::KeystoreFull)?;
+            *slot = entry;
+        }
         self.dirty = true;
         Ok(())
     }
