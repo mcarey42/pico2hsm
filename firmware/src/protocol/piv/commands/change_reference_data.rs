@@ -95,7 +95,7 @@ fn handle_change_puk(state: &mut PivState, cmd: &ApduCommand<'_>) -> ApduRespons
         return ApduResponse::err(0x6700);
     }
 
-    if state.pin_state.puk_blocked {
+    if state.pin_state.puk_blocked || state.pin_state.puk_retries_remaining == 0 {
         return ApduResponse::err(0x6983);
     }
 

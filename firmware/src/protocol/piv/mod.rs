@@ -409,11 +409,13 @@ impl Piv {
         let _ = buf.extend_from_slice(&ps.pin_salt);
         let _ = buf.push(ps.pin_retries_remaining);
         let _ = buf.push(ps.pin_max_retries);
-        let _ = buf.push(ps.pin_blocked as u8);
+        // Blocked is derived from the counter too: the last wrong guess
+        // spends the counter to 0 on flash before the handler sets the flag.
+        let _ = buf.push((ps.pin_blocked || ps.pin_retries_remaining == 0) as u8);
         let _ = buf.extend_from_slice(&ps.puk_hash);
         let _ = buf.extend_from_slice(&ps.puk_salt);
         let _ = buf.push(ps.puk_retries_remaining);
-        let _ = buf.push(ps.puk_blocked as u8);
+        let _ = buf.push((ps.puk_blocked || ps.puk_retries_remaining == 0) as u8);
 
         let mut obj = KeyObject {
             key_type: KmKeyType::Generic,
@@ -500,11 +502,11 @@ impl Piv {
         ps.pin_salt.copy_from_slice(&b[32..48]);
         ps.pin_retries_remaining = b[48];
         ps.pin_max_retries = b[49];
-        ps.pin_blocked = b[50] != 0;
+        ps.pin_blocked = b[50] != 0 || ps.pin_retries_remaining == 0;
         ps.puk_hash.copy_from_slice(&b[51..83]);
         ps.puk_salt.copy_from_slice(&b[83..99]);
         ps.puk_retries_remaining = b[99];
-        ps.puk_blocked = b[100] != 0;
+        ps.puk_blocked = b[100] != 0 || ps.puk_retries_remaining == 0;
         true
     }
 
@@ -534,7 +536,9 @@ impl Piv {
     ) -> ApduResponse {
         let before = *counter.get(&mut self.state).0;
         if before == 0 {
-            return self.route_with_store(cmd, store);
+            // No retries left: blocked, whatever the flag says.  Never reach
+            // a compare that would not be paid for.
+            return ApduResponse::err(0x6983);
         }
         let spent = before - 1;
         *counter.get(&mut self.state).0 = spent;
@@ -879,6 +883,31 @@ mod retry_persistence_tests {
         let n = store.saves.len();
         assert_eq!(store.saves[n - 2][48], max - 2, "spent before the compare");
         assert_eq!(store.saves[n - 1][48], max, "restored after success");
+    }
+
+    #[test]
+    fn puk_block_survives_reload() {
+        fn change_puk(piv: &mut Piv, store: &mut PinStore, old: &[u8]) -> u16 {
+            let mut apdu: heapless::Vec<u8, 24> = heapless::Vec::new();
+            apdu.extend_from_slice(&[0x00, 0x24, 0x00, 0x81, 16])
+                .unwrap();
+            apdu.extend_from_slice(old).unwrap();
+            apdu.extend_from_slice(b"87654321").unwrap();
+            let r = piv.process_apdu_with_store(&apdu, store);
+            u16::from_be_bytes([r[r.len() - 2], r[r.len() - 1]])
+        }
+        let mut piv = Piv::new();
+        let mut store = PinStore {
+            saves: heapless::Vec::new(),
+        };
+        for _ in 0..crate::security::pin::MAX_PUK_RETRIES {
+            assert_ne!(change_puk(&mut piv, &mut store, b"00000000"), 0x9000);
+        }
+        // Reset: reload from flash, then try the right PUK.
+        let mut fresh = Piv::new();
+        Piv::restore_pin_record(&mut fresh.state, &mut store);
+        assert!(fresh.state.pin_state.puk_blocked, "blocked after reload");
+        assert_eq!(change_puk(&mut fresh, &mut store, b"12345678"), 0x6983);
     }
 
     #[test]
