@@ -355,7 +355,13 @@ impl<'d, D: Driver<'d>> CcidTransport<'d, D> {
                     // dwFeatures = 0x000400FE includes bit 0x00040000 (Short and
                     // Extended APDU level exchange). The host sends a raw APDU as
                     // the XfrBlock payload — no T=1 framing at the CCID layer.
-                    if raw.len() <= CCID_HEADER_LEN {
+                    if !self.card_powered {
+                        // No APDUs to an unpowered card: bmCommandStatus =
+                        // failed, bmICCStatus = present but inactive (0x41),
+                        // bError = ICC_MUTE (0xFE).
+                        let resp = self.build_slot_status(header.seq, 0x41, 0xFE);
+                        self.write_response(&resp).await?;
+                    } else if raw.len() <= CCID_HEADER_LEN {
                         let resp = self.build_slot_status(header.seq, 0x40, 0x00);
                         self.write_response(&resp).await?;
                     } else {
@@ -439,10 +445,18 @@ impl<'d, D: Driver<'d>> CcidTransport<'d, D> {
         buf: &mut Vec<u8, 4096>,
     ) -> Result<CcidHeader, CcidError> {
         let mut pkt = [0u8; 64];
+        // Packets from a previous host session must not be glued onto this
+        // one: restart the message whenever the session changes mid-read.
+        let mut epoch = crate::SESSION_EPOCH.load(core::sync::atomic::Ordering::SeqCst);
 
         // Read packets until we have at least the 10-byte CCID header.
         while buf.len() < CCID_HEADER_LEN {
             let n = self.read_ep.read(&mut pkt).await?;
+            let now = crate::SESSION_EPOCH.load(core::sync::atomic::Ordering::SeqCst);
+            if now != epoch {
+                buf.clear();
+                epoch = now;
+            }
             buf.extend_from_slice(&pkt[..n])
                 .map_err(|_| CcidError::BufferOverflow)?;
         }
@@ -489,8 +503,14 @@ impl<'d, D: Driver<'d>> CcidTransport<'d, D> {
             return Ok(());
         }
 
+        // Stop if the host session ends mid-message: the remaining packets
+        // would otherwise be read by the next session as its response.
+        let epoch = crate::SESSION_EPOCH.load(core::sync::atomic::Ordering::SeqCst);
         let mut offset = 0;
         while offset < data.len() {
+            if crate::SESSION_EPOCH.load(core::sync::atomic::Ordering::SeqCst) != epoch {
+                return Err(CcidError::UsbDisconnected);
+            }
             let end = (offset + BULK_MAX_PACKET_SIZE as usize).min(data.len());
             self.write_ep.write(&data[offset..end]).await?;
             offset = end;
@@ -500,6 +520,8 @@ impl<'d, D: Driver<'d>> CcidTransport<'d, D> {
 
     /// Handle `PC_TO_RDR_ICCPOWERON`: respond with ATR in a DataBlock.
     async fn handle_power_on(&mut self, seq: u8) -> Result<(), CcidError> {
+        // A card power cycle ends the session: no authentication survives it.
+        crate::bump_session_epoch();
         self.card_powered = true;
         let hdr = self.build_data_block_header(seq, ATR.len() as u32);
         // Header and ATR must be in one buffer so they go in a single USB bulk
@@ -515,6 +537,7 @@ impl<'d, D: Driver<'d>> CcidTransport<'d, D> {
 
     /// Handle `PC_TO_RDR_ICCPOWEROFF`: respond with SlotStatus.
     async fn handle_power_off(&mut self, seq: u8) -> Result<(), CcidError> {
+        crate::bump_session_epoch();
         self.card_powered = false;
         // bStatus = 0x01: ICC present but no longer active
         let resp = self.build_slot_status(seq, 0x01, ERROR_OK);

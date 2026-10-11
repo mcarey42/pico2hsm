@@ -80,6 +80,18 @@ pub const WATCHDOG_STALL_LIMIT: u32 = 20;
 pub static WATCHDOG_SUPPRESS: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
+/// Host session counter.  Bumped when the host session ends — USB bus
+/// reset / deconfiguration (core0's USB handler) or a CCID card power cycle
+/// (IccPowerOn/Off).  Core1 clears all authentication state before the
+/// first APDU of a new session; core0 drops any response computed for an
+/// older one instead of sending it into the new session.
+pub static SESSION_EPOCH: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// Start a new host session (see [`SESSION_EPOCH`]).
+pub fn bump_session_epoch() {
+    SESSION_EPOCH.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+}
+
 /// Holds [`WATCHDOG_SUPPRESS`] set for its lifetime and clears it on drop,
 /// so every return path (including `?` and early returns) re-arms the
 /// stall detector.

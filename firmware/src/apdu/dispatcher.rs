@@ -399,6 +399,39 @@ impl Dispatcher {
         out
     }
 
+    /// End the host session: drop every applet's authentication state and the
+    /// selection, as a real card does on reset / power cycle.  Keys and
+    /// persisted state are untouched (no reload needed).
+    pub fn clear_session(&mut self) {
+        self.active = ActiveProtocol::None;
+        self.shared_buf.invalidate();
+        let sc = &mut self.sc_hsm.state;
+        sc.pin_verified = false;
+        sc.so_pin_verified = false;
+        sc.session_pin = None;
+        sc.challenge = None;
+        sc.current_key_id = None;
+        sc.current_algo = None;
+        sc.current_se_op = None;
+        sc.exchange_ephem_priv = None;
+        sc.exchange_ephem_pub = None;
+        sc.exchange_challenge = None;
+        sc.exchange_peer_ephem_pub = None;
+        sc.op_buf.invalidate();
+        #[cfg(feature = "applet-piv")]
+        {
+            let piv = &mut self.piv.state;
+            piv.pin_verified = false;
+            piv.pin_state.session_authenticated = false;
+            piv.mgmt_key_authenticated = false;
+            piv.mgmt_challenge = None;
+        }
+        let pgp = &mut self.openpgp.state;
+        pgp.pw1_verified_sign = false;
+        pgp.pw1_verified_other = false;
+        pgp.pw3_verified = false;
+    }
+
     /// Route a SELECT-by-AID command and return the appropriate FCI response.
     fn select_aid(&mut self, aid: &[u8]) -> ApduResponse {
         // SC-HSM AID
@@ -652,5 +685,31 @@ mod tests {
             )
         };
         assert!(!bytes.windows(32).any(|w| w == pattern));
+    }
+
+    #[test]
+    fn clear_session_drops_all_authentication() {
+        let mut slot = core::mem::MaybeUninit::<Dispatcher>::uninit();
+        let d = Dispatcher::init_in_place(&mut slot);
+        d.active = ActiveProtocol::ScHsm;
+        d.sc_hsm.state.pin_verified = true;
+        d.sc_hsm.state.so_pin_verified = true;
+        d.sc_hsm.state.session_pin = Some([1; 8]);
+        #[cfg(feature = "applet-piv")]
+        {
+            d.piv.state.pin_verified = true;
+            d.piv.state.mgmt_key_authenticated = true;
+        }
+        d.openpgp.state.pw1_verified_sign = true;
+        d.openpgp.state.pw3_verified = true;
+
+        d.clear_session();
+
+        assert_eq!(d.active, ActiveProtocol::None);
+        assert!(!d.sc_hsm.state.pin_verified && !d.sc_hsm.state.so_pin_verified);
+        assert!(d.sc_hsm.state.session_pin.is_none());
+        #[cfg(feature = "applet-piv")]
+        assert!(!d.piv.state.pin_verified && !d.piv.state.mgmt_key_authenticated);
+        assert!(!d.openpgp.state.pw1_verified_sign && !d.openpgp.state.pw3_verified);
     }
 }

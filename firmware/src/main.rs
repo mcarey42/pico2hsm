@@ -351,8 +351,16 @@ fn dispatcher_loop(ptr_wrapper: DispatcherPtr) -> ! {
     // lifetime of the firmware (backed by StaticCell in BSS).
     let dispatcher = unsafe { &mut *dispatcher_ptr };
 
+    let mut session = pico2hsm_firmware::SESSION_EPOCH.load(core::sync::atomic::Ordering::SeqCst);
     loop {
         let mut apdu_bytes = blocking_receive(&APDU_CHANNEL);
+        // A new host session (USB reset/deconfigure or card power cycle)
+        // must not inherit PIN/key authentication from the previous one.
+        let now = pico2hsm_firmware::SESSION_EPOCH.load(core::sync::atomic::Ordering::SeqCst);
+        if now != session {
+            dispatcher.clear_session();
+            session = now;
+        }
         // No defmt logging inside the receive loop.  All embassy_rp TRACE logs
         // from Core0 fill the RTT buffer rapidly; any defmt write from Core1
         // here would block on BLOCK_IF_FULL mode and deadlock both cores.
@@ -728,17 +736,49 @@ async fn await_core1_response<'d, D: embassy_usb::driver::Driver<'d>>(
 }
 
 /// Send a response to the host, then wipe its data: responses can carry
-/// secrets (decrypted plaintext, ECDH output, wrapped keys).
+/// secrets (decrypted plaintext, ECDH output, wrapped keys).  Dropped
+/// unsent if the host session changed while the command ran.
 #[cfg(target_arch = "arm")]
 async fn send_and_wipe<'d, D: embassy_usb::driver::Driver<'d>>(
     ccid: &mut pico2hsm_firmware::transport::CcidTransport<'d, D>,
     response: &mut heapless::Vec<u8, 4098>,
+    epoch: u32,
 ) -> Result<(), pico2hsm_firmware::transport::ccid::CcidError> {
-    let result = ccid.send_response(response).await;
+    // A response computed for a previous host session must not be delivered
+    // into the new one (it would answer the new session's first command).
+    let current = pico2hsm_firmware::SESSION_EPOCH.load(core::sync::atomic::Ordering::SeqCst);
+    let result = if current == epoch {
+        ccid.send_response(response).await
+    } else {
+        Ok(())
+    };
     // Keep the trailing SW (not secret): display boards show status from it.
     let data_len = response.len().saturating_sub(2);
     zeroize::Zeroize::zeroize(&mut response[..data_len]);
     result
+}
+
+/// Ends the host session on USB bus reset or deconfiguration (see
+/// `SESSION_EPOCH`).  embassy-rp endpoints never report `Disabled`, so this
+/// is the only reliable signal that the host went away.
+#[cfg(target_arch = "arm")]
+struct UsbSessionHandler;
+
+/// The board's USB session handler (one board runner runs per boot).
+#[cfg(target_arch = "arm")]
+static USB_SESSION_HANDLER: StaticCell<UsbSessionHandler> = StaticCell::new();
+
+#[cfg(target_arch = "arm")]
+impl embassy_usb::Handler for UsbSessionHandler {
+    fn reset(&mut self) {
+        pico2hsm_firmware::bump_session_epoch();
+    }
+
+    fn configured(&mut self, configured: bool) {
+        if !configured {
+            pico2hsm_firmware::bump_session_epoch();
+        }
+    }
 }
 
 /// Core1 is stuck: tell the host (SW 6F00) and reset the whole chip.
@@ -843,6 +883,7 @@ async fn run_one_board(p: embassy_rp::Peripherals) {
 
     // Register the CCID class — allocates bulk-OUT, bulk-IN, interrupt-IN
     // endpoints and embeds the 54-byte CCID class descriptor.
+    builder.handler(USB_SESSION_HANDLER.init(UsbSessionHandler));
     let mut ccid = CcidTransport::new(&mut builder);
 
     // CDC-ACM serial logger — /dev/ttyACMx for daemon diagnostics + debug.
@@ -904,6 +945,8 @@ async fn run_one_board(p: embassy_rp::Peripherals) {
             loop {
                 match ccid.recv_apdu().await {
                     Ok(apdu_bytes) => {
+                        let epoch = pico2hsm_firmware::SESSION_EPOCH
+                            .load(core::sync::atomic::Ordering::SeqCst);
                         board.led().set_status(LedStatus::Busy);
                         let _ = APDU_CHANNEL.send(apdu_bytes).await;
                         cortex_m::asm::sev(); // wake core1 from WFE
@@ -912,7 +955,7 @@ async fn run_one_board(p: embassy_rp::Peripherals) {
                                 Some(r) => r,
                                 None => watchdog_reset(&mut ccid).await,
                             };
-                        match send_and_wipe(&mut ccid, &mut response).await {
+                        match send_and_wipe(&mut ccid, &mut response, epoch).await {
                             Ok(()) => {
                                 for _ in 0..16 {
                                     pico2hsm_firmware::transport::cdc_serial::drain_one(
@@ -1071,6 +1114,7 @@ async fn run_geek_board(p: embassy_rp::Peripherals) {
 
     // ── CHECKPOINT 5 — CCID class registration ───────────────────────────────
     serial_println!("CCID class register...");
+    builder.handler(USB_SESSION_HANDLER.init(UsbSessionHandler));
     let mut ccid = CcidTransport::new(&mut builder);
     serial_println!("CCID class ok");
 
@@ -1253,6 +1297,8 @@ async fn run_geek_board(p: embassy_rp::Peripherals) {
             loop {
                 match ccid.recv_apdu().await {
                     Ok(apdu_bytes) => {
+                        let epoch = pico2hsm_firmware::SESSION_EPOCH
+                            .load(core::sync::atomic::Ordering::SeqCst);
                         let now = embassy_time::Instant::now();
                         if screensaver == ScreensaverState::Sleeping {
                             screensaver = ScreensaverState::Active;
@@ -1282,7 +1328,7 @@ async fn run_geek_board(p: embassy_rp::Peripherals) {
                                 Some(r) => r,
                                 None => watchdog_reset(&mut ccid).await,
                             };
-                        match send_and_wipe(&mut ccid, &mut response).await {
+                        match send_and_wipe(&mut ccid, &mut response, epoch).await {
                             Ok(()) => {
                                 display_state.status = LedStatus::Ready;
                                 display_state.uptime_secs =
@@ -1486,6 +1532,8 @@ async fn run_pico2_board(p: embassy_rp::Peripherals) {
         &mut control_buf,
     );
 
+    builder.handler(USB_SESSION_HANDLER.init(UsbSessionHandler));
+
     let mut ccid = CcidTransport::new(&mut builder);
 
     // CDC-ACM serial logger — /dev/ttyACMx for daemon diagnostics + debug.
@@ -1545,6 +1593,8 @@ async fn run_pico2_board(p: embassy_rp::Peripherals) {
             loop {
                 match ccid.recv_apdu().await {
                     Ok(apdu_bytes) => {
+                        let epoch = pico2hsm_firmware::SESSION_EPOCH
+                            .load(core::sync::atomic::Ordering::SeqCst);
                         board.led().set_status(LedStatus::Busy);
                         // No defmt logging here — the RTT buffer fills from trace-level
                         // embassy_rp USB logs; any defmt call here blocks Core0 before
@@ -1556,7 +1606,7 @@ async fn run_pico2_board(p: embassy_rp::Peripherals) {
                                 Some(r) => r,
                                 None => watchdog_reset(&mut ccid).await,
                             };
-                        match send_and_wipe(&mut ccid, &mut response).await {
+                        match send_and_wipe(&mut ccid, &mut response, epoch).await {
                             Ok(()) => {
                                 for _ in 0..16 {
                                     pico2hsm_firmware::transport::cdc_serial::drain_one(
@@ -1864,6 +1914,8 @@ async fn run_waveshare_lcd_board(p: embassy_rp::Peripherals) {
         &mut control_buf,
     );
 
+    builder.handler(USB_SESSION_HANDLER.init(UsbSessionHandler));
+
     let mut ccid = CcidTransport::new(&mut builder);
 
     // CDC-ACM serial logger — /dev/ttyACMx for daemon diagnostics + debug.
@@ -1951,6 +2003,8 @@ async fn run_waveshare_lcd_board(p: embassy_rp::Peripherals) {
             loop {
                 match ccid.recv_apdu().await {
                     Ok(apdu_bytes) => {
+                        let epoch = pico2hsm_firmware::SESSION_EPOCH
+                            .load(core::sync::atomic::Ordering::SeqCst);
                         let now = embassy_time::Instant::now();
                         if screensaver == ScreensaverState::Sleeping {
                             screensaver = ScreensaverState::Active;
@@ -2006,7 +2060,7 @@ async fn run_waveshare_lcd_board(p: embassy_rp::Peripherals) {
                                 Some(r) => r,
                                 None => watchdog_reset(&mut ccid).await,
                             };
-                        match send_and_wipe(&mut ccid, &mut response).await {
+                        match send_and_wipe(&mut ccid, &mut response, epoch).await {
                             Ok(()) => {
                                 display_state.status = LedStatus::Ready;
                                 display_state.uptime_secs =
