@@ -21,7 +21,7 @@ _TAG = bytes.fromhex("5FC105")
 
 def _cert_object(size: int) -> bytes:
     """A 70/71/FE certificate container whose total length is ``size``."""
-    pad = size - 4 - 3 - 2 - 4  # 70 82 LL LL, 71 01 00, FE 00, cert TLV header
+    pad = size - 4 - 3 - 2  # 70 82 LL LL, 71 01 00, FE 00
     cert = bytes((i * 7 + 3) & 0xFF for i in range(pad))
     inner = b"\x70\x82" + len(cert).to_bytes(2, "big") + cert + b"\x71\x01\x00\xFE\x00"
     assert len(inner) == size
