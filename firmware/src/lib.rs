@@ -25,6 +25,7 @@
 pub mod allocator;
 pub mod apdu;
 pub mod crypto;
+pub mod domain;
 pub mod protocol;
 pub mod security;
 pub mod serial_debug;

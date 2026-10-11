@@ -38,6 +38,21 @@
 //!         [12..16] CRC-32 of (seq LE || [0..12])
 //! ```
 //!
+//! A second record kind holds the domain **Lamport counter** (cluster plan
+//! V3 §6.1), the `u64` that numbers every local change:
+//!
+//! ```text
+//! lamport [0] 0x4C 'L'   [1] counter id (1)   [2..4] 0x00
+//!         [4..12] value (u64 LE)
+//!         [12..16] CRC-32 of (seq LE || [0..12])
+//! ```
+//!
+//! It never goes down ([`RetryCounterBackend::put_lamport`] refuses a lower
+//! value) and is carried over when a full sector is rotated, exactly like
+//! the credential states.  Firmware from before the counter skips these
+//! records (unknown tag) and drops them at its next rotation, which only a
+//! downgrade can cause (rollback is out of scope, plan §2).
+//!
 //! Records carry absolute values, so the last valid record per credential
 //! is its state and a duplicated record is harmless.  The record CRC is
 //! bound to the sector's sequence number.  The active sector is the one
@@ -197,6 +212,14 @@ pub trait RetryCounterBackend {
 
     /// Initialise an unformatted log with `seeds` (migration only).
     fn format(&mut self, seeds: &[(Credential, CounterState)]) -> Result<(), StorageError>;
+
+    /// The persisted domain Lamport counter (0 if never written).
+    fn lamport(&mut self) -> Result<u64, StorageError>;
+
+    /// Durably set the Lamport counter to `value`.  Refuses to lower it
+    /// (`IntegrityFailure`); writing the current value is a no-op.
+    /// Returns only once the record is on flash.
+    fn put_lamport(&mut self, value: u64) -> Result<(), StorageError>;
 }
 
 // ─── Applet-facing helpers ───────────────────────────────────────────────────
@@ -258,6 +281,26 @@ pub fn set(store: &mut dyn KeyStore, cred: Credential, remaining: u8) -> Result<
     Ok(())
 }
 
+/// The persisted domain Lamport counter (cluster plan V3 §6.1).
+pub fn lamport(store: &mut dyn KeyStore) -> Result<u64, HsmError> {
+    Ok(backend(store)?.lamport()?)
+}
+
+/// Number a local change: `max(counter, seen) + 1`, durably on flash
+/// *before* this returns, so the change it numbers can only follow it.
+/// `seen` is the highest version observed in a record from another member
+/// (0 until records are imported, P3).  Overflow fails closed.
+pub fn advance_lamport(store: &mut dyn KeyStore, seen: u64) -> Result<u64, HsmError> {
+    let log = backend(store)?;
+    let next = log
+        .lamport()?
+        .max(seen)
+        .checked_add(1)
+        .ok_or(HsmError::Storage(StorageError::WriteError))?;
+    log.put_lamport(next)?;
+    Ok(next)
+}
+
 // ─── Flash access ────────────────────────────────────────────────────────────
 
 /// Raw access to the counter region.  Offsets are relative to its start.
@@ -278,6 +321,10 @@ pub const SLOTS_PER_SECTOR: u16 = (pico2hsm_core::flash::SECTOR_SIZE / SLOT_SIZE
 const HEADER_MAGIC: [u8; 4] = *b"P2RC";
 const FORMAT_VERSION: u8 = 1;
 const RECORD_TAG: u8 = 0x52;
+/// Tag of a Lamport-counter record.
+const LAMPORT_TAG: u8 = 0x4C;
+/// Counter id of the domain Lamport counter (the only one so far).
+const LAMPORT_DOMAIN: u8 = 0x01;
 /// Program attempts (each in a new slot) before a write is reported failed.
 const WRITE_ATTEMPTS: usize = 3;
 
@@ -332,6 +379,28 @@ fn decode_record(seq: u32, b: &[u8; SLOT_SIZE]) -> Option<(Credential, CounterSt
     Some((Credential::from_id(b[1])?, state))
 }
 
+fn encode_lamport(seq: u32, value: u64) -> [u8; SLOT_SIZE] {
+    let mut b = [0u8; SLOT_SIZE];
+    b[0] = LAMPORT_TAG;
+    b[1] = LAMPORT_DOMAIN;
+    b[4..12].copy_from_slice(&value.to_le_bytes());
+    let c = crc(Some(seq), &b[0..12]);
+    b[12..16].copy_from_slice(&c.to_le_bytes());
+    b
+}
+
+fn decode_lamport(seq: u32, b: &[u8; SLOT_SIZE]) -> Option<u64> {
+    if b[0] != LAMPORT_TAG
+        || b[1] != LAMPORT_DOMAIN
+        || b[12..16] != crc(Some(seq), &b[0..12]).to_le_bytes()
+    {
+        return None;
+    }
+    let mut v = [0u8; 8];
+    v.copy_from_slice(&b[4..12]);
+    Some(u64::from_le_bytes(v))
+}
+
 fn is_erased(b: &[u8]) -> bool {
     b.iter().all(|&x| x == 0xFF)
 }
@@ -359,6 +428,8 @@ pub struct CounterLog<F: CounterFlash> {
     /// Next header `seq` to commit (above every one ever seen or tried).
     next_seq: u32,
     entries: [Option<CounterState>; MAX_CREDENTIALS],
+    /// The domain Lamport counter (`None`: never written).
+    lamport: Option<u64>,
 }
 
 impl<F: CounterFlash> CounterLog<F> {
@@ -370,6 +441,7 @@ impl<F: CounterFlash> CounterLog<F> {
             state: LogState::Failed,
             next_seq: 1,
             entries: [None; MAX_CREDENTIALS],
+            lamport: None,
         };
         log.state = log.scan().unwrap_or(LogState::Failed);
         log
@@ -412,6 +484,10 @@ impl<F: CounterFlash> CounterLog<F> {
             head = slot + 1;
             if let Some((cred, state)) = decode_record(seq, &b) {
                 self.entries[cred.index()] = Some(state);
+            } else if let Some(v) = decode_lamport(seq, &b) {
+                // Monotonic: a torn-then-rewritten history can only hold
+                // values in increasing order, but never trust that.
+                self.lamport = Some(self.lamport.map_or(v, |old| old.max(v)));
             }
         }
         Ok(LogState::Active { sector, seq, head })
@@ -439,6 +515,7 @@ impl<F: CounterFlash> CounterLog<F> {
         sector: u32,
         seq: u32,
         entries: &[Option<CounterState>; MAX_CREDENTIALS],
+        lamport: Option<u64>,
     ) -> Result<u16, StorageError> {
         self.flash.erase_sector(sector)?;
         for slot in 0..SLOTS_PER_SECTOR {
@@ -453,6 +530,10 @@ impl<F: CounterFlash> CounterLog<F> {
                 slot += 1;
             }
         }
+        if let Some(v) = lamport {
+            self.program_slot(sector, slot, &encode_lamport(seq, v))?;
+            slot += 1;
+        }
         // The commit point: until this header reads back valid, the sector
         // is ignored and the previous one stays authoritative.
         self.program_slot(sector, 0, &encode_header(seq))?;
@@ -464,6 +545,7 @@ impl<F: CounterFlash> CounterLog<F> {
         &mut self,
         avoid: Option<u32>,
         entries: &[Option<CounterState>; MAX_CREDENTIALS],
+        lamport: Option<u64>,
     ) -> Result<(), StorageError> {
         let start = avoid.map_or(0, |a| a + 1);
         let mut last = Err(StorageError::WriteError);
@@ -476,9 +558,10 @@ impl<F: CounterFlash> CounterLog<F> {
             // header behind: never reuse its seq.
             let seq = self.next_seq;
             self.next_seq = seq.checked_add(1).ok_or(StorageError::WriteError)?;
-            match self.write_sector(sector, seq, entries) {
+            match self.write_sector(sector, seq, entries, lamport) {
                 Ok(head) => {
                     self.entries = *entries;
+                    self.lamport = lamport;
                     self.state = LogState::Active { sector, seq, head };
                     return Ok(());
                 }
@@ -521,7 +604,7 @@ impl<F: CounterFlash> RetryCounterBackend for CounterLog<F> {
                 // the next sector.
                 let mut entries = self.entries;
                 entries[i] = Some(new);
-                return self.commit(Some(sector), &entries);
+                return self.commit(Some(sector), &entries, self.lamport);
             }
             // Whatever happens, this slot is used up (a torn write leaves
             // it neither erased nor valid).
@@ -557,7 +640,56 @@ impl<F: CounterFlash> RetryCounterBackend for CounterLog<F> {
         for (cred, state) in seeds {
             entries[cred.index()] = Some(*state);
         }
-        self.commit(None, &entries)
+        self.commit(None, &entries, None)
+    }
+
+    fn lamport(&mut self) -> Result<u64, StorageError> {
+        match self.state {
+            LogState::Active { .. } => Ok(self.lamport.unwrap_or(0)),
+            LogState::Unformatted => Err(StorageError::NotFormatted),
+            LogState::Failed => Err(StorageError::ReadError),
+        }
+    }
+
+    fn put_lamport(&mut self, value: u64) -> Result<(), StorageError> {
+        if let Some(old) = self.lamport {
+            if value < old {
+                return Err(StorageError::IntegrityFailure);
+            }
+            if value == old && matches!(self.state, LogState::Active { .. }) {
+                return Ok(());
+            }
+        }
+        let mut attempts = 0;
+        loop {
+            let LogState::Active { sector, seq, head } = self.state else {
+                return Err(match self.state {
+                    LogState::Unformatted => StorageError::NotFormatted,
+                    _ => StorageError::ReadError,
+                });
+            };
+            if head >= SLOTS_PER_SECTOR {
+                let entries = self.entries;
+                return self.commit(Some(sector), &entries, Some(value));
+            }
+            self.state = LogState::Active {
+                sector,
+                seq,
+                head: head + 1,
+            };
+            match self.program_slot(sector, head, &encode_lamport(seq, value)) {
+                Ok(()) => {
+                    self.lamport = Some(value);
+                    return Ok(());
+                }
+                Err(e) => {
+                    attempts += 1;
+                    if attempts >= WRITE_ATTEMPTS {
+                        return Err(e);
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -578,6 +710,10 @@ pub struct MemCounters {
     pub attempts: usize,
     /// Report "not yet formatted" until `format` is called.
     pub unformatted: bool,
+    /// The Lamport counter.
+    pub lamport: u64,
+    /// Fail every `put_lamport`.
+    pub fail_lamport: bool,
 }
 
 impl MemCounters {
@@ -623,6 +759,24 @@ impl RetryCounterBackend for MemCounters {
             self.entries[cred.index()] = Some(*state);
         }
         self.unformatted = false;
+        Ok(())
+    }
+
+    fn lamport(&mut self) -> Result<u64, StorageError> {
+        if self.unformatted {
+            return Err(StorageError::NotFormatted);
+        }
+        Ok(self.lamport)
+    }
+
+    fn put_lamport(&mut self, value: u64) -> Result<(), StorageError> {
+        if self.unformatted || self.fail_lamport {
+            return Err(StorageError::WriteError);
+        }
+        if value < self.lamport {
+            return Err(StorageError::IntegrityFailure);
+        }
+        self.lamport = value;
         Ok(())
     }
 }
@@ -798,6 +952,60 @@ mod tests {
             allowance: 3,
         };
         assert_eq!(s.after_failure(), None);
+    }
+
+    // ── Lamport counter ─────────────────────────────────────────────────
+
+    #[test]
+    fn lamport_persists_and_never_goes_down() {
+        let mut log = formatted();
+        assert_eq!(log.lamport(), Ok(0));
+        log.put_lamport(5).unwrap();
+        log.put(PIN, CounterState::fresh(3)).unwrap();
+        log.put_lamport(7).unwrap();
+        assert_eq!(log.put_lamport(6), Err(StorageError::IntegrityFailure));
+        let mut again = reopen(&mut log);
+        assert_eq!(again.lamport(), Ok(7));
+        assert_eq!(again.get(PIN), Ok(Some(CounterState::fresh(3))));
+        let programs = again.flash_mut().programs;
+        again.put_lamport(7).unwrap();
+        assert_eq!(again.flash_mut().programs, programs, "same value: no write");
+    }
+
+    #[test]
+    fn lamport_survives_sector_rotation() {
+        let mut log = formatted();
+        log.put(PIN, CounterState::fresh(3)).unwrap();
+        // Several sectors' worth of increments.
+        for v in 1..=(3 * u64::from(SLOTS_PER_SECTOR)) {
+            log.put_lamport(v).unwrap();
+        }
+        let n = 3 * u64::from(SLOTS_PER_SECTOR);
+        let mut again = reopen(&mut log);
+        assert_eq!(again.lamport(), Ok(n));
+        assert_eq!(again.get(PIN), Ok(Some(CounterState::fresh(3))));
+        // A credential write that rotates keeps the counter too.
+        for _ in 0..SLOTS_PER_SECTOR {
+            let s = again.get(PIN).unwrap().unwrap().after_reset(3);
+            again.put(PIN, s.after_failure().unwrap()).unwrap();
+        }
+        assert_eq!(reopen(&mut again).lamport(), Ok(n));
+    }
+
+    #[test]
+    fn torn_lamport_record_keeps_the_previous_value() {
+        let mut log = formatted();
+        log.put_lamport(3).unwrap();
+        log.flash_mut().program_budget = Some(5);
+        assert!(log.put_lamport(4).is_err());
+        assert_eq!(reopen(&mut log).lamport(), Ok(3));
+    }
+
+    #[test]
+    fn unformatted_log_has_no_counter() {
+        let mut log = open(SimFlash::new());
+        assert_eq!(log.lamport(), Err(StorageError::NotFormatted));
+        assert_eq!(log.put_lamport(1), Err(StorageError::NotFormatted));
     }
 
     // ── Log format ──────────────────────────────────────────────────────

@@ -1,6 +1,6 @@
 # pico2hsm Domains and Multi-Way Sync: Design Plan V3
 
-*Supersedes the domain, enrollment and sync parts of `CLUSTER_PLAN_V2.md`. The V2 DKEK exchange (§1) is kept and generalised. Date: 2026-10-11. Status: approved by the owner on 2026-10-11 (§12). P0 is merged and verified on hardware (single device, 2026-10-11).*
+*Supersedes the domain, enrollment and sync parts of `CLUSTER_PLAN_V2.md`. The V2 DKEK exchange (§1) is kept and generalised. Date: 2026-10-11. Status: approved by the owner on 2026-10-11 (§12). P0 is merged and verified on hardware (single device, 2026-10-11). P1 is implemented on `feat/p1-foundations` (host tests pass; hardware run pending); the format decisions it made are folded into §4, §6 and §8 below and listed in §11a.*
 
 ---
 
@@ -33,9 +33,9 @@ The production daemon is a new `pico2hsm-syncd` crate in the `pico2hsm-tool` rep
 | DKEK from shares (`KEY DOMAIN` P1=00, raw 32-byte share) | Works with `sc-hsm-tool --import-dkek-share`. Needs no PIN (A-01). The DKEK is persisted at key ref 0xFD and never overwritten while it is set. |
 | Device identity | A static P-256 key derived from the OTP identity key (`HKDF(otp_identity, "pico2hsm-noise-static-v1")`). Readable with `0x54/P1=30`. |
 | Device-to-device DKEK transfer (`0x54/P1=35–38`) | Mutually authenticated. Uses ephemeral ECDH, signatures over a challenge from the target, and AES-GCM with AAD = the target's static key. Needs the SO-PIN on both devices. |
-| Peer enrollment (`0x54/P1=3D`) | **One** peer slot (0xFC). |
-| Generation counter | `u64` held **in RAM only**; it is reset on every boot. |
-| `GET_KEY_MANIFEST` (`0x54/P1=39`) | At most 32 entries; needs the user PIN. |
+| Peer enrollment (`0x54/P1=3D`) | **One** peer slot (0xFC). *P1: replaced by a single-use pinned peer (§4.4); a 0xFC record migrates to it at boot.* |
+| Generation counter | `u64` held **in RAM only**; it is reset on every boot. *P1: the persisted Lamport counter (§6.1).* |
+| `GET_KEY_MANIFEST` (`0x54/P1=39`) | At most 32 entries; needs the user PIN. *P1: paged, no cap, optional object IDs (§8).* |
 | `GET_STATE_HASH` (`0x54/P1=3A`) | A SHA-256 root over the keys; no on-device signature. |
 | WRAP / UNWRAP (`0x72` / `0x74`) | **CardContact key blob** (P0, `feat/p0-cardcontact-wrap`): KCV = SHA-256(DKEK)[0..8], AES-256-CBC + AES-CMAC under SHA-256(DKEK‖counter) keys; EC P-256/384/521 and secp256k1, RSA (CRT out; CRT and plain in), AES; algorithm list in the blob's field. Known-answer tests against an independent Python reference and against pico-hsm's own `kek.c`. The old pico2hsm v2/v3 blobs still UNWRAP (deprecated, one release). KEY DOMAIN status/KCV follow OpenSC. Layout: `SC_HSM_APDU_REFERENCE.md` §3.32. |
 | Tombstones | Designed in V2 §2d but not implemented. |
@@ -98,11 +98,13 @@ Everything else depends on this layer, and it is also the main gap against the o
 Every member derives the same **domain signing key** from the DKEK:
 
 ```
-seed      = HKDF-SHA256(ikm = DKEK, salt = "pico2hsm-domain-v1", info = "sign")
-d_domain  = hash-to-scalar(seed)        # P-256; RFC 9380 hash_to_field, or retry on out-of-range
-Q_domain  = d_domain · G
+okm       = HKDF-SHA256(ikm = DKEK, salt = "pico2hsm-domain-v1", info = "sign", L = 48)
+d_domain  = OS2IP(okm) mod n            # P-256 order n; d = 0 is refused (p = 2^-256)
+Q_domain  = d_domain · G                # 65-byte uncompressed SEC1
 domain_id = SHA-256(Q_domain)[0..16]
 ```
+
+*As implemented in P1:* reducing 48 bytes mod n is the `hash_to_field` reduction of RFC 9380 §5.2 (L = 48 for P-256) with HKDF-Expand as the expander, so no retry loop is needed and every member gets the same key. Firmware: `firmware/src/domain/key.rs`; independent reference: `tools/python/pico2hsm/domain.py`; known answers: `firmware/tests/vectors/domain_v1.txt`.
 
 - Any member can issue domain signatures. Anyone holding `Q_domain` can verify them.
 - `domain_id` names the domain. Devices with different DKEKs can never agree on it by accident.
@@ -112,27 +114,32 @@ domain_id = SHA-256(Q_domain)[0..16]
 Each device's member key is the existing static identity key, `HKDF(otp_identity, "pico2hsm-noise-static-v1")`. On an unprovisioned debug board it comes from the development identity, and the device reports that it is in development mode.
 
 ### 4.3 Member certificate
-A member certificate is a fixed-format record; X.509 is not needed:
+A member certificate is a fixed-format record of 187 bytes; X.509 is not needed:
 
 ```
 MemberCert {
   version        u8      = 1
   domain_id      [16]
+  member_id      [16]    // SHA-256(member_pub)[0..16]
   member_pub     [65]    // uncompressed P-256
-  member_serial  u32     // per-domain sequence number, assigned by the sponsor
-  sponsor_pub    [65]    // the member that enrolled it
-  issued_lamport u64     // see §6.1
-  flags          u8      // bit0 = may sponsor others
-  sig_domain     [64]    // ECDSA(d_domain) over SHA-256 of all preceding fields
+  sponsor_id     [16]    // member ID of the issuer; = member_id when self-issued
+  issued_lamport u64 BE  // the issuer's Lamport counter, see §6.1
+  flags          u8      // bit0 = may sponsor others (default on, §12.3)
+  sig_domain     [64]    // ECDSA-P256(d_domain), r||s, over
+                         // SHA-256("pico2hsm-member-cert-v1" || all preceding fields)
 }
 ```
 
 Because the certificate is signed with the **domain** key, a device enrolled through B is accepted by A without A ever having seen B's enrollment.
 
+**Member IDs instead of serials (P1 decision).** The draft used a sponsor-assigned `member_serial u32`. Two devices that form a domain independently from the same shares (§5.1, §5.3) would both give themselves serial 1, and a sponsor-plus-counter serial needs coordination a partitioned domain does not have. A member is therefore named by `member_id = SHA-256(member_pub)[0..16]`: derived, collision-free at 128 bits, the same in every certificate issued for that device (so a re-issue or a second sponsor never creates a second identity), and checkable by anyone who holds the certificate. Everything that said `member_serial` now carries the 16-byte `member_id` (§6.1, §6.3, §6.4, §8). The signature input begins with a context string so that no other message the domain key signs can be replayed as a certificate.
+
 ### 4.4 Member list on the device
-- Replace the single peer slot 0xFC with a **member list**: up to 32 certificates at about 260 bytes each, stored as one keystore object in the reserved range.
+- Replace the single peer slot 0xFC with a **member list**: up to 32 entries, one keystore object per slot in the domain namespace (`KeyId` partition 0xD0, applet 0x10, kind 0x01, slot), filled densely from slot 0. An entry is 197 bytes: `version(1) = 1 | status(1) (0 active, 1 revoked) | revoked_lamport(8 BE) | MemberCert(187)`. (One object for the whole list would exceed the keystore's 2400-byte object limit.)
 - Revoked members stay in the list, marked as tombstoned (§6.4).
-- `ENROLL_PEER_PUBKEY` (P1=3D) remains for operator-pinned bootstrap only (§5.2).
+- `ENROLL_PEER_PUBKEY` (P1=3D) remains for operator-pinned bootstrap only (§5.2). It now **pins** the peer for one exchange (record `KeyId` 0xD010_0200): SOURCE spends the pin before it releases the encrypted DKEK (step 3), TARGET before it installs it (step 4); failed steps keep it. A peer enrolled in the old permanent slot 0xFC is moved into the pin at boot and 0xFC is erased (the reference stays reserved).
+- **Self certificate.** A device that holds the DKEK and has no member list issues its own certificate (sponsor = itself, may sponsor, `issued_lamport` = a freshly advanced counter): when the last share is imported, when an exchange installs the DKEK, and at boot for a device that held a DKEK before this firmware. With member IDs (§4.3) two devices formed independently never clash; P2's sponsor-issued certificate for a joiner replaces the joiner's self certificate by member ID.
+- SC-HSM INITIALIZE wipes the whole domain namespace (member list, sidecars, pin) together with the DKEK; the Lamport counter is never reset.
 
 ## 5. Enrollment
 
@@ -140,7 +147,7 @@ Because the certificate is signed with the **domain** key, a device enrolled thr
 - **Option A:** `sc-hsm-tool --initialize --dkek-shares N`, then `--import-dkek-share` ×N. This is the standard path and keeps the shares as the offline backup.
 - **Option B:** `pico2hsm-tool domain create` generates the DKEK on the device and requires the operator to export N shares in the `sc-hsm-tool` share-file format before the domain becomes usable. The firmware support for this would be new.
 
-Either way, the device then issues its own member certificate (serial 1) and reports `domain_id` and the KCV.
+Either way, the device then issues its own member certificate (self-sponsored, §4.4) and reports `domain_id` and the KCV.
 
 ### 5.2 Joining a device (sponsor S, joiner J)
 1. The operator authenticates with the SO-PIN on both devices.
@@ -165,15 +172,18 @@ After a device holds a DKEK and a member certificate, raw share import stays ref
 ## 6. Object model
 
 ### 6.1 Versions
-- Each device keeps a **persisted Lamport counter** (`u64`), which replaces the RAM-only generation counter. It is stored in the retry-counter log region or in its own small log, written before the change it numbers.
+- Each device keeps a **persisted Lamport counter** (`u64`), which replaces the RAM-only generation counter. It is written before the change it numbers.
+  - *P1:* it is a second record kind in the retry-counter log on internal flash (16-byte record `'L' | id 1 | value u64 LE | CRC-32 bound to the sector sequence`), carried over on sector rotation like the credential states, written through the core1→core0 FlashOp channel. `put_lamport` refuses a lower value. A command whose counter record cannot be written is refused with 6581 and changes nothing.
+  - Numbered commands (P1): GENERATE KEY PAIR, GENERATE KEY, UNWRAP/IMPORT KEY, DELETE FILE, WRITE DATA, UPDATE BINARY — when the user PIN or SO-PIN is verified (unauthenticated APDUs cannot wear the log); the self certificate (§4.4). A refused command leaves a gap, which is harmless. INITIALIZE does not reset it.
 - On any local change: `counter = max(counter, highest version seen) + 1`.
-- Version = (counter, member_serial); the member serial breaks ties.
+- Version = (counter, member_id); the member ID breaks ties (byte-wise comparison).
 - Wall-clock time is never used for ordering. Only the daemon uses it, for garbage-collection timers.
 
 ### 6.2 Global object ID
-- **Asymmetric keys:** SHA-256 of the public key, truncated to 20 bytes. This matches how OpenSC derives CKA_ID, so a key keeps the same CKA_ID on every member.
-- **Symmetric keys and plain files (certificates, data objects):** a random 16-byte ID assigned when the object is created.
+- **Asymmetric keys:** the intrinsic CKA_ID OpenSC computes (`sc_pkcs15init_select_intrinsic_id`, `pkcs15-id-style = mozilla` from `pkcs15.profile`): **SHA-1 of the X coordinate** for EC keys and **SHA-1 of the modulus** for RSA, 20 bytes. *(Corrected in P1: the draft said SHA-256 truncated to 20 bytes, which is not what OpenSC 0.25 does. The ID is only a name; record integrity comes from signatures, and only a member could try to collide two IDs.)* It is computed from the public key on demand and never stored, so existing keys need no migration.
+- **Symmetric keys and standalone files (CD/DCOD descriptors, CA certificates, data objects: prefixes C8, C9, CA, CD, CF):** a random 16-byte ID assigned when the object is created (GENERATE KEY, UNWRAP of an AES key, first write of the EF) and kept in the object's sidecar (§6.5). Objects from before P1 get theirs lazily, the first time an authenticated command needs it (`GET_KEY_MANIFEST` v2). A key's PRKD (C4) and EE certificate (CE) travel with the key and have no ID of their own.
 - The one-byte SC-HSM key reference stays local to each device: an importing device picks any free slot and keeps CKA_ID and label in the PKCS#15 descriptor. Two members that each create "slot 3" never collide.
+- **CKA_ID across devices:** an OpenSC-written PRKD (with a caller's `--id`, or the intrinsic ID) is an EF that travels with the key and is served as written. For a key without one, the PRKD the firmware synthesises now carries the intrinsic ID instead of the slot number, so the CKA_ID no longer depends on the slot.
 
 ### 6.3 Sync record
 ```
@@ -182,8 +192,8 @@ SyncRecord {
   domain_id      [16]
   object_id      [20]
   kind           u8       // 1 = key (with certificate/CD/PRKD), 2 = file/EF, 3 = member cert
-  obj_version    (u64 lamport, u32 member_serial)
-  origin_serial  u32      // member that minted this version
+  obj_version    (u64 lamport, [16] member_id)
+  origin_id      [16]     // member ID of the member that minted this version
   meta_len u16, meta      // label, PKCS#15 descriptors, policy summary (public)
   blob_len u16, blob      // CardContact wrapped key (kind 1) or plain file content (kind 2)
   sig_member     [64]     // ECDSA(origin member key) over SHA-256(all preceding fields)
@@ -204,8 +214,8 @@ Imports are idempotent. Equal versions with equal hashes are a no-op. Equal vers
 ```
 Tombstone {
   version u8 = 1, domain_id [16], object_id [20],
-  del_version   (u64, u32)    // must be higher than the version it deletes
-  origin_serial u32
+  del_version   (u64, [16])   // must be higher than the version it deletes
+  origin_id     [16]
   sig_member    [64]
 }
 ```
@@ -221,6 +231,7 @@ Tombstone {
 
 ### 6.5 Where sync state lives on the device
 - Each synced key gains a small sidecar object in the keystore: object_id, version, origin and the record hash, about 64 bytes.
+  - *P1 layout (144 bytes, `KeyId` = the object's partition, applet 0x10, the object's 16-bit local ID):* `version(1)=1 | kind(1) (1 key, 2 file) | id_len(1) | flags(1) | object_id(20, zero-padded) | version(8 BE) | origin member ID(16) | record hash(32) | sig_member(64)`. P1 fills only the first 24 bytes; the rest is reserved for P3, so the format need not change. P1 writes sidecars only for objects with a random ID; asymmetric keys get theirs in P3, when they are first versioned.
 - The signed record is reconstructed when it is exported (§7.4), so wrapped blobs are not stored twice.
   - **Snag:** the origin's signature must be kept, because only the origin can produce it. So the sidecar also stores `sig_member`, making it about 130 bytes.
 - Tombstones and member certificates are keystore objects in their own `KeyId` namespace (new applet ID 0x10 = domain). That needs no format change: the A/B directory and blob encryption already handle it.
@@ -266,14 +277,14 @@ The decision behind importing without a PIN (open question Q1): a fully unattend
 
 | P1 | Name | Auth |
 |---|---|---|
-| 40 | DOMAIN_STATUS: domain_id, KCV, Q_domain, member serial, lamport, mode | none |
+| 40 | DOMAIN_STATUS: domain_id, KCV, Q_domain, own member ID, lamport, mode (P1, layout in `SC_HSM_APDU_REFERENCE.md` §3.29) | none |
 | 41 | GET_STATE (signed root) | none |
 | 42 | GET_BUCKETS / GET_BUCKET(n) | none |
 | 43 | EXPORT_RECORD(object_id), returns a SyncRecord or Tombstone | none |
 | 44 | IMPORT_RECORD (chained or extended APDU) | signature checked on the device |
 | 45 | ISSUE_MEMBER_CERT(member_pub, flags) | SO-PIN, plus a pinned peer from the enrollment just completed |
-| 46 | REVOKE_MEMBER(serial) | SO-PIN |
-| 47 | GET_MEMBERS | none |
+| 46 | REVOKE_MEMBER(member_id) | SO-PIN |
+| 47 | GET_MEMBERS (P1; paged, P2 = first slot) | none |
 | 48 | DOMAIN_CREATE (optional Option B: generate DKEK, export shares) | SO-PIN, right after INITIALIZE |
 | 3A/3C/39/34 | Legacy V1 and V2 calls | Kept for one release, then removed |
 
@@ -326,7 +337,7 @@ crates/
 | Phase | Firmware | Host | Done when |
 |---|---|---|---|
 | **P0 Compatibility** — done; single-device hardware run passed (full suite 343/0 plus the `sc-hsm-tool` interop test); two-device run pending | CardContact wrap format and KCV (§3); compatibility UNWRAP for v0x02/v0x03 | Known-answer vectors in `firmware/tests/vectors/` (Python reference + pico-hsm) for `pico2hsm-proto` to reuse | `sc-hsm-tool` wrap/unwrap round trip across two devices (`tests/hw/test_11_dkek_roundtrip.py::TestCardContactInterop` covers one device) |
-| **P1 Foundations** | Persisted Lamport counter; global IDs and PKCS#15 CKA_ID kept on import; domain key; member list replacing 0xFC; DOMAIN_STATUS | libpico2hsm APDUs; `domain status` | Two devices from the same shares report the same domain_id |
+| **P1 Foundations** — implemented on `feat/p1-foundations` (host tests pass); hardware run pending | Persisted Lamport counter; global IDs and PKCS#15 CKA_ID kept on import; domain key; member list replacing 0xFC; DOMAIN_STATUS | libpico2hsm APDUs; `domain status`; `pico2hsm-proto` (MemberCert, DOMAIN_STATUS decode, shared vectors) | Two devices from the same shares report the same domain_id |
 | **P2 Enrollment** | ISSUE/REVOKE member cert; single-use pinned peer for the existing exchange | `domain enroll` with the short string; `domain revoke` | Enroll C through B, then A accepts C's records |
 | **P3 Records** | Sidecars, EXPORT/IMPORT_RECORD, tombstones, signed GET_STATE, buckets | proto codecs and fuzzing | Create, delete and re-create converge across 3 devices on one host |
 | **P4 Daemon** | (none) | `pico2hsm-syncd` USB mode, then TCP/mTLS, then bundles | 3 devices, one on another host, one sync by bundle only, all converge; partition and heal tests |
@@ -334,6 +345,21 @@ crates/
 | **P6 PIV/OpenPGP** | Per-applet sync opt-in; slot/role records; per-device exclusions (§12a) | `domain applet-sync`; overwrite reporting | `ykman` / `gpg --card-status` show the same keys on every member; signing works on any member |
 
 P0 is useful on its own, since it delivers the compatibility goal, and can ship before the rest.
+
+### 11a. P1 as built (2026-10-11)
+
+| Item | Decision |
+|---|---|
+| Lamport counter | Record kind `'L'` in the retry-counter log (§6.1); 6581 and no change when it cannot be written; read by `0x34`/`0x3C`/`0x3A`/`0x40`. |
+| Member identity | 16-byte `member_id = SHA-256(member_pub)[0..16]` instead of `member_serial` (§4.3); versions tie-break on it. |
+| Asymmetric object ID | OpenSC's intrinsic CKA_ID: SHA-1(x) / SHA-1(n), computed, not stored (§6.2). |
+| Random object IDs | 16 bytes in a 144-byte sidecar, at creation; lazily for older objects (§6.2, §6.5). |
+| Domain key | HKDF-SHA256 → 48 bytes → mod n (RFC 9380 reduction), vectors shared with the host tool (§4.1). |
+| Member list | 32 slot objects of 197 bytes, partition 0xD0 / applet 0x10 (§4.4). |
+| Pinned peer | Single use, spent before the DKEK is released or installed; 0xFC migrates (§4.4). |
+| Self certificate | Issued when the DKEK appears and no list exists; also at boot for older DKEK holders (§4.4). |
+| GET_KEY_MANIFEST | Paged by P2 (first key ref); data `02` adds the object ID per entry (64-byte entries). |
+| Core1 stack | New worst SC-HSM path ≈ 85 KB (manifest v2 with lazy sidecar), below the PIV PUT DATA worst case (≈ 89 KB). |
 
 ## 12. Owner decisions (2026-10-11)
 

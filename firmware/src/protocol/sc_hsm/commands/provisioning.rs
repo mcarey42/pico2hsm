@@ -66,26 +66,24 @@ const OTP_BOOT_FLAGS_ROW: usize = crate::security::otp_layout::BOOT_FLAGS_ROW as
 ///   83 01 [secure_boot_enabled: 0|1]  -- CRIT1 row 0x40 bit 0
 ///   84 01 [glitch_detector_armed: 0|1]
 /// ```
+/// Whether the OTP production-mode flag is set (`false` on the host and
+/// when the row cannot be read).
+pub fn production_mode() -> bool {
+    #[cfg(target_arch = "arm")]
+    {
+        embassy_rp::otp::read_raw_word(OTP_BOOT_FLAGS_ROW)
+            .map(|flags| flags & BOOT_FLAG_PRODUCTION_MODE != 0)
+            .unwrap_or(false)
+    }
+    #[cfg(not(target_arch = "arm"))]
+    {
+        false
+    }
+}
+
 pub fn handle_get_status(_state: &mut ScHsmState, _cmd: &ApduCommand<'_>) -> ApduResponse {
     // Read production mode flag from OTP.
-    let production_mode: u8 = {
-        #[cfg(target_arch = "arm")]
-        {
-            embassy_rp::otp::read_raw_word(OTP_BOOT_FLAGS_ROW)
-                .map(|flags| {
-                    if flags & BOOT_FLAG_PRODUCTION_MODE != 0 {
-                        1
-                    } else {
-                        0
-                    }
-                })
-                .unwrap_or(0)
-        }
-        #[cfg(not(target_arch = "arm"))]
-        {
-            0
-        }
-    };
+    let production_mode = u8::from(production_mode());
 
     // Read JTAG SW flag (bit 0 of the boot flags row).
     let jtag_sw_flag: u8 = {

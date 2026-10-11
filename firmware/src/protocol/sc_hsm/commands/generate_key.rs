@@ -119,7 +119,6 @@ pub fn handle(
         key_flags: 0,
     });
 
-    state.generation = state.generation.wrapping_add(1);
     ApduResponse::ok(&[])
 }
 

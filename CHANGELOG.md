@@ -9,6 +9,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Security and robustness release from the October 2026 audit
 (`docs/AUDIT_2026-10.md` lists every finding with its commit).
 
+### Added — domains, phase P1 (`docs/CLUSTER_PLAN_V3.md` §11a)
+- **Persisted Lamport counter.**  The SC-HSM generation counter is now a
+  `u64` on internal flash (a new record kind in the retry-counter log),
+  advanced before every key or file change it numbers and never reset —
+  not by a reboot, not by INITIALIZE.  A change whose counter cannot be
+  written is refused (6581).  `GET_GENERATION` (0x54/34),
+  `GET_GENERATION_V2` (0x54/3C) and `GET_STATE_HASH` (0x54/3A) report it.
+- **Domain key and DOMAIN_STATUS (0x54/40, no PIN).**  Every device with
+  the same DKEK derives the same P-256 domain key (HKDF-SHA256 from the
+  DKEK) and reports the same `domain_id`, with the KCV, `Q_domain`, its own
+  member ID, the Lamport counter and production/development mode.
+  Independent Python reference `tools/python/pico2hsm/domain.py`; vectors
+  `firmware/tests/vectors/domain_v1.txt` (shared with `pico2hsm-tool`).
+- **Member certificates and list, GET_MEMBERS (0x54/47, no PIN).**  A
+  device that completes a DKEK certifies itself with the domain key; up to
+  32 certificates are kept.  Members are named by
+  `SHA-256(member_pub)[0..16]`, not by a serial number.
+- **Global object IDs.**  EC/RSA keys: OpenSC's intrinsic CKA_ID (SHA-1 of
+  the X coordinate / modulus); AES keys and standalone files: a random
+  16-byte ID in a per-object sidecar, assigned at creation.
+  `GET_KEY_MANIFEST` with data `02` lists them.
+
+### Changed — domains, phase P1
+- **ENROLL_PEER_PUBKEY (0x54/3D) pins the peer for one DKEK exchange**
+  instead of enrolling it permanently in key reference 0xFC; the exchange
+  that completes spends the pin.  A 0xFC enrollment from earlier firmware
+  becomes the pin at the first boot.
+- **GET_KEY_MANIFEST (0x54/39) has no 32-key cap:** paged by P2 (first key
+  reference), each page as large as one response allows (GET RESPONSE
+  chaining).
+- **Synthesised PRKDs carry the intrinsic CKA_ID** (SHA-1 of the public X
+  coordinate or modulus) instead of the key reference, for keys that have
+  no PRKD written by OpenSC — the CKA_ID no longer depends on the slot.
+  PRKDs written by OpenSC (every `pkcs11-tool --keypairgen`) are unchanged.
+- **SC-HSM INITIALIZE also erases the domain records** (member list,
+  object sidecars, pinned peer), which depend on the DKEK it clears.
+
 ### Breaking
 - **WRAP / UNWRAP KEY use the SmartCard-HSM (CardContact) key blob** —
   KCV = SHA-256(DKEK)[0..8], AES-256-CBC under SHA-256(DKEK‖00000001) with

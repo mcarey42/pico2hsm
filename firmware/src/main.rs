@@ -138,6 +138,9 @@ enum FlashOp {
         pico2hsm_firmware::storage::retry_counter::Credential,
         pico2hsm_firmware::storage::retry_counter::CounterState,
     ),
+    /// Append the domain Lamport counter to the same log (internal flash,
+    /// core0 only, every board).
+    PutLamport(u64),
 }
 
 // SAFETY: the only non-Send field is `SaveKey`'s pointer, which core0
@@ -318,6 +321,22 @@ impl pico2hsm_firmware::storage::retry_counter::RetryCounterBackend for Core1Key
     ) -> Result<(), pico2hsm_core::error::StorageError> {
         // Migration runs at boot on core0 only (`init_retry_counters`).
         Err(pico2hsm_core::error::StorageError::WriteError)
+    }
+
+    fn lamport(&mut self) -> Result<u64, pico2hsm_core::error::StorageError> {
+        use pico2hsm_firmware::storage::KeyStore as _;
+        match self.direct().retry_counters() {
+            Some(log) => log.lamport(),
+            None => Err(pico2hsm_core::error::StorageError::NotFormatted),
+        }
+    }
+
+    fn put_lamport(&mut self, value: u64) -> Result<(), pico2hsm_core::error::StorageError> {
+        match Self::on_core0(FlashOp::PutLamport(value)) {
+            Ok(()) => Ok(()),
+            Err(pico2hsm_core::error::HsmError::Storage(e)) => Err(e),
+            Err(_) => Err(pico2hsm_core::error::StorageError::WriteError),
+        }
     }
 }
 
@@ -792,6 +811,14 @@ fn handle_flash_op(
                 pico2hsm_core::error::StorageError::NotFormatted,
             )),
         },
+        FlashOp::PutLamport(value) => match store.retry_counters() {
+            Some(log) => log
+                .put_lamport(value)
+                .map_err(pico2hsm_core::error::HsmError::Storage),
+            None => Err(pico2hsm_core::error::HsmError::Storage(
+                pico2hsm_core::error::StorageError::NotFormatted,
+            )),
+        },
     }
 }
 
@@ -1147,6 +1174,7 @@ async fn run_one_board(p: embassy_rp::Peripherals) {
         use pico2hsm_firmware::storage::KeyStore as _;
         init_retry_counters(store);
         dispatcher_ref.load_keys_from_store(store);
+        dispatcher_ref.migrate_domain(store);
     }
     KEY_COUNT.store(
         dispatcher_ref.in_memory_key_count(),
@@ -1482,6 +1510,7 @@ async fn run_geek_board(p: embassy_rp::Peripherals) {
         use pico2hsm_firmware::storage::KeyStore as _;
         init_retry_counters(store);
         dispatcher_ref.load_keys_from_store(store);
+        dispatcher_ref.migrate_domain(store);
     }
     KEY_COUNT.store(
         dispatcher_ref.in_memory_key_count(),
@@ -1808,6 +1837,7 @@ async fn run_pico2_board(p: embassy_rp::Peripherals) {
         use pico2hsm_firmware::storage::KeyStore as _;
         init_retry_counters(store);
         dispatcher_ref.load_keys_from_store(store);
+        dispatcher_ref.migrate_domain(store);
     }
     KEY_COUNT.store(
         dispatcher_ref.in_memory_key_count(),
@@ -2211,6 +2241,7 @@ async fn run_waveshare_lcd_board(p: embassy_rp::Peripherals) {
         use pico2hsm_firmware::storage::KeyStore as _;
         init_retry_counters(store);
         dispatcher_ref.load_keys_from_store(store);
+        dispatcher_ref.migrate_domain(store);
     }
     KEY_COUNT.store(
         dispatcher_ref.in_memory_key_count(),

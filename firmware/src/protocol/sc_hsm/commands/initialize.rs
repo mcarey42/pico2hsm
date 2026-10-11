@@ -191,6 +191,13 @@ pub fn handle(
     if store.wipe_by_owner(AppletId::ScHsm).is_err() {
         return ApduResponse::err(pico2hsm_core::apdu::SW_MEMORY_FAILURE);
     }
+    // The domain records (member list, object sidecars, pinned peer) go
+    // with the DKEK and the objects they describe.  The Lamport counter
+    // lives in the counter log and is never reset.
+    if store.wipe_by_owner(AppletId::Domain).is_err() {
+        return ApduResponse::err(pico2hsm_core::apdu::SW_MEMORY_FAILURE);
+    }
+    state.domain = None;
 
     // Generate fresh random salts for all credentials.
     let so_salt = gen_salt();
@@ -262,8 +269,8 @@ pub fn handle(
     state.exchange_challenge = None;
     state.exchange_peer_ephem_pub = None;
 
-    // Clear the enrolled peer pubkey (re-enroll with ENROLL_PEER_PUBKEY).
-    state.noise_enrolled_peer_pubkey = None;
+    // Clear the pinned peer (pin again with ENROLL_PEER_PUBKEY).
+    state.pinned_peer = None;
 
     // Generate device identity P-256 keypair for DKEK exchange.
     // Stored at reserved slot 0xFE; public key written to EF 0x2F02.

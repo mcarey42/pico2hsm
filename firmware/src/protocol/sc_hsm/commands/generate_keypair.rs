@@ -641,7 +641,6 @@ pub fn handle(
                 return ApduResponse::err(pico2hsm_core::apdu::SW_MEMORY_FAILURE);
             }
         }
-        state.generation = state.generation.wrapping_add(1);
 
         // Store metadata in key_index (replacing any existing entry with the same key_id)
         state.key_index.retain(|m| m.key_id != key_id);
@@ -700,7 +699,6 @@ pub fn handle(
             return ApduResponse::err(pico2hsm_core::apdu::SW_MEMORY_FAILURE);
         }
     }
-    state.generation = state.generation.wrapping_add(1);
 
     // Store metadata in key_index (replacing any existing entry with the same key_id)
     state.key_index.retain(|m| m.key_id != key_id);

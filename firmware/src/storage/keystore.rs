@@ -287,6 +287,12 @@ impl RetryCounterBackend for NullKeyStore {
     fn format(&mut self, _: &[(Credential, CounterState)]) -> Result<(), StorageError> {
         Ok(())
     }
+    fn lamport(&mut self) -> Result<u64, StorageError> {
+        Ok(0)
+    }
+    fn put_lamport(&mut self, _: u64) -> Result<(), StorageError> {
+        Ok(())
+    }
 }
 
 // ─── HybridKeyStore<P, S> — RAID-1 mirror (primary flash + secondary SD) ─────
