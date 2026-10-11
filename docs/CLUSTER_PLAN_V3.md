@@ -169,6 +169,8 @@ After a device holds a DKEK and a member certificate, raw share import stays ref
 - do the import in one sitting;
 - optional: `pico2hsm-tool` runs INITIALIZE and the share imports in a single card session.
 
+> **Session binding (verified on hardware, 2026-10-11).** The V2 exchange state (P1=35–38) lives in the card session. It is cleared when the host session ends (card power cycle, USB reset), like the SO-PIN. The daemon must keep one PC/SC connection per device for all four steps. Separate `opensc-tool` invocations do not work.
+
 ## 6. Object model
 
 ### 6.1 Versions
@@ -336,8 +338,8 @@ crates/
 
 | Phase | Firmware | Host | Done when |
 |---|---|---|---|
-| **P0 Compatibility** — done; single-device hardware run passed (full suite 343/0 plus the `sc-hsm-tool` interop test); two-device run pending | CardContact wrap format and KCV (§3); compatibility UNWRAP for v0x02/v0x03 | Known-answer vectors in `firmware/tests/vectors/` (Python reference + pico-hsm) for `pico2hsm-proto` to reuse | `sc-hsm-tool` wrap/unwrap round trip across two devices (`tests/hw/test_11_dkek_roundtrip.py::TestCardContactInterop` covers one device) |
-| **P1 Foundations** — implemented on `feat/p1-foundations`; single-device hardware run passed (full suite 349/0, `test_18_domain` 6/6); two-device check pending | Persisted Lamport counter; global IDs and PKCS#15 CKA_ID kept on import; domain key; member list replacing 0xFC; DOMAIN_STATUS | libpico2hsm APDUs; `domain status`; `pico2hsm-proto` (MemberCert, DOMAIN_STATUS decode, shared vectors) | Two devices from the same shares report the same domain_id |
+| **P0 Compatibility** — done; hardware-verified on one device (full suite plus `sc-hsm-tool` interop) and across two (`test_10::test_wrapped_key_moves_between_devices`: wrap on A, unwrap on B, B's signature verifies against A's public key) | CardContact wrap format and KCV (§3); compatibility UNWRAP for v0x02/v0x03 | Known-answer vectors in `firmware/tests/vectors/` (Python reference + pico-hsm) for `pico2hsm-proto` to reuse | `sc-hsm-tool` wrap/unwrap round trip across two devices (`tests/hw/test_11_dkek_roundtrip.py::TestCardContactInterop` covers one device) |
+| **P1 Foundations** — done; full suite 349/0 and `test_18_domain` 6/6 on one device; two devices after the V2 exchange report the same domain_id and KCV with distinct member IDs (`test_10` 8/8) | Persisted Lamport counter; global IDs and PKCS#15 CKA_ID kept on import; domain key; member list replacing 0xFC; DOMAIN_STATUS | libpico2hsm APDUs; `domain status`; `pico2hsm-proto` (MemberCert, DOMAIN_STATUS decode, shared vectors) | Two devices from the same shares report the same domain_id |
 | **P2 Enrollment** | ISSUE/REVOKE member cert; single-use pinned peer for the existing exchange | `domain enroll` with the short string; `domain revoke` | Enroll C through B, then A accepts C's records |
 | **P3 Records** | Sidecars, EXPORT/IMPORT_RECORD, tombstones, signed GET_STATE, buckets | proto codecs and fuzzing | Create, delete and re-create converge across 3 devices on one host |
 | **P4 Daemon** | (none) | `pico2hsm-syncd` USB mode, then TCP/mTLS, then bundles | 3 devices, one on another host, one sync by bundle only, all converge; partition and heal tests |

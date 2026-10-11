@@ -318,59 +318,52 @@ class TestDkekExchangeV2:
     def test_full_exchange_completes(
         self, enrolled_peers, runner: CLIRunner
     ) -> None:
-        """Full 4-step relay: SOURCE sends DKEK → TARGET receives and stores it."""
+        """Full 4-step relay: SOURCE sends DKEK → TARGET receives and stores it.
+
+        The exchange state lives in the card session (it is cleared when the
+        host session ends, like the SO-PIN), so each device keeps one PC/SC
+        connection for all of its steps — as the sync daemon does.
+        """
+        from helpers.pcsc import session
+
         source_pub = self._get_pubkey(runner, reader=0)
         target_pub = self._get_pubkey(runner, reader=1)
 
-        # Step 1: TARGET — NOISE_TARGET_INIT(source_static_pub) → 161B
-        apdu_35 = self._apdu_with_lc_data(0x35, source_pub)
-        result_35 = runner.send_apdu(
-            SELECT_SC_HSM, VERIFY_SO_PIN, apdu_35,
-            reader=1, save_as="10_step1_target_init",
-        )
-        assert _last_sw(result_35.stdout) == 0x9000, "Step 1 failed"
-        init_data = _parse_received_bytes(result_35.stdout)[-161:]
-        ephem_T_pub = init_data[:65]
-        challenge   = init_data[65:97]
-        sig_T       = init_data[97:161]
+        with session(0) as src, session(1) as tgt:
+            for s in (src, tgt):
+                s.ok(SELECT_SC_HSM)
+                s.ok(VERIFY_SO_PIN)
 
-        # Step 2: SOURCE — NOISE_SOURCE_RESPOND(ephem_T + challenge + sig_T) → 129B
-        payload_36 = ephem_T_pub + challenge + sig_T   # 161 bytes
-        apdu_36 = self._apdu_with_lc_data(0x36, payload_36)
-        result_36 = runner.send_apdu(
-            SELECT_SC_HSM, VERIFY_SO_PIN, apdu_36,
-            reader=0, save_as="10_step2_source_respond",
-        )
-        assert _last_sw(result_36.stdout) == 0x9000, f"Step 2 failed: {result_36.stdout}"
-        respond_data = _parse_received_bytes(result_36.stdout)[-129:]
-        ephem_S_pub = respond_data[:65]
-        sig_S       = respond_data[65:129]
-        assert ephem_S_pub[0] == 0x04
-        log.info("Step 2 OK — ephem_S=%s", ephem_S_pub[:4].hex())
+            # Step 1: TARGET — NOISE_TARGET_INIT(source_static_pub) → 161 B
+            init = tgt.ok(self._apdu_with_lc_data(0x35, source_pub))
+            assert len(init) == 161, len(init)
+            ephem_T_pub, challenge, sig_T = init[:65], init[65:97], init[97:161]
 
-        # Step 3: SOURCE — NOISE_FINALIZE_SEND_V2(ephem_T + target_static + challenge) → 60B
-        payload_37 = ephem_T_pub + target_pub + challenge   # 162 bytes
-        apdu_37 = self._apdu_with_lc_data(0x37, payload_37)
-        result_37 = runner.send_apdu(
-            SELECT_SC_HSM, VERIFY_SO_PIN, apdu_37,
-            reader=0, save_as="10_step3_send_v2",
-        )
-        assert _last_sw(result_37.stdout) == 0x9000, f"Step 3 failed: {result_37.stdout}"
-        enc_dkek_data = _parse_received_bytes(result_37.stdout)
-        assert len(enc_dkek_data) >= 60, f"Expected >= 60B encrypted DKEK, got {len(enc_dkek_data)}"
-        enc_dkek = enc_dkek_data[-60:]
-        log.info("Step 3 OK — enc_dkek=%s...", enc_dkek[:8].hex())
+            # Step 2: SOURCE — NOISE_SOURCE_RESPOND(ephem_T ‖ challenge ‖ sig_T) → 129 B
+            resp = src.ok(self._apdu_with_lc_data(0x36, ephem_T_pub + challenge + sig_T))
+            assert len(resp) == 129, len(resp)
+            ephem_S_pub, sig_S = resp[:65], resp[65:129]
+            assert ephem_S_pub[0] == 0x04
 
-        # Step 4: TARGET — NOISE_FINALIZE_RECV_V2(ephem_S + sig_S + enc_dkek) → empty SW=9000
-        payload_38 = ephem_S_pub + sig_S + enc_dkek   # 189 bytes
-        apdu_38 = self._apdu_with_lc_data(0x38, payload_38)
-        result_38 = runner.send_apdu(
-            SELECT_SC_HSM, VERIFY_SO_PIN, apdu_38,
-            reader=1, save_as="10_step4_recv_v2",
+            # Step 3: SOURCE — NOISE_FINALIZE_SEND_V2(ephem_T ‖ target_static ‖ challenge) → 60 B
+            enc_dkek = src.ok(self._apdu_with_lc_data(0x37, ephem_T_pub + target_pub + challenge))
+            assert len(enc_dkek) == 60, len(enc_dkek)
+
+            # Step 4: TARGET — NOISE_FINALIZE_RECV_V2(ephem_S ‖ sig_S ‖ enc_dkek)
+            _, sw = tgt.send(self._apdu_with_lc_data(0x38, ephem_S_pub + sig_S + enc_dkek))
+            assert sw == 0x9000, f"Step 4 (NOISE_FINALIZE_RECV_V2) failed: SW={sw:04X}"
+
+            # Cluster plan V3 P1 done criterion: one domain, two members.
+            st_src = src.ok("8054400000")
+            st_tgt = tgt.ok("8054400000")
+        # DOMAIN_STATUS: version(1) flags(1) domain_id(16) kcv(8) Q(65) member_id(16) ...
+        assert st_src[2:18] == st_tgt[2:18] != bytes(16), "same domain_id"
+        assert st_src[18:26] == st_tgt[18:26], "same DKEK check value"
+        assert st_src[91:107] != st_tgt[91:107], "distinct member IDs"
+        log.info(
+            "DKEK exchange complete: domain %s, members %s / %s",
+            st_src[2:18].hex(), st_src[91:107].hex(), st_tgt[91:107].hex(),
         )
-        last = _last_sw(result_38.stdout)
-        assert last == 0x9000, f"Step 4 (NOISE_FINALIZE_RECV_V2) failed: SW={last:04X}"
-        log.info("Full DKEK exchange complete — DKEK now established on target (reader 1)")
 
     def test_generation_independent_per_device(
         self, dkek_loaded_source, runner: CLIRunner
@@ -406,3 +399,92 @@ class TestDkekExchangeV2:
                 "State roots are equal — source key gen may have failed. "
                 "Roots: %s", root0.hex()
             )
+
+
+def _kcv(runner: CLIRunner, reader: int) -> Optional[str]:
+    out = runner.sc_hsm_tool("-r", str(reader)).stdout
+    m = re.search(r"key check value\s*:\s*([0-9A-Fa-f]+)", out, re.IGNORECASE)
+    return m.group(1).upper() if m else None
+
+
+def _pkcs11_slots(runner: CLIRunner) -> list[str]:
+    out = runner.pkcs11_tool("-L").stdout
+    return re.findall(r"^Slot \d+ \((0x[0-9a-fA-F]+)\)", out, re.MULTILINE)
+
+
+def _key_ref_for_id(reader: int, key_id: int) -> Optional[int]:
+    """SC-HSM key reference whose PRKD carries CKA_ID ``key_id`` (LIST KEYS + PRKD read)."""
+    from helpers.pcsc import session
+
+    with session(reader) as s:
+        s.ok(SELECT_SC_HSM)
+        listing = s.ok("0058000000")
+        refs = [listing[i + 1] for i in range(0, len(listing), 2) if listing[i] == 0xCC]
+        for ref in refs:
+            # READ BINARY (odd INS) of the PRKD C4<ref>, offset 0.
+            data, sw = s.send(f"00B1C4{ref:02X}0454020000" + "00")
+            if sw == 0x9000 and bytes([0x04, 0x01, key_id]) in data:
+                return ref
+    return None
+
+
+def test_wrapped_key_moves_between_devices(enrolled_peers, runner: CLIRunner, config: dict, tmp_path) -> None:
+    """P0 across devices: sc-hsm-tool wraps on reader 0, unwraps on reader 1, reader 1 signs.
+
+    Needs both devices to hold the same DKEK (the exchange test above, or the
+    same shares).  The signature from reader 1 must verify against the public
+    key generated on reader 0.
+    """
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+
+    k0, k1 = _kcv(runner, 0), _kcv(runner, 1)
+    if not k0 or k0 != k1:
+        pytest.skip(f"devices do not share a DKEK (KCV {k0} / {k1})")
+    slots = _pkcs11_slots(runner)
+    assert len(slots) >= 2, slots
+
+    key_id = 0x7A
+    gen = runner.pkcs11_tool(
+        "--slot", slots[0], "--login", "--pin", config["pin"], "--keypairgen",
+        "--key-type", "EC:prime256v1", "--id", f"{key_id:02x}", "--label", "xdev-move",
+        save_as="10_xdev_keygen",
+    )
+    assert gen.returncode == 0, gen.stderr[-2000:]
+    pub_der = tmp_path / "pub.der"
+    rd = runner.pkcs11_tool(
+        "--slot", slots[0], "--read-object", "--type", "pubkey", "--id", f"{key_id:02x}",
+        "-o", str(pub_der),
+    )
+    assert rd.returncode == 0, rd.stderr[-2000:]
+    pub = serialization.load_der_public_key(pub_der.read_bytes())
+
+    ref = _key_ref_for_id(0, key_id)
+    if ref is None:
+        # Fall back to the newest key reference.
+        from helpers.pcsc import session
+        with session(0) as s:
+            s.ok(SELECT_SC_HSM)
+            listing = s.ok("0058000000")
+        ref = max(listing[i + 1] for i in range(0, len(listing), 2) if listing[i] == 0xCC)
+
+    wky = tmp_path / "move.wky"
+    w = runner.sc_hsm_tool("-r", "0", "--wrap-key", str(wky), "--key-reference", str(ref),
+                           "--pin", config["pin"], save_as="10_xdev_wrap")
+    assert w.returncode == 0, w.stderr[-2000:]
+    u = runner.sc_hsm_tool("-r", "1", "--unwrap-key", str(wky), "--key-reference", str(ref),
+                           "--pin", config["pin"], "--force", save_as="10_xdev_unwrap")
+    assert u.returncode == 0 and "successfully imported" in u.stdout, u.stdout + u.stderr[-2000:]
+
+    msg = tmp_path / "msg.bin"
+    msg.write_bytes(b"pico2hsm cross-device wrap/unwrap")
+    sig = tmp_path / "sig.bin"
+    sg = runner.pkcs11_tool(
+        "--slot", slots[1], "--login", "--pin", config["pin"], "--sign",
+        "--mechanism", "ECDSA-SHA256", "--id", f"{key_id:02x}",
+        "-i", str(msg), "-o", str(sig), "--signature-format", "openssl",
+        save_as="10_xdev_sign",
+    )
+    assert sg.returncode == 0, sg.stderr[-2000:]
+    pub.verify(sig.read_bytes(), msg.read_bytes(), ec.ECDSA(hashes.SHA256()))
+    log.info("key ref %d moved reader 0 → reader 1 and signs there", ref)
