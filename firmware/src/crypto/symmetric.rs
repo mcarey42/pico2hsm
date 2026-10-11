@@ -282,6 +282,57 @@ pub fn aes_cbc_decrypt(
 // AES-CBC (raw-key implementation helpers)
 // -------------------------------------------------------------------------
 
+/// AES-CBC over whole blocks, no padding (SmartCard-HSM ALGO_AES_CBC_ENCRYPT
+/// / _DECRYPT semantics: the host pads).  `data` must be a non-empty
+/// multiple of 16 bytes.
+///
+/// No padding is ever checked on decryption, so there is no padding
+/// oracle: every ciphertext of a valid length decrypts to *something*.
+pub fn aes_cbc_nopad(
+    key: &KeyMaterial,
+    iv: &[u8; AES_BLOCK_SIZE],
+    data: &[u8],
+    encrypt: bool,
+    out: &mut heapless::Vec<u8, 4096>,
+) -> Result<(), CryptoError> {
+    let raw = key_bytes(key)?;
+    if data.is_empty() || data.len() % AES_BLOCK_SIZE != 0 {
+        return Err(CryptoError::BufferTooSmall);
+    }
+    out.clear();
+    out.extend_from_slice(data)
+        .map_err(|_| CryptoError::BufferTooSmall)?;
+    let n = out.len();
+    let work = &mut out[..];
+    macro_rules! run {
+        ($aes:ty) => {
+            if encrypt {
+                <CbcEncryptor<$aes> as KeyIvInit>::new_from_slices(raw, iv)
+                    .map_err(|_| CryptoError::EncryptFailure)?
+                    .encrypt_padded_mut::<NoPadding>(work, n)
+                    .map(|_| ())
+                    .map_err(|_| CryptoError::EncryptFailure)
+            } else {
+                <CbcDecryptor<$aes> as KeyIvInit>::new_from_slices(raw, iv)
+                    .map_err(|_| CryptoError::DecryptFailure)?
+                    .decrypt_padded_mut::<NoPadding>(work)
+                    .map(|_| ())
+                    .map_err(|_| CryptoError::DecryptFailure)
+            }
+        };
+    }
+    let r = match raw.len() {
+        16 => run!(Aes128),
+        24 => run!(Aes192),
+        32 => run!(Aes256),
+        _ => Err(CryptoError::WrongKeyLength),
+    };
+    if r.is_err() {
+        out.zeroize();
+    }
+    r
+}
+
 /// AES-CBC encrypt with raw key (16/24/32 bytes). PKCS#7 padded.
 fn aes_cbc_encrypt_raw(
     key: &[u8],

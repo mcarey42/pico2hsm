@@ -531,10 +531,11 @@ fn rsa_card_hash_ids_follow_the_spec() {
 
 #[cfg(feature = "rsa")]
 #[test]
-fn rsa_decrypt_pkcs1_returns_only_the_message() {
-    // Regression (review): DECIPHER 22 (card removes PKCS#1 padding) ran
-    // the raw private-key operation of 21, so a key allowed only 22 was
-    // still a raw RSA (signing) oracle.
+fn rsa_decipher_has_no_padding_oracle() {
+    // Regression (review): DECIPHER 22 first ran the raw operation of 21
+    // (a key allowed only 22 was a raw RSA oracle), then — removing the
+    // padding on the card — answered bad padding differently from good.
+    // 22 is now refused before the key is touched, whatever the input.
     use crate::security::key_management::{AlgorithmId, KeyType as KmType};
     use ::rsa::pkcs1::DecodeRsaPrivateKey;
     let pair = crate::crypto::asymmetric::generate_rsa_keypair(
@@ -548,6 +549,7 @@ fn rsa_decrypt_pkcs1_returns_only_the_message() {
     obj.private_key
         .extend_from_slice(&pair.private_key_der)
         .unwrap();
+    obj.policy.use_counter = Some(5);
     obj.policy.algorithms.push(ALGO_RSA_DECRYPT_PKCS1).unwrap();
     crate::storage::KeyStore::save_key(&mut store, &obj).unwrap();
     hsm.state
@@ -562,17 +564,59 @@ fn rsa_decrypt_pkcs1_returns_only_the_message() {
     let pk = ::rsa::RsaPrivateKey::from_pkcs1_der(&pair.private_key_der)
         .unwrap()
         .to_public_key();
-    let ct = pk
+    let good = pk
         .encrypt(&mut FwRng, ::rsa::Pkcs1v15Encrypt, b"secret")
         .unwrap();
-    let mut a: heapless::Vec<u8, 300> = heapless::Vec::new();
-    a.extend_from_slice(&[0x80, 0x62, 0x31, 0x22, 0x00, 0x01, 0x00])
-        .unwrap();
-    a.extend_from_slice(&ct).unwrap();
-    let (sw, pt) = run(&mut hsm, &mut store, &a);
+    let mut bad = good.clone();
+    bad[255] ^= 1;
+    let mut answers: heapless::Vec<(u16, usize), 2> = heapless::Vec::new();
+    for ct in [&good[..], &bad[..]] {
+        let mut a: heapless::Vec<u8, 300> = heapless::Vec::new();
+        a.extend_from_slice(&[0x80, 0x62, 0x31, 0x22, 0x00, 0x01, 0x00])
+            .unwrap();
+        a.extend_from_slice(ct).unwrap();
+        let (sw, data) = run(&mut hsm, &mut store, &a);
+        answers.push((sw, data.len())).unwrap();
+        // The raw operation (21) is not in the list either.
+        a[3] = 0x21;
+        assert_eq!(run(&mut hsm, &mut store, &a).0, SW_CONDITIONS_NOT_SATISFIED);
+    }
+    assert_eq!(answers[0], (pico2hsm_core::apdu::SW_INS_NOT_SUPPORTED, 0));
+    assert_eq!(
+        answers[0], answers[1],
+        "same answer for good and bad padding"
+    );
+    assert_eq!(store.load(kid).unwrap().policy.use_counter, Some(5));
+}
+
+#[test]
+fn cbc_decrypt_has_no_padding_oracle() {
+    // Regression (review): CIPHER CBC decrypt stripped PKCS#7 and answered
+    // 6985 on bad padding.  Now whole blocks in, whole blocks out.
+    let (mut hsm, mut store) = (logged_in(), BlobStore::new());
+    let (sw, _) = run(&mut hsm, &mut store, &apdu(0x00, 0x48, 0x40, 0xB2, &[]));
     assert_eq!(sw, SW_OK);
-    assert_eq!(&pt[..], b"secret");
-    // The raw operation (21) is not in the list.
-    a[3] = 0x21;
-    assert_eq!(run(&mut hsm, &mut store, &a).0, SW_CONDITIONS_NOT_SATISFIED);
+    hsm.state.current_key_id = Some(0x40);
+    let mut msg = [0u8; 16 + 32];
+    msg[16..].copy_from_slice(&[0xA7; 32]); // IV = 0, two blocks
+    let (sw, ct) = run(&mut hsm, &mut store, &apdu(0x80, 0x78, 0x01, 0x02, &msg));
+    assert_eq!((sw, ct.len()), (SW_OK, 32), "no padding added");
+    let mut back = [0u8; 48];
+    back[16..].copy_from_slice(&ct);
+    let (sw, pt) = run(&mut hsm, &mut store, &apdu(0x80, 0x78, 0x02, 0x02, &back));
+    assert_eq!((sw, &pt[..]), (SW_OK, &[0xA7u8; 32][..]));
+    // Any ciphertext decrypts: no answer depends on padding.
+    for flip in 0..32 {
+        let mut t = back;
+        t[16 + flip] ^= 0x5C;
+        let (sw, pt) = run(&mut hsm, &mut store, &apdu(0x80, 0x78, 0x02, 0x02, &t));
+        assert_eq!((sw, pt.len()), (SW_OK, 32));
+    }
+    // Not whole blocks: refused for the length alone.
+    let (sw, _) = run(
+        &mut hsm,
+        &mut store,
+        &apdu(0x80, 0x78, 0x02, 0x02, &back[..40]),
+    );
+    assert_eq!(sw, pico2hsm_core::apdu::SW_WRONG_LENGTH);
 }

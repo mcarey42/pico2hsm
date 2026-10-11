@@ -2048,4 +2048,4 @@ mod reserved_slot_and_dkek_tests {
 }
 
 #[cfg(test)]
-mod policy_tests;
+pub(crate) mod policy_tests;

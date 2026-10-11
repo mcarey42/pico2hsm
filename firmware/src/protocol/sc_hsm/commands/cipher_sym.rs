@@ -4,7 +4,7 @@
 //! keystore. The operation and mode are specified via P1/P2.
 //!
 //! Supported modes:
-//! - AES-CBC (P2=0x02): `[IV:16][plaintext or ciphertext]`
+//! - AES-CBC (P2=0x02): `[IV:16][whole blocks]`, no padding either way (host pads)
 //! - AES-CTR (P2=0x03): `[nonce:16][data]`  (AES-256 only)
 //! - AES-GCM (P2=0x05): encrypt `[nonce:12][aad_len:2 BE][aad][plaintext]`
 //!                       decrypt `[nonce:12][aad_len:2 BE][aad][ct||tag]`
@@ -121,9 +121,15 @@ pub fn handle(
     let direction = cmd.p1;
     let data = cmd.data;
 
-    // Refusals that need no key use go first (CTR is AES-256 only).
+    // Refusals that need no key use go first (CTR is AES-256 only; CBC
+    // takes IV + whole blocks).
     if mode == P2_AES_CTR && raw_key.0.len() != symmetric::AES256_KEY_SIZE {
         return ApduResponse::err(SW_INS_NOT_SUPPORTED);
+    }
+    if mode == P2_AES_CBC
+        && (data.len() <= symmetric::AES_BLOCK_SIZE || data.len() % symmetric::AES_BLOCK_SIZE != 0)
+    {
+        return ApduResponse::err(SW_WRONG_LENGTH);
     }
     if let Err(sw) = crate::security::key_policy::authorize_use(store, &mut key_obj, policy_algo) {
         return ApduResponse::err(sw);
@@ -153,22 +159,14 @@ fn handle_cbc(km: &KeyMaterial, direction: u8, data: &[u8]) -> ApduResponse {
     };
     let payload = &data[16..];
 
+    // Whole blocks, no padding, in both directions (SmartCard-HSM
+    // ALGO_AES_CBC_ENCRYPT / _DECRYPT: the host pads).  Decryption used to
+    // strip PKCS#7 and answer 6985 on bad padding — a CBC padding oracle.
+    // Lengths were checked before the key was used (`cbc_payload_ok`).
     let mut out: heapless::Vec<u8, 4096> = heapless::Vec::new();
-
-    match direction {
-        P1_ENCRYPT => {
-            if symmetric::aes_cbc_encrypt(km, iv, payload, &mut out).is_err() {
-                return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED);
-            }
-        }
-        P1_DECRYPT => {
-            if symmetric::aes_cbc_decrypt(km, iv, payload, &mut out).is_err() {
-                return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED);
-            }
-        }
-        _ => return ApduResponse::err(SW_INS_NOT_SUPPORTED),
+    if symmetric::aes_cbc_nopad(km, iv, payload, direction == P1_ENCRYPT, &mut out).is_err() {
+        return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED);
     }
-
     ApduResponse::ok(&out)
 }
 
