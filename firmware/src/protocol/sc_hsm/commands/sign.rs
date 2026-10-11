@@ -154,7 +154,15 @@ pub(crate) fn compute_signature(
     };
 
     // Policy: algorithm allowed, one use spent — last check before signing.
-    if let Err(sw) = authorize_use(store, &mut key_obj, Some(algo)) {
+    // The pico2hsm per-curve codes 13/15/17/19 are the same operation as
+    // CardContact's ALGO_EC_RAW (70) and are checked as 70: the list holds
+    // CardContact IDs only, and 13..19 mean nothing (or something else)
+    // there.
+    let policy_algo = match algo {
+        0x13 | 0x15 | 0x17 | 0x19 => crate::security::key_policy::ALGO_EC_RAW,
+        a => a,
+    };
+    if let Err(sw) = authorize_use(store, &mut key_obj, Some(policy_algo)) {
         return ApduResponse::err(sw);
     }
 

@@ -104,11 +104,16 @@ pub(crate) fn decipher(
     // 0x21 = ALGO_RSA_DECRYPT: OpenSC sends ciphertext; card returns c^d mod n
     //        (raw, no padding removal). OpenSC strips PKCS#1v1.5 or OAEP in software.
     //        OpenSC uses P2=0x21 for BOTH CKM_RSA_PKCS and CKM_RSA_PKCS_OAEP.
-    // 0x22 = ALGO_RSA_OAEP (used by some OpenSC versions): same raw op.
+    // 0x22 = ALGO_RSA_DECRYPT_PKCS1: the card removes the PKCS#1 v1.5
+    //        padding and returns the message only.  (It used to return the
+    //        raw c^d mod n as well: a key whose algorithm list allowed only
+    //        22 then still gave out the raw private-key operation of 21,
+    //        a signing oracle.)
+    // 0x23 = ALGO_RSA_DECRYPT_OEP (OAEP): not implemented.
     #[cfg(feature = "rsa")]
     match algo {
         0x21 | 0x22 => {
-            use crate::crypto::asymmetric::rsa_private_raw;
+            use crate::crypto::asymmetric::{rsa_decrypt_pkcs1v15, rsa_private_raw};
 
             // Check metadata index for the key
             let _meta = match state.key_index.iter().find(|m| m.key_id == full_key_id) {
@@ -135,8 +140,17 @@ pub(crate) fn decipher(
                 return ApduResponse::err(sw);
             }
 
-            // Raw RSA: result = ciphertext^d mod n. OpenSC handles all unpadding.
-            return match rsa_private_raw(&der_buf[..der_len], data) {
+            let result = if algo == 0x22 {
+                rsa_decrypt_pkcs1v15(
+                    pico2hsm_core::key::KeyType::RsaPrivate2048, // unused by the primitive
+                    &der_buf[..der_len],
+                    data,
+                )
+            } else {
+                // Raw RSA: result = ciphertext^d mod n. OpenSC unpads.
+                rsa_private_raw(&der_buf[..der_len], data)
+            };
+            return match result {
                 Ok(p) => ApduResponse::ok(&p),
                 Err(_) => ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
             };
@@ -191,7 +205,15 @@ pub(crate) fn decipher(
     let Some(priv_buf) = crate::security::zeroize::key_buf::<66>(&key_obj.private_key) else {
         return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED);
     };
-    if let Err(sw) = authorize_use(store, &mut key_obj, Some(algo)) {
+    // Every ECDH form is the CardContact operation ALGO_EC_DH (80) for the
+    // usage policy.  The pico2hsm per-curve codes 23/25/27/29 must not be
+    // checked as themselves: 23 is CardContact's RSA-OAEP decrypt, so a
+    // list meant for RSA would otherwise authorise ECDH (and vice versa).
+    if let Err(sw) = authorize_use(
+        store,
+        &mut key_obj,
+        Some(crate::security::key_policy::ALGO_EC_DH),
+    ) {
         return ApduResponse::err(sw);
     }
 

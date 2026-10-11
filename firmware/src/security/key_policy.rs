@@ -199,6 +199,17 @@ impl KeyPolicy {
         Ok(p)
     }
 
+    /// A policy holding one PIV attribute (`AA` PIN policy or `AB` touch
+    /// policy, Yubico values); 6A80 for any other tag or value.
+    pub fn from_piv_attribute(tag: u8, value: &[u8]) -> Result<Self, u16> {
+        if !matches!(tag, TAG_PIN_POLICY | TAG_TOUCH_POLICY) {
+            return Err(SW_WRONG_DATA);
+        }
+        let mut p = KeyPolicy::default();
+        p.set_attribute(tag, value)?;
+        Ok(p)
+    }
+
     /// Set one attribute from its TLV value.
     fn set_attribute(&mut self, tag: u8, value: &[u8]) -> Result<(), u16> {
         match tag {
@@ -381,9 +392,9 @@ pub fn authorize_use(
 /// form or `81 xx` / `82 xx xx`.  A structure that does not parse to the
 /// end is an error (6A80): a key attribute after a field the walker could
 /// not skip must never be silently dropped.
-pub fn for_each_tlv(
-    data: &[u8],
-    mut f: impl FnMut(u16, &[u8]) -> Result<(), u16>,
+pub fn for_each_tlv<'a>(
+    data: &'a [u8],
+    mut f: impl FnMut(u16, &'a [u8]) -> Result<(), u16>,
 ) -> Result<(), u16> {
     let mut i = 0usize;
     while i < data.len() {

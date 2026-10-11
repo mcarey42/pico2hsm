@@ -307,33 +307,124 @@ fn with_dkek(hsm: &mut ScHsm) {
     hsm.state.dkek.set_dkek_direct(&[0x42; 32]);
 }
 
+fn import(hsm: &mut ScHsm, store: &mut BlobStore, key_ref: u8, blob: &[u8]) -> u16 {
+    let mut a: heapless::Vec<u8, 600> = heapless::Vec::new();
+    a.extend_from_slice(&[0x80, 0x74, key_ref, 0x93, 0x00])
+        .unwrap();
+    a.extend_from_slice(&(blob.len() as u16).to_be_bytes())
+        .unwrap();
+    a.extend_from_slice(blob).unwrap();
+    run(hsm, store, &a).0
+}
+
 #[test]
 fn policy_survives_wrap_and_unwrap() {
     let (mut hsm, mut store) = (logged_in(), BlobStore::new());
     with_dkek(&mut hsm);
-    let attrs = [0x90, 0x04, 0, 0, 0, 3, 0x91, 0x02, 0x73, 0x92];
+    let attrs = [0x91, 0x02, 0x73, 0x92, 0x92, 0x01, 0x00];
     assert_eq!(generate(&mut hsm, &mut store, 0x10, &attrs), SW_OK);
-    assert_eq!(sign(&mut hsm, &mut store, 0x10, ALGO_EC_SHA256), SW_OK);
     let (sw, blob) = run(&mut hsm, &mut store, &apdu(0x80, 0x72, 0x10, 0x92, &[]));
     assert_eq!(sw, SW_OK);
     assert_eq!(blob[8], 0x03, "wrap format version 3");
-    // Restore into another slot: same list, the uses that were left.
-    let mut a: heapless::Vec<u8, 600> = heapless::Vec::new();
-    a.extend_from_slice(&[0x80, 0x74, 0x11, 0x93, 0x00])
-        .unwrap();
-    a.extend_from_slice(&(blob.len() as u16).to_be_bytes())
-        .unwrap();
-    a.extend_from_slice(&blob).unwrap();
-    let (sw, _) = run(&mut hsm, &mut store, &a);
-    assert_eq!(sw, SW_OK);
+    // Restore into another slot: same list and domain.
+    assert_eq!(import(&mut hsm, &mut store, 0x11, &blob), SW_OK);
     let restored = store.load(KeyId::sc_hsm(0, 0x11)).unwrap();
-    assert_eq!(restored.policy.use_counter, Some(2));
     assert_eq!(&restored.policy.algorithms[..], &[0x73, 0x92]);
+    assert_eq!(restored.policy.domain, Some(0));
+    assert_eq!(restored.policy.use_counter, None);
     assert_eq!(
         sign(&mut hsm, &mut store, 0x11, ALGO_EC_RAW),
         SW_CONDITIONS_NOT_SATISFIED
     );
     assert_eq!(sign(&mut hsm, &mut store, 0x11, ALGO_EC_SHA256), SW_OK);
+}
+
+#[test]
+fn counter_limited_key_is_not_exportable() {
+    // Regression (review): exporting a key with a use counter let every
+    // re-import start again from the exported count.
+    let (mut hsm, mut store) = (logged_in(), BlobStore::new());
+    with_dkek(&mut hsm);
+    let attrs = [0x90, 0x04, 0, 0, 0, 3];
+    assert_eq!(generate(&mut hsm, &mut store, 0x14, &attrs), SW_OK);
+    let (sw, blob) = run(&mut hsm, &mut store, &apdu(0x80, 0x72, 0x14, 0x92, &[]));
+    assert_eq!(sw, SW_CONDITIONS_NOT_SATISFIED);
+    assert!(blob.is_empty());
+    // Also with WRAP in its algorithm list.
+    let attrs = [0x90, 0x04, 0, 0, 0, 3, 0x91, 0x02, 0x70, 0x92];
+    assert_eq!(generate(&mut hsm, &mut store, 0x15, &attrs), SW_OK);
+    let (sw, _) = run(&mut hsm, &mut store, &apdu(0x80, 0x72, 0x15, 0x92, &[]));
+    assert_eq!(sw, SW_CONDITIONS_NOT_SATISFIED);
+    // A blob that does carry a counter (made by a DKEK holder) is imported
+    // with it: a counter in a blob can only restrict.
+    let mut policy = KeyPolicy::default();
+    policy.use_counter = Some(1);
+    let key = store.load(KeyId::sc_hsm(0, 0x14)).unwrap();
+    let blob = hsm
+        .state
+        .dkek
+        .wrap_with_policy(&key.private_key, 0x13, 0, &policy, &mut FwRng)
+        .unwrap();
+    assert_eq!(import(&mut hsm, &mut store, 0x16, &blob), SW_OK);
+    assert_eq!(sign(&mut hsm, &mut store, 0x16, ALGO_EC_RAW), SW_OK);
+    assert_eq!(
+        sign(&mut hsm, &mut store, 0x16, ALGO_EC_RAW),
+        SW_KEY_EXHAUSTED
+    );
+}
+
+#[test]
+fn proprietary_codes_are_checked_as_their_cardcontact_operation() {
+    // Regression (review): the per-curve codes were checked as themselves,
+    // and 23 (ECDH P-256 here) is CardContact's RSA-OAEP decrypt.
+    let (mut hsm, mut store) = (logged_in(), BlobStore::new());
+    // List meant for an RSA key (OAEP decrypt) does not authorise ECDH.
+    assert_eq!(
+        generate(&mut hsm, &mut store, 0x17, &[0x91, 0x01, 0x23]),
+        SW_OK
+    );
+    let point = [0x04u8; 65];
+    let (sw, _) = run(&mut hsm, &mut store, &apdu(0x80, 0x62, 0x17, 0x23, &point));
+    assert_eq!(sw, SW_CONDITIONS_NOT_SATISFIED);
+    // ECDH (80) in the list covers the per-curve ECDH code too (the
+    // garbage point is then refused by the ECDH itself, not the policy).
+    assert_eq!(
+        generate(&mut hsm, &mut store, 0x18, &[0x91, 0x01, 0x80]),
+        SW_OK
+    );
+    let (sw, _) = run(&mut hsm, &mut store, &apdu(0x80, 0x62, 0x18, 0x23, &point));
+    assert_ne!(sw, SW_OK);
+    assert_ne!(sw, 0x6A84);
+    let peer = crate::crypto::asymmetric::generate_ec_keypair(
+        pico2hsm_core::key::KeyType::EcPrivateP256,
+        &mut FwRng,
+    )
+    .unwrap();
+    let (sw, _) = run(
+        &mut hsm,
+        &mut store,
+        &apdu(0x80, 0x62, 0x18, 0x23, &peer.public_key),
+    );
+    assert_eq!(sw, SW_OK);
+    // ...but not signing.
+    assert_eq!(
+        sign(&mut hsm, &mut store, 0x18, 0x13),
+        SW_CONDITIONS_NOT_SATISFIED
+    );
+    // Pre-hashed ECDSA 13 is ALGO_EC_RAW (70) for the policy.
+    assert_eq!(
+        generate(&mut hsm, &mut store, 0x19, &[0x91, 0x01, 0x70]),
+        SW_OK
+    );
+    assert_eq!(sign(&mut hsm, &mut store, 0x19, 0x13), SW_OK);
+    assert_eq!(
+        generate(&mut hsm, &mut store, 0x1A, &[0x91, 0x01, 0x13]),
+        SW_OK
+    );
+    assert_eq!(
+        sign(&mut hsm, &mut store, 0x1A, 0x13),
+        SW_CONDITIONS_NOT_SATISFIED
+    );
 }
 
 #[test]
@@ -436,4 +527,52 @@ fn rsa_card_hash_ids_follow_the_spec() {
     // Not in the list: refused.
     let (sw, _) = run(&mut hsm, &mut store, &apdu(0x80, 0x68, 0x30, 0x35, msg));
     assert_eq!(sw, SW_CONDITIONS_NOT_SATISFIED);
+}
+
+#[cfg(feature = "rsa")]
+#[test]
+fn rsa_decrypt_pkcs1_returns_only_the_message() {
+    // Regression (review): DECIPHER 22 (card removes PKCS#1 padding) ran
+    // the raw private-key operation of 21, so a key allowed only 22 was
+    // still a raw RSA (signing) oracle.
+    use crate::security::key_management::{AlgorithmId, KeyType as KmType};
+    use ::rsa::pkcs1::DecodeRsaPrivateKey;
+    let pair = crate::crypto::asymmetric::generate_rsa_keypair(
+        pico2hsm_core::key::KeyType::RsaPrivate2048,
+        &mut FwRng,
+    )
+    .unwrap();
+    let (mut hsm, mut store) = (logged_in(), BlobStore::new());
+    let kid = KeyId::sc_hsm(0, 0x31);
+    let mut obj = KeyObject::new(KmType::Rsa, kid.0, AppletId::ScHsm, AlgorithmId::RsaDecrypt);
+    obj.private_key
+        .extend_from_slice(&pair.private_key_der)
+        .unwrap();
+    obj.policy.algorithms.push(ALGO_RSA_DECRYPT_PKCS1).unwrap();
+    crate::storage::KeyStore::save_key(&mut store, &obj).unwrap();
+    hsm.state
+        .key_index
+        .push(KeyMeta {
+            key_id: kid.0,
+            key_type: CoreKeyType::RsaPrivate2048 as u8,
+            algo: 0x05,
+            key_flags: 0,
+        })
+        .unwrap();
+    let pk = ::rsa::RsaPrivateKey::from_pkcs1_der(&pair.private_key_der)
+        .unwrap()
+        .to_public_key();
+    let ct = pk
+        .encrypt(&mut FwRng, ::rsa::Pkcs1v15Encrypt, b"secret")
+        .unwrap();
+    let mut a: heapless::Vec<u8, 300> = heapless::Vec::new();
+    a.extend_from_slice(&[0x80, 0x62, 0x31, 0x22, 0x00, 0x01, 0x00])
+        .unwrap();
+    a.extend_from_slice(&ct).unwrap();
+    let (sw, pt) = run(&mut hsm, &mut store, &a);
+    assert_eq!(sw, SW_OK);
+    assert_eq!(&pt[..], b"secret");
+    // The raw operation (21) is not in the list.
+    a[3] = 0x21;
+    assert_eq!(run(&mut hsm, &mut store, &a).0, SW_CONDITIONS_NOT_SATISFIED);
 }

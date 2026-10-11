@@ -81,12 +81,18 @@ pub fn handle(
     }
 
     // An algorithm list without ALGO_WRAP (92) forbids export (CardContact
-    // key use control).  Wrapping is not a use of the key: the use counter
-    // is not spent, it travels in the blob with what is left.
+    // key use control).
     if !key_obj
         .policy
         .allows(crate::security::key_policy::ALGO_WRAP)
     {
+        return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED);
+    }
+    // A key with a use counter is not exportable: a wrapped copy can be
+    // unwrapped any number of times (into several slots, or again over the
+    // original after it was used), each copy with the count at export
+    // time, so no counter carried in the blob could bound the total.
+    if key_obj.policy.use_counter.is_some() {
         return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED);
     }
 
