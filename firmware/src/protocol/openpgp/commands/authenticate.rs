@@ -42,6 +42,16 @@ pub fn handle(state: &mut OpenPgpState, cmd: &ApduCommand<'_>) -> ApduResponse {
         return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED);
     };
 
+    // Ed25519 (EdDSA signs the challenge itself; raw 64-byte R||S).  It
+    // went through ecdsa_sign, which rejects Ed25519: always 6985.
+    #[cfg(feature = "applet-openpgp-curve25519")]
+    if key_type == pico2hsm_core::key::KeyType::Ed25519 {
+        return match crate::crypto::asymmetric::ed25519_sign(&priv_buf[..priv_len], cmd.data) {
+            Ok(sig) => ApduResponse::ok(&sig),
+            Err(_) => ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
+        };
+    }
+
     // Sign: input is the hash/challenge
     let mut rng = crate::protocol::sc_hsm::FwRng;
     let der_sig = match crate::crypto::asymmetric::ecdsa_sign(
@@ -62,4 +72,24 @@ pub fn handle(state: &mut OpenPgpState, cmd: &ApduCommand<'_>) -> ApduResponse {
 
     // No signature counter increment for INTERNAL AUTHENTICATE
     ApduResponse::ok(&raw_sig)
+}
+
+#[cfg(all(test, feature = "applet-openpgp-curve25519"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ed25519_auth_key_signs() {
+        let mut state = OpenPgpState::new();
+        state.pw1_verified_other = true;
+        let mut seed = heapless::Vec::new();
+        seed.extend_from_slice(&[7u8; 32]).unwrap();
+        state.auth_private = Some(seed);
+        state.auth_key_type = Some(pico2hsm_core::key::KeyType::Ed25519);
+        let apdu = [0x00, 0x88, 0x00, 0x00, 0x04, 1, 2, 3, 4, 0x00];
+        let cmd = ApduCommand::parse(&apdu).unwrap();
+        let r = handle(&mut state, &cmd);
+        assert_eq!(r.sw, 0x9000);
+        assert_eq!(r.data.len(), 64);
+    }
 }
