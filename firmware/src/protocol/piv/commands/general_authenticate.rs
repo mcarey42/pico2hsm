@@ -243,7 +243,8 @@ fn handle_asymmetric_auth(
             // Build response: 7C { 82 <sig_len> <signature> }
             let mut resp = heapless::Vec::<u8, 256>::new();
             let _ = resp.push(0x7C);
-            let sig_inner_len = 2 + sig.len(); // tag(1) + len(1+) + data
+            // tag(1) + length field (1, or 2 as 81 xx from 128) + data.
+            let sig_inner_len = 1 + if sig.len() < 128 { 1 } else { 2 } + sig.len();
             if sig_inner_len < 128 {
                 let _ = resp.push(sig_inner_len as u8);
             } else {
