@@ -310,7 +310,7 @@ impl Dispatcher {
         self.shared_buf.clear_if_not_get_response();
 
         // Forward to the active protocol.
-        let raw_resp: Vec<u8, 4096> = match self.active {
+        let raw_resp: Vec<u8, 4098> = match self.active {
             ActiveProtocol::ScHsm => self.sc_hsm.process_apdu(raw_apdu),
             ActiveProtocol::Piv => self.piv.process_apdu(raw_apdu),
             ActiveProtocol::OpenPgp => self.openpgp.process_apdu(raw_apdu),
@@ -354,7 +354,7 @@ impl Dispatcher {
     /// and the truncated response is returned with SW=0x61xx.
     ///
     /// `raw_resp` is the serialized response from the protocol (data + SW1 + SW2).
-    fn apply_le_truncation(&mut self, raw_resp: Vec<u8, 4096>, le: Option<u16>) -> Vec<u8, 4098> {
+    fn apply_le_truncation(&mut self, raw_resp: Vec<u8, 4098>, le: Option<u16>) -> Vec<u8, 4098> {
         // Deserialize: last 2 bytes are SW, rest is data.
         if raw_resp.len() < 2 {
             let mut out: Vec<u8, 4098> = Vec::new();

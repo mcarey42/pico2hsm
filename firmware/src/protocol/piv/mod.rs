@@ -483,25 +483,20 @@ impl Piv {
         &mut self,
         apdu: &[u8],
         store: &mut dyn crate::storage::KeyStore,
-    ) -> Vec<u8, 4096> {
+    ) -> Vec<u8, 4098> {
         #[cfg(feature = "applet-piv")]
         {
             let resp = match pico2hsm_core::apdu::ApduCommand::parse(apdu) {
                 Ok(cmd) => self.dispatch_with_store(&cmd, store),
                 Err(_) => ApduResponse::err(SW_INS_NOT_SUPPORTED),
             };
-            let serialized = resp.serialize();
-            let mut out: Vec<u8, 4096> = Vec::new();
-            let _ = out.extend_from_slice(&serialized[..serialized.len().min(4096)]);
-            out
+            // Full serialized response: data (≤4096) + SW — never truncated.
+            resp.serialize()
         }
         #[cfg(not(feature = "applet-piv"))]
         {
             let resp = ApduResponse::err(SW_INS_NOT_SUPPORTED);
-            let s = resp.serialize();
-            let mut out: Vec<u8, 4096> = Vec::new();
-            let _ = out.extend_from_slice(&s);
-            out
+            resp.serialize()
         }
     }
 
@@ -563,26 +558,21 @@ impl Piv {
 use pico2hsm_core::key::AppletId;
 
 impl HsmProtocol for Piv {
-    fn process_apdu(&mut self, apdu: &[u8]) -> Vec<u8, 4096> {
+    fn process_apdu(&mut self, apdu: &[u8]) -> Vec<u8, 4098> {
         #[cfg(feature = "applet-piv")]
         {
             let resp = match ApduCommand::parse(apdu) {
                 Ok(cmd) => self.dispatch(&cmd),
                 Err(_) => ApduResponse::err(SW_INS_NOT_SUPPORTED),
             };
-            let serialized = resp.serialize();
-            let mut out: Vec<u8, 4096> = Vec::new();
-            let _ = out.extend_from_slice(&serialized[..serialized.len().min(4096)]);
-            out
+            // Full serialized response: data (≤4096) + SW — never truncated.
+            resp.serialize()
         }
 
         #[cfg(not(feature = "applet-piv"))]
         {
             let resp = ApduResponse::err(SW_INS_NOT_SUPPORTED);
-            let s = resp.serialize();
-            let mut out = Vec::new();
-            let _ = out.extend_from_slice(&s);
-            out
+            resp.serialize()
         }
     }
 

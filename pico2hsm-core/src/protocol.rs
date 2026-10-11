@@ -23,7 +23,7 @@ pub trait HsmProtocol {
     ///
     /// The implementation MUST NOT panic. If an unrecoverable internal error
     /// occurs, return `SW_CONDITIONS_NOT_SATISFIED` (0x6985).
-    fn process_apdu(&mut self, apdu: &[u8]) -> Vec<u8, 4096>;
+    fn process_apdu(&mut self, apdu: &[u8]) -> Vec<u8, 4098>;
 
     /// Returns `true` if this protocol implementation handles the given AID.
     ///

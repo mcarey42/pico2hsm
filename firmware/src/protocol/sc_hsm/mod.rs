@@ -1114,20 +1114,18 @@ impl ScHsm {
         &mut self,
         apdu: &[u8],
         store: &mut dyn crate::storage::KeyStore,
-    ) -> Vec<u8, 4096> {
+    ) -> Vec<u8, 4098> {
         let resp = match ApduCommand::parse(apdu) {
             Ok(cmd) => self.dispatch_with_store(&cmd, store),
             Err(_) => ApduResponse::err(SW_INS_NOT_SUPPORTED),
         };
-        let serialized = resp.serialize();
-        let mut out: Vec<u8, 4096> = Vec::new();
-        let _ = out.extend_from_slice(&serialized[..serialized.len().min(4096)]);
-        out
+        // Full serialized response: data (≤4096) + SW — never truncated.
+        resp.serialize()
     }
 }
 
 impl HsmProtocol for ScHsm {
-    fn process_apdu(&mut self, apdu: &[u8]) -> Vec<u8, 4096> {
+    fn process_apdu(&mut self, apdu: &[u8]) -> Vec<u8, 4098> {
         // Used by the stateless dispatch path (host-side tests).
         // Key-mutating commands here use NullKeyStore (no-op flash writes).
         // GET RESPONSE chaining and Le-truncation are handled by the Dispatcher.
@@ -1135,10 +1133,8 @@ impl HsmProtocol for ScHsm {
             Ok(cmd) => self.dispatch(&cmd),
             Err(_) => ApduResponse::err(SW_INS_NOT_SUPPORTED),
         };
-        let serialized = resp.serialize();
-        let mut out: Vec<u8, 4096> = Vec::new();
-        let _ = out.extend_from_slice(&serialized[..serialized.len().min(4096)]);
-        out
+        // Full serialized response: data (≤4096) + SW — never truncated.
+        resp.serialize()
     }
 
     fn handles_aid(&self, aid: &[u8]) -> bool {
