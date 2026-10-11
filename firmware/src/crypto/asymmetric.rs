@@ -831,59 +831,25 @@ pub fn rsa_sign_pkcs1v15(
     _rng: &mut impl RngCore,
 ) -> Result<heapless::Vec<u8, 512>, CryptoError> {
     use ::rsa::pkcs1::DecodeRsaPrivateKey;
-    use ::rsa::pkcs1v15::SigningKey;
-    use ::rsa::signature::hazmat::PrehashSigner;
-    use ::rsa::RsaPrivateKey;
+    use ::rsa::{Pkcs1v15Sign, RsaPrivateKey};
     use sha1::Sha1;
-    use sha2::{Sha256, Sha384, Sha512};
+    use sha2::{Sha224, Sha256, Sha384, Sha512};
 
     let priv_key =
         RsaPrivateKey::from_pkcs1_der(private_key_der).map_err(|_| CryptoError::WrongKeyLength)?;
 
-    // Each arm produces the raw signature bytes (heap-allocated by rsa crate).
-    let sig_bytes: alloc::vec::Vec<u8> = match hash_algo {
-        HashAlgorithm::Sha1 => {
-            let key: SigningKey<Sha1> = SigningKey::new(priv_key);
-            let sig = key
-                .sign_prehash(hash_data)
-                .map_err(|_| CryptoError::SignFailure)?;
-            use ::rsa::signature::SignatureEncoding;
-            sig.to_bytes().to_vec()
-        }
-        HashAlgorithm::Sha224 => {
-            use sha2::Sha224;
-            let key: SigningKey<Sha224> = SigningKey::new(priv_key);
-            let sig = key
-                .sign_prehash(hash_data)
-                .map_err(|_| CryptoError::SignFailure)?;
-            use ::rsa::signature::SignatureEncoding;
-            sig.to_bytes().to_vec()
-        }
-        HashAlgorithm::Sha256 => {
-            let key: SigningKey<Sha256> = SigningKey::new(priv_key);
-            let sig = key
-                .sign_prehash(hash_data)
-                .map_err(|_| CryptoError::SignFailure)?;
-            use ::rsa::signature::SignatureEncoding;
-            sig.to_bytes().to_vec()
-        }
-        HashAlgorithm::Sha384 => {
-            let key: SigningKey<Sha384> = SigningKey::new(priv_key);
-            let sig = key
-                .sign_prehash(hash_data)
-                .map_err(|_| CryptoError::SignFailure)?;
-            use ::rsa::signature::SignatureEncoding;
-            sig.to_bytes().to_vec()
-        }
-        HashAlgorithm::Sha512 => {
-            let key: SigningKey<sha2::Sha512> = SigningKey::new(priv_key);
-            let sig = key
-                .sign_prehash(hash_data)
-                .map_err(|_| CryptoError::SignFailure)?;
-            use ::rsa::signature::SignatureEncoding;
-            sig.to_bytes().to_vec()
-        }
+    // Blinded (random r per operation) and fault-checked: sign_with_rng runs
+    // rsa_decrypt_and_check with blinding, unlike the rng-less SigningKey path.
+    let scheme = match hash_algo {
+        HashAlgorithm::Sha1 => Pkcs1v15Sign::new::<Sha1>(),
+        HashAlgorithm::Sha224 => Pkcs1v15Sign::new::<Sha224>(),
+        HashAlgorithm::Sha256 => Pkcs1v15Sign::new::<Sha256>(),
+        HashAlgorithm::Sha384 => Pkcs1v15Sign::new::<Sha384>(),
+        HashAlgorithm::Sha512 => Pkcs1v15Sign::new::<Sha512>(),
     };
+    let sig_bytes = priv_key
+        .sign_with_rng(&mut crate::protocol::sc_hsm::FwRng, scheme, hash_data)
+        .map_err(|_| CryptoError::SignFailure)?;
 
     let mut out: heapless::Vec<u8, 512> = heapless::Vec::new();
     out.extend_from_slice(&sig_bytes)
@@ -950,8 +916,13 @@ pub fn rsa_decrypt_pkcs1v15(
     let priv_key =
         RsaPrivateKey::from_pkcs1_der(private_key_der).map_err(|_| CryptoError::WrongKeyLength)?;
 
+    // Blinded against timing side channels (Marvin-class attacks).
     let plaintext = priv_key
-        .decrypt(Pkcs1v15Encrypt, ciphertext)
+        .decrypt_blinded(
+            &mut crate::protocol::sc_hsm::FwRng,
+            Pkcs1v15Encrypt,
+            ciphertext,
+        )
         .map_err(|_| CryptoError::DecryptFailure)?;
 
     let mut out: heapless::Vec<u8, 512> = heapless::Vec::new();
@@ -984,7 +955,7 @@ pub fn rsa_decrypt_oaep(
 
     let scheme = Oaep::new::<Sha256>();
     let plaintext = priv_key
-        .decrypt(scheme, ciphertext)
+        .decrypt_blinded(&mut crate::protocol::sc_hsm::FwRng, scheme, ciphertext)
         .map_err(|_| CryptoError::DecryptFailure)?;
 
     let mut out: heapless::Vec<u8, 512> = heapless::Vec::new();
@@ -1019,25 +990,15 @@ pub fn rsa_private_raw(
     // Convert input bytes to BigUint (rsa 0.9 re-exports BigUint)
     let c = ::rsa::BigUint::from_bytes_be(data);
 
-    // Raw RSA private key operation: m = c^d mod n (with CRT, no blinding)
-    // SAFETY: hazmat — caller is responsible for ensuring correct use.
-    // We pass None for the blinding RNG; a local phantom type satisfies the generic bound.
-    struct NoRng;
-    impl ::rsa::rand_core::RngCore for NoRng {
-        fn next_u32(&mut self) -> u32 {
-            0
-        }
-        fn next_u64(&mut self) -> u64 {
-            0
-        }
-        fn fill_bytes(&mut self, _: &mut [u8]) {}
-        fn try_fill_bytes(&mut self, _: &mut [u8]) -> Result<(), ::rsa::rand_core::Error> {
-            Ok(())
-        }
-    }
-    impl ::rsa::rand_core::CryptoRng for NoRng {}
-    let m = ::rsa::hazmat::rsa_decrypt(None::<&mut NoRng>, &priv_key, &c)
-        .map_err(|_| CryptoError::DecryptFailure)?;
+    // Raw RSA private key operation: m = c^d mod n (CRT), blinded with a
+    // fresh random r, and checked by re-encrypting the result: a faulted CRT
+    // half (Bellcore attack) is caught instead of leaking a factor of n.
+    let m = ::rsa::hazmat::rsa_decrypt_and_check(
+        &priv_key,
+        Some(&mut crate::protocol::sc_hsm::FwRng),
+        &c,
+    )
+    .map_err(|_| CryptoError::DecryptFailure)?;
 
     // Convert result to big-endian, zero-padded to key_len bytes
     let m_bytes = m.to_bytes_be();
@@ -1305,5 +1266,57 @@ mod tests {
             generate_ec_keypair(KeyType::EcPrivateBrainpoolP256, &mut rng),
             Err(CryptoError::UnsupportedAlgorithm)
         ));
+    }
+}
+
+#[cfg(all(test, feature = "rsa"))]
+mod rsa_blinding_tests {
+    use super::*;
+    use ::rsa::pkcs1::EncodeRsaPrivateKey;
+    use ::rsa::traits::PublicKeyParts;
+    use ::rsa::{Pkcs1v15Encrypt, Pkcs1v15Sign, RsaPrivateKey, RsaPublicKey};
+    use sha2::{Digest, Sha256};
+
+    fn key() -> (RsaPrivateKey, alloc::vec::Vec<u8>) {
+        // 1024-bit keeps the debug-build test fast; the code path is size-independent.
+        let k = RsaPrivateKey::new(&mut crate::protocol::sc_hsm::FwRng, 1024).unwrap();
+        let der = k.to_pkcs1_der().unwrap().as_bytes().to_vec();
+        (k, der)
+    }
+
+    #[test]
+    fn blinded_sign_decrypt_and_raw_are_correct() {
+        let (k, der) = key();
+        let public = RsaPublicKey::from(&k);
+        let hash: [u8; 32] = Sha256::digest(b"pico2hsm").into();
+
+        let sig = rsa_sign_pkcs1v15(
+            KeyType::RsaPrivate2048,
+            &der,
+            &hash,
+            HashAlgorithm::Sha256,
+            &mut crate::protocol::sc_hsm::FwRng,
+        )
+        .unwrap();
+        public
+            .verify(Pkcs1v15Sign::new::<Sha256>(), &hash, &sig)
+            .unwrap();
+
+        let ct = public
+            .encrypt(
+                &mut crate::protocol::sc_hsm::FwRng,
+                Pkcs1v15Encrypt,
+                b"secret",
+            )
+            .unwrap();
+        let pt = rsa_decrypt_pkcs1v15(KeyType::RsaPrivate2048, &der, &ct).unwrap();
+        assert_eq!(&pt[..], b"secret");
+
+        // Raw op: (m^e)^d == m.
+        let m = ::rsa::BigUint::from(0x1234_5678u32);
+        let c = ::rsa::hazmat::rsa_encrypt(&public, &m).unwrap();
+        let out = rsa_private_raw(&der, &c.to_bytes_be()).unwrap();
+        assert_eq!(::rsa::BigUint::from_bytes_be(&out), m);
+        assert_eq!(out.len(), k.size());
     }
 }
