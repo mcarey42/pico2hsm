@@ -35,8 +35,9 @@ pub fn handle(state: &mut OpenPgpState, cmd: &ApduCommand<'_>) -> ApduResponse {
 
 /// Handle PSO:CDS — sign with the SIG key.
 fn handle_cds(state: &mut OpenPgpState, cmd: &ApduCommand<'_>) -> ApduResponse {
-    // Check PW1 authorization (mode 81 or mode 82)
-    if !state.pw1_verified_sign && !state.pw1_verified_other {
+    // Signing needs PW1 mode 81 (OpenPGP Card 3.4 §7.2.10); mode 82 covers
+    // decipher/authenticate only and must not authorise signatures.
+    if !state.pw1_verified_sign {
         return ApduResponse::err(SW_SECURITY_STATUS);
     }
 

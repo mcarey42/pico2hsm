@@ -21,6 +21,7 @@
 //! - GET CHALLENGE (0x84) — return random bytes
 
 pub mod commands;
+pub mod pw;
 
 use heapless::Vec;
 use pico2hsm_core::{
@@ -85,9 +86,9 @@ pub const PW3_MAX_RETRIES: u8 = 3;
 pub struct OpenPgpState {
     // --- PIN state (simple hash-based, matching SC-HSM pattern) ---
     /// PW1 hash (SHA-256). None if not yet initialized.
-    pub pw1_hash: Option<[u8; 32]>,
+    pub pw1_hash: Option<pw::PwHash>,
     /// PW3 hash (SHA-256). None if not yet initialized.
-    pub pw3_hash: Option<[u8; 32]>,
+    pub pw3_hash: Option<pw::PwHash>,
     /// PW1 remaining retries.
     pub pw1_retries: u8,
     /// PW3 remaining retries.
@@ -194,11 +195,61 @@ impl Drop for OpenPgpState {
     }
 }
 
+/// Serialize a PW record.
+///
+/// `[0..32]` digest, `[32]` has_hash, `[33]` retries, `[34]` blocked,
+/// `[35]` KDF (0 = legacy SHA-256, 1 = PBKDF2), `[36]` length (0 = unknown),
+/// `[37..53]` salt.  Records written before 2026-10 stop at byte 35 and
+/// load as legacy with unknown length.
+fn encode_pw(buf: &mut heapless::Vec<u8, 64>, pw: Option<&pw::PwHash>, retries: u8) {
+    let empty = pw::PwHash {
+        digest: [0; 32],
+        salt: [0; 16],
+        len: 0,
+        kdf: pw::PwKdf::Legacy,
+    };
+    let rec = pw.unwrap_or(&empty);
+    let _ = buf.extend_from_slice(&rec.digest);
+    let _ = buf.push(pw.is_some() as u8);
+    let _ = buf.push(retries);
+    let _ = buf.push((retries == 0) as u8);
+    let _ = buf.push(rec.kdf as u8);
+    let _ = buf.push(rec.len);
+    let _ = buf.extend_from_slice(&rec.salt);
+}
+
+/// Parse a PW record (see `encode_pw`): `(hash, retries)`, or `None` if short.
+fn decode_pw(b: &[u8]) -> Option<(Option<pw::PwHash>, u8)> {
+    if b.len() < 35 {
+        return None;
+    }
+    let retries = b[33];
+    if b[32] == 0 {
+        return Some((None, retries));
+    }
+    let mut rec = pw::PwHash {
+        digest: b[0..32].try_into().ok()?,
+        salt: [0; 16],
+        len: 0,
+        kdf: pw::PwKdf::Legacy,
+    };
+    if b.len() >= 53 {
+        rec.kdf = if b[35] == 1 {
+            pw::PwKdf::Pbkdf2
+        } else {
+            pw::PwKdf::Legacy
+        };
+        rec.len = b[36];
+        rec.salt = b[37..53].try_into().ok()?;
+    }
+    Some((Some(rec), retries))
+}
+
 impl OpenPgpState {
     pub fn new() -> Self {
         // Compute default PW1 and PW3 hashes
-        let pw1_hash = Self::hash_pin(b"123456");
-        let pw3_hash = Self::hash_pin(b"12345678");
+        let pw1_hash = pw::PwHash::factory_default(b"123456");
+        let pw3_hash = pw::PwHash::factory_default(b"12345678");
 
         let mut algo_sig = heapless::Vec::new();
         let _ = algo_sig.extend_from_slice(DEFAULT_ECDSA_ALGO_ATTRS);
@@ -247,17 +298,6 @@ impl OpenPgpState {
         }
     }
 
-    /// Compute SHA-256 hash of a PIN (simple, same as SC-HSM verify pattern).
-    pub fn hash_pin(pin: &[u8]) -> [u8; 32] {
-        use sha2::{Digest, Sha256};
-        let mut h = Sha256::new();
-        h.update(pin);
-        let result = h.finalize();
-        let mut out = [0u8; 32];
-        out.copy_from_slice(&result);
-        out
-    }
-
     /// Reset all PIN verification flags (called on SELECT).
     pub fn reset_security_state(&mut self) {
         self.pw1_verified_sign = false;
@@ -286,12 +326,19 @@ enum PwCounter {
 impl PwCounter {
     /// The counter `cmd` would spend; malformed APDUs (rejected by the
     /// handler before any comparison) spend nothing.
-    fn spent_by(cmd: &ApduCommand<'_>) -> Option<Self> {
+    fn spent_by(cmd: &ApduCommand<'_>, state: &OpenPgpState) -> Option<Self> {
         let n = cmd.data.len();
         let well_formed = cmd.p1 == 0x00
-            && match cmd.ins {
-                verify::INS_VERIFY => (6..=127).contains(&n),
-                change_pin::INS_CHANGE_PIN => n >= 12,
+            && match (cmd.ins, cmd.p2) {
+                (verify::INS_VERIFY, _) => (6..=127).contains(&n),
+                (change_pin::INS_CHANGE_PIN, 0x81) => {
+                    change_pin::split_at(state.pw1_hash.as_ref(), n, change_pin::PW1_MIN_LEN)
+                        .is_some()
+                }
+                (change_pin::INS_CHANGE_PIN, 0x83) => {
+                    change_pin::split_at(state.pw3_hash.as_ref(), n, change_pin::PW3_MIN_LEN)
+                        .is_some()
+                }
                 _ => false,
             };
         if !well_formed {
@@ -395,7 +442,7 @@ impl OpenPgp {
             }
         }
 
-        if let Some(pw) = PwCounter::spent_by(cmd) {
+        if let Some(pw) = PwCounter::spent_by(cmd, &self.state) {
             return self.with_persisted_attempt(pw, cmd, store);
         }
         self.route_with_store(cmd, store)
@@ -487,6 +534,7 @@ impl OpenPgp {
     ///   [32]    has_pw1_hash (1 if Some, 0 if None)
     ///   [33]    pw1_retries
     ///   [34]    pw1_blocked as u8
+    ///   [35..]  see `encode_pw` (KDF, length, salt)
     pub fn save_pw1_to_store(
         state: &OpenPgpState,
         store: &mut dyn crate::storage::KeyStore,
@@ -495,15 +543,7 @@ impl OpenPgp {
         use pico2hsm_core::key::AppletId;
 
         let mut buf: heapless::Vec<u8, 64> = heapless::Vec::new();
-        let (hash_bytes, has_hash) = match &state.pw1_hash {
-            Some(h) => (*h, 1u8),
-            None => ([0u8; 32], 0u8),
-        };
-        let _ = buf.extend_from_slice(&hash_bytes);
-        let _ = buf.push(has_hash);
-        let _ = buf.push(state.pw1_retries);
-        let blocked = if state.pw1_retries == 0 { 1u8 } else { 0u8 };
-        let _ = buf.push(blocked);
+        encode_pw(&mut buf, state.pw1_hash.as_ref(), state.pw1_retries);
 
         let mut obj = KeyObject {
             key_type: KmKeyType::Generic,
@@ -529,6 +569,7 @@ impl OpenPgp {
     ///   [32]    has_pw3_hash (1 if Some, 0 if None)
     ///   [33]    pw3_retries
     ///   [34]    pw3_blocked as u8
+    ///   [35..]  see `encode_pw` (KDF, length, salt)
     pub fn save_pw3_to_store(
         state: &OpenPgpState,
         store: &mut dyn crate::storage::KeyStore,
@@ -537,15 +578,7 @@ impl OpenPgp {
         use pico2hsm_core::key::AppletId;
 
         let mut buf: heapless::Vec<u8, 64> = heapless::Vec::new();
-        let (hash_bytes, has_hash) = match &state.pw3_hash {
-            Some(h) => (*h, 1u8),
-            None => ([0u8; 32], 0u8),
-        };
-        let _ = buf.extend_from_slice(&hash_bytes);
-        let _ = buf.push(has_hash);
-        let _ = buf.push(state.pw3_retries);
-        let blocked = if state.pw3_retries == 0 { 1u8 } else { 0u8 };
-        let _ = buf.push(blocked);
+        encode_pw(&mut buf, state.pw3_hash.as_ref(), state.pw3_retries);
 
         let mut obj = KeyObject {
             key_type: KmKeyType::Generic,
@@ -572,33 +605,18 @@ impl OpenPgp {
         // Load PW1 state.
         if let Ok(Some(obj)) = store.fetch_key(OPENPGP_PW1_KEY_ID) {
             let b = &obj.private_key;
-            if b.len() >= 35 {
-                let has_hash = b[32] != 0;
-                if has_hash {
-                    let mut h = [0u8; 32];
-                    h.copy_from_slice(&b[0..32]);
-                    self.state.pw1_hash = Some(h);
-                } else {
-                    self.state.pw1_hash = None;
-                }
-                self.state.pw1_retries = b[33];
-                // b[34] is pw1_blocked but we derive it from retries
+            if let Some((hash, retries)) = decode_pw(b) {
+                self.state.pw1_hash = hash;
+                self.state.pw1_retries = retries;
             }
         }
 
         // Load PW3 state.
         if let Ok(Some(obj)) = store.fetch_key(OPENPGP_PW3_KEY_ID) {
             let b = &obj.private_key;
-            if b.len() >= 35 {
-                let has_hash = b[32] != 0;
-                if has_hash {
-                    let mut h = [0u8; 32];
-                    h.copy_from_slice(&b[0..32]);
-                    self.state.pw3_hash = Some(h);
-                } else {
-                    self.state.pw3_hash = None;
-                }
-                self.state.pw3_retries = b[33];
+            if let Some((hash, retries)) = decode_pw(b) {
+                self.state.pw3_hash = hash;
+                self.state.pw3_retries = retries;
             }
         }
 
@@ -815,6 +833,165 @@ mod terminate_tests {
             pgp.state.auth_private,
             Some(auth),
             "authentication key untouched"
+        );
+    }
+}
+
+#[cfg(test)]
+mod pw_tests {
+    use super::*;
+    use crate::security::key_management::{AlgorithmId, KeyObject, KeyType as KmKeyType};
+    use pico2hsm_core::error::HsmError;
+    use pico2hsm_core::key::{AppletId, KeyId};
+
+    /// Keeps the latest record per KeyId.
+    struct MemStore {
+        records: heapless::Vec<(KeyId, heapless::Vec<u8, 64>), 8>,
+    }
+
+    impl crate::storage::KeyStore for MemStore {
+        fn save_key(&mut self, obj: &KeyObject) -> Result<(), HsmError> {
+            let kid = KeyId(obj.key_id);
+            self.records.retain(|(k, _)| *k != kid);
+            let mut b = heapless::Vec::new();
+            let _ = b.extend_from_slice(&obj.private_key[..obj.private_key.len().min(64)]);
+            let _ = self.records.push((kid, b));
+            Ok(())
+        }
+        fn fetch_key(&mut self, kid: KeyId) -> Result<Option<KeyObject>, HsmError> {
+            Ok(self.records.iter().find(|(k, _)| *k == kid).map(|(_, b)| {
+                let mut o = KeyObject::new(
+                    KmKeyType::Generic,
+                    kid.0,
+                    AppletId::OpenPgp,
+                    AlgorithmId::AesGcm,
+                );
+                o.private_key.extend_from_slice(b).unwrap();
+                o
+            }))
+        }
+        fn erase_key(&mut self, _: KeyId) -> Result<(), HsmError> {
+            Ok(())
+        }
+        fn wipe_all(&mut self) -> Result<(), HsmError> {
+            Ok(())
+        }
+        fn wipe_by_owner(&mut self, _: AppletId) -> Result<(), HsmError> {
+            Ok(())
+        }
+        fn enumerate_keys(&self) -> heapless::Vec<KeyId, 64> {
+            heapless::Vec::new()
+        }
+        fn for_each_key(&self, f: &mut dyn FnMut(KeyId)) {
+            for (k, _) in self.records.iter() {
+                f(*k);
+            }
+        }
+    }
+
+    fn sw(pgp: &mut OpenPgp, store: &mut MemStore, apdu: &[u8]) -> u16 {
+        let r = pgp.process_apdu_with_store(apdu, store);
+        u16::from_be_bytes([r[r.len() - 2], r[r.len() - 1]])
+    }
+
+    fn apdu(ins: u8, p2: u8, data: &[u8]) -> heapless::Vec<u8, 64> {
+        let mut v = heapless::Vec::new();
+        v.extend_from_slice(&[0x00, ins, 0x00, p2, data.len() as u8])
+            .unwrap();
+        v.extend_from_slice(data).unwrap();
+        v
+    }
+
+    #[test]
+    fn verify_upgrades_default_to_salted_record_on_flash() {
+        let mut pgp = OpenPgp::new();
+        let mut store = MemStore {
+            records: heapless::Vec::new(),
+        };
+        assert_eq!(
+            sw(&mut pgp, &mut store, &apdu(0x20, 0x81, b"123456")),
+            0x9000
+        );
+        let rec = pgp.state.pw1_hash.unwrap();
+        assert_eq!(rec.kdf, pw::PwKdf::Pbkdf2);
+        assert_eq!(rec.len(), Some(6));
+        let mut fresh = OpenPgp::new();
+        fresh.load_from_store(&mut store);
+        assert_eq!(fresh.state.pw1_hash, Some(rec), "upgrade persisted");
+        assert_eq!(
+            sw(&mut fresh, &mut store, &apdu(0x20, 0x81, b"123456")),
+            0x9000
+        );
+    }
+
+    #[test]
+    fn change_pin_checks_exactly_one_candidate() {
+        let mut pgp = OpenPgp::new();
+        let mut store = MemStore {
+            records: heapless::Vec::new(),
+        };
+        // Old PIN is 6 bytes; "1234561234567" would match under some other
+        // split only if more than one were tried.
+        let before = pgp.state.pw1_retries;
+        assert_eq!(
+            sw(&mut pgp, &mut store, &apdu(0x24, 0x81, b"12345X654321")),
+            0x63C0 | (before - 1) as u16
+        );
+        assert_eq!(
+            sw(&mut pgp, &mut store, &apdu(0x24, 0x81, b"123456654321")),
+            0x9000
+        );
+        assert_eq!(
+            sw(&mut pgp, &mut store, &apdu(0x20, 0x81, b"654321")),
+            0x9000
+        );
+    }
+
+    #[test]
+    fn signing_needs_mode_81() {
+        let mut pgp = OpenPgp::new();
+        let mut store = MemStore {
+            records: heapless::Vec::new(),
+        };
+        assert_eq!(
+            sw(&mut pgp, &mut store, &apdu(0x20, 0x82, b"123456")),
+            0x9000
+        );
+        let pso_cds = [
+            0x00, 0x2A, 0x9E, 0x9A, 0x20, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
+        assert_eq!(sw(&mut pgp, &mut store, &pso_cds), 0x6982);
+    }
+
+    #[test]
+    fn legacy_record_of_unknown_length_asks_for_verify_without_spending() {
+        let mut pgp = OpenPgp::new();
+        let mut store = MemStore {
+            records: heapless::Vec::new(),
+        };
+        // A pre-2026-10 record: 35 bytes, SHA-256("123456"), no length.
+        let mut old: heapless::Vec<u8, 64> = heapless::Vec::new();
+        use sha2::Digest;
+        old.extend_from_slice(&sha2::Sha256::digest(b"123456"))
+            .unwrap();
+        old.extend_from_slice(&[1, 3, 0]).unwrap();
+        store.records.push((OPENPGP_PW1_KEY_ID, old)).unwrap();
+        pgp.load_from_store(&mut store);
+        assert_eq!(pgp.state.pw1_hash.unwrap().len(), None);
+
+        assert_eq!(
+            sw(&mut pgp, &mut store, &apdu(0x24, 0x81, b"123456654321")),
+            0x6985
+        );
+        assert_eq!(pgp.state.pw1_retries, 3, "no retry spent");
+        assert_eq!(
+            sw(&mut pgp, &mut store, &apdu(0x20, 0x81, b"123456")),
+            0x9000
+        );
+        assert_eq!(
+            sw(&mut pgp, &mut store, &apdu(0x24, 0x81, b"123456654321")),
+            0x9000
         );
     }
 }

@@ -61,7 +61,7 @@ pub fn handle(state: &mut OpenPgpState, cmd: &ApduCommand<'_>) -> ApduResponse {
             if cmd.data.len() < 6 || cmd.data.len() > 127 {
                 return ApduResponse::err(SW_WRONG_LENGTH);
             }
-            state.pw1_hash = Some(OpenPgpState::hash_pin(cmd.data));
+            state.pw1_hash = Some(crate::protocol::openpgp::pw::PwHash::new(cmd.data));
             state.pw1_retries = PW1_MAX_RETRIES;
             state.pw1_verified_sign = false;
             state.pw1_verified_other = false;

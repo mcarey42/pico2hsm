@@ -20,10 +20,20 @@ fn sw_retry(remaining: u8) -> u16 {
     0x63C0 | (remaining as u16 & 0x0F)
 }
 
-/// Verify a PIN hash in constant time.
-fn verify_pin_hash(pin: &[u8], stored_hash: &[u8; 32]) -> bool {
-    let computed = OpenPgpState::hash_pin(pin);
-    computed.ct_eq(stored_hash).into()
+/// Check `pw` against `slot`; on success upgrade a legacy (unsalted) record
+/// to salted PBKDF2 — the caller persists it with the restored counter.
+fn check_and_upgrade(slot: &mut Option<crate::protocol::openpgp::pw::PwHash>, pw: &[u8]) -> bool {
+    use crate::protocol::openpgp::pw::{PwHash, PwKdf};
+    let Some(stored) = slot.as_ref() else {
+        return false;
+    };
+    if !stored.matches(pw) {
+        return false;
+    }
+    if stored.kdf == PwKdf::Legacy {
+        *slot = Some(PwHash::new(pw));
+    }
+    true
 }
 
 /// Handle a VERIFY APDU command.
@@ -74,12 +84,11 @@ pub fn handle(state: &mut OpenPgpState, cmd: &ApduCommand<'_>) -> ApduResponse {
                 return ApduResponse::err(SW_AUTH_BLOCKED);
             }
 
-            let stored = match &state.pw1_hash {
-                Some(h) => *h,
-                None => return ApduResponse::err(SW_AUTH_BLOCKED),
-            };
+            if state.pw1_hash.is_none() {
+                return ApduResponse::err(SW_AUTH_BLOCKED);
+            }
 
-            if verify_pin_hash(cmd.data, &stored) {
+            if check_and_upgrade(&mut state.pw1_hash, cmd.data) {
                 state.pw1_verified_sign = true;
                 state.pw1_retries = crate::protocol::openpgp::PW1_MAX_RETRIES;
                 ApduResponse::ok(&[])
@@ -114,12 +123,11 @@ pub fn handle(state: &mut OpenPgpState, cmd: &ApduCommand<'_>) -> ApduResponse {
                 return ApduResponse::err(SW_AUTH_BLOCKED);
             }
 
-            let stored = match &state.pw1_hash {
-                Some(h) => *h,
-                None => return ApduResponse::err(SW_AUTH_BLOCKED),
-            };
+            if state.pw1_hash.is_none() {
+                return ApduResponse::err(SW_AUTH_BLOCKED);
+            }
 
-            if verify_pin_hash(cmd.data, &stored) {
+            if check_and_upgrade(&mut state.pw1_hash, cmd.data) {
                 state.pw1_verified_other = true;
                 state.pw1_retries = crate::protocol::openpgp::PW1_MAX_RETRIES;
                 ApduResponse::ok(&[])
@@ -154,12 +162,11 @@ pub fn handle(state: &mut OpenPgpState, cmd: &ApduCommand<'_>) -> ApduResponse {
                 return ApduResponse::err(SW_AUTH_BLOCKED);
             }
 
-            let stored = match &state.pw3_hash {
-                Some(h) => *h,
-                None => return ApduResponse::err(SW_AUTH_BLOCKED),
-            };
+            if state.pw3_hash.is_none() {
+                return ApduResponse::err(SW_AUTH_BLOCKED);
+            }
 
-            if verify_pin_hash(cmd.data, &stored) {
+            if check_and_upgrade(&mut state.pw3_hash, cmd.data) {
                 state.pw3_verified = true;
                 state.pw3_retries = crate::protocol::openpgp::PW3_MAX_RETRIES;
                 ApduResponse::ok(&[])
