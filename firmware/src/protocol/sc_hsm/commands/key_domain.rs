@@ -71,6 +71,13 @@ pub fn handle(state: &mut ScHsmState, cmd: &ApduCommand<'_>) -> ApduResponse {
         return ApduResponse::err(SW_SECURITY_STATUS);
     }
 
+    // An established DKEK is never replaced or cleared here — the same
+    // invariant as the DKEK exchange (S-02).  Wrapped backups depend on
+    // it; INITIALIZE (which wipes every key) is the only way to start over.
+    if matches!(cmd.p1, 0x01 | 0x02) && state.dkek.is_ready() {
+        return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED);
+    }
+
     match cmd.p1 {
         0x01 => {
             // Create key domain — reset DKEK state and begin share collection.
@@ -126,6 +133,22 @@ mod tests {
     use pico2hsm_core::apdu::{ApduCommand, SW_OK, SW_SECURITY_STATUS, SW_WRONG_DATA};
 
     use crate::protocol::sc_hsm::ScHsmState;
+
+    #[test]
+    fn established_dkek_cannot_be_reset_or_deleted() {
+        let mut state = make_state_with_dkek_shares(1);
+        let share = build_apdu(0x00, 0x00, &[0x11; 32]);
+        let cmd = ApduCommand::parse(&share).unwrap();
+        assert_eq!(handle(&mut state, &cmd).sw, SW_OK);
+        assert!(state.dkek.is_ready());
+        state.so_pin_verified = true;
+        for p1 in [0x01, 0x02] {
+            let apdu = build_apdu(p1, 0x00, &[]);
+            let cmd = ApduCommand::parse(&apdu).unwrap();
+            assert_eq!(handle(&mut state, &cmd).sw, SW_CONDITIONS_NOT_SATISFIED);
+            assert!(state.dkek.is_ready(), "DKEK kept (P1={p1:02X})");
+        }
+    }
 
     fn make_state_with_dkek_shares(n: u8) -> ScHsmState {
         let mut state = ScHsmState::new();
