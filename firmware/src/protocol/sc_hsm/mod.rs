@@ -77,7 +77,7 @@ impl RetryCounter {
             initialize::INS_INITIALIZE
                 if state.initialized
                     && state.so_pin_hash.is_some()
-                    && initialize::init_code(cmd).is_some() =>
+                    && initialize::well_formed(cmd) =>
             {
                 Some(Self::SoPin)
             }

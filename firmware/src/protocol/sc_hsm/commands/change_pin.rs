@@ -129,6 +129,7 @@ pub fn handle(state: &mut ScHsmState, cmd: &ApduCommand<'_>) -> ApduResponse {
             state.user_pin_hash = Some(hash_pin_pbkdf2(new_pin, &new_salt));
             state.pin_retry_count = 3;
             state.pin_verified = false; // require re-verify after change
+            state.session_pin = None; // stood in for the old PIN
             ApduResponse::ok(&[])
         }
 
@@ -155,6 +156,7 @@ pub fn handle(state: &mut ScHsmState, cmd: &ApduCommand<'_>) -> ApduResponse {
             state.so_pin_hash = Some(hash_pin_pbkdf2(new_pin, &new_salt));
             state.so_pin_retry_count = 5;
             state.so_pin_verified = false;
+            state.session_pin = None; // stood in for the old PIN
             ApduResponse::ok(&[])
         }
 

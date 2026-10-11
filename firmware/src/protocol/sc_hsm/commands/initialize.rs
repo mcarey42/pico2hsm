@@ -36,6 +36,20 @@ pub fn init_code<'a>(cmd: &ApduCommand<'a>) -> Option<&'a [u8]> {
     find_tlv(cmd.data, 0x82).filter(|c| c.len() == 8)
 }
 
+/// Every field check `handle` makes before comparing the SO-PIN.  The
+/// retry wrapper charges only requests that pass, so a malformed request
+/// costs nothing and a correct SO-PIN is never charged for a later field
+/// error (five of those blocked the SO-PIN for good).
+pub fn well_formed(cmd: &ApduCommand<'_>) -> bool {
+    let d = cmd.data;
+    init_code(cmd).is_some()
+        && find_tlv(d, 0x81).is_none_or(|p| (6..=16).contains(&p.len()))
+        && find_tlv(d, 0x91)
+            .and_then(|v| v.first().copied())
+            .is_none_or(|r| (1..=15).contains(&r))
+        && find_tlv(d, 0x93).is_none_or(|p| (8..=16).contains(&p.len()))
+}
+
 fn find_tlv(data: &[u8], tag: u8) -> Option<&[u8]> {
     let mut i = 0;
     while i + 1 < data.len() {
@@ -111,22 +125,6 @@ pub fn handle(
         return ApduResponse::err(SW_WRONG_LENGTH);
     }
 
-    // Re-initialization: the provided init code must match the stored hash.
-    // The real SmartCard-HSM authenticates re-init via the init code in the
-    // command itself — no prior VERIFY is required.
-    if state.initialized {
-        // The retry itself is spent on flash by ScHsm::with_persisted_attempt.
-        if state.so_pin_hash.is_some() && state.so_pin_retry_count == 0 {
-            return ApduResponse::err(pico2hsm_core::apdu::SW_AUTH_BLOCKED);
-        }
-        if let Some(stored_hash) = state.so_pin_hash {
-            let provided_hash = hash_pin_pbkdf2(init_code, &state.so_pin_salt);
-            if !bool::from(provided_hash.ct_eq(&stored_hash)) {
-                return ApduResponse::err(SW_SECURITY_STATUS);
-            }
-        }
-    }
-
     // Tag 0x81: User PIN (optional, 6–16 bytes).
     let user_pin = find_tlv(data, 0x81);
     if let Some(up) = user_pin {
@@ -166,6 +164,23 @@ pub fn handle(
     let dkek_count = find_tlv(data, 0x92)
         .and_then(|v| v.first().copied())
         .unwrap_or(0);
+
+    // Re-initialization: the provided init code must match the stored hash
+    // (checked last, after every field — see `well_formed`).
+    // The real SmartCard-HSM authenticates re-init via the init code in the
+    // command itself — no prior VERIFY is required.
+    if state.initialized {
+        // The retry itself is spent on flash by ScHsm::with_persisted_attempt.
+        if state.so_pin_hash.is_some() && state.so_pin_retry_count == 0 {
+            return ApduResponse::err(pico2hsm_core::apdu::SW_AUTH_BLOCKED);
+        }
+        if let Some(stored_hash) = state.so_pin_hash {
+            let provided_hash = hash_pin_pbkdf2(init_code, &state.so_pin_salt);
+            if !bool::from(provided_hash.ct_eq(&stored_hash)) {
+                return ApduResponse::err(SW_SECURITY_STATUS);
+            }
+        }
+    }
 
     // Wipe SC-HSM's keys from flash first, before any credential in RAM
     // changes.  Old keys must really be gone, or they would reappear after
@@ -211,6 +226,7 @@ pub fn handle(
     state.dkek_shares_imported = 0;
 
     // Reset auth state.
+    state.session_pin = None;
     state.pin_verified = false;
     state.so_pin_verified = false;
     state.so_pin_retry_count = 5;

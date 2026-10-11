@@ -128,6 +128,9 @@ pub struct PivState {
     pub pin_state: crate::security::pin::PinState,
     /// True after a successful VERIFY (session-level).
     pub pin_verified: bool,
+    /// The PIN was verified by the immediately preceding command: slot 9C
+    /// is "PIN always" (SP 800-73-4), one signature per VERIFY.
+    pub pin_always_ok: bool,
     /// Management key (3DES, 24 bytes).
     pub mgmt_key: [u8; 24],
     /// True after successful 3DES mutual auth with management key.
@@ -160,6 +163,7 @@ impl PivState {
         PivState {
             pin_state,
             pin_verified: false,
+            pin_always_ok: false,
             mgmt_key: DEFAULT_MGMT_KEY,
             mgmt_key_authenticated: false,
             mgmt_challenge: None,
@@ -213,11 +217,17 @@ impl PivRetryCounter {
         use commands::*;
         let n = cmd.data.len();
         match (cmd.ins, cmd.p1, cmd.p2) {
-            (verify::INS_VERIFY, 0x00, 0x80) if n == 8 => Some(Self::Pin),
+            (verify::INS_VERIFY, 0x00, 0x80)
+                if n == 8 && change_reference_data::valid_new_pin(cmd.data) =>
+            {
+                Some(Self::Pin)
+            }
             // Mirrors the handlers' checks before the compare, so a
             // malformed request is refused without spending a retry.
             (change_reference_data::INS_CHANGE_REFERENCE_DATA, 0x00, 0x80)
-                if n == 16 && change_reference_data::valid_new_pin(&cmd.data[8..]) =>
+                if n == 16
+                    && change_reference_data::valid_new_pin(&cmd.data[..8])
+                    && change_reference_data::valid_new_pin(&cmd.data[8..]) =>
             {
                 Some(Self::Pin)
             }
@@ -280,6 +290,8 @@ impl Piv {
             let state = addr_of_mut!((*dest).state);
             addr_of_mut!((*state).pin_state).write(pin_state);
             addr_of_mut!((*state).pin_verified).write(false);
+            addr_of_mut!((*state).pin_always_ok).write(false);
+            addr_of_mut!((*state).credentials_persisted).write(false);
             addr_of_mut!((*state).mgmt_key).write(DEFAULT_MGMT_KEY);
             addr_of_mut!((*state).mgmt_key_authenticated).write(false);
             addr_of_mut!((*state).mgmt_challenge).write(None);
@@ -519,6 +531,12 @@ impl Piv {
         cmd: &ApduCommand<'_>,
         store: &mut dyn crate::storage::KeyStore,
     ) -> ApduResponse {
+        // "PIN always" covers only the command right after VERIFY.
+        if cmd.ins != commands::verify::INS_VERIFY
+            && cmd.ins != commands::general_authenticate::INS_GENERAL_AUTHENTICATE
+        {
+            self.state.pin_always_ok = false;
+        }
         match PivRetryCounter::spent_by(cmd) {
             Some(counter) => self.with_persisted_attempt(counter, cmd, store),
             None => self.route_with_store(cmd, store),
@@ -1126,10 +1144,7 @@ mod data_object_tests {
                 "5FC1{low:02X}"
             );
         }
-        assert!(store
-            .records
-            .iter()
-            .all(|(k, _)| (k.0 >> 8) & 0xFF != 0xD0));
+        assert!(store.records.iter().all(|(k, _)| (k.0 >> 8) & 0xFF != 0xD0));
     }
 
     #[test]

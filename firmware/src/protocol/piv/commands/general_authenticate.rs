@@ -174,8 +174,9 @@ fn handle_asymmetric_auth(
     match key_ref {
         0x9E => {} // Card Authentication — no PIN required
         0x9C => {
-            // Digital Signature — PIN always required (every use)
-            if !state.pin_verified {
+            // Digital Signature — PIN always: a VERIFY right before each use
+            // (any earlier VERIFY in the session used to do).
+            if !state.pin_verified || !state.pin_always_ok {
                 return ApduResponse::err(0x6982);
             }
         }
@@ -263,7 +264,7 @@ fn handle_asymmetric_auth(
             // NIST SP 800-73-4 Part 2 §3.3.2 — PIN Always for slot 9C:
             // clear pin_verified after each successful Digital Signature use.
             if key_ref == 0x9C {
-                state.pin_verified = false;
+                state.pin_always_ok = false;
             }
 
             return ApduResponse::ok(&resp);

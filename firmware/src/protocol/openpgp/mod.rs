@@ -348,6 +348,9 @@ impl PwCounter {
         let n = cmd.data.len();
         let well_formed = cmd.p1 == 0x00
             && match (cmd.ins, cmd.p2) {
+                // PW3 needs 8+ bytes; the handler refuses shorter ones
+                // before comparing, so they must not cost a retry.
+                (verify::INS_VERIFY, 0x83) => (8..=127).contains(&n),
                 (verify::INS_VERIFY, _) => (6..=127).contains(&n),
                 (change_pin::INS_CHANGE_PIN, 0x81) => change_pin::counts_as_attempt(
                     state.pw1_hash.as_ref(),

@@ -426,6 +426,7 @@ impl Dispatcher {
         {
             let piv = &mut self.piv.state;
             piv.pin_verified = false;
+            piv.pin_always_ok = false;
             piv.pin_state.session_authenticated = false;
             piv.mgmt_key_authenticated = false;
             piv.mgmt_challenge = None;
@@ -457,6 +458,7 @@ impl Dispatcher {
             #[cfg(feature = "applet-piv")]
             {
                 self.piv.state.pin_verified = false;
+                self.piv.state.pin_always_ok = false;
                 self.piv.state.mgmt_key_authenticated = false;
                 self.piv.state.mgmt_challenge = None;
             }

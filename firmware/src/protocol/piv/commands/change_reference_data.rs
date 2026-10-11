@@ -66,7 +66,7 @@ fn handle_change_pin(state: &mut PivState, cmd: &ApduCommand<'_>) -> ApduRespons
     let new_pin = strip_pin_padding(&cmd.data[8..16]);
 
     // FIPS 201-2 §2.4.3: PIV PIN must contain only numeric digits (0x30–0x39).
-    if old_pin.iter().any(|&b| !(0x30..=0x39).contains(&b)) || !valid_new_pin(&cmd.data[8..16]) {
+    if !valid_new_pin(&cmd.data[..8]) || !valid_new_pin(&cmd.data[8..16]) {
         return ApduResponse::err(0x6A80); // wrong data — non-digit byte
     }
 

@@ -176,6 +176,10 @@ pub fn handle(state: &mut ScHsmState, cmd: &ApduCommand<'_>) -> ApduResponse {
                 Some(p) => p,
                 None => return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
             };
+            // It stands in for the user PIN: not while that is blocked or unset.
+            if state.pin_retry_count == 0 || state.user_pin_hash.is_none() {
+                return ApduResponse::err(SW_AUTH_BLOCKED);
+            }
 
             // Constant-time comparison against the 8-byte candidate
             if pin.ct_eq(cmd.data).into() {
@@ -219,6 +223,19 @@ mod tests {
     }
 
     #[test]
+    fn session_pin_refused_while_user_pin_blocked() {
+        let mut state = ScHsmState::new();
+        let stored = [0x01; 8];
+        state.session_pin = Some(stored);
+        state.user_pin_hash = Some([1; 32]);
+        state.pin_retry_count = 0;
+        let apdu = make_session_verify(&stored);
+        let cmd = ApduCommand::parse(&apdu).unwrap();
+        assert_eq!(handle(&mut state, &cmd).sw, SW_AUTH_BLOCKED);
+        assert!(!state.pin_verified);
+    }
+
+    #[test]
     fn test_session_pin_verify_no_pin_stored() {
         let mut state = ScHsmState::new();
         // session_pin is None
@@ -234,6 +251,8 @@ mod tests {
         let mut state = ScHsmState::new();
         let stored = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x11, 0x22];
         state.session_pin = Some(stored);
+        state.user_pin_hash = Some([1; 32]);
+        state.pin_retry_count = 3;
 
         let wrong = [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
         let apdu = make_session_verify(&wrong);
@@ -250,6 +269,8 @@ mod tests {
         let mut state = ScHsmState::new();
         let stored = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08];
         state.session_pin = Some(stored);
+        state.user_pin_hash = Some([1; 32]);
+        state.pin_retry_count = 3;
 
         let apdu = make_session_verify(&stored);
         let cmd = ApduCommand::parse(&apdu).unwrap();
