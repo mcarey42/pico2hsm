@@ -20,7 +20,10 @@
 //! 1. Verify OTP provisioning status flag is set
 //! 2. Verify JTAG disable flag is set (record in pico2hsm boot flags)
 //! 3. Check for debugger attachment (SWD active) — halt if found in production
-//! 4. Arm the hardware watchdog
+//!
+//! The hardware watchdog is armed before these checks, by `main` (see
+//! `crate::watchdog`); a halt here therefore turns into a watchdog reset
+//! loop, which never gets past the checks either.
 //!
 //! # RP2350 OTP references (verified against pico-sdk otp_data.h + rp-pac 7.0.0)
 //!
@@ -49,15 +52,6 @@
 //! Row 0x18 is NUM_GPIOS, NOT CRIT0.  Previous code incorrectly wrote
 //! to row 0x18 believing it was CRIT0 — that was a no-op at best.
 
-use embassy_rp::watchdog::Watchdog;
-use embassy_time::Duration;
-
-/// Watchdog feed period in milliseconds.
-///
-/// The watchdog must be fed at least this often to prevent a reset.
-/// Set to 5000ms (5 seconds); main loop feeds every ~1000ms.
-pub const WATCHDOG_PERIOD_MS: u32 = 5000;
-
 /// Perform all boot-time security checks.
 ///
 /// Called during firmware startup before any USB or crypto operations.
@@ -78,7 +72,7 @@ pub fn security_checks() {
         Err(()) => {
             // OTP read failure — security state is unknowable. Hard reset.
             // Do NOT log or proceed: a glitch may have caused this.
-            cortex_m::peripheral::SCB::sys_reset();
+            crate::watchdog::reset_now(crate::watchdog::ResetCause::BootCheck);
         }
     };
 
@@ -113,7 +107,7 @@ pub fn security_checks() {
                 // Production mode set but secure boot not active — inconsistency.
                 // This may indicate incomplete provisioning or a hardware fault.
                 // Hard reset: do not boot in this state.
-                cortex_m::peripheral::SCB::sys_reset();
+                crate::watchdog::reset_now(crate::watchdog::ResetCause::BootCheck);
             }
 
             // Record the JTAG-disabled bookkeeping bit in the boot flags row.
@@ -277,41 +271,6 @@ pub fn disable_jtag_permanent() {
             defmt::error!("boot: failed to set JTAG disable OTP flag");
         }
     }
-}
-
-/// Feed the hardware watchdog with the standard period.
-///
-/// Must be called at least once per `WATCHDOG_PERIOD_MS` milliseconds.
-/// Wraps `Watchdog::feed(Duration)` with the constant period.
-///
-/// # Note on embassy-rp 0.10 API
-/// In embassy-rp 0.10, `Watchdog::feed()` takes a `Duration` argument
-/// (unlike rp-hal which is stateless). The period must be passed on every
-/// feed call. This design allows varying the timeout dynamically; we always
-/// use the constant `WATCHDOG_PERIOD_MS`.
-pub fn watchdog_feed(wd: &mut Watchdog) {
-    wd.feed(Duration::from_millis(WATCHDOG_PERIOD_MS as u64));
-}
-
-/// Arm the hardware watchdog timer.
-///
-/// After this call the processor must call `watchdog_feed()` at least
-/// once every `period_ms` milliseconds, or the RP2350 will reset.
-///
-/// # RP2350 Watchdog limits
-/// The RP2350 watchdog counter is 24 bits and counts in microseconds.
-/// Maximum period = 0xFF_FFFF µs ≈ 16.77 seconds (RP2350 datasheet §7.4).
-/// The `embassy_rp::watchdog::Watchdog::start()` method enforces this
-/// limit and will panic if exceeded.
-///
-/// # Implementation note
-/// Calls `Watchdog::start(Duration)` which:
-/// 1. Disables the watchdog
-/// 2. Configures the PSM reset mask (resets everything except ROSC/XOSC)
-/// 3. Loads the timeout counter
-/// 4. Enables the watchdog
-pub fn arm_watchdog(wd: &mut Watchdog, period_ms: u32) {
-    wd.start(Duration::from_millis(period_ms as u64));
 }
 
 /// Check whether a debugger is currently attached via SWD/JTAG.

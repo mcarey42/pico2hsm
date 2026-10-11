@@ -28,6 +28,7 @@ pub mod crypto;
 pub mod protocol;
 pub mod security;
 pub mod serial_debug;
+pub mod watchdog;
 
 // These modules depend on embassy-rp / embassy-usb / embassy-time which
 // only compile for ARM bare-metal targets. They are excluded from host tests.
@@ -57,17 +58,20 @@ pub static CORE1_PROGRESS: core::sync::atomic::AtomicU8 = core::sync::atomic::At
 /// Watchdog heartbeat counter incremented by Core1 during long-running crypto
 /// operations (via `FwRng::fill_bytes` — called thousands of times during RSA
 /// prime generation and before each ECDSA sign).  Core0 monitors this in the
-/// time-extension loop: if the heartbeat has not changed for several consecutive
-/// 1.5 s intervals, Core1 is assumed stuck and the APDU is aborted with an
-/// error response.
+/// time-extension loop and in the hardware-watchdog feeder: if neither the
+/// heartbeat nor the request/reply counters move for 30 s while a request is
+/// outstanding, Core1 is assumed stuck and the chip is reset (see
+/// [`watchdog`]).  Storage sector operations bump it too
+/// ([`watchdog::progress`]).
 ///
 /// `Relaxed` ordering is sufficient: RP2350 is cache-coherent across cores and
 /// we only need eventual visibility, not ordering with other memory operations.
 pub static WATCHDOG_HEARTBEAT: core::sync::atomic::AtomicU32 =
     core::sync::atomic::AtomicU32::new(0);
 
-/// Consecutive time-extension intervals (1.5 s each) without a heartbeat change
-/// before Core0 declares Core1 stuck and aborts the APDU.  20 intervals = 30 s.
+/// Time-extension intervals (1.5 s each) without a heartbeat change before
+/// Core0 declares Core1 stuck, answers 6F00 and resets the chip through the
+/// hardware watchdog.  20 intervals = 30 s ([`watchdog::CORE1_STALL_MS`]).
 /// The watchdog is a true deadlock detector — legitimate long operations (DKEK
 /// derivation, ECDSA scalar multiply) bump the heartbeat via `FwRng::fill_bytes`.
 /// RSA keygen suppresses the watchdog via [`WatchdogSuppressGuard`] because modular

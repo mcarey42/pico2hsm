@@ -318,6 +318,8 @@ where
     /// 3. Wait for BUSY to clear.
     /// 4. Verify by reading back and comparing.
     fn write_page(&mut self, addr: u32, data: &[u8]) -> Result<(), StorageError> {
+        // Feeds the hardware watchdog on core0 / bumps core1's heartbeat.
+        crate::watchdog::progress();
         self.write_enable()?;
 
         let cmd = if self.use_4byte_addr {
@@ -349,6 +351,8 @@ where
     /// 2. Sector Erase command + address.
     /// 3. Wait for BUSY to clear (sector erase ≤ 400 ms on W25Qxx).
     fn erase_sector(&mut self, addr: u32) -> Result<(), StorageError> {
+        // Feeds the hardware watchdog on core0 / bumps core1's heartbeat.
+        crate::watchdog::progress();
         self.write_enable()?;
 
         let cmd = if self.use_4byte_addr {
@@ -470,6 +474,8 @@ impl FlashChip for QmiFlash {
     }
 
     fn write_page(&mut self, addr: u32, data: &[u8]) -> Result<(), StorageError> {
+        // Feeds the hardware watchdog on core0 / bumps core1's heartbeat.
+        crate::watchdog::progress();
         if addr as u64 + data.len() as u64 > self.capacity {
             return Err(StorageError::WriteError);
         }
@@ -506,6 +512,10 @@ impl FlashChip for QmiFlash {
     }
 
     fn erase_sector(&mut self, addr: u32) -> Result<(), StorageError> {
+        // Runs from flash after the previous erase returned (XIP is back),
+        // so nothing here needs to be in RAM.
+        // Feeds the hardware watchdog on core0 / bumps core1's heartbeat.
+        crate::watchdog::progress();
         if addr as u64 + 4096 > self.capacity {
             return Err(StorageError::EraseError);
         }

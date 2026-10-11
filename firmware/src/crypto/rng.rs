@@ -299,8 +299,9 @@ pub fn fill_random(buf: &mut [u8]) -> Result<(), CryptoError> {
 pub fn fill_or_reset(buf: &mut [u8]) {
     if fill_random(buf).is_err() {
         // No log: core1 must not block on RTT, and a queued CDC line would
-        // never be sent before the reset.
-        cortex_m::peripheral::SCB::sys_reset();
+        // never be sent before the reset.  Through the watchdog: a full
+        // chip reset from either core, with the cause kept for the boot log.
+        crate::watchdog::reset_now(crate::watchdog::ResetCause::RngFailure);
     }
 }
 
