@@ -326,6 +326,9 @@ const EF_DEV_AUT: &[u8] = &[
 /// Inner read: return up to `max_len` bytes from file `file_id` starting at
 /// byte `offset`. Used by both the standard (INS=0xB0) and odd (INS=0xB1)
 /// READ BINARY handlers.
+/// File-ID high byte of PIN-protected data objects (OpenSC `PROT_DATA_PREFIX`).
+const PROT_DATA_PREFIX: u8 = 0xCD;
+
 fn read_file(
     state: &mut ScHsmState,
     store: &mut dyn KeyStore,
@@ -357,6 +360,12 @@ fn read_file(
         let start = offset.min(prkdf.len());
         let slice = &prkdf[start..prkdf.len().min(start + max_len)];
         return ApduResponse::ok(slice);
+    }
+
+    // PIN-protected data objects (OpenSC PROT_DATA_PREFIX): the real
+    // SC-HSM serves them only after user-PIN verification.
+    if (file_id >> 8) as u8 == PROT_DATA_PREFIX && !state.pin_verified {
+        return ApduResponse::err(pico2hsm_core::apdu::SW_SECURITY_STATUS);
     }
 
     // Check EF cache first, then fall back to flash via cross-core RPC.
@@ -494,4 +503,35 @@ pub fn handle_odd(
         Some(n) => n as usize,
     };
     read_file(state, store, file_id, offset, max_len)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::sc_hsm::KeyMeta;
+
+    #[test]
+    fn protected_data_object_needs_user_pin() {
+        let mut state = ScHsmState::new();
+        let mut store = crate::storage::NullKeyStore;
+        for fid_hi in [PROT_DATA_PREFIX, 0xCF] {
+            let kid = KeyId::sc_hsm_ef(0, fid_hi, 0x01).0;
+            let _ = state.key_index.push(KeyMeta {
+                key_id: kid,
+                key_type: 16,
+                algo: fid_hi,
+                key_flags: 0,
+            });
+            state.ef_cache_put(kid, b"secret");
+        }
+
+        // OpenSC reads these with READ BINARY ODD; both end in read_file.
+        assert_eq!(read_file(&mut state, &mut store, 0xCD01, 0, 256).sw, 0x6982);
+        assert_eq!(read_file(&mut state, &mut store, 0xCF01, 0, 256).sw, 0x9000);
+
+        state.pin_verified = true;
+        let r = read_file(&mut state, &mut store, 0xCD01, 0, 256);
+        assert_eq!(r.sw, 0x9000);
+        assert_eq!(&r.data[..], b"secret");
+    }
 }
