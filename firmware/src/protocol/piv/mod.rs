@@ -42,6 +42,9 @@ pub const MAX_PIV_DATA_OBJECTS: usize = 4;
 /// Maximum size of a single PIV data object in bytes.
 pub const MAX_PIV_DATA_SIZE: usize = 2048;
 
+// Every PIV data object must fit a stored object, with or without `rsa`.
+const _: () = assert!(MAX_PIV_DATA_SIZE <= crate::security::key_management::MAX_OBJECT_DATA_SIZE);
+
 /// Default PIV PIN: "123456" (ASCII).
 const DEFAULT_PIV_PIN: &[u8] = b"123456";
 

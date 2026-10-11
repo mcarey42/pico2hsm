@@ -95,8 +95,9 @@ const P2K4_HEADER_SIZE: usize = 21;
 /// Maximum plaintext payload inside a P2K4 encrypted blob.
 ///
 /// Layout: `[opt 2-byte priv_len] || priv_key || pub_len(2) || pub_key`.
-/// The 2-byte priv_len prefix is added when `priv_key.len() > 255` (RSA).
-pub const MAX_PLAINTEXT_SIZE: usize = 2 + MAX_PRIVATE_KEY_SIZE + 2 + MAX_PUBLIC_KEY_SIZE;
+/// The 2-byte priv_len prefix is added when `priv_key.len() > 255` (RSA
+/// keys and data objects).
+pub const MAX_PLAINTEXT_SIZE: usize = 2 + MAX_OBJECT_DATA_SIZE + 2 + MAX_PUBLIC_KEY_SIZE;
 
 /// Maximum encrypted blob size (P2K4 format).
 ///
@@ -109,14 +110,28 @@ const DKEK_MAX_PAYLOAD: usize = 1 + 2 + MAX_PRIVATE_KEY_SIZE + 7;
 /// Maximum DKEK-wrapped blob: nonce(12) + payload + tag(16).
 const DKEK_MAX_BLOB: usize = NONCE_SIZE + DKEK_MAX_PAYLOAD + TAG_SIZE;
 
-/// Maximum private key size.
+/// Maximum private key size (key material only: bounds DKEK export/import).
 ///
 /// RSA-2048 PKCS#1 DER private keys are ~1192 bytes; RSA-4096 are ~2350 bytes.
-/// Sized to 2400 bytes to cover both RSA key sizes and all EC curves.
+/// Sized to 2400 bytes to cover both RSA key sizes and all EC curves.  Without
+/// RSA the largest key is far below 512 bytes (P-521 scalar, AES-256).
 #[cfg(feature = "rsa")]
 pub const MAX_PRIVATE_KEY_SIZE: usize = 2400;
 #[cfg(not(feature = "rsa"))]
 pub const MAX_PRIVATE_KEY_SIZE: usize = 512;
+
+/// Maximum size of the secret payload of a stored object
+/// ([`KeyObject::private_key`]): a private key, or the content of a data
+/// object (PIV `5FC1xx` objects, OpenPGP DOs such as the `7F21` cardholder
+/// certificate, SC-HSM `CExx` / `C4xx` EFs and PIN records).
+///
+/// Independent of the `rsa` feature (audit R2-11): an EC-only build stores
+/// certificates and data objects of the same size as an RSA build.  The
+/// protocol layers cap their objects below this (PIV 2048, OpenPGP 7F21
+/// 1024, SC-HSM EFs by APDU length).
+pub const MAX_OBJECT_DATA_SIZE: usize = 2400;
+
+const _: () = assert!(MAX_PRIVATE_KEY_SIZE <= MAX_OBJECT_DATA_SIZE);
 
 /// Maximum public key size.
 ///
@@ -279,8 +294,9 @@ pub struct KeyObject {
     pub key_flags: u8,
     /// Daemon-assigned HLC timestamp (ms since epoch), 0 for legacy/locally-generated keys.
     pub timestamp_ms: u64,
-    /// Raw private key scalar or symmetric key bytes (zeroized on drop).
-    pub private_key: heapless::Vec<u8, MAX_PRIVATE_KEY_SIZE>,
+    /// Raw private key scalar or symmetric key bytes, or a data object's
+    /// content (zeroized on drop).
+    pub private_key: heapless::Vec<u8, MAX_OBJECT_DATA_SIZE>,
     /// Optional raw public key (uncompressed EC point, or RSA public key DER).
     pub public_key: heapless::Vec<u8, MAX_PUBLIC_KEY_SIZE>,
 }
