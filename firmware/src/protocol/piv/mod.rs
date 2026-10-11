@@ -286,6 +286,29 @@ impl Piv {
         pico2hsm_core::key::KeyId(0x000100FF)
     }
 
+    /// KeyId of the persisted management key (slot reference 9B).
+    pub fn piv_mgmt_key_id() -> pico2hsm_core::key::KeyId {
+        pico2hsm_core::key::KeyId::piv(0x9B)
+    }
+
+    /// Persist the management key (keystore-encrypted, like any key).
+    #[cfg(feature = "applet-piv")]
+    pub fn save_mgmt_key_to_store(
+        state: &PivState,
+        store: &mut dyn crate::storage::KeyStore,
+    ) -> Result<(), pico2hsm_core::error::HsmError> {
+        use crate::security::key_management::{AlgorithmId, KeyObject, KeyType as KmKeyType};
+        use pico2hsm_core::key::AppletId;
+        let mut obj = KeyObject::new(
+            KmKeyType::Generic,
+            Self::piv_mgmt_key_id().0,
+            AppletId::Piv,
+            AlgorithmId::AesGcm,
+        );
+        let _ = obj.private_key.extend_from_slice(&state.mgmt_key);
+        store.save_key(&obj)
+    }
+
     /// Serialize and persist the PIV PIN/PUK state to flash.
     ///
     /// Stored as a Generic key object at `KeyId::piv(0xFF)`.
@@ -422,6 +445,18 @@ impl Piv {
         use commands::*;
 
         match cmd.ins {
+            set_management_key::INS_SET_MGMT_KEY => {
+                let old = self.state.mgmt_key;
+                let resp = set_management_key::handle(&mut self.state, cmd);
+                if resp.sw == pico2hsm_core::apdu::SW_OK
+                    && Self::save_mgmt_key_to_store(&self.state, store).is_err()
+                {
+                    // Keep RAM consistent with flash.
+                    self.state.mgmt_key = old;
+                    return ApduResponse::err(pico2hsm_core::apdu::SW_MEMORY_FAILURE);
+                }
+                resp
+            }
             generate_keypair::INS_GENERATE_KEYPAIR => {
                 generate_keypair::handle_with_store(&mut self.state, store, cmd)
             }
@@ -476,6 +511,11 @@ impl Piv {
         {
             // Load PIN state first.
             Self::load_pin_state_from_store(&mut self.state, store);
+            if let Ok(Some(obj)) = store.fetch_key(Self::piv_mgmt_key_id()) {
+                if obj.private_key.len() == 24 {
+                    self.state.mgmt_key.copy_from_slice(&obj.private_key);
+                }
+            }
 
             // Load key objects for PIV slots.
             let mut piv_ids: heapless::Vec<pico2hsm_core::key::KeyId, 16> = heapless::Vec::new();
@@ -638,5 +678,31 @@ mod retry_persistence_tests {
         let n = store.saves.len();
         assert_eq!(store.saves[n - 2][48], max - 2, "spent before the compare");
         assert_eq!(store.saves[n - 1][48], max, "restored after success");
+    }
+
+    #[test]
+    fn mgmt_key_change_requires_mgmt_auth() {
+        let mut piv = Piv::new();
+        let mut store = PinStore {
+            saves: heapless::Vec::new(),
+        };
+        let new_key = [0x42u8; 24];
+        let mut apdu: heapless::Vec<u8, 40> = heapless::Vec::new();
+        apdu.extend_from_slice(&[0x00, 0xFF, 0xFF, 0xFF, 27, 0x03, 0x9B, 0x18])
+            .unwrap();
+        apdu.extend_from_slice(&new_key).unwrap();
+
+        let r = piv.process_apdu_with_store(&apdu, &mut store);
+        assert_eq!(
+            &r[r.len() - 2..],
+            &[0x69, 0x82],
+            "needs management-key auth"
+        );
+        assert_ne!(piv.state.mgmt_key, new_key);
+
+        piv.state.mgmt_key_authenticated = true;
+        let r = piv.process_apdu_with_store(&apdu, &mut store);
+        assert_eq!(&r[r.len() - 2..], &[0x90, 0x00]);
+        assert_eq!(piv.state.mgmt_key, new_key);
     }
 }

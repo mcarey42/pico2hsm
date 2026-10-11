@@ -7,4 +7,5 @@ pub mod get_data;
 pub mod put_data;
 pub mod reset_retry_counter;
 pub mod select;
+pub mod set_management_key;
 pub mod verify;
