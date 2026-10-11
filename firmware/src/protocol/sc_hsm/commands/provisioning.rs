@@ -188,34 +188,24 @@ pub fn handle_get_status(_state: &mut ScHsmState, _cmd: &ApduCommand<'_>) -> Apd
 ///
 /// # Prerequisites
 /// - SO-PIN must be verified (returns SW 6982 if not).
-/// - Key material must already be provisioned in OTP rows 0x100+. If the
-///   first ECC word at row 0x100 reads as 0, returns SW 6985 (conditions
-///   not satisfied). This prevents setting production mode before key
-///   material is provisioned, which would make `write_storage_key_material()`
-///   permanently unreachable (MEDIUM-2 security audit finding).
+/// - The storage key must have been provisioned in OTP **and the device
+///   rebooted since** (boot derives the key and read-locks the page; that
+///   boot-time result is what is checked).  Otherwise SW 6985.  This
+///   prevents setting production mode before key material is provisioned,
+///   which would make `write_storage_key_material()` permanently
+///   unreachable (MEDIUM-2 security audit finding).
 pub fn handle_set_production_mode(state: &mut ScHsmState, _cmd: &ApduCommand<'_>) -> ApduResponse {
     if !state.so_pin_verified {
         return ApduResponse::err(SW_SECURITY_STATUS);
     }
 
-    // MEDIUM-2: Check that key material is already provisioned before allowing
-    // production mode. Reading OTP row 0x100 (first ECC word of storage key).
-    // If it reads as 0, key material has not been provisioned yet.
+    // MEDIUM-2: key material must be provisioned before production mode,
+    // or write_storage_key_material() becomes permanently unreachable.
+    // Decided at boot: the key page is read-locked by then (S-05), so
+    // reading row 0x100 here would always fail.
     #[cfg(target_arch = "arm")]
-    {
-        match embassy_rp::otp::read_ecc_word(0x100) {
-            Ok(0) => {
-                // Key material not provisioned — refuse to set production mode.
-                return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED);
-            }
-            Ok(_) => {
-                // Key material is present — proceed.
-            }
-            Err(_) => {
-                // OTP read error — cannot verify key material. Refuse.
-                return ApduResponse::err(SW_INTERNAL_ERROR);
-            }
-        }
+    if !crate::security::otp::storage_key_provisioned() {
+        return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED);
     }
 
     #[cfg(target_arch = "arm")]

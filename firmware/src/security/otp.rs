@@ -66,6 +66,17 @@ const BOOT_FLAG_PROVISIONED: u32 = layout::BOOT_FLAG_PROVISIONED;
 /// after the key rows become unreadable.
 static KEY_PAGE_LOCKED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
+/// Set at boot when the OTP storage key was present and derived — recorded
+/// before the key page is read-locked, after which it can't be re-checked.
+static STORAGE_KEY_PROVISIONED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Whether this boot found a provisioned OTP storage key (see
+/// [`boot_storage_master_key`]).  SET PRODUCTION MODE requires it.
+pub fn storage_key_provisioned() -> bool {
+    STORAGE_KEY_PROVISIONED.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 // ─── Legacy constants (kept for backward compat with old stubs) ───────────────
 
 /// OTP row index for device root secret start (legacy layout).
@@ -531,6 +542,8 @@ pub fn boot_storage_master_key() -> Option<zeroize::Zeroizing<[u8; 32]>> {
             }
             if smk.is_none() {
                 defmt::error!("OTP: storage key derivation failed — keystore disabled");
+            } else {
+                STORAGE_KEY_PROVISIONED.store(true, core::sync::atomic::Ordering::Relaxed);
             }
             smk
         }
