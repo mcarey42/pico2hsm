@@ -64,15 +64,15 @@ All SC-HSM commands use `CLA = 0x00` unless noted. OpenSC's session-PIN flow use
 | `0x28` | PUK AUTH | Authenticate with PUK to unblock PIN | Implemented |
 | `0x2A` | PSO | Perform Security Operation (sign / decipher / MAC) | Implemented |
 | `0x2C` | RESET RETRY COUNTER | Reset PIN retry counter (requires SO-PIN) | Implemented |
-| `0x34` | EXPORT KEY | Export DKEK-wrapped key blob | Stubbed (SW_INS_NOT_SUPPORTED) |
+| `0x34` / `0x72` | EXPORT KEY | Export DKEK-wrapped key blob (refused for NO_EXPORT keys) | Implemented |
 | `0x46` | GENERATE KEY PAIR | Generate asymmetric key pair on-device | Implemented |
 | `0x48` | GENERATE SYMMETRIC KEY | Generate AES-128/192/256 key on-device | Implemented |
 | `0x50` | INITIALIZE | Initialize / re-initialize device | Implemented |
 | `0x52` | KEY DOMAIN | Manage DKEK key domains | Partially implemented |
 | `0x54` | EXTRAS | Additional KDF / MAC primitives | Implemented |
-| `0x58` | LIST KEYS / IMPORT KEY | List key slots (P2=0x00) or import wrapped key (P2=0x93) | LIST: Implemented; IMPORT: Stubbed |
+| `0x58` | LIST KEYS | List key slots (IMPORT KEY uses `0x74`; see §3.25) | Implemented |
 | `0x60` | BIP/SLIP HD DERIVE | BIP32 / SLIP-0010 hierarchical key derivation | Implemented |
-| `0x62` | DECIPHER / DERIVE ASYM | ECDH key agreement or RSA decrypt (P1=key_id) or derive asymmetric key (P1=0x01) | Implemented |
+| `0x62` | DECIPHER / DERIVE ASYM | ECDH key agreement or RSA decrypt (P1=key_id, P2=algo) or derive asymmetric key (P1=0x01 **and** P2=0x00) | Implemented |
 | `0x68` | SIGN | Compute digital signature (ECDSA / RSA) | Implemented |
 | `0x78` | SYMMETRIC CIPHER | AES-CBC / CTR / GCM / CMAC | Implemented |
 | `0x82` | EXTERNAL AUTHENTICATE | Removed (2026-10): keyed by the stored SO-PIN hash, so reading the PIN record granted SO. Returns `6D00`. | Removed |
@@ -825,10 +825,15 @@ Computes an ECDSA or RSA digital signature. The key reference and algorithm are 
 
 ### 3.22 DECIPHER / DERIVE ASYMMETRIC KEY (INS = 0x62)
 
-INS `0x62` is shared between two operations, disambiguated by P1:
+INS `0x62` is shared between two operations, disambiguated by P1 **and** P2
+(since v1.0.1):
 
-- P1 = key slot ID (any value except `0x01`): **DECIPHER** — ECDH key agreement or RSA decrypt
-- P1 = `0x01`: **DERIVE ASYMMETRIC KEY** — KDF-based derivation using a stored key
+- P1 = `0x01` and P2 = `0x00`: **DERIVE ASYMMETRIC KEY** — KDF-based derivation using a stored key
+- anything else: **DECIPHER** — ECDH key agreement or RSA decrypt (P1 = key slot, P2 = non-zero algorithm code)
+
+P1 alone is not enough: OpenSC assigns key reference `0x01` to the first
+generated key, so a P-256 ECDH DECIPHER on slot 1 (`80 62 01 80`) must not
+reach the derive handler.
 
 #### 3.22a DECIPHER
 
@@ -972,46 +977,38 @@ Performs symmetric encryption or decryption. Key must be selected by a preceding
 
 ---
 
-### 3.25 IMPORT KEY (INS = 0x58, P2 = 0x93)
+### 3.25 IMPORT KEY (INS = 0x74)
 
-Imports a wrapped key blob (SC-HSM DKEK wrap format). Stub — not yet implemented.
+Imports a DKEK-wrapped key into slot P1. User PIN and a ready DKEK are
+required. The blob is either inline or written beforehand to EF `2F10`
+(the `sc-hsm-tool --unwrap-key` path). Slots `0x00` and `0xFC`–`0xFF` are
+refused, and the key length must match the algorithm.
 
-**Command:**
+**Wrapped blob format (v2, since 2026-10):**
 
-| Field | Value |
-|---|---|
-| CLA | `0x00` |
-| INS | `0x58` |
-| P1 | Key slot ID |
-| P2 | `0x93` |
-| Data | Wrapped key blob |
+```
+KCV(8) || 0x02 || IV(16) || AES-256-CBC(kenc, key || algo || flags || PKCS#7) || MAC(16)
+kenc = HMAC-SHA256(DKEK, "pico2hsm-wrap-v2-enc")
+kmac = HMAC-SHA256(DKEK, "pico2hsm-wrap-v2-mac")
+MAC  = HMAC-SHA256(kmac, everything before the MAC)[..16]
+```
 
-**Status words:**
+The MAC is verified (constant time) before any decryption, so every forged
+or altered blob fails the same way (`6A80`). Version-1 blobs (no version
+byte, no MAC) are refused: they made IMPORT KEY a CBC padding oracle.
 
-| SW | Meaning |
-|---|---|
-| `6D00` | Not implemented (SW_INS_NOT_SUPPORTED) |
+**Status words:** `9000` imported; `6A80` bad/forged blob or wrong key
+length; `6A86` reserved slot; `6982` PIN not verified; `6985` no DKEK;
+`6581` the key could not be stored.
 
 ---
 
-### 3.26 EXPORT KEY (INS = 0x34)
+### 3.26 EXPORT KEY (INS = 0x72, alias 0x34)
 
-Exports a key wrapped under the DKEK. Stub — not yet implemented.
-
-**Command:**
-
-| Field | Value |
-|---|---|
-| CLA | `0x00` |
-| INS | `0x34` |
-| P1 | Key slot ID |
-| P2 | `0x00` |
-
-**Status words:**
-
-| SW | Meaning |
-|---|---|
-| `6D00` | Not implemented (SW_INS_NOT_SUPPORTED) |
+Exports the key in slot P1 wrapped under the DKEK (format as in §3.25).
+User PIN and a ready DKEK are required; keys generated or imported with the
+NO_EXPORT flag (bit 3 of tag `D4`) are refused with `6985`, as are reserved
+slots `0xFC`–`0xFF` (`6A86`).
 
 ---
 
@@ -1308,13 +1305,13 @@ MF  (3F00)
 
 2. **Key persistence:** EC and RSA keys are persisted to flash via `storage::KeyStore`. Symmetric keys are also persisted. Keys survive power cycles.
 
-3. **DKEK / key wrapping:** EXPORT KEY and IMPORT KEY are stubs (return `SW_INS_NOT_SUPPORTED`). KEY DOMAIN management (create/delete/assign) is also not implemented.
+3. **DKEK / key wrapping:** EXPORT/IMPORT KEY use the pico2hsm v2 wrap format (§3.25), not the CardContact format. The DKEK is persisted (reserved slot `0xFD`) and restored at boot. KEY DOMAIN create/delete/assign remain partial.
 
 4. **Session PIN P2=0x82:** The session PIN is cleared from state after the first VERIFY attempt, whether correct or wrong, preventing replay. This matches the reference spec behavior.
 
 5. **SIGN uses P1=key_id, P2=algo directly** rather than requiring a prior MSE SET. Both paths (direct P1/P2 in INS=0x68, and MSE SET + INS=0x2A) are supported.
 
-6. **DECIPHER / DERIVE ASYM sharing INS=0x62:** When INS=0x62 and P1=0x01, the DERIVE ASYMMETRIC handler is invoked. Any other P1 value routes to DECIPHER.
+6. **DECIPHER / DERIVE ASYM sharing INS=0x62:** DERIVE ASYMMETRIC is selected only by P1=0x01 **and** P2=0x00; everything else routes to DECIPHER (see §3.22).
 
 7. **LIST KEYS / IMPORT KEY sharing INS=0x58:** When INS=0x58 and P2=0x93, the IMPORT KEY handler is invoked. P2=0x00 routes to LIST KEYS.
 
@@ -1325,3 +1322,32 @@ MF  (3F00)
 10. **DEBUG DUMP (INS=0xFE):** Only compiled in `#[cfg(feature = "debug")]` builds. The stub currently returns `SW_WRONG_DATA`. Never enable the `debug` feature in production.
 
 11. **ECDH1-COFACTOR-DERIVE:** For all supported curves the cofactor h=1, making COFACTOR-DERIVE and plain DERIVE identical at the APDU level. OpenSC 0.25's SC-HSM driver rejects COFACTOR-DERIVE for P-256 at the PKCS#11 layer; tests use `ECDH1-DERIVE` to avoid this driver-side restriction.
+
+---
+
+## Security notes (October 2026 audit)
+
+See `docs/AUDIT_2026-10.md` for the full list and commits.
+
+- **Retry counters** for the user PIN, SO-PIN and PUK are written to flash
+  *before* the credential is compared, so a power cycle or USB reset cannot
+  undo a failed guess. Only well-formed attempts count (malformed APDUs
+  are rejected without spending a retry). Re-INITIALIZE spends the SO-PIN
+  counter and is refused while the SO-PIN is blocked. Minimum user PIN
+  length is 6.
+- **Reserved key references `0xFC`–`0xFF`** (enrolled peer, DKEK, device
+  identity key, PIN record) are refused by SIGN, DECIPHER, PSO via MSE,
+  GENERAL AUTHENTICATE, BIP/SLIP, GENERATE KEY [PAIR], IMPORT/EXPORT KEY and
+  DELETE FILE.
+- **EXTRAS DKEK exchange (`0x35`–`0x38`)** requires the SO-PIN and a peer
+  enrolled with `0x3D` on both devices; there is no unauthenticated mode.
+  SOURCE encrypts the DKEK only to the ephemeral key whose signature it
+  verified in `0x36`; TARGET never overwrites an existing DKEK.
+- **EXTRAS `0x39` GET_KEY_MANIFEST** requires the user PIN (`0x3A` state hash
+  stays open: it is a device-signed attestation).
+- **EXTERNAL AUTHENTICATE (`0x82`)** is removed (returns `6D00`).
+- **BIP/SLIP derive** refuses NO_EXPORT keys and the empty path (which would
+  return the master key).
+- **Write failures** (`6581`) are reported; the card state is left as it was
+  on flash.
+

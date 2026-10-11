@@ -354,7 +354,7 @@ impl LedController for St7789V3StatusDisplay {
 
 /// Full 320×172 landscape framebuffer.
 ///
-/// With CORE1_STACK reduced from 256 KB to 128 KB (actual peak ~65 KB), there
+/// With CORE1_STACK reduced from 256 KB to 128 KB (measured peak ~70 KB), there
 /// is now sufficient BSS headroom for the full-resolution buffer.
 /// `flush_display()` maps this to CASET 0–319 × RASET 34–205.
 const FB_W: usize = 320;

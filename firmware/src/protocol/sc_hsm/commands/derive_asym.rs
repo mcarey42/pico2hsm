@@ -1,8 +1,8 @@
-//! DERIVE ASYMMETRIC KEY command handler (INS = 0x62, P1 = 0x01).
+//! DERIVE ASYMMETRIC KEY command handler (INS = 0x62, P1 = 0x01, P2 = 0x00).
 //!
-//! Note: INS=0x62 is shared with DECIPHER. The P1 byte distinguishes:
-//! - P1=0x00 (default): Decipher → decrypt.rs handler
-//! - P1=0x01: Derive asymmetric key → this handler
+//! Note: INS=0x62 is shared with DECIPHER. Routing (in `ScHsm`) needs both
+//! bytes: P1=0x01 **and** P2=0x00 → this handler; anything else → DECIPHER
+//! (decrypt.rs), whose P1 is the key slot and P2 a non-zero algorithm code.
 //!
 //! Derives a new asymmetric key pair from a stored master key using
 //! a KDF-based deterministic derivation (X9.63 or HKDF).

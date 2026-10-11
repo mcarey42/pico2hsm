@@ -64,8 +64,10 @@ use static_cell::StaticCell;
 
 // ─── Core1 stack (ARM only) ──────────────────────────────────────────────────
 
-/// Stack for core1.  Measured peak usage ~65 KB (38 KB ScHsmState inline
-/// storage + 16 KB dispatch-chain temporaries).  128 KB gives ~2× headroom.
+/// Stack for core1.  Measured worst path (2026-10, pico2_4m debug, from the
+/// `sub sp` prologues): dispatcher_loop 16 KB → dispatch_with_store 8 KB →
+/// process_apdu_with_store 8 KB → route_with_store 4 KB → bip_slip 13 KB →
+/// fetch_key 12 KB → read_key 7 KB ≈ 70 KB, so 128 KB leaves ~58 KB.
 /// Do not reduce below 96 KB.
 ///
 /// Core1 runs a synchronous dispatch loop (no Embassy executor) — the
@@ -360,7 +362,7 @@ fn dispatcher_loop(ptr_wrapper: DispatcherPtr) -> ! {
             //
             // NOTE: must use `reset_in_place` (writes fields through a raw
             // pointer) rather than `*dispatcher = Dispatcher::new()`.  The
-            // Dispatcher struct is ~82 KB; in debug builds `Dispatcher::new()`
+            // Dispatcher struct is ~36 KB; in debug builds `Dispatcher::new()`
             // would place the full struct on the Core1 stack before copying
             // it into BSS, risking silent stack overflow on the second USB
             // reconnect in a test session.  reset_in_place also zeroizes the

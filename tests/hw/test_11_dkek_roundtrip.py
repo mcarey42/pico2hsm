@@ -114,7 +114,7 @@ def _create_dkek_share(share_path: Path, passphrase: str) -> None:
 def _get_first_key_slot(reader: int = 0) -> int | None:
     """Return the first device key slot number from LIST KEYS, or None if no keys.
 
-    SC-HSM LIST KEYS (CLA=0x80 INS=0x58 P1=0x00 P2=0xFF Le=0x00) returns
+    SC-HSM LIST KEYS (CLA=0x80 INS=0x58 P1=0x00 P2=0x00 Le=0x00) returns
     pairs of bytes [hi, lo] where hi identifies the file type:
       0xCC = key blob → lo is the key reference (device slot number)
       0xC4 = PRKD descriptor → lo is the key reference
@@ -147,6 +147,9 @@ def _get_first_key_slot(reader: int = 0) -> int | None:
     if current is not None:
         blocks.append(current)
     if not blocks:
+        # Same diagnostic as below: an empty parse is the case worth seeing.
+        log.warning("_get_first_key_slot: no response blocks; stdout=%r stderr=%r",
+                    output, result.stderr.decode(errors="replace"))
         return None
     resp = blocks[-1]
     # Walk pairs looking for 0xCC (key blob), skip slot 0 (device sentinel)

@@ -6,6 +6,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+Security and robustness release from the October 2026 audit
+(`docs/AUDIT_2026-10.md` lists every finding with its commit).
+
+### Breaking
+- **DKEK-wrapped key blobs use a new authenticated format (v2):**
+  `KCV || 0x02 || IV || CBC || HMAC-SHA256-128`. v1 blobs (no MAC) are
+  refused; re-export backups made with earlier firmware.
+- **SC-HSM EF file IDs** are stored under new KeyIds (the full 16-bit FID).
+  Certificates written by OpenSC must be re-imported; INITIALIZE regenerates
+  the device-key EF 2F02.
+- **DKEK exchange (EXTRAS 0x35–0x38)** requires the SO-PIN and an enrolled
+  peer on both devices; unauthenticated "bootstrap" mode is removed.
+  `hsm-tool dkek-exchange` takes `--so-pin`; the TCP relay framing is `P2H2`.
+- **EXTERNAL AUTHENTICATE (INS 0x82) removed** (it accepted the stored
+  SO-PIN hash as the key). Returns 6D00.
+- **Minimum SC-HSM user PIN length is 6** for VERIFY, CHANGE PIN and RESET
+  RETRY (INITIALIZE already required 6).
+- **GET_KEY_MANIFEST (EXTRAS 0x39) requires the user PIN.**
+- **OTP boot flags moved from row 0x110 to 0x140** (0x110 was inside the
+  storage-key rows). Never write row 0x110.
+- **Release builds on unprovisioned OTP disable the keystore** instead of
+  using a fixed public key (debug builds, or the `insecure-dev-keystore`
+  feature, keep the development key with a boot warning).
+
+### Security
+- PIN / SO-PIN / PUK retry counters (SC-HSM, PIV, OpenPGP) are written to
+  flash before the credential is compared; a reset no longer restores
+  guesses. Re-INITIALIZE counts against the SO-PIN.
+- DKEK exchange only encrypts the DKEK to the ephemeral key the enrolled peer
+  signed; the DKEK is persisted (it was lost on every reset).
+- Reserved key refs 0xFC–0xFF can no longer be used, exported or overwritten
+  through user key commands.
+- RSA private operations are blinded; the raw path is fault-checked.
+- P-521 ECDSA uses hedged RFC 6979 nonces; RNG failures reset the chip.
+- OpenPGP: salted PBKDF2 password records, one guess per CHANGE PIN, PSO:CDS
+  needs PW1 mode 81, TERMINATE erases flash records.
+- PIV: SET MANAGEMENT KEY (Yubico extension); data objects persisted.
+- BIP/SLIP derive honours NO_EXPORT and refuses the empty path.
+- OTP key page read-locked at boot; failures fail closed.
+- Secrets wiped in place: reset, DKEK copies, key buffers, response buffers.
+
+### Fixed
+- USB-disconnect reset deadlock on QMI-flash boards.
+- Core1 stack: worst path ~123 KB → ~70 KB of 128 KB.
+- Responses with ≥4095 data bytes lost their status word.
+- Watchdog abort left core1 running (replies off by one); now resets.
+- CCID time extensions are sent on time during long flash work.
+- Oversized CCID messages no longer desync the bulk pipe.
+- Storage write errors are reported instead of ignored.
+- IMPORT KEY validates key length (over-long keys hard-faulted core1).
+- PIV data objects (certificates, CHUID) survive reset; unique CHUID GUID.
+- Core0 MSPLIM covers the RTT buffer.
+- CI: clippy gate passes on current stable; PIV/OpenPGP built and tested.
+
 ## [1.0.1] - 2026-04-29
 
 First maintenance release of the v1.0 line.  Three coupled SC-HSM bug fixes
@@ -41,7 +95,7 @@ paths that were already passing on v1.0.0.
   reach the device through plain DERIVE.  Removes the per-curve mechanism
   switch.
 - `tests/hw/test_11_dkek_roundtrip.py` `LIST_KEYS` APDU now sends
-  `80 58 00 00 00` (Le=0) instead of `80 58 00 FF 00` (Lc=0xFF, malformed
+  `80 58 00 00 00` (Le=0) instead of `80 58 00 FF 00` (P2=0xFF, malformed
   for this command).  Adds diagnostic logging when no `0xCC` slot is found
   so future regressions surface in the test log instead of returning
   `None` silently.

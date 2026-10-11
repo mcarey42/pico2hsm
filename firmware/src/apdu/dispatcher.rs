@@ -82,10 +82,10 @@ impl Dispatcher {
     }
 
     /// Initialise a Dispatcher directly in the provided `MaybeUninit` slot,
-    /// avoiding an 82 KB stack temporary.
+    /// avoiding a ~36 KB stack temporary.
     ///
     /// In debug builds the compiler does not perform Named Return Value
-    /// Optimisation, so `Dispatcher::new()` would place the full ~82 KB
+    /// Optimisation, so `Dispatcher::new()` would place the full ~36 KB
     /// struct on the Core0 machine stack before `memcpy`-ing it to the
     /// destination.  With only ~113 KB of stack this overflows into BSS
     /// and corrupts wakers / async state.
@@ -133,7 +133,7 @@ impl Dispatcher {
     }
 
     /// Reset a live Dispatcher back to post-boot state **without** allocating
-    /// a full ~82 KB Dispatcher on the stack.
+    /// a full ~36 KB Dispatcher on the stack.
     ///
     /// Used by the Core1 dispatcher loop on USB-reconnect reset signals.
     /// In debug builds `Dispatcher::new()` (and therefore `*self = Self::new()`)

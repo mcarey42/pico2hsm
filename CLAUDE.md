@@ -182,23 +182,46 @@ Each board's LED/display driver is fully implemented (not stubbed):
 - Full 320×172 RGB444 framebuffer (83 KB in BSS); `ScreenLayout::waveshare_320x172()`.
 - Both LCD colour and WS2812B GRB are set simultaneously via `status_to_colors()`.
 
+## Security invariants
+
+Established by the October 2026 audit (`docs/AUDIT_2026-10.md`); keep them
+when changing the code.
+
+- **Credential retries are spent on flash before comparing.** VERIFY / CHANGE
+  PIN / PUK / re-INITIALIZE (SC-HSM), VERIFY / CHANGE / RESET (PIV), VERIFY /
+  CHANGE (OpenPGP) all go through `with_persisted_attempt`; only APDUs the
+  handler would actually compare count (`spent_by` mirrors the handler's
+  pre-checks). New credential checks must use the same wrapper.
+- **Storage errors fail closed.** `Core1KeyStore` is synchronous, so
+  `save_key` / `erase_key` / `wipe_*` results are real. Never `let _ =` them
+  in a handler: report 6581 and keep RAM consistent with flash.
+- **OTP layout lives in `security/otp_layout.rs`** (compile-time overlap
+  checks). Never hard-code OTP rows elsewhere; never write row 0x110.
+- **Reserved SC-HSM key refs 0xFC–0xFF** (peer record, DKEK, device key, PIN
+  record) are refused by every user key command (`targets_reserved_slot`).
+- **The DKEK** is persisted at 0xFD, only replaced by an authenticated,
+  SO-PIN, enrolled-peer exchange, never overwritten while set.
+- **Secrets are wiped in place.** Zeroize before moving or dropping; use
+  `security::zeroize::key_buf` for fixed key buffers; `mem::replace` /
+  assigning `None` does not wipe the old bytes.
+
 ## Known pitfalls
 
-### Core1 stack overflow (silent hang)
+### Core1 stack overflow
 
-**Symptom**: APDU is received and logged by core0 (`APDU XX XX XX XX len=N`), time extensions fire every 1.5 s, but no log lines from the command handler ever appear — not even the first `defmt::info!` at the top of the function. The command never completes.
+**Symptom**: APDU is received and logged by core0 (`APDU XX XX XX XX len=N`), time extensions fire every 1.5 s, but the command never completes; after ~30 s the watchdog sends 6F00 and resets the chip.
 
-**Cause**: `ScHsmState` holds `ef_files: Vec<EfEntry, 16>` where each `EfEntry` contains `Vec<u8, 2048>` inline — 32 KB of fixed EF storage alone. Combined with multiple `Vec<u8, 4096>` response buffers allocated as stack temporaries across the `Dispatcher → ScHsm::process_apdu → ScHsm::dispatch → handle()` call chain (~12–16 KB), the total easily exceeds the core1 stack limit. On Cortex-M33 without MPU guard pages this is a **silent** overflow: no panic, no fault, core1 just runs garbage.
+**Cause**: core1 runs the whole dispatch chain on its own 128 KB stack (`CORE1_STACK` in `firmware/src/main.rs`). Large stack temporaries — `Vec<u8, 4096>` response buffers, `KeyObject`s (~3 KB), 4 KB flash sector buffers, PKCS#1 DER buffers — add up across `dispatcher_loop → Dispatcher::dispatch_with_store → <protocol>::process_apdu_with_store → route_with_store → handler → store`. MSPLIM is set at the stack base, so an overflow faults (UsageFault) instead of silently corrupting memory, but core1 still stops. (The protocol *state*, e.g. `ScHsmState`, lives in BSS via `DISPATCHER_CELL`, not on this stack.)
 
-**Fix**: Set `CORE1_STACK` in `firmware/src/main.rs` to 128 KB.  Measured peak usage
-is ~65 KB (38 KB ScHsmState inline storage + 16 KB dispatch-chain temporaries),
-giving ~2× headroom:
-```rust
-// 128 KB — ~2× measured peak of ~65 KB.  Do not reduce below 96 KB.
-static mut CORE1_STACK: Stack<131072> = Stack::new();
+**Measured** (2026-10, pico2_4m debug, worst path): dispatcher_loop 16 KB → dispatch_with_store 8 KB → process_apdu_with_store 8 KB → route_with_store 4 KB → bip_slip 13 KB → fetch_key 12 KB → read_key 7 KB ≈ **70 KB of 128 KB**. Before the synchronous `Core1KeyStore` (which removed a queue of by-value `KeyObject`s) it was ~123 KB.
+
+**Re-measure** after adding large locals or a deeper call path:
+```sh
+cargo build -p pico2hsm-firmware --no-default-features --features pico2_4m,rsa,applet-piv,applet-openpgp-curve25519
+arm-none-eabi-objdump -d --no-show-raw-insn -C target/thumbv8m.main-none-eabihf/debug/pico2hsm \
+  | grep -A6 '<pico2hsm::dispatcher_loop>:' | grep 'sub.*sp'   # frame size per function
 ```
-
-**Rule of thumb**: Any time a new large static allocation is added to `ScHsmState` (keys, files, buffers), re-evaluate core1 stack headroom. The RP2350 has 520 KB SRAM total; current BSS is ~332 KB (rp2350_geek_16m with all applets, after removing Embassy executor from core1).
+Keep heavy buffers off the stack (`Zeroizing` helpers like `security::zeroize::key_buf` keep secrets wiped but still use stack), and never queue `KeyObject`s by value.
 
 **Core1 synchronous loop**: Core1 no longer runs an Embassy executor — it uses a
 synchronous `dispatcher_loop()` with `wfe`/`sev` for cooperative sleep/wake.

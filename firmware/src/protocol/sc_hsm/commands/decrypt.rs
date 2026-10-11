@@ -1,4 +1,4 @@
-//! DECIPHER command handler (INS = 0x62, P1 = 0x00).
+//! DECIPHER command handler (INS = 0x62, P1 = key slot, P2 = algorithm).
 //!
 //! For EC key agreement (ECDH) algorithms, the command data contains the
 //! peer's uncompressed public key point (`04 || X || Y`). The response is
