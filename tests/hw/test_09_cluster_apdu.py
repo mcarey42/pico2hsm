@@ -251,9 +251,12 @@ class TestGetKeyManifest:
         """After keygen, manifest must have 44 bytes × number of keys."""
         result = runner.send_apdu(SELECT_SC_HSM, VERIFY_PIN, APDU_GET_MANIFEST, reader=0)
         data = _parse_received_bytes(result.stdout)
+        # Other fixtures (the RSA keys) may have added keys too: every
+        # provisioned key must be listed, in whole 44-byte entries.
         n_keys = sum(1 for v in provisioned_keys.values() if v.get("generated"))
-        assert len(data) == 44 * n_keys, (
-            f"Expected {44 * n_keys} bytes for {n_keys} keys, got {len(data)}"
+        assert len(data) % 44 == 0, f"{len(data)} bytes is not whole 44-byte entries"
+        assert len(data) // 44 >= n_keys, (
+            f"Expected at least {n_keys} entries, got {len(data) // 44}"
         )
 
     def test_manifest_entry_format(
