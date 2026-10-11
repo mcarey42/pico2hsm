@@ -43,6 +43,9 @@ const SD_RESERVED_SECTORS: u32 = 8; // 8 × 512 = 4 096 bytes = one 4 KiB logica
 /// Byte offset added to every FlashChip address before issuing SD card I/O.
 const SD_BYTE_OFFSET: u32 = SD_RESERVED_SECTORS * SD_SECTOR_BYTES;
 
+/// Keystore region on the card (16 MiB = 4096 sectors of 4 KiB).
+const SD_KEYSTORE_MAX_BYTES: u64 = 16 * 1024 * 1024;
+
 /// SDCard wrapped as a `FlashChip`.
 ///
 /// `SPI` must implement `embedded_hal::spi::SpiDevice<u8>`.
@@ -79,8 +82,14 @@ where
 
         let total_bytes = card.num_bytes().map_err(|_| StorageError::NotFormatted)?;
 
-        // Subtract the reserved region (signature block) from usable capacity.
-        let capacity_bytes = total_bytes.saturating_sub(SD_BYTE_OFFSET as u64);
+        // Subtract the reserved region (signature block) from usable capacity,
+        // and use only the first SD_KEYSTORE_MAX_BYTES: addresses are u32, so
+        // anything past 4 GiB (minus the offset) would wrap onto other keys,
+        // the directory or the signature block.  340 directory entries need
+        // only a few MB.
+        let capacity_bytes = total_bytes
+            .saturating_sub(SD_BYTE_OFFSET as u64)
+            .min(SD_KEYSTORE_MAX_BYTES);
 
         defmt::info!(
             "SdCardFlash: total={} B usable={} B ({} MiB), reserved {} sectors for signature",

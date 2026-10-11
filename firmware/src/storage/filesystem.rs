@@ -887,7 +887,10 @@ impl<Chip: FlashChip> KeyFilesystem<Chip> {
             if chip.is_degraded() {
                 continue;
             }
-            let cap_sectors = (chip.capacity() / SECTOR_SIZE as u64) as u32;
+            // Byte addresses are u32: never allocate a sector whose address
+            // would wrap (large SD cards).
+            let cap_sectors = (chip.capacity() / SECTOR_SIZE as u64)
+                .min((u32::MAX / SECTOR_SIZE as u32) as u64) as u32;
             if cap_sectors <= DATA_START_SECTOR {
                 continue;
             }
