@@ -95,10 +95,13 @@ pub fn handle(
         _ => return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
     };
 
-    let mut raw_key: heapless::Vec<u8, 32> = heapless::Vec::new();
-    let _ = raw_key.extend_from_slice(&key_obj.private_key);
+    // Wiped on drop; a key that doesn't fit is refused, not truncated.
+    let mut raw_key = crate::security::zeroize::WipeOnDrop::<32>::new();
+    if raw_key.0.extend_from_slice(&key_obj.private_key).is_err() {
+        return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED);
+    }
 
-    let km = match make_key_material(full_key_id, &raw_key) {
+    let km = match make_key_material(full_key_id, &raw_key.0) {
         Some(k) => k,
         None => return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
     };

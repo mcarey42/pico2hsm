@@ -415,6 +415,23 @@ fn pso_decipher(
 // PSO Compute / Verify Cryptographic Checksum helpers
 // ---------------------------------------------------------------------------
 
+/// The selected key as symmetric key bytes, wiped on drop.  Only AES keys
+/// of 16/24/32 bytes: copying any other key into a 32-byte buffer used to
+/// fail silently, leaving an *empty* HMAC key — publicly computable tags.
+fn sym_key(
+    key_obj: &crate::security::key_management::KeyObject,
+) -> Option<crate::security::zeroize::WipeOnDrop<32>> {
+    use crate::security::key_management::KeyType as KmType;
+    if !matches!(key_obj.key_type, KmType::Aes)
+        || !matches!(key_obj.private_key.len(), 16 | 24 | 32)
+    {
+        return None;
+    }
+    let mut k = crate::security::zeroize::WipeOnDrop::new();
+    k.0.extend_from_slice(&key_obj.private_key).ok()?;
+    Some(k)
+}
+
 /// Build a `KeyMaterial` from raw symmetric key bytes.
 fn make_sym_key_material(key_id: u32, raw: &[u8]) -> Option<KeyMaterial> {
     use pico2hsm_core::key::KeyType as Kt;
@@ -468,18 +485,20 @@ fn pso_compute_checksum(
         _ => return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
     };
 
-    let mut raw_key: heapless::Vec<u8, 32> = heapless::Vec::new();
-    let _ = raw_key.extend_from_slice(&key_obj.private_key);
+    let Some(raw_key) = sym_key(&key_obj) else {
+        return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED);
+    };
+    let raw_key: &[u8] = &raw_key.0;
 
     // Determine MAC algorithm from current_algo:
     // 0xA0 = HMAC-SHA256; anything else (or None) defaults to AES-CMAC.
     let use_hmac = state.current_algo == Some(0xA0);
 
     if use_hmac {
-        let tag = crate::crypto::kdf::hmac_sha256(&raw_key, cmd.data);
+        let tag = crate::crypto::kdf::hmac_sha256(raw_key, cmd.data);
         ApduResponse::ok(&tag)
     } else {
-        let km = match make_sym_key_material(full_key_id, &raw_key) {
+        let km = match make_sym_key_material(full_key_id, raw_key) {
             Some(k) => k,
             None => return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
         };
@@ -520,8 +539,10 @@ fn pso_verify_checksum(
         _ => return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
     };
 
-    let mut raw_key: heapless::Vec<u8, 32> = heapless::Vec::new();
-    let _ = raw_key.extend_from_slice(&key_obj.private_key);
+    let Some(raw_key) = sym_key(&key_obj) else {
+        return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED);
+    };
+    let raw_key: &[u8] = &raw_key.0;
 
     let use_hmac = state.current_algo == Some(0xA0);
     let tag_len: usize = if use_hmac { 32 } else { 16 };
@@ -535,8 +556,11 @@ fn pso_verify_checksum(
     let expected_tag = &cmd.data[msg_len..];
 
     if use_hmac {
-        let computed = crate::crypto::kdf::hmac_sha256(&raw_key, message);
-        if computed.as_ref() == expected_tag {
+        let computed = crate::crypto::kdf::hmac_sha256(raw_key, message);
+        if bool::from(subtle::ConstantTimeEq::ct_eq(
+            computed.as_ref(),
+            expected_tag,
+        )) {
             ApduResponse::ok(&[])
         } else {
             ApduResponse::err(SW_DATA_INVALID)
@@ -546,7 +570,7 @@ fn pso_verify_checksum(
             Ok(a) => a,
             Err(_) => return ApduResponse::err(SW_WRONG_LENGTH),
         };
-        match crate::crypto::symmetric::aes_cmac_verify(&raw_key, message, &expected) {
+        match crate::crypto::symmetric::aes_cmac_verify(raw_key, message, &expected) {
             Ok(true) => ApduResponse::ok(&[]),
             Ok(false) => ApduResponse::err(SW_DATA_INVALID),
             Err(_) => ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
