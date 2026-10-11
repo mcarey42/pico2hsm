@@ -8,6 +8,7 @@
 #   ./build-all-debug.sh pico2_4m
 #   ./build-all-debug.sh rp2350_one_4m
 #   ./build-all-debug.sh rp2350_geek_16m
+#   EXTRA_FEATURES=debug ./build-all-debug.sh pico2_4m   # adds the debug-only APDUs
 #
 # Valid board features:
 #   pico2_4m               Raspberry Pi Pico 2 4MB
@@ -60,14 +61,15 @@ CHIP="RP235x"
 KEY_FILE="ec_firmware_signing_key.pem"
 
 # ── Build (debug profile) ─────────────────────────────────────────────────────
+FEATURES="$FEAT,rsa,applet-piv,applet-openpgp-curve25519${EXTRA_FEATURES:+,$EXTRA_FEATURES}"
 section "Debug build: $FEAT"
-info "cargo build --no-default-features --features $FEAT,rsa,applet-piv,applet-openpgp-curve25519"
+info "cargo build --no-default-features --features $FEATURES"
 
 DEFMT_LOG=trace \
 cargo build \
     --manifest-path firmware/Cargo.toml \
     --no-default-features \
-    --features "$FEAT,rsa,applet-piv,applet-openpgp-curve25519"
+    --features "$FEATURES"
 
 [[ -f "$ELF" ]] || die "ELF not found at $ELF"
 ok "Build complete: $ELF"
