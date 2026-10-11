@@ -526,6 +526,9 @@ impl OpenPgp {
             terminate_activate::INS_TERMINATE_DF => {
                 terminate_activate::handle_terminate_with_store(&mut self.state, store, cmd)
             }
+            put_data::INS_PUT_DATA | put_data::INS_PUT_DATA_ODD => {
+                put_data::handle_with_store(&mut self.state, store, cmd)
+            }
             // Password checks: persistence is handled by with_persisted_attempt.
             verify::INS_VERIFY => verify::handle(&mut self.state, cmd),
             change_pin::INS_CHANGE_PIN => change_pin::handle(&mut self.state, cmd),
@@ -635,14 +638,24 @@ impl OpenPgp {
         // factory default.  TERMINATE (allowed once PW3 is blocked) is the
         // way out.
         let mut has_keys = false;
+        // Persisted DOs (fingerprints, cardholder data) hold no secrets and
+        // may be written before any key; they don't count.
+        let mut do_ids: Vec<pico2hsm_core::key::KeyId, 18> = Vec::new();
         store.for_each_key(&mut |kid| {
-            if kid.applet_byte() == AppletId::OpenPgp as u8
-                && kid != OPENPGP_PW1_KEY_ID
-                && kid != OPENPGP_PW3_KEY_ID
-            {
+            if kid.applet_byte() != AppletId::OpenPgp as u8 {
+                return;
+            }
+            if put_data::tag_of_record(kid).is_some() {
+                let _ = do_ids.push(kid);
+            } else if kid != OPENPGP_PW1_KEY_ID && kid != OPENPGP_PW3_KEY_ID {
                 has_keys = true;
             }
         });
+        for kid in do_ids.iter() {
+            if let (Some(tag), Ok(Some(rec))) = (put_data::tag_of_record(*kid), store.fetch_key(*kid)) {
+                let _ = put_data::set_do(&mut self.state, tag, &rec.private_key);
+            }
+        }
         let mut persisted = true;
         for (kid, hash, retries) in [
             (OPENPGP_PW1_KEY_ID, &mut self.state.pw1_hash, &mut self.state.pw1_retries),
@@ -667,7 +680,7 @@ impl OpenPgp {
         store.for_each_key(&mut |kid| {
             if kid.applet_byte() == AppletId::OpenPgp as u8 {
                 let slot = kid.proto_ref();
-                if slot != 0xFE && slot != 0xFF {
+                if matches!(slot, SLOT_SIG | SLOT_DEC | SLOT_AUTH) && kid.0 & 0xFF00 == 0 {
                     let _ = openpgp_ids.push(kid);
                 }
             }
@@ -989,6 +1002,29 @@ mod pw_tests {
             0x9000,
             "TERMINATE allowed once PW3 is blocked"
         );
+    }
+
+    #[test]
+    fn put_data_fingerprint_survives_reload() {
+        let mut store = MemStore {
+            records: heapless::Vec::new(),
+        };
+        let mut pgp = OpenPgp::new();
+        assert_eq!(
+            sw(&mut pgp, &mut store, &apdu(0x20, 0x83, b"12345678")),
+            0x9000
+        );
+        let fp = [0x7Au8; 20];
+        let mut put: heapless::Vec<u8, 64> = heapless::Vec::new();
+        put.extend_from_slice(&[0x00, 0xDA, 0x00, 0xC7, 20]).unwrap();
+        put.extend_from_slice(&fp).unwrap();
+        assert_eq!(sw(&mut pgp, &mut store, &put), 0x9000);
+
+        let mut fresh = OpenPgp::new();
+        fresh.load_from_store(&mut store);
+        assert_eq!(fresh.state.fp_sig, fp);
+        // A DO record is not a key: PW defaults stay usable on this card.
+        assert_eq!(fresh.state.pw1_retries, PW1_MAX_RETRIES);
     }
 
     #[test]

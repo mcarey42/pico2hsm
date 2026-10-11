@@ -18,6 +18,11 @@ use pico2hsm_core::apdu::{
 
 use crate::protocol::openpgp::OpenPgpState;
 
+/// The value being set; lets the per-tag arms below keep reading `cmd.data`.
+struct SetDo<'a> {
+    data: &'a [u8],
+}
+
 /// INS byte for PUT DATA (even).
 pub const INS_PUT_DATA: u8 = 0xDA;
 
@@ -36,7 +41,96 @@ pub fn handle(state: &mut OpenPgpState, cmd: &ApduCommand<'_>) -> ApduResponse {
     if !state.pw3_verified {
         return ApduResponse::err(SW_SECURITY_STATUS);
     }
+    set_do(state, tag, cmd.data)
+}
 
+/// The DOs PUT DATA can write; each is persisted as its own record.
+pub const PERSISTED_TAGS: [u16; 18] = [
+    0x005B, 0x005E, 0x5F2D, 0x5F35, 0x00C1, 0x00C2, 0x00C3, 0x00C7, 0x00C8, 0x00C9, 0x00CA,
+    0x00CB, 0x00CC, 0x00CE, 0x00CF, 0x00D0, 0x5F50, 0x7F21,
+];
+
+/// KeyId of a persisted DO: 0xD0 in bits 15–8 keeps these apart from the
+/// key slots (0x90–0x92) and PW records (0xFE/0xFF); the low byte is the
+/// tag's low byte, unique across `PERSISTED_TAGS`.
+pub fn do_key_id(tag: u16) -> pico2hsm_core::key::KeyId {
+    pico2hsm_core::key::KeyId(0x0002_D000 | (tag & 0xFF) as u32)
+}
+
+/// The DO tag a persisted record belongs to, if it is one.
+pub fn tag_of_record(kid: pico2hsm_core::key::KeyId) -> Option<u16> {
+    if kid.0 & 0xFFFF_FF00 != 0x0002_D000 {
+        return None;
+    }
+    PERSISTED_TAGS
+        .iter()
+        .copied()
+        .find(|t| (t & 0xFF) as u8 == kid.proto_ref())
+}
+
+/// Current value of a writable DO (what `set_do` would have to be given
+/// to restore it).
+pub fn get_do(state: &OpenPgpState, tag: u16, out: &mut heapless::Vec<u8, 1024>) {
+    out.clear();
+    let v: &[u8] = match tag {
+        0x005B => &state.cardholder_name,
+        0x005E => &state.login_data,
+        0x5F2D => &state.language,
+        0x5F35 => core::slice::from_ref(&state.sex),
+        0x00C1 => &state.algo_sig,
+        0x00C2 => &state.algo_dec,
+        0x00C3 => &state.algo_auth,
+        0x00C7 => &state.fp_sig,
+        0x00C8 => &state.fp_dec,
+        0x00C9 => &state.fp_auth,
+        0x00CA => &state.ca_fp1,
+        0x00CB => &state.ca_fp2,
+        0x00CC => &state.ca_fp3,
+        0x00CE => &state.ts_sig,
+        0x00CF => &state.ts_dec,
+        0x00D0 => &state.ts_auth,
+        0x5F50 => &state.url,
+        0x7F21 => &state.cardholder_cert,
+        _ => &[],
+    };
+    let _ = out.extend_from_slice(v);
+}
+
+/// PUT DATA with persistence: the DO is saved to flash, and if that fails
+/// RAM goes back to the old value (6581) so a reset can't silently undo
+/// what the host was told succeeded — e.g. the key fingerprints gpg
+/// writes after generating a key.
+pub fn handle_with_store(
+    state: &mut OpenPgpState,
+    store: &mut dyn crate::storage::KeyStore,
+    cmd: &ApduCommand<'_>,
+) -> ApduResponse {
+    use crate::security::key_management::{AlgorithmId, KeyObject, KeyType as KmKeyType};
+    let tag = ((cmd.p1 as u16) << 8) | cmd.p2 as u16;
+    let mut old = heapless::Vec::new();
+    get_do(state, tag, &mut old);
+    let resp = handle(state, cmd);
+    if resp.sw != pico2hsm_core::apdu::SW_OK {
+        return resp;
+    }
+    let mut rec = KeyObject::new(
+        KmKeyType::Generic,
+        do_key_id(tag).0,
+        pico2hsm_core::key::AppletId::OpenPgp,
+        AlgorithmId::AesGcm,
+    );
+    let mut value = heapless::Vec::new();
+    get_do(state, tag, &mut value);
+    if rec.private_key.extend_from_slice(&value).is_err() || store.save_key(&rec).is_err() {
+        let _ = set_do(state, tag, &old);
+        return ApduResponse::err(pico2hsm_core::apdu::SW_MEMORY_FAILURE);
+    }
+    resp
+}
+
+/// Validate and store one DO value (no access check — see `handle`).
+pub fn set_do(state: &mut OpenPgpState, tag: u16, data: &[u8]) -> ApduResponse {
+    let cmd = SetDo { data };
     match tag {
         // 005B — Cardholder Name (max 39 bytes)
         0x005B => {
