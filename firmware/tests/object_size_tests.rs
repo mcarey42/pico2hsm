@@ -19,6 +19,7 @@ use std::collections::BTreeMap;
 use pico2hsm_core::error::HsmError;
 use pico2hsm_core::key::{AppletId, KeyId};
 use pico2hsm_firmware::security::key_management::{KeyObject, MAX_OBJECT_DATA_SIZE};
+use pico2hsm_firmware::storage::retry_counter::{MemCounters, RetryCounterBackend};
 use pico2hsm_firmware::storage::KeyStore;
 
 /// Deterministic fake Storage Master Key (test use only).
@@ -30,6 +31,8 @@ const TEST_SMK: [u8; 32] = [0x5A; 32];
 struct EncryptingStore {
     blobs: BTreeMap<u32, Vec<u8>>,
     nonce_ctr: u64,
+    /// Credential retry counters (the board keeps these in their own log).
+    counters: MemCounters,
 }
 
 impl KeyStore for EncryptingStore {
@@ -71,6 +74,9 @@ impl KeyStore for EncryptingStore {
         for k in self.blobs.keys() {
             f(KeyId(*k));
         }
+    }
+    fn retry_counters(&mut self) -> Option<&mut dyn RetryCounterBackend> {
+        Some(&mut self.counters)
     }
 }
 
