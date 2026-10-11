@@ -246,7 +246,7 @@ static KEY_COUNT: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::n
 #[cfg(target_arch = "arm")]
 use pico2hsm_firmware::CORE1_PROGRESS;
 #[cfg(target_arch = "arm")]
-use pico2hsm_firmware::{WATCHDOG_HEARTBEAT, WATCHDOG_STALL_LIMIT, WATCHDOG_SUPPRESS};
+use pico2hsm_firmware::{watchdog_suppressed, WATCHDOG_HEARTBEAT, WATCHDOG_STALL_LIMIT};
 
 /// Dispatcher — stored in BSS outside the async task state machine so that
 /// the `dispatcher_task` pool does not need to hold the full 50 KB Dispatcher
@@ -684,7 +684,7 @@ async fn recv_core1_response(
 ///   is absolute, so a stream of flash ops (which block this executor) cannot
 ///   push it back; an overdue extension goes out as soon as the op finishes.
 /// - Stall detector: if core1's heartbeat doesn't move for
-///   `WATCHDOG_STALL_LIMIT` intervals (and `WATCHDOG_SUPPRESS` is clear),
+///   `WATCHDOG_STALL_LIMIT` intervals (and stall detection is not suppressed),
 ///   returns `None`; the caller must reset the device (see `watchdog_reset`).
 ///
 /// On USB disconnect, drains core1's response and returns an empty Vec so the
@@ -716,7 +716,7 @@ async fn await_core1_response<'d, D: embassy_usb::driver::Driver<'d>>(
                 deadline = Instant::now() + WTX_INTERVAL;
                 let progress = CORE1_PROGRESS.load(Relaxed);
                 let heartbeat = WATCHDOG_HEARTBEAT.load(Relaxed);
-                if WATCHDOG_SUPPRESS.load(Relaxed) || heartbeat != last_heartbeat {
+                if watchdog_suppressed() || heartbeat != last_heartbeat {
                     stall_count = 0;
                     last_heartbeat = heartbeat;
                     defmt::warn!(

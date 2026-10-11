@@ -70,15 +70,39 @@ pub static WATCHDOG_HEARTBEAT: core::sync::atomic::AtomicU32 =
 /// before Core0 declares Core1 stuck and aborts the APDU.  20 intervals = 30 s.
 /// The watchdog is a true deadlock detector — legitimate long operations (DKEK
 /// derivation, ECDSA scalar multiply) bump the heartbeat via `FwRng::fill_bytes`.
-/// RSA keygen suppresses the watchdog via [`WATCHDOG_SUPPRESS`] because modular
+/// RSA keygen suppresses the watchdog via [`WatchdogSuppressGuard`] because modular
 /// exponentiation runs for minutes without RNG calls.
 pub const WATCHDOG_STALL_LIMIT: u32 = 20;
 
-/// When `true`, Core0 skips stall detection and never aborts — it just sends
-/// time-extensions.  Core1 sets this before RSA keygen and clears it after.
-/// `Relaxed` ordering is fine (same rationale as `WATCHDOG_HEARTBEAT`).
-pub static WATCHDOG_SUPPRESS: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(false);
+/// Uptime (seconds) until which Core0 skips stall detection and just sends
+/// time extensions; 0 = not suppressed.  Core1 sets it for RSA keygen (see
+/// [`WatchdogSuppressGuard`]).  A deadline rather than a flag: if core1
+/// faults mid-keygen the guard is never dropped, and a flag would keep the
+/// host waiting forever.  `Relaxed` ordering is fine (same rationale as
+/// `WATCHDOG_HEARTBEAT`).
+pub static WATCHDOG_SUPPRESS_UNTIL: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+
+/// Longest a suppression lasts: generous for RSA-4096 keygen, which the
+/// test suite allows an hour.
+pub const WATCHDOG_SUPPRESS_MAX_SECS: u32 = 3600;
+
+fn uptime_secs() -> u32 {
+    #[cfg(target_arch = "arm")]
+    {
+        embassy_time::Instant::now().as_secs() as u32
+    }
+    #[cfg(not(target_arch = "arm"))]
+    {
+        0
+    }
+}
+
+/// Whether stall detection is currently suppressed.
+pub fn watchdog_suppressed() -> bool {
+    let until = WATCHDOG_SUPPRESS_UNTIL.load(core::sync::atomic::Ordering::Relaxed);
+    until != 0 && uptime_secs() < until
+}
 
 /// Host session counter.  Bumped when the host session ends — USB bus
 /// reset / deconfiguration (core0's USB handler) or a CCID card power cycle
@@ -98,22 +122,23 @@ pub fn bump_session_epoch() {
     SESSION_EPOCH.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
 }
 
-/// Holds [`WATCHDOG_SUPPRESS`] set for its lifetime and clears it on drop,
-/// so every return path (including `?` and early returns) re-arms the
-/// stall detector.
+/// Suppresses stall detection (for at most [`WATCHDOG_SUPPRESS_MAX_SECS`])
+/// for its lifetime and re-arms it on drop, so every return path
+/// (including `?` and early returns) re-arms the stall detector.
 pub struct WatchdogSuppressGuard(());
 
 impl WatchdogSuppressGuard {
     /// Disarm the core1 stall detector until the guard is dropped.
     pub fn new() -> Self {
-        WATCHDOG_SUPPRESS.store(true, core::sync::atomic::Ordering::Relaxed);
+        let until = uptime_secs().saturating_add(WATCHDOG_SUPPRESS_MAX_SECS).max(1);
+        WATCHDOG_SUPPRESS_UNTIL.store(until, core::sync::atomic::Ordering::Relaxed);
         WatchdogSuppressGuard(())
     }
 }
 
 impl Drop for WatchdogSuppressGuard {
     fn drop(&mut self) {
-        WATCHDOG_SUPPRESS.store(false, core::sync::atomic::Ordering::Relaxed);
+        WATCHDOG_SUPPRESS_UNTIL.store(0, core::sync::atomic::Ordering::Relaxed);
     }
 }
 
