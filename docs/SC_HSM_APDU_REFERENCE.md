@@ -75,7 +75,7 @@ All SC-HSM commands use `CLA = 0x00` unless noted. OpenSC's session-PIN flow use
 | `0x62` | DECIPHER / DERIVE ASYM | ECDH key agreement or RSA decrypt (P1=key_id) or derive asymmetric key (P1=0x01) | Implemented |
 | `0x68` | SIGN | Compute digital signature (ECDSA / RSA) | Implemented |
 | `0x78` | SYMMETRIC CIPHER | AES-CBC / CTR / GCM / CMAC | Implemented |
-| `0x82` | EXTERNAL AUTHENTICATE | Challenge-response authentication (HMAC-SHA256) | Implemented |
+| `0x82` | EXTERNAL AUTHENTICATE | Removed (2026-10): keyed by the stored SO-PIN hash, so reading the PIN record granted SO. Returns `6D00`. | Removed |
 | `0x84` | GET CHALLENGE | Return random bytes from TRNG | Implemented |
 | `0x86` | GENERAL AUTHENTICATE | Single-step challenge-sign via Dynamic Auth Template | Implemented |
 | `0xA4` | SELECT | Select EF/DF within SC-HSM virtual filesystem | Implemented |
@@ -607,7 +607,7 @@ At least one of tag `0x80` or `0x84` must be present. Either may be omitted if o
 
 ### 3.16 GET CHALLENGE (INS = 0x84)
 
-Returns random bytes from the hardware TRNG. The first 8 bytes are also stored in `state.challenge` for subsequent EXTERNAL AUTHENTICATE. The challenge is single-use (cleared by EXTERNAL AUTHENTICATE regardless of outcome).
+Returns random bytes from the hardware TRNG. The first 8 bytes are also stored in `state.challenge`.
 
 **Command:**
 
@@ -629,32 +629,12 @@ Returns random bytes from the hardware TRNG. The first 8 bytes are also stored i
 
 ---
 
-### 3.17 EXTERNAL AUTHENTICATE (INS = 0x82)
+### 3.17 EXTERNAL AUTHENTICATE (INS = 0x82) — removed
 
-Authenticates an external entity using HMAC-SHA256 challenge-response. Establishes SO-PIN session (`state.so_pin_verified = true`) without presenting the SO-PIN directly.
-
-**Command:**
-
-| Field | Value |
-|---|---|
-| CLA | `0x00` |
-| INS | `0x82` |
-| P1 | `0x00` |
-| P2 | `0x00` |
-| Data | 32 bytes: `HMAC-SHA256(so_pin_hash, challenge)` |
-
-The challenge is the 8-byte value previously returned by GET CHALLENGE. The key is the 32-byte SHA-256 hash of the SO-PIN (init code). The challenge is cleared from state immediately — whether or not the cryptogram matches — preventing replay.
-
-**Status words:**
-
-| SW | Meaning |
-|---|---|
-| `9000` | Cryptogram correct, SO-PIN session opened |
-| `6982` | SO-PIN hash not set |
-| `6984` | No challenge outstanding |
-| `6700` | Response not exactly 32 bytes |
-
----
+Removed in October 2026. The pico2hsm variant verified
+`HMAC-SHA256(so_pin_hash, challenge)`, i.e. it was keyed by the *stored*
+SO-PIN hash: anyone able to read the PIN record became SO without knowing
+the SO-PIN. No client used it. The command now returns `6D00`.
 
 ### 3.18 GENERAL AUTHENTICATE (INS = 0x86)
 
@@ -1340,7 +1320,7 @@ MF  (3F00)
 
 8. **EF.PrKDF is always empty:** The standard PKCS#15 PrKDF mechanism is not used. OpenSC is expected to call LIST KEYS (INS=0x58) to discover occupied slots, then read per-key PRKD (C4xx) EFs for key metadata.
 
-9. **EXTERNAL AUTHENTICATE:** Uses `HMAC-SHA256(so_pin_hash, challenge)` rather than a hardware-stored key pair. This is a pico2hsm simplification.
+9. **EXTERNAL AUTHENTICATE:** not supported (removed 2026-10; see §3.17).
 
 10. **DEBUG DUMP (INS=0xFE):** Only compiled in `#[cfg(feature = "debug")]` builds. The stub currently returns `SW_WRONG_DATA`. Never enable the `debug` feature in production.
 

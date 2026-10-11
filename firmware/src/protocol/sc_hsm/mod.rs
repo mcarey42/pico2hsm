@@ -40,16 +40,12 @@ use commands::*;
 /// 0xFF PIN record.  User keys use 0x00–0xFB.
 pub const RESERVED_KEY_REF_MIN: u8 = 0xFC;
 
-/// EXTERNAL AUTHENTICATE retry limit.
-pub const EXT_AUTH_MAX_RETRIES: u8 = 5;
-
 /// A persistent retry counter that a credential-checking APDU spends.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RetryCounter {
     UserPin,
     SoPin,
     Puk,
-    ExtAuth,
 }
 
 impl RetryCounter {
@@ -77,9 +73,6 @@ impl RetryCounter {
             puk_auth::INS_PUK_AUTH if (8..=16).contains(&n) && state.puk_hash.is_some() => {
                 Some(Self::Puk)
             }
-            external_auth::INS_EXTERNAL_AUTH if n != 0 && state.challenge.is_some() => {
-                Some(Self::ExtAuth)
-            }
             // Re-INITIALIZE is authorised by the SO-PIN carried in the command.
             initialize::INS_INITIALIZE
                 if state.initialized
@@ -97,7 +90,6 @@ impl RetryCounter {
             Self::UserPin => &mut state.pin_retry_count,
             Self::SoPin => &mut state.so_pin_retry_count,
             Self::Puk => &mut state.puk_retry_count,
-            Self::ExtAuth => &mut state.ext_auth_retry_count,
         }
     }
 }
@@ -394,12 +386,6 @@ pub struct ScHsmState {
     /// Remaining PUK retry attempts (0 = blocked).
     pub puk_retry_count: u8,
 
-    /// Remaining EXTERNAL AUTHENTICATE retry attempts (0 = blocked).
-    ///
-    /// Initialized to 5. Decremented on each failed EXTERNAL AUTH attempt.
-    /// Resets to 5 on success. Returns SW_AUTH_BLOCKED (0x6983) when zero.
-    pub ext_auth_retry_count: u8,
-
     /// Lightweight metadata index for all keys and EF files in flash.
     /// Replaces the previous `keys`, `rsa_keys`, `sym_keys`, and `ef_files`
     /// Vec fields. Key material stays in flash; only metadata lives in RAM.
@@ -480,7 +466,6 @@ impl ScHsmState {
             puk_hash: None,
             puk_salt: [0u8; 16],
             puk_retry_count: 10,
-            ext_auth_retry_count: 5,
             key_index: heapless::Vec::new(),
             op_buf: OpBuffer::new(),
             write_target_file: None,
@@ -526,7 +511,6 @@ impl ScHsmState {
             addr_of_mut!((*dest).puk_hash).write(None);
             addr_of_mut!((*dest).puk_salt).write([0u8; 16]);
             addr_of_mut!((*dest).puk_retry_count).write(10);
-            addr_of_mut!((*dest).ext_auth_retry_count).write(5);
             addr_of_mut!((*dest).key_index).write(heapless::Vec::new());
             addr_of_mut!((*dest).op_buf).write(OpBuffer::new());
             addr_of_mut!((*dest).write_target_file).write(None);
@@ -736,7 +720,6 @@ impl ScHsm {
             // Credential checks: persistence is handled by with_persisted_attempt.
             verify::INS_VERIFY => verify::handle(&mut self.state, cmd),
             puk_auth::INS_PUK_AUTH => puk_auth::handle(&mut self.state, cmd),
-            external_auth::INS_EXTERNAL_AUTH => external_auth::handle(&mut self.state, cmd),
             generate_keypair::INS_GENERATE_KEYPAIR => {
                 generate_keypair::handle(&mut self.state, store, cmd)
             }
@@ -865,7 +848,6 @@ impl ScHsm {
             verify::INS_VERIFY => verify::handle(&mut self.state, cmd),
             mse::INS_MSE => mse::handle(&mut self.state, cmd),
             challenge::INS_CHALLENGE => challenge::handle(&mut self.state, cmd),
-            external_auth::INS_EXTERNAL_AUTH => external_auth::handle(&mut self.state, cmd),
             list_keys::INS_LIST_KEYS => list_keys::handle(&mut self.state, cmd),
             create_file::INS_CREATE_FILE => create_file::handle(&mut self.state, cmd),
             key_domain::INS_KEY_DOMAIN => key_domain::handle(&mut self.state, cmd),
@@ -911,8 +893,7 @@ impl ScHsm {
     ///   [130..146] puk_salt (16 bytes)
     ///   [146]      puk_retry_count
     ///   [147]      initialized (1 = true, 0 = false)
-    ///   [148]      EXTERNAL AUTHENTICATE failures used (5 − retries left;
-    ///              0 in blobs written before this field existed)
+    ///   [148]      reserved (0)
     ///
     /// NOTE: Format changed from 101-byte (bare SHA-256, no salts) to 149-byte
     /// (PBKDF2 + per-credential salts).  Old flash blobs are ≤101 bytes and will
@@ -940,7 +921,7 @@ impl ScHsm {
         let _ = buf.extend_from_slice(&state.puk_salt);
         let _ = buf.push(state.puk_retry_count);
         let _ = buf.push(state.initialized as u8);
-        let _ = buf.push(EXT_AUTH_MAX_RETRIES.saturating_sub(state.ext_auth_retry_count));
+        let _ = buf.push(0); // reserved (was EXTERNAL AUTHENTICATE failures)
 
         crate::CORE1_PROGRESS.store(35, core::sync::atomic::Ordering::Relaxed);
         let kid = Self::sc_hsm_pin_key_id();
@@ -995,7 +976,6 @@ impl ScHsm {
                 state.puk_salt = b[130..146].try_into().unwrap_or([0u8; 16]);
                 state.puk_retry_count = b[146];
                 state.initialized = b[147] != 0;
-                state.ext_auth_retry_count = EXT_AUTH_MAX_RETRIES.saturating_sub(b[148]);
             }
         }
     }
@@ -1339,23 +1319,6 @@ mod retry_persistence_tests {
     }
 
     #[test]
-    fn ext_auth_failures_persist() {
-        let (mut hsm, mut store) = initialized();
-        // GET CHALLENGE first: without one the handler compares nothing.
-        let mut get_challenge: heapless::Vec<u8, 8> = heapless::Vec::new();
-        get_challenge
-            .extend_from_slice(&[0x00, 0x84, 0x00, 0x00, 0x08])
-            .unwrap();
-        hsm.process_apdu_with_store(&get_challenge, &mut store);
-        let r = hsm.process_apdu_with_store(&apdu(0x00, 0x82, 0, 0, &[0u8; 8]), &mut store);
-        assert_ne!(sw(&r), SW_OK);
-        assert_eq!(store.last().3, 1);
-        let mut fresh = ScHsm::new();
-        ScHsm::load_pin_state_from_store(&mut fresh.state, &mut store);
-        assert_eq!(fresh.state.ext_auth_retry_count, EXT_AUTH_MAX_RETRIES - 1);
-    }
-
-    #[test]
     fn change_pin_with_failed_final_write_keeps_old_pin() {
         let (mut hsm, mut store) = initialized();
         // Attempt 0 = spend-before-compare, attempt 1 = persist the new PIN.
@@ -1403,12 +1366,8 @@ mod retry_persistence_tests {
         }
         assert!(store.saves.is_empty(), "no retry spent on malformed APDUs");
         assert_eq!(
-            (
-                hsm.state.pin_retry_count,
-                hsm.state.so_pin_retry_count,
-                hsm.state.ext_auth_retry_count
-            ),
-            (3, 5, EXT_AUTH_MAX_RETRIES)
+            (hsm.state.pin_retry_count, hsm.state.so_pin_retry_count),
+            (3, 5)
         );
     }
 }

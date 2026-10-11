@@ -191,7 +191,6 @@ pub fn handle(
     state.pin_verified = false;
     state.so_pin_verified = false;
     state.so_pin_retry_count = 5;
-    state.ext_auth_retry_count = crate::protocol::sc_hsm::EXT_AUTH_MAX_RETRIES;
 
     // Reset MSE state.
     state.current_key_id = None;
