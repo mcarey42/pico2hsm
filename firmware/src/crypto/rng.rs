@@ -287,6 +287,21 @@ pub fn fill_random(buf: &mut [u8]) -> Result<(), CryptoError> {
     Ok(())
 }
 
+/// Fill `buf` from the CSPRNG, or reset the chip if the TRNG has failed.
+///
+/// For callers that cannot propagate an error (`RngCore::fill_bytes`,
+/// challenge/nonce helpers).  Handing out a zero or predictable buffer as a
+/// nonce, salt or key is never acceptable on an HSM, and a panic is not
+/// enough: with `panic = abort` RAII guards such as `WatchdogSuppressGuard`
+/// never run, so the stall detector could stay disarmed.  A full reset is the
+/// only state known to be safe.
+pub fn fill_or_reset(buf: &mut [u8]) {
+    if fill_random(buf).is_err() {
+        defmt::error!("RNG: TRNG failure — resetting");
+        cortex_m::peripheral::SCB::sys_reset();
+    }
+}
+
 /// Generate `n` random bytes and return them in a heapless Vec.
 pub fn get_random_bytes(n: usize) -> Result<heapless::Vec<u8, 256>, CryptoError> {
     if n > 256 {

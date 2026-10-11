@@ -362,7 +362,7 @@ fn tdes_encrypt_ecb(_key: &[u8; 24], _block: &[u8]) -> Option<[u8; 8]> {
 fn fill_random_bytes(buf: &mut [u8]) {
     #[cfg(target_arch = "arm")]
     {
-        let _ = crate::crypto::rng::fill_random(buf);
+        crate::crypto::rng::fill_or_reset(buf);
     }
     #[cfg(not(target_arch = "arm"))]
     {

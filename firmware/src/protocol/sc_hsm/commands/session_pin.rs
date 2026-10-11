@@ -23,7 +23,7 @@ pub fn handle(state: &mut ScHsmState, _cmd: &ApduCommand<'_>) -> ApduResponse {
     let mut buf = [0u8; 8];
     #[cfg(target_arch = "arm")]
     {
-        let _ = crate::crypto::rng::fill_random(&mut buf);
+        crate::crypto::rng::fill_or_reset(&mut buf);
     }
     #[cfg(not(target_arch = "arm"))]
     {

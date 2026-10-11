@@ -290,7 +290,8 @@ impl rand_core::RngCore for FwRng {
         crate::WATCHDOG_HEARTBEAT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         #[cfg(target_arch = "arm")]
         {
-            let _ = crate::crypto::rng::fill_random(dest);
+            // Never return unrandom bytes: a TRNG failure resets the chip.
+            crate::crypto::rng::fill_or_reset(dest);
         }
         #[cfg(not(target_arch = "arm"))]
         {

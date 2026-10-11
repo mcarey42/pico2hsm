@@ -128,7 +128,7 @@ fn handle_change_puk(state: &mut PivState, cmd: &ApduCommand<'_>) -> ApduRespons
 fn fill_random_bytes(buf: &mut [u8]) {
     #[cfg(target_arch = "arm")]
     {
-        let _ = crate::crypto::rng::fill_random(buf);
+        crate::crypto::rng::fill_or_reset(buf);
     }
     #[cfg(not(target_arch = "arm"))]
     {

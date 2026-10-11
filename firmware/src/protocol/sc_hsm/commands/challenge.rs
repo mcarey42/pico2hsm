@@ -33,7 +33,7 @@ pub fn handle(state: &mut ScHsmState, cmd: &ApduCommand<'_>) -> ApduResponse {
     }
     #[cfg(target_arch = "arm")]
     {
-        let _ = crate::crypto::rng::fill_random(&mut buf);
+        crate::crypto::rng::fill_or_reset(&mut buf);
     }
 
     // Store 8-byte challenge for subsequent EXTERNAL AUTHENTICATE

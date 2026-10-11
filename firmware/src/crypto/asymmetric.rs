@@ -547,27 +547,60 @@ where
 }
 
 /// P-521 ECDSA sign — dedicated impl because NistP521 has no DigestPrimitive.
-/// Uses randomized k from CryptoRng (hardware TRNG on RP2350).
-/// No standard hash has OutputSize == 66 bytes (P-521 field size), so RFC 6979's
-/// type-level guarantee cannot be used. Randomized k with a CSPRNG is equally secure.
+///
+/// The nonce is RFC 6979 (HMAC-DRBG over SHA-512) *hedged* with 32 fresh
+/// random bytes as additional data (RFC 6979 §3.6): a weak or faulted RNG no
+/// longer leaks the key through a biased `k`, and the randomness still
+/// defeats fault attacks on deterministic signing.
 fn ecdsa_sign_p521(
     private_key_raw: &[u8],
     hash_data: &[u8],
     rng: &mut (impl rand_core::CryptoRng + rand_core::RngCore),
 ) -> Result<EcdsaSignature, CryptoError> {
+    let mut extra = [0u8; 32];
+    rng.try_fill_bytes(&mut extra)
+        .map_err(|_| CryptoError::RngFailure)?;
+    ecdsa_sign_p521_with_ad(private_key_raw, hash_data, &extra)
+}
+
+/// P-521 ECDSA with an RFC 6979 nonce over SHA-512 and additional data `ad`
+/// (empty = plain deterministic RFC 6979, used by the test vectors).
+fn ecdsa_sign_p521_with_ad(
+    private_key_raw: &[u8],
+    hash_data: &[u8],
+    ad: &[u8],
+) -> Result<EcdsaSignature, CryptoError> {
     use ecdsa::hazmat::{bits2field, SignPrimitive};
-    use elliptic_curve::NonZeroScalar;
+    use elliptic_curve::ops::Reduce;
+    use elliptic_curve::PrimeField;
 
     let secret = SecretKey::<p521::NistP521>::from_slice(private_key_raw)
         .map_err(|_| CryptoError::WrongKeyLength)?;
     // SignPrimitive<NistP521> is implemented on p521::Scalar, not NonZeroScalar.
-    // Deref with explicit type annotation to avoid Rust resolving to the NonZeroScalar copy.
     let nz = secret.to_nonzero_scalar();
     let scalar: p521::Scalar = *nz;
     let z = bits2field::<p521::NistP521>(hash_data).map_err(|_| CryptoError::SignFailure)?;
-    // Generate a random k from the hardware TRNG, convert to Scalar for Invert bound.
-    let k_nz = NonZeroScalar::<p521::NistP521>::random(rng);
-    let k: p521::Scalar = *k_nz;
+
+    // RFC 6979 §3.2 with qlen = 521, rlen = 528: x = int2octets(d),
+    // h1 = bits2octets(z) = int2octets(z mod n).
+    let x = zeroize::Zeroizing::new(scalar.to_repr());
+    let h1 =
+        <p521::Scalar as Reduce<<p521::NistP521 as elliptic_curve::Curve>::Uint>>::reduce_bytes(&z)
+            .to_repr();
+    let mut drbg = rfc6979::HmacDrbg::<sha2::Sha512>::new(x.as_slice(), &h1, ad);
+    let k = loop {
+        // T = 66 bytes of DRBG output; k = bits2int(T) = leftmost 521 bits.
+        let mut t = zeroize::Zeroizing::new(p521::FieldBytes::default());
+        drbg.fill_bytes(t.as_mut_slice());
+        shift_right_bits(t.as_mut_slice(), 66 * 8 - 521);
+        let candidate: Option<p521::Scalar> = p521::Scalar::from_repr(*t).into();
+        match candidate {
+            Some(k) if !bool::from(k.is_zero()) => break k,
+            // k ≥ n or k = 0: fill_bytes already did the §3.2(h) K/V update.
+            _ => continue,
+        }
+    };
+
     let (sig, _recid) = scalar
         .try_sign_prehashed(k, &z)
         .map_err(|_| CryptoError::SignFailure)?;
@@ -577,6 +610,17 @@ fn ecdsa_sign_p521(
     out.extend_from_slice(sig_bytes)
         .map_err(|_| CryptoError::BufferTooSmall)?;
     Ok(out)
+}
+
+/// Shift a big-endian integer right by `bits` (< 8) in place.
+fn shift_right_bits(be: &mut [u8], bits: usize) {
+    debug_assert!(bits < 8);
+    let mut carry = 0u8;
+    for b in be.iter_mut() {
+        let next = *b << (8 - bits);
+        *b = (*b >> bits) | carry;
+        carry = next;
+    }
 }
 
 /// P-521 ECDSA verify — dedicated impl because NistP521 has no DigestPrimitive.
@@ -1318,5 +1362,54 @@ mod rsa_blinding_tests {
         let out = rsa_private_raw(&der, &c.to_bytes_be()).unwrap();
         assert_eq!(::rsa::BigUint::from_bytes_be(&out), m);
         assert_eq!(out.len(), k.size());
+    }
+}
+
+#[cfg(test)]
+mod p521_rfc6979_tests {
+    use super::*;
+    use sha2::{Digest, Sha512};
+
+    fn hex(s: &str) -> alloc::vec::Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    const X: &str = "00FAD06DAA62BA3B25D2FB40133DA757205DE67F5BB0018FEE8C86E1B68C7E75CAA896EB32F1F47C70855836A6D16FCC1466F6D8FBEC67DB89EC0C08B0E996B83538";
+
+    /// RFC 6979 A.2.7, P-521, SHA-512, message "sample" (also reproduced
+    /// with python-ecdsa `sign_digest_deterministic`).
+    #[test]
+    fn deterministic_nonce_matches_rfc6979_vector() {
+        let h = Sha512::digest(b"sample");
+        let der = ecdsa_sign_p521_with_ad(&hex(X), &h, &[]).unwrap();
+        let sig = ecdsa::Signature::<p521::NistP521>::from_der(&der).unwrap();
+        let (r, s) = sig.split_bytes();
+        assert_eq!(
+            r.as_slice(),
+            hex("00C328FAFCBD79DD77850370C46325D987CB525569FB63C5D3BC53950E6D4C5F174E25A1EE9017B5D450606ADD152B534931D7D4E8455CC91F9B15BF05EC36E377FA")
+        );
+        assert_eq!(
+            s.as_slice(),
+            hex("00617CCE7CF5064806C467F678D3B4080D6F1CC50AF26CA209417308281B68AF282623EAA63E5B5C0723D8B8C37FF0777B1A20F8CCB1DCCC43997F1EE0E44DA4A67A")
+        );
+    }
+
+    #[test]
+    fn hedged_signatures_verify_and_differ() {
+        let h = Sha512::digest(b"sample");
+        let a = ecdsa_sign_p521(&hex(X), &h, &mut crate::protocol::sc_hsm::FwRng).unwrap();
+        let b = ecdsa_sign_p521(&hex(X), &h, &mut crate::protocol::sc_hsm::FwRng).unwrap();
+        assert_ne!(a, b, "fresh additional data per signature");
+        let public = SecretKey::<p521::NistP521>::from_slice(&hex(X))
+            .unwrap()
+            .public_key();
+        use elliptic_curve::sec1::ToEncodedPoint;
+        let sec1 = public.to_encoded_point(false);
+        for der in [a, b] {
+            assert_eq!(ecdsa_verify_p521(sec1.as_bytes(), &h, &der), Ok(true));
+        }
     }
 }

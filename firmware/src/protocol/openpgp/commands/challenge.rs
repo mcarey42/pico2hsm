@@ -28,7 +28,7 @@ pub fn handle(_state: &mut OpenPgpState, cmd: &ApduCommand<'_>) -> ApduResponse 
     }
     #[cfg(target_arch = "arm")]
     {
-        let _ = crate::crypto::rng::fill_random(&mut buf);
+        crate::crypto::rng::fill_or_reset(&mut buf);
     }
 
     ApduResponse::ok(&buf)
