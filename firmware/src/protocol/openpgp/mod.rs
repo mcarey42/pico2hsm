@@ -176,6 +176,13 @@ pub struct OpenPgpState {
 ///
 /// Assigning `None` alone only changes the discriminant and leaves the key
 /// bytes in RAM.
+/// Replace a private key slot's contents, writing the bytes in place:
+/// building a `Vec` and moving it in leaves a plaintext copy behind.
+pub(crate) fn set_key(slot: &mut Option<Vec<u8, 66>>, key: &[u8]) {
+    wipe_key(slot);
+    let _ = slot.insert(Vec::new()).extend_from_slice(key);
+}
+
 pub(crate) fn wipe_key(slot: &mut Option<Vec<u8, 66>>) {
     if let Some(key) = slot.as_mut() {
         zeroize::Zeroize::zeroize(key.as_mut_slice());
@@ -704,24 +711,22 @@ impl OpenPgp {
                     _ => continue,
                 };
 
-                let mut priv_vec: Vec<u8, 66> = Vec::new();
-                let _ = priv_vec.extend_from_slice(&obj.private_key);
                 let mut pub_vec: Vec<u8, 133> = Vec::new();
                 let _ = pub_vec.extend_from_slice(&obj.public_key);
 
                 match slot {
                     s if s == SLOT_SIG => {
-                        self.state.sig_private = Some(priv_vec);
+                        set_key(&mut self.state.sig_private, &obj.private_key);
                         self.state.sig_public = Some(pub_vec);
                         self.state.sig_key_type = Some(key_type);
                     }
                     s if s == SLOT_DEC => {
-                        self.state.dec_private = Some(priv_vec);
+                        set_key(&mut self.state.dec_private, &obj.private_key);
                         self.state.dec_public = Some(pub_vec);
                         self.state.dec_key_type = Some(key_type);
                     }
                     s if s == SLOT_AUTH => {
-                        self.state.auth_private = Some(priv_vec);
+                        set_key(&mut self.state.auth_private, &obj.private_key);
                         self.state.auth_public = Some(pub_vec);
                         self.state.auth_key_type = Some(key_type);
                     }

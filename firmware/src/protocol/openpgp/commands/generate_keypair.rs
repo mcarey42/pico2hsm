@@ -144,9 +144,7 @@ pub fn handle(state: &mut OpenPgpState, cmd: &ApduCommand<'_>) -> ApduResponse {
             // have &mut state above; the borrow checker can't see through
             // the raw-pointer indirection but we know the slots are disjoint.)
             unsafe {
-                let mut priv_vec: heapless::Vec<u8, 66> = heapless::Vec::new();
-                let _ = priv_vec.extend_from_slice(&pair.private_key);
-                *priv_slot = Some(priv_vec);
+                crate::protocol::openpgp::set_key(&mut *priv_slot, &pair.private_key);
 
                 let mut pub_vec: heapless::Vec<u8, 133> = heapless::Vec::new();
                 let _ = pub_vec.extend_from_slice(&pair.public_key);
