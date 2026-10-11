@@ -449,7 +449,27 @@ impl<'d, D: Driver<'d>> CcidTransport<'d, D> {
 
         let header = CcidHeader::from_bytes(buf).ok_or(CcidError::MalformedMessage)?;
         let payload_len = header.length as usize;
-        let total = CCID_HEADER_LEN + payload_len;
+        let total = CCID_HEADER_LEN.saturating_add(payload_len);
+
+        if total > buf.capacity() {
+            // Too big to hold.  Consume the rest of this message (up to its
+            // declared end or a short packet) so the next read starts at a
+            // header — otherwise payload bytes would be parsed as headers
+            // and the bulk pipe would stay out of step — then fail it.
+            let mut consumed = buf.len();
+            while consumed < total {
+                let n = self.read_ep.read(&mut pkt).await?;
+                consumed += n;
+                if n < pkt.len() {
+                    break;
+                }
+            }
+            // bmCommandStatus = failed (0x40), bError = 0x01: offset of the
+            // offending dwLength field (CCID §6.2.6).
+            let resp = self.build_slot_status(header.seq, 0x40, 0x01);
+            self.write_response(&resp).await?;
+            return Err(CcidError::BufferOverflow);
+        }
 
         // Read remaining packets until we have the full message.
         while buf.len() < total {
