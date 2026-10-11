@@ -21,10 +21,15 @@ pub fn handle_with_store(
     store: &mut dyn crate::storage::KeyStore,
     cmd: &ApduCommand<'_>,
 ) -> ApduResponse {
+    let before = (state.pw1_hash, state.pw1_retries);
     let resp = handle(state, cmd);
     if resp.sw == 0x9000
         && crate::protocol::openpgp::OpenPgp::save_pw1_to_store(state, store).is_err()
     {
+        // Keep RAM what flash holds: the new PW1 must not work until reboot.
+        (state.pw1_hash, state.pw1_retries) = before;
+        state.pw1_verified_sign = false;
+        state.pw1_verified_other = false;
         return ApduResponse::err(pico2hsm_core::apdu::SW_MEMORY_FAILURE);
     }
     resp

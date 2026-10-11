@@ -424,9 +424,10 @@ impl Piv {
         store.save_key(&obj)
     }
 
-    /// Load PIN/PUK state from flash into `state`.
+    /// Load PIN/PUK and management key from flash into `state` (boot and
+    /// reset only: needs a store that can enumerate keys, i.e. core0's).
     #[cfg(feature = "applet-piv")]
-    fn load_pin_state_from_store(state: &mut PivState, store: &mut dyn crate::storage::KeyStore) {
+    fn load_credentials_from_store(state: &mut PivState, store: &mut dyn crate::storage::KeyStore) {
         // A missing record is a fresh applet only while the applet stores
         // nothing; the records are written before its first key or object.
         // Missing next to stored content, unreadable, or malformed means
@@ -458,19 +459,45 @@ impl Piv {
             }
         }
         if let Ok(Some(obj)) = pin {
-            let b = &obj.private_key;
-            if b.len() >= 101 {
-                state.pin_state.pin_hash.copy_from_slice(&b[0..32]);
-                state.pin_state.pin_salt.copy_from_slice(&b[32..48]);
-                state.pin_state.pin_retries_remaining = b[48];
-                state.pin_state.pin_max_retries = b[49];
-                state.pin_state.pin_blocked = b[50] != 0;
-                state.pin_state.puk_hash.copy_from_slice(&b[51..83]);
-                state.pin_state.puk_salt.copy_from_slice(&b[83..99]);
-                state.pin_state.puk_retries_remaining = b[99];
-                state.pin_state.puk_blocked = b[100] != 0;
+            Self::apply_pin_record(state, &obj.private_key);
+        }
+    }
+
+    /// Runtime rollback after a failed PIN-record save: put RAM back to
+    /// what flash holds.  Only the PIN record — the management key is
+    /// untouched — and if it can't be read, PIN and PUK are blocked rather
+    /// than left at whatever the failed command put in RAM.
+    #[cfg(feature = "applet-piv")]
+    fn restore_pin_record(state: &mut PivState, store: &mut dyn crate::storage::KeyStore) {
+        match store.fetch_key(Self::piv_pin_key_id()) {
+            Ok(Some(obj)) if Self::apply_pin_record(state, &obj.private_key) => {}
+            _ => {
+                let ps = &mut state.pin_state;
+                ps.pin_retries_remaining = 0;
+                ps.pin_blocked = true;
+                ps.puk_retries_remaining = 0;
+                ps.puk_blocked = true;
             }
         }
+    }
+
+    /// Decode a PIN record (layout: `save_pin_to_store`) into `state`.
+    #[cfg(feature = "applet-piv")]
+    fn apply_pin_record(state: &mut PivState, b: &[u8]) -> bool {
+        if b.len() < 101 {
+            return false;
+        }
+        let ps = &mut state.pin_state;
+        ps.pin_hash.copy_from_slice(&b[0..32]);
+        ps.pin_salt.copy_from_slice(&b[32..48]);
+        ps.pin_retries_remaining = b[48];
+        ps.pin_max_retries = b[49];
+        ps.pin_blocked = b[50] != 0;
+        ps.puk_hash.copy_from_slice(&b[51..83]);
+        ps.puk_salt.copy_from_slice(&b[83..99]);
+        ps.puk_retries_remaining = b[99];
+        ps.puk_blocked = b[100] != 0;
+        true
     }
 
     /// Dispatch a parsed APDU using the store-aware path for mutations.
@@ -520,7 +547,7 @@ impl Piv {
         if *after != spent && Self::save_pin_to_store(&self.state, store).is_err() {
             // Keep RAM consistent with flash (spent counter, old PIN) and
             // fail closed; see ScHsm::with_persisted_attempt.
-            Self::load_pin_state_from_store(&mut self.state, store);
+            Self::restore_pin_record(&mut self.state, store);
             *counter.get(&mut self.state).0 = spent;
             self.state.pin_verified = false;
             self.state.pin_state.session_authenticated = false;
@@ -646,9 +673,8 @@ impl Piv {
     pub fn load_from_store(&mut self, store: &mut dyn crate::storage::KeyStore) {
         #[cfg(feature = "applet-piv")]
         {
-            // Load PIN state first.
             // PIN, PUK and management key (fail closed on tampering).
-            Self::load_pin_state_from_store(&mut self.state, store);
+            Self::load_credentials_from_store(&mut self.state, store);
 
             // Load key objects for PIV slots.
             let mut piv_ids: Vec<pico2hsm_core::key::KeyId, 16> = Vec::new();
@@ -822,7 +848,7 @@ mod retry_persistence_tests {
         assert_eq!(store.saves[0][48], max - 1);
 
         let mut fresh = Piv::new();
-        Piv::load_pin_state_from_store(&mut fresh.state, &mut store);
+        Piv::restore_pin_record(&mut fresh.state, &mut store);
         assert_eq!(fresh.state.pin_state.pin_retries_remaining, max - 1);
 
         assert_eq!(verify(&mut fresh, &mut store, DEFAULT_PIV_PIN), 0x9000);
