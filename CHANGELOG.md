@@ -74,6 +74,11 @@ Security and robustness release from the October 2026 audit
 - PIV data objects (certificates, CHUID) survive reset; unique CHUID GUID.
 - Core0 MSPLIM covers the RTT buffer.
 - CI: clippy gate passes on current stable; PIV/OpenPGP built and tested.
+- Builds without `rsa` store certificates and data objects of the same
+  size as RSA builds (PIV objects up to 2048 bytes, OpenPGP 7F21 up to
+  1024, SC-HSM EFs up to 2400); they were capped at 512 bytes, so EC
+  certificates failed closed.  CI builds and tests the applets without
+  `rsa` too.
 
 ## [1.0.1] - 2026-04-29
 
