@@ -176,13 +176,9 @@ impl<Chip: FlashChip> KeyStore for FlashKeyStore<Chip> {
     }
 
     fn wipe_by_owner(&mut self, owner: AppletId) -> Result<(), HsmError> {
-        let keys = self.storage.list_keys();
-        for k in keys {
-            if ((k.0 >> 16) & 0xFF) as u8 == owner as u8 {
-                self.storage.delete_key(k).map_err(HsmError::Storage)?;
-            }
-        }
-        Ok(())
+        self.storage
+            .delete_where(&|k: KeyId| ((k.0 >> 16) & 0xFF) as u8 == owner as u8)
+            .map_err(HsmError::Storage)
     }
 
     fn enumerate_keys(&self) -> Vec<KeyId, 64> {

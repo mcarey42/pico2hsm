@@ -350,6 +350,11 @@ impl<Chip: FlashChip> StorageManager<Chip> {
         self.filesystem.delete_key(key_id)
     }
 
+    /// Delete every key matching `pred`; see [`KeyFilesystem::delete_where`].
+    pub fn delete_where(&mut self, pred: &dyn Fn(KeyId) -> bool) -> Result<(), StorageError> {
+        self.filesystem.delete_where(pred)
+    }
+
     /// Check whether a key ID exists in the directory.
     pub fn key_exists(&self, key_id: KeyId) -> bool {
         self.filesystem.directory.find(key_id).is_some()

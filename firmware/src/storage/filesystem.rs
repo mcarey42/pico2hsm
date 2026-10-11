@@ -424,6 +424,10 @@ impl<Chip: FlashChip> KeyFilesystem<Chip> {
         let mut buf = [0u8; SECTOR_SIZE];
         self.directory.serialize(&mut buf)?;
 
+        // A failed write is reported, and the directory stays dirty: callers
+        // (DELETE, INITIALIZE) must not believe a removal is durable when
+        // the old directory — still listing the key — is what's on flash.
+        let mut result = Ok(());
         for chip in self.chips.iter_mut() {
             let addr = DIRECTORY_SECTOR * SECTOR_SIZE as u32;
             if let Err(e) = chip.erase_sector(addr) {
@@ -431,6 +435,7 @@ impl<Chip: FlashChip> KeyFilesystem<Chip> {
                     "KeyFilesystem: erase directory sector failed: {:?}",
                     defmt::Debug2Format(&e)
                 );
+                result = Err(e);
                 continue;
             }
             if let Err(e) = write_sector(chip, addr, &buf) {
@@ -438,10 +443,13 @@ impl<Chip: FlashChip> KeyFilesystem<Chip> {
                     "KeyFilesystem: write directory sector failed: {:?}",
                     defmt::Debug2Format(&e)
                 );
+                result = Err(e);
             }
         }
-        self.directory.dirty = false;
-        Ok(())
+        if result.is_ok() {
+            self.directory.dirty = false;
+        }
+        result
     }
 
     // ── Key read ─────────────────────────────────────────────────────────────
@@ -641,22 +649,65 @@ impl<Chip: FlashChip> KeyFilesystem<Chip> {
             return Err(StorageError::WriteError);
         }
 
-        // Erase the data sectors.
+        // Erase the data sectors.  A failed erase is an error: the key's
+        // ciphertext may still be on flash, and the caller must not report
+        // it deleted.
+        self.erase_data_sectors(chip_index, sector_index, sector_count)?;
+
+        // Remove from directory.
+        self.directory.remove(key_id);
+        self.flush_directory()
+    }
+
+    fn erase_data_sectors(
+        &mut self,
+        chip_index: usize,
+        sector_index: u32,
+        sector_count: u32,
+    ) -> Result<(), StorageError> {
+        let chip = self.chips.get_mut(chip_index).ok_or(StorageError::WriteError)?;
         for s in 0..sector_count {
             let addr = (sector_index + s) * SECTOR_SIZE as u32;
-            if let Err(e) = self.chips[chip_index].erase_sector(addr) {
+            if let Err(e) = chip.erase_sector(addr) {
                 defmt::warn!(
                     "KeyFilesystem: erase sector {} failed: {:?}",
                     sector_index + s,
                     defmt::Debug2Format(&e)
                 );
+                return Err(e);
             }
         }
-
-        // Remove from directory.
-        self.directory.remove(key_id);
-        self.flush_directory()?;
         Ok(())
+    }
+
+    /// Delete every key whose id matches `pred`, writing the directory once.
+    ///
+    /// Walks the whole directory (no 64-entry cap: keys past it used to
+    /// survive INITIALIZE).  Data sectors are erased before the directory
+    /// drops the entry; a key whose erase fails stays listed and the call
+    /// fails, but the rest are still removed.
+    pub fn delete_where(&mut self, pred: &dyn Fn(KeyId) -> bool) -> Result<(), StorageError> {
+        let mut result = Ok(());
+        for i in 0..self.directory.entries.len() {
+            let e = &self.directory.entries[i];
+            if e.key_id == 0xFFFF_FFFF || (e.flags & 0x01) != 0 || !pred(KeyId(e.key_id)) {
+                continue;
+            }
+            let (kid, chip, sector, count) = (
+                KeyId(e.key_id),
+                e.chip_index as usize,
+                e.sector_index,
+                e.sector_count as u32,
+            );
+            match self.erase_data_sectors(chip, sector, count) {
+                Ok(()) => {
+                    self.directory.remove(kid);
+                }
+                Err(err) => result = Err(err),
+            }
+        }
+        let flushed = self.flush_directory();
+        result.and(flushed)
     }
 
     // ── Key list ─────────────────────────────────────────────────────────────
