@@ -70,47 +70,59 @@ pub fn handle(
     // as a Case-1 APDU with no inline data.  We must support both paths.
 
     // Copy blob into a local buffer so we can later mutate state.
-    let blob_data: heapless::Vec<u8, 2480> = if !cmd.data.is_empty() {
-        let mut v: heapless::Vec<u8, 2480> = heapless::Vec::new();
-        if v.extend_from_slice(cmd.data).is_err() {
-            return ApduResponse::err(SW_WRONG_DATA);
-        }
-        v
-    } else {
-        // Standard sc-hsm-tool protocol: host wrote the blob to EF 0x2F10 first,
-        // then sends IMPORT KEY as Case-1 APDU (no inline data).
-        // EF 0x2F10 is stored via write_data; read from ef_cache first,
-        // then fall back to flash via cross-core fetch_key RPC.
-        let ef_key_id = KeyId::sc_hsm_ef(0, 0x2F, 0x10);
-        if let Some(data) = state.ef_cache_get(ef_key_id.0) {
-            if !data.is_empty() {
-                let mut v: heapless::Vec<u8, 2480> = heapless::Vec::new();
-                if v.extend_from_slice(data).is_err() {
-                    return ApduResponse::err(SW_WRONG_DATA);
-                }
-                v
-            } else {
+    let blob_data: heapless::Vec<u8, { crate::security::dkek::WRAP_MAX_BLOB }> =
+        if !cmd.data.is_empty() {
+            let mut v: heapless::Vec<u8, { crate::security::dkek::WRAP_MAX_BLOB }> =
+                heapless::Vec::new();
+            if v.extend_from_slice(cmd.data).is_err() {
                 return ApduResponse::err(SW_WRONG_DATA);
             }
-        } else if let Ok(Some(obj)) = store.fetch_key(ef_key_id) {
-            if !obj.private_key.is_empty() {
-                state.ef_cache_put(ef_key_id.0, &obj.private_key);
-                let mut v: heapless::Vec<u8, 2480> = heapless::Vec::new();
-                if v.extend_from_slice(&obj.private_key).is_err() {
-                    return ApduResponse::err(SW_WRONG_DATA);
-                }
-                v
-            } else {
-                return ApduResponse::err(SW_WRONG_DATA);
-            }
+            v
         } else {
-            return ApduResponse::err(SW_WRONG_DATA);
-        }
-    };
+            // Standard sc-hsm-tool protocol: host wrote the blob to EF 0x2F10 first,
+            // then sends IMPORT KEY as Case-1 APDU (no inline data).
+            // EF 0x2F10 is stored via write_data; read from ef_cache first,
+            // then fall back to flash via cross-core fetch_key RPC.
+            let ef_key_id = KeyId::sc_hsm_ef(0, 0x2F, 0x10);
+            if let Some(data) = state.ef_cache_get(ef_key_id.0) {
+                if !data.is_empty() {
+                    let mut v: heapless::Vec<u8, { crate::security::dkek::WRAP_MAX_BLOB }> =
+                        heapless::Vec::new();
+                    if v.extend_from_slice(data).is_err() {
+                        return ApduResponse::err(SW_WRONG_DATA);
+                    }
+                    v
+                } else {
+                    return ApduResponse::err(SW_WRONG_DATA);
+                }
+            } else if let Ok(Some(obj)) = store.fetch_key(ef_key_id) {
+                if !obj.private_key.is_empty() {
+                    state.ef_cache_put(ef_key_id.0, &obj.private_key);
+                    let mut v: heapless::Vec<u8, { crate::security::dkek::WRAP_MAX_BLOB }> =
+                        heapless::Vec::new();
+                    if v.extend_from_slice(&obj.private_key).is_err() {
+                        return ApduResponse::err(SW_WRONG_DATA);
+                    }
+                    v
+                } else {
+                    return ApduResponse::err(SW_WRONG_DATA);
+                }
+            } else {
+                return ApduResponse::err(SW_WRONG_DATA);
+            }
+        };
 
     // Unwrap key blob under DKEK.
-    let (key_material, algo_id, key_flags) = match state.dkek.unwrap(&blob_data) {
-        Ok((key, algo, flags)) => (crate::security::zeroize::WipeOnDrop(key), algo, flags),
+    // Version-3 blobs carry the key's usage policy, which the imported key
+    // keeps (a key without one stays unrestricted).
+    let (key_material, algo_id, key_flags, policy) = match state.dkek.unwrap_with_policy(&blob_data)
+    {
+        Ok((key, algo, flags, policy)) => (
+            crate::security::zeroize::WipeOnDrop(key),
+            algo,
+            flags,
+            policy,
+        ),
         Err(_) => return ApduResponse::err(SW_WRONG_DATA),
     };
 
@@ -122,7 +134,10 @@ pub fn handle(
 
     // Clear EF 0x2F10 now that we have consumed the blob.
     let ef_key_id_2f10 = KeyId::sc_hsm_ef(0, 0x2F, 0x10);
-    let _ = store.erase_key(ef_key_id_2f10);
+    if cmd.data.is_empty() && store.erase_key(ef_key_id_2f10).is_err() {
+        // Fail closed: RAM and flash stay consistent, nothing imported.
+        return ApduResponse::err(pico2hsm_core::apdu::SW_MEMORY_FAILURE);
+    }
     state.key_index.retain(|m| m.key_id != ef_key_id_2f10.0);
     state.ef_cache_remove(ef_key_id_2f10.0);
 
@@ -146,7 +161,15 @@ pub fn handle(
     // Build KeyObject for persistent storage.
     let mut key_obj = KeyObject::new(km_type, full_key_id.0, AppletId::ScHsm, km_algo);
     key_obj.key_flags = key_flags;
-    let _ = key_obj.private_key.extend_from_slice(&key_material);
+    key_obj.key_domain = policy.domain.unwrap_or(0);
+    key_obj.policy = policy;
+    if key_obj
+        .private_key
+        .extend_from_slice(&key_material)
+        .is_err()
+    {
+        return ApduResponse::err(SW_WRONG_DATA);
+    }
 
     // Persist to flash; an import that is not stored did not happen.
     if store.save_key(&key_obj).is_err() {
@@ -246,7 +269,11 @@ mod tests {
     }
 
     /// Wrap a known key so we have a valid blob for import tests.
-    fn wrap_test_key(state: &ScHsmState, private_key: &[u8], algo: u8) -> heapless::Vec<u8, 2480> {
+    fn wrap_test_key(
+        state: &ScHsmState,
+        private_key: &[u8],
+        algo: u8,
+    ) -> heapless::Vec<u8, { crate::security::dkek::WRAP_MAX_BLOB }> {
         let mut rng = FwRng;
         state.dkek.wrap(private_key, algo, 0x01, &mut rng).unwrap()
     }
@@ -346,7 +373,7 @@ mod tests {
 
     /// A store that holds one EF 0x2F10 blob for testing the standard import path.
     struct EfStore {
-        ef_data: Option<heapless::Vec<u8, 2480>>,
+        ef_data: Option<heapless::Vec<u8, { crate::security::dkek::WRAP_MAX_BLOB }>>,
     }
     impl KeyStore for EfStore {
         fn save_key(

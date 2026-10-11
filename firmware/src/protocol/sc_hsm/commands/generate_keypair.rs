@@ -747,6 +747,15 @@ pub fn handle(
         .and_then(|v| v.first().copied())
         .unwrap_or(0x00);
 
+    // CardContact key attributes after the CVC request body: 90 key use
+    // counter, 91 algorithm list, 92 key domain.  Parsed strictly (a
+    // malformed request is refused, never stored without its policy) and
+    // before the key is generated.
+    let policy = match crate::security::key_policy::KeyPolicy::from_creation_tlvs(cmd.data) {
+        Ok(p) => p,
+        Err(sw) => return ApduResponse::err(sw),
+    };
+
     // ---- RSA key generation (feature-gated) ---------------------------------
     #[cfg(feature = "rsa")]
     if is_rsa_key_type(key_type) {
@@ -798,6 +807,8 @@ pub fn handle(
                 km_algo,
             );
             key_obj.key_flags = key_flags;
+            key_obj.key_domain = policy.domain.unwrap_or(0);
+            key_obj.policy = policy.clone();
             let _ = key_obj.private_key.extend_from_slice(&pair.private_key_der);
             // Store modulus || exponent in public_key for future reconstruction.
             // Layout: [2-byte modulus_len BE] || modulus || exponent
@@ -860,6 +871,8 @@ pub fn handle(
             km_algo,
         );
         key_obj.key_flags = key_flags;
+        key_obj.key_domain = policy.domain.unwrap_or(0);
+        key_obj.policy = policy;
         let _ = key_obj.private_key.extend_from_slice(&pair.private_key);
         let _ = key_obj.public_key.extend_from_slice(&pair.public_key);
         // Persist before indexing: a key the host is told about must survive reset.

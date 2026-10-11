@@ -25,6 +25,7 @@ use pico2hsm_core::{
 };
 
 use crate::protocol::sc_hsm::ScHsmState;
+use crate::security::key_policy::authorize_use;
 use crate::storage::KeyStore;
 
 /// INS byte for DECIPHER.
@@ -80,11 +81,22 @@ pub fn handle(
 
     // SC-HSM encodes the key reference in P1 and the algorithm in P2 directly
     // in the DECIPHER APDU (no preceding MSE SET required).
-    let key_id = cmd.p1; // u8 protocol key reference
-    let full_key_id = pico2hsm_core::key::KeyId::sc_hsm(0, key_id).0; // u32 internal ID
-    let algo = cmd.p2;
+    decipher(state, store, cmd.p1, cmd.p2, cmd.data)
+}
 
-    if cmd.data.is_empty() {
+/// DECIPHER / ECDH with key `key_ref` and algorithm `algo` (DECIPHER and
+/// PSO:DECIPHER).  The caller checked the PIN.  The key's usage policy is
+/// checked against `algo`, and a use spent, right before the operation.
+pub(crate) fn decipher(
+    state: &mut ScHsmState,
+    store: &mut dyn KeyStore,
+    key_ref: u8,
+    algo: u8,
+    data: &[u8],
+) -> ApduResponse {
+    let full_key_id = pico2hsm_core::key::KeyId::sc_hsm(0, key_ref).0; // u32 internal ID
+
+    if data.is_empty() {
         return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED);
     }
 
@@ -105,10 +117,13 @@ pub fn handle(
             };
 
             // Load key material from flash
-            let key_obj = match store.fetch_key(pico2hsm_core::key::KeyId(full_key_id)) {
+            let mut key_obj = match store.fetch_key(pico2hsm_core::key::KeyId(full_key_id)) {
                 Ok(Some(obj)) => obj,
                 _ => return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
             };
+            if key_obj.key_type != crate::security::key_management::KeyType::Rsa {
+                return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED);
+            }
 
             // RSA-2048 PKCS#1 DER is ≤1200 bytes; RSA-4096 is ≤2400 bytes.
             let der_len = key_obj.private_key.len();
@@ -116,9 +131,12 @@ pub fn handle(
             else {
                 return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED);
             };
+            if let Err(sw) = authorize_use(store, &mut key_obj, Some(algo)) {
+                return ApduResponse::err(sw);
+            }
 
             // Raw RSA: result = ciphertext^d mod n. OpenSC handles all unpadding.
-            return match rsa_private_raw(&der_buf[..der_len], cmd.data) {
+            return match rsa_private_raw(&der_buf[..der_len], data) {
                 Ok(p) => ApduResponse::ok(&p),
                 Err(_) => ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
             };
@@ -164,7 +182,7 @@ pub fn handle(
     let needs_04_prefix = algo == 0x80;
 
     // Load key material from flash
-    let key_obj = match store.fetch_key(pico2hsm_core::key::KeyId(full_key_id)) {
+    let mut key_obj = match store.fetch_key(pico2hsm_core::key::KeyId(full_key_id)) {
         Ok(Some(obj)) => obj,
         _ => return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
     };
@@ -173,12 +191,15 @@ pub fn handle(
     let Some(priv_buf) = crate::security::zeroize::key_buf::<66>(&key_obj.private_key) else {
         return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED);
     };
+    if let Err(sw) = authorize_use(store, &mut key_obj, Some(algo)) {
+        return ApduResponse::err(sw);
+    }
 
-    let shared =
-        match crate::crypto::asymmetric::ecdh_agree(key_type, &priv_buf[..priv_len], cmd.data) {
-            Ok(s) => s,
-            Err(_) => return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
-        };
+    let shared = match crate::crypto::asymmetric::ecdh_agree(key_type, &priv_buf[..priv_len], data)
+    {
+        Ok(s) => s,
+        Err(_) => return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
+    };
 
     if needs_04_prefix {
         // Prepend 0x04 so OpenSC can strip it and get the exact field-size

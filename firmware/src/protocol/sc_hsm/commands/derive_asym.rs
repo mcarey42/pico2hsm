@@ -50,7 +50,7 @@ pub fn handle(
     };
 
     // Load key material from flash
-    let key_obj = match store.fetch_key(pico2hsm_core::key::KeyId(full_key_id)) {
+    let mut key_obj = match store.fetch_key(pico2hsm_core::key::KeyId(full_key_id)) {
         Ok(Some(obj)) => obj,
         _ => return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
     };
@@ -59,6 +59,14 @@ pub fn handle(
     let mut key_bytes = crate::security::zeroize::WipeOnDrop::<66>::new();
     if key_bytes.extend_from_slice(&key_obj.private_key).is_err() {
         return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED);
+    }
+
+    // HKDF output from a stored key has no SmartCard-HSM algorithm ID
+    // (CardContact's EC derive stores a new key, AES derive uses its own
+    // KDF): only a key without an algorithm list may be used; the use
+    // counter applies.
+    if let Err(sw) = crate::security::key_policy::authorize_use(store, &mut key_obj, None) {
+        return ApduResponse::err(sw);
     }
 
     let mut output = [0u8; 32];

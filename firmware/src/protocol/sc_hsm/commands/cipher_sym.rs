@@ -90,9 +90,20 @@ pub fn handle(
     };
 
     // Load key material from flash
-    let key_obj = match store.fetch_key(KeyId(full_key_id)) {
+    let mut key_obj = match store.fetch_key(KeyId(full_key_id)) {
         Ok(Some(obj)) => obj,
         _ => return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
+    };
+
+    // Usage policy: the SmartCard-HSM algorithm ID of this mode/direction.
+    // CTR and GCM have none (`None`: keys without an algorithm list only).
+    use crate::security::key_policy::{ALGO_AES_CBC_DECRYPT, ALGO_AES_CBC_ENCRYPT, ALGO_AES_CMAC};
+    let policy_algo = match (cmd.p2, cmd.p1) {
+        (P2_AES_CBC, P1_ENCRYPT) => Some(ALGO_AES_CBC_ENCRYPT),
+        (P2_AES_CBC, P1_DECRYPT) => Some(ALGO_AES_CBC_DECRYPT),
+        (P2_AES_CMAC, _) => Some(ALGO_AES_CMAC),
+        (P2_AES_CTR, _) | (P2_AES_GCM, P1_ENCRYPT | P1_DECRYPT) => None,
+        _ => return ApduResponse::err(SW_INS_NOT_SUPPORTED),
     };
 
     // Wiped on drop; a key that doesn't fit is refused, not truncated.
@@ -109,6 +120,14 @@ pub fn handle(
     let mode = cmd.p2;
     let direction = cmd.p1;
     let data = cmd.data;
+
+    // Refusals that need no key use go first (CTR is AES-256 only).
+    if mode == P2_AES_CTR && raw_key.0.len() != symmetric::AES256_KEY_SIZE {
+        return ApduResponse::err(SW_INS_NOT_SUPPORTED);
+    }
+    if let Err(sw) = crate::security::key_policy::authorize_use(store, &mut key_obj, policy_algo) {
+        return ApduResponse::err(sw);
+    }
 
     match mode {
         P2_AES_CBC => handle_cbc(&km, direction, data),

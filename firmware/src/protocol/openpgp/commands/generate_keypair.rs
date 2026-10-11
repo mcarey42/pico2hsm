@@ -272,6 +272,7 @@ pub fn handle_with_store(
         timestamp_ms: 0,
         private_key: heapless::Vec::new(),
         public_key: heapless::Vec::new(),
+        policy: Default::default(),
     };
     let _ = obj.private_key.extend_from_slice(priv_bytes);
     let _ = obj.public_key.extend_from_slice(pub_bytes);

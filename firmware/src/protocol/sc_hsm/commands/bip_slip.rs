@@ -70,7 +70,7 @@ pub fn handle(
         None => return ApduResponse::err(SW_FILE_NOT_FOUND),
     };
 
-    let key_obj = match store.fetch_key(KeyId(full_key_id)) {
+    let mut key_obj = match store.fetch_key(KeyId(full_key_id)) {
         Ok(Some(obj)) => obj,
         _ => return ApduResponse::err(SW_FILE_NOT_FOUND),
     };
@@ -124,6 +124,18 @@ pub fn handle(
         key_id: KeyId(full_key_id),
         raw: master_raw,
     };
+
+    if !matches!(
+        key_type,
+        KeyType::Bip32Master | KeyType::EcPrivateK256 | KeyType::EcPrivateP256
+    ) {
+        return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED);
+    }
+    // HD derivation has no CardContact algorithm ID: only a key without an
+    // algorithm list may be used; the use counter applies.
+    if let Err(sw) = crate::security::key_policy::authorize_use(store, &mut key_obj, None) {
+        return ApduResponse::err(sw);
+    }
 
     // Dispatch to BIP32 or SLIP-0010 based on key type
     let derived = match key_type {

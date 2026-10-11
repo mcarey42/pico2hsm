@@ -112,7 +112,7 @@ pub fn handle(
     };
 
     // Load key material from flash.
-    let key_obj = match store.fetch_key(pico2hsm_core::key::KeyId(full_key_id)) {
+    let mut key_obj = match store.fetch_key(pico2hsm_core::key::KeyId(full_key_id)) {
         Ok(Some(obj)) => obj,
         _ => return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
     };
@@ -122,6 +122,16 @@ pub fn handle(
     let Some(priv_buf) = crate::security::zeroize::key_buf::<66>(&key_obj.private_key) else {
         return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED);
     };
+
+    // The card hashes the challenge with SHA-256 and signs it with ECDSA:
+    // SmartCard-HSM algorithm ALGO_EC_SHA256 for the key's usage policy.
+    if let Err(sw) = crate::security::key_policy::authorize_use(
+        store,
+        &mut key_obj,
+        Some(crate::security::key_policy::ALGO_EC_SHA256),
+    ) {
+        return ApduResponse::err(sw);
+    }
 
     // Hash the challenge with SHA-256 before signing.
     let hash = sha2::Sha256::digest(challenge);

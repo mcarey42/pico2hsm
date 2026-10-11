@@ -637,6 +637,7 @@ impl OpenPgp {
             timestamp_ms: 0,
             private_key: Vec::new(),
             public_key: Vec::new(),
+            policy: Default::default(),
         };
         let _ = obj.private_key.extend_from_slice(&buf);
         store.save_key(&obj)

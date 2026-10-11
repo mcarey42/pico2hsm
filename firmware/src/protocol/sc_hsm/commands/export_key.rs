@@ -80,12 +80,26 @@ pub fn handle(
         return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED);
     }
 
-    // Wrap key under DKEK.
-    let mut rng = FwRng;
-    match state
-        .dkek
-        .wrap(&private_key_bytes, algo_byte, key_flags, &mut rng)
+    // An algorithm list without ALGO_WRAP (92) forbids export (CardContact
+    // key use control).  Wrapping is not a use of the key: the use counter
+    // is not spent, it travels in the blob with what is left.
+    if !key_obj
+        .policy
+        .allows(crate::security::key_policy::ALGO_WRAP)
     {
+        return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED);
+    }
+
+    // Wrap key under DKEK, with its usage policy (wrap format version 3
+    // when it has one).
+    let mut rng = FwRng;
+    match state.dkek.wrap_with_policy(
+        &private_key_bytes,
+        algo_byte,
+        key_flags,
+        &key_obj.policy,
+        &mut rng,
+    ) {
         Ok(wrapped) => ApduResponse::ok(&wrapped),
         Err(_) => ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
     }

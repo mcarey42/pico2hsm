@@ -473,6 +473,7 @@ impl Piv {
             timestamp_ms: 0,
             private_key: Vec::new(),
             public_key: Vec::new(),
+            policy: Default::default(),
         };
         let _ = obj.private_key.extend_from_slice(&Self::pin_record(state));
         store.save_key(&obj)

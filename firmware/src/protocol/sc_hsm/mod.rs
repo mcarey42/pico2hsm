@@ -853,6 +853,7 @@ impl ScHsm {
                 self.persist_dkek_change(had_dkek, resp, store)
             }
             // File commands that need flash access.
+            select::INS_SELECT => select::handle_with_store(&mut self.state, store, cmd),
             read_binary::INS_READ_BINARY => read_binary::handle(&mut self.state, store, cmd),
             read_binary::INS_READ_BINARY_ODD => {
                 read_binary::handle_odd(&mut self.state, store, cmd)
@@ -2045,3 +2046,6 @@ mod reserved_slot_and_dkek_tests {
         assert_eq!(st.ef_cache_get(0xCE0D).map(<[u8]>::len), Some(200));
     }
 }
+
+#[cfg(test)]
+mod policy_tests;

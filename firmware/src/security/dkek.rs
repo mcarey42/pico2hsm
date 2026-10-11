@@ -68,6 +68,8 @@ use cbc::{Decryptor as CbcDecryptor, Encryptor as CbcEncryptor};
 use cipher::block_padding::NoPadding;
 use cipher::{BlockDecryptMut, BlockEncryptMut, KeyIvInit};
 
+use crate::security::key_policy::KeyPolicy;
+
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
@@ -105,6 +107,13 @@ const CBC_IV_SIZE: usize = 16;
 /// Minimum wrapped blob size: KCV(8) + IV(16) + at least one CBC block(16).
 /// Wrap blob format version (encrypt-then-MAC).
 const WRAP_VERSION: u8 = 0x02;
+/// Wrap blob format version 3: version 2 plus the key's usage policy.
+const WRAP_VERSION_POLICY: u8 = 0x03;
+/// Largest wrap plaintext: key (2400) + policy + its length + algo + flags
+/// + up to 16 bytes of padding, rounded to a block.
+const WRAP_MAX_PT: usize = (2400 + crate::security::key_policy::MAX_POLICY_EXT + 3 + 16) / 16 * 16;
+/// Largest wrapped blob: header + ciphertext + MAC.
+pub const WRAP_MAX_BLOB: usize = WRAP_HEADER_SIZE + WRAP_MAX_PT + WRAP_MAC_SIZE;
 /// Truncated HMAC-SHA256 tag length.
 const WRAP_MAC_SIZE: usize = 16;
 /// Header: KCV || version || IV.
@@ -604,83 +613,116 @@ impl DkekManager {
         Ok(kcv)
     }
 
-    /// Wrap key material in SC-HSM DKEK wrap format.
-    ///
-    /// Output format: KCV(8) || IV(16) || AES-256-CBC(DKEK, IV, padded_plaintext)
-    /// Plaintext before padding: key_material || algo_id(1) || key_flags(1)
-    /// PKCS#7 padding to 16-byte boundary.
+    /// Wrap key material without a usage policy (wrap format version 2).
     pub fn wrap(
         &self,
         key_material: &[u8],
         algo_id: u8,
         key_flags: u8,
         rng: &mut (impl rand_core::CryptoRng + rand_core::RngCore),
-    ) -> Result<heapless::Vec<u8, 2480>, DkekError> {
+    ) -> Result<heapless::Vec<u8, WRAP_MAX_BLOB>, DkekError> {
+        self.wrap_with_policy(key_material, algo_id, key_flags, &KeyPolicy::default(), rng)
+    }
+
+    /// Wrap key material under the DKEK, with its usage policy.
+    ///
+    /// Output: `KCV(8) || version(1) || IV(16) || AES-256-CBC(K_enc, IV, pt) || MAC(16)`,
+    /// MAC = truncated HMAC-SHA256(K_mac) over everything before it.
+    ///
+    /// Plaintext before PKCS#7 padding:
+    /// - version 2 (key without a policy):
+    ///   `key_material || algo_id(1) || key_flags(1)`
+    /// - version 3 (key with a policy):
+    ///   `key_material || policy || policy_len(1) || algo_id(1) || key_flags(1)`,
+    ///   `policy` = the `A5` TLV of `key_policy` (uses left, algorithm
+    ///   list, key domain), so the policy survives backup and restore.  An
+    ///   unrestricted key keeps writing version 2, which every earlier
+    ///   firmware can import.
+    pub fn wrap_with_policy(
+        &self,
+        key_material: &[u8],
+        algo_id: u8,
+        key_flags: u8,
+        policy: &KeyPolicy,
+        rng: &mut (impl rand_core::CryptoRng + rand_core::RngCore),
+    ) -> Result<heapless::Vec<u8, WRAP_MAX_BLOB>, DkekError> {
         let dkek = self.get_dkek().ok_or(DkekError::WrongState)?;
 
         // Compute KCV.
         let kcv = self.compute_kcv()?;
 
-        // Build plaintext: key_material || algo_id || key_flags
-        let plain_data_len = key_material.len() + 2; // +2 for algo_id + key_flags
-                                                     // PKCS#7 pad to 16-byte boundary.
-        let pad_len = 16 - (plain_data_len % 16);
-        let padded_len = plain_data_len + pad_len;
-
-        // Use a stack buffer. Max private key = ~2350 bytes (RSA-4096 PKCS#1 DER);
-        // + 2 (algo_id + key_flags) + up to 16 pad = ~2368 bytes.
-        let mut pt: heapless::Vec<u8, 2400> = heapless::Vec::new();
-        pt.extend_from_slice(key_material)
+        let mut ext: heapless::Vec<u8, { crate::security::key_policy::MAX_POLICY_EXT }> =
+            heapless::Vec::new();
+        policy
+            .encode(&mut ext)
             .map_err(|_| DkekError::EncryptFailure)?;
-        pt.push(algo_id).map_err(|_| DkekError::EncryptFailure)?;
-        pt.push(key_flags).map_err(|_| DkekError::EncryptFailure)?;
-        for _ in 0..pad_len {
-            pt.push(pad_len as u8)
-                .map_err(|_| DkekError::EncryptFailure)?;
-        }
+        let version = if ext.is_empty() {
+            WRAP_VERSION
+        } else {
+            WRAP_VERSION_POLICY
+        };
 
-        // Generate random IV.
+        // Assemble KCV(8) || version || IV(16) || plaintext (layout above,
+        // PKCS#7-padded), then encrypt the plaintext in place and append
+        // MAC(16).  Wiped on drop, so an early return leaves no plaintext.
+        let mut out: Zeroizing<heapless::Vec<u8, WRAP_MAX_BLOB>> =
+            Zeroizing::new(heapless::Vec::new());
         let mut iv = [0u8; CBC_IV_SIZE];
         rng.fill_bytes(&mut iv);
-
-        // AES-256-CBC encrypt in-place.
-        // The cbc encryptor needs a mutable fixed-size slice. Use a fixed stack buffer.
-        let mut ct_buf = [0u8; 2400];
-        let ct_slice = &mut ct_buf[..padded_len];
-        ct_slice.copy_from_slice(&pt[..padded_len]);
+        let fail = |_| DkekError::EncryptFailure;
+        out.extend_from_slice(&kcv).map_err(fail)?;
+        out.push(version).map_err(|_| DkekError::EncryptFailure)?;
+        out.extend_from_slice(&iv).map_err(fail)?;
+        out.extend_from_slice(key_material).map_err(fail)?;
+        if !ext.is_empty() {
+            out.extend_from_slice(&ext).map_err(fail)?;
+            out.push(ext.len() as u8)
+                .map_err(|_| DkekError::EncryptFailure)?;
+        }
+        out.push(algo_id).map_err(|_| DkekError::EncryptFailure)?;
+        out.push(key_flags).map_err(|_| DkekError::EncryptFailure)?;
+        let pad_len = 16 - ((out.len() - WRAP_HEADER_SIZE) % 16);
+        for _ in 0..pad_len {
+            out.push(pad_len as u8)
+                .map_err(|_| DkekError::EncryptFailure)?;
+        }
+        let padded_len = out.len() - WRAP_HEADER_SIZE;
+        if padded_len > WRAP_MAX_PT {
+            return Err(DkekError::EncryptFailure);
+        }
 
         let (kenc, kmac) = wrap_keys(dkek);
         let enc = <CbcEncryptor<Aes256> as KeyIvInit>::new_from_slices(kenc.as_ref(), &iv)
             .map_err(|_| DkekError::EncryptFailure)?;
-        enc.encrypt_padded_mut::<NoPadding>(ct_slice, padded_len)
-            .map_err(|_| DkekError::EncryptFailure)?;
-
-        // Zeroize plaintext buffer.
-        // Volatile wipes: a plain loop over a dead buffer can be optimised out.
-        pt.zeroize();
-
-        // Assemble output: KCV(8) || 0x02 || IV(16) || ciphertext || MAC(16),
-        // MAC = HMAC-SHA256(kmac, everything before it) — encrypt-then-MAC.
-        let mut out: heapless::Vec<u8, 2480> = heapless::Vec::new();
-        out.extend_from_slice(&kcv)
-            .map_err(|_| DkekError::EncryptFailure)?;
-        out.push(WRAP_VERSION)
-            .map_err(|_| DkekError::EncryptFailure)?;
-        out.extend_from_slice(&iv)
-            .map_err(|_| DkekError::EncryptFailure)?;
-        out.extend_from_slice(ct_slice)
+        enc.encrypt_padded_mut::<NoPadding>(&mut out[WRAP_HEADER_SIZE..], padded_len)
             .map_err(|_| DkekError::EncryptFailure)?;
         let tag = wrap_mac(&kmac, &out);
-        out.extend_from_slice(&tag)
-            .map_err(|_| DkekError::EncryptFailure)?;
-        Ok(out)
+        out.extend_from_slice(&tag).map_err(fail)?;
+        // Ciphertext only from here on: hand it out without the wipe.
+        Ok(core::mem::take(&mut *out))
     }
 
-    /// Unwrap a DKEK-wrapped key blob.
+    /// Unwrap a version-2 blob (key without a usage policy).
     ///
-    /// Verifies KCV, decrypts AES-256-CBC, removes PKCS#7 padding.
-    /// Returns: (key_material, algo_id, key_flags)
+    /// A version-3 blob carries a policy this caller would drop, so it is
+    /// refused here; [`DkekManager::unwrap_with_policy`] reads both.
     pub fn unwrap(&self, blob: &[u8]) -> Result<(heapless::Vec<u8, 2400>, u8, u8), DkekError> {
+        let (key, algo, flags, policy) = self.unwrap_with_policy(blob)?;
+        if !policy.is_unrestricted() {
+            return Err(DkekError::InvalidWrapBlob);
+        }
+        Ok((key, algo, flags))
+    }
+
+    /// Unwrap a DKEK-wrapped key blob (versions 2 and 3).
+    ///
+    /// Verifies KCV and MAC, decrypts AES-256-CBC, removes PKCS#7 padding.
+    /// Returns `(key_material, algo_id, key_flags, policy)`.
+    #[allow(clippy::type_complexity)]
+    pub fn unwrap_with_policy(
+        &self,
+        blob: &[u8],
+    ) -> Result<(heapless::Vec<u8, 2400>, u8, u8, KeyPolicy), DkekError> {
         let dkek = self.get_dkek().ok_or(DkekError::WrongState)?;
 
         // Validate minimum length and alignment.
@@ -691,7 +733,8 @@ impl DkekManager {
         // Version-1 blobs (no MAC) are refused: decrypting unauthenticated
         // CBC is what made IMPORT KEY a padding oracle.
         let ct_len = blob.len() - WRAP_HEADER_SIZE - WRAP_MAC_SIZE;
-        if ct_len % 16 != 0 || blob[KCV_SIZE] != WRAP_VERSION {
+        let version = blob[KCV_SIZE];
+        if ct_len % 16 != 0 || (version != WRAP_VERSION && version != WRAP_VERSION_POLICY) {
             return Err(DkekError::InvalidWrapBlob);
         }
         let kcv_received: &[u8; KCV_SIZE] = blob[..KCV_SIZE].try_into().unwrap();
@@ -703,14 +746,15 @@ impl DkekManager {
         if !bool::from(kcv_expected.ct_eq(kcv_received)) {
             return Err(DkekError::KcvMismatch);
         }
-        // Verify the MAC before touching the ciphertext.
+        // Verify the MAC (it covers the version byte) before touching the
+        // ciphertext.
         let (kenc, kmac) = wrap_keys(dkek);
         if !bool::from(wrap_mac(&kmac, authenticated).ct_eq(tag)) {
             return Err(DkekError::InvalidWrapBlob);
         }
         // AES-256-CBC decrypt.
         // Self-wiping: also covers the early error returns below.
-        let mut pt_buf = Zeroizing::new([0u8; 2400]);
+        let mut pt_buf = Zeroizing::new([0u8; WRAP_MAX_PT]);
         if ct_len > pt_buf.len() {
             return Err(DkekError::InvalidWrapBlob);
         }
@@ -750,14 +794,28 @@ impl DkekManager {
         }
         let unpadded_len = ct_len - pad_len;
 
-        // Extract key_material, algo_id, key_flags.
-        // Layout: key_material(unpadded_len - 2) || algo_id(1) || key_flags(1)
+        // Trailer: [policy || policy_len] (version 3) || algo_id || key_flags.
         if unpadded_len < 2 {
             return Err(DkekError::InvalidWrapBlob);
         }
-        let key_material_len = unpadded_len - 2;
-        let algo_id = pt_slice[key_material_len];
-        let key_flags = pt_slice[key_material_len + 1];
+        let algo_id = pt_slice[unpadded_len - 2];
+        let key_flags = pt_slice[unpadded_len - 1];
+        let mut key_material_len = unpadded_len - 2;
+        let mut policy = KeyPolicy::default();
+        if version == WRAP_VERSION_POLICY {
+            let len_at = key_material_len
+                .checked_sub(1)
+                .ok_or(DkekError::InvalidWrapBlob)?;
+            let ext_start = len_at
+                .checked_sub(pt_slice[len_at] as usize)
+                .ok_or(DkekError::InvalidWrapBlob)?;
+            policy = KeyPolicy::decode(&pt_slice[ext_start..len_at])
+                .map_err(|_| DkekError::InvalidWrapBlob)?;
+            if policy.is_unrestricted() {
+                return Err(DkekError::InvalidWrapBlob);
+            }
+            key_material_len = ext_start;
+        }
 
         let mut key_material: heapless::Vec<u8, 2400> = heapless::Vec::new();
         key_material
@@ -767,7 +825,7 @@ impl DkekManager {
         // Zeroize pt_buf.
         pt_buf.zeroize();
 
-        Ok((key_material, algo_id, key_flags))
+        Ok((key_material, algo_id, key_flags, policy))
     }
 }
 
@@ -1152,6 +1210,52 @@ mod tests {
 
         let dkek = mgr.get_dkek().unwrap();
         assert_eq!(dkek, &expected);
+    }
+
+    #[test]
+    fn wrap_v3_carries_the_policy() {
+        let mut mgr = DkekManager::new(test_device_id());
+        mgr.set_dkek_direct(&[0x21u8; 32]);
+        let mut rng = DeterministicRng::seeded(3);
+        let mut policy = KeyPolicy::default();
+        policy.use_counter = Some(4);
+        policy.algorithms.extend_from_slice(&[0x73, 0x92]).unwrap();
+        policy.domain = Some(0);
+        // RSA-4096-sized material still fits with the largest policy.
+        for len in [32usize, 2350] {
+            let key = [0x6Bu8; 2400];
+            let blob = mgr
+                .wrap_with_policy(&key[..len], 0x13, 0x00, &policy, &mut rng)
+                .unwrap();
+            assert_eq!(blob[KCV_SIZE], WRAP_VERSION_POLICY);
+            let (k, algo, flags, p) = mgr.unwrap_with_policy(&blob).unwrap();
+            assert_eq!((&k[..], algo, flags), (&key[..len], 0x13, 0x00));
+            assert_eq!(p, policy);
+            // The policy-blind unwrap refuses it rather than drop the policy.
+            assert_eq!(mgr.unwrap(&blob), Err(DkekError::InvalidWrapBlob));
+        }
+        // No policy: version 2, readable by both.
+        let blob = mgr.wrap(&[0x6Bu8; 32], 0x13, 0x00, &mut rng).unwrap();
+        assert_eq!(blob[KCV_SIZE], WRAP_VERSION);
+        assert!(mgr.unwrap(&blob).is_ok());
+        assert!(mgr.unwrap_with_policy(&blob).unwrap().3.is_unrestricted());
+    }
+
+    #[test]
+    fn wrap_version_byte_is_authenticated() {
+        let mut mgr = DkekManager::new(test_device_id());
+        mgr.set_dkek_direct(&[0x21u8; 32]);
+        let mut rng = DeterministicRng::seeded(4);
+        let mut policy = KeyPolicy::default();
+        policy.use_counter = Some(1);
+        let mut blob = mgr
+            .wrap_with_policy(&[1u8; 32], 0x13, 0, &policy, &mut rng)
+            .unwrap();
+        blob[KCV_SIZE] = WRAP_VERSION; // try to strip the policy
+        assert_eq!(
+            mgr.unwrap_with_policy(&blob),
+            Err(DkekError::InvalidWrapBlob)
+        );
     }
 
     #[test]
