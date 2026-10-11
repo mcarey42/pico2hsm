@@ -148,9 +148,8 @@ pub fn security_checks() {
 ///
 /// P1-3 hardening is preserved: the only error path is an out-of-range
 /// row index (compile-time constant, so this cannot be fault-injected).
-/// A glitch that flips fuse bits to all-ones would clear the production
-/// flag — but that's correct behavior (no production protections apply
-/// if the fuse state is indeterminate).
+/// An indeterminate read (all-ones, or two reads that disagree) counts as
+/// production mode: a glitch must not be able to switch protections off.
 fn is_production_mode_otp() -> Result<bool, ()> {
     const OTP_DATA_RAW_BASE: *const u32 = 0x4013_4000 as *const u32;
     const OTP_NUM_ROWS: usize = 4096;
@@ -163,14 +162,17 @@ fn is_production_mode_otp() -> Result<bool, ()> {
 
     // SAFETY: OTP_DATA_RAW is a memory-mapped read-only register block.
     // The boot flags row is within the valid range (checked above).
-    let value = unsafe { OTP_DATA_RAW_BASE.add(OTP_BOOT_FLAGS_ROW).read() };
+    let read = || unsafe { core::ptr::read_volatile(OTP_DATA_RAW_BASE.add(OTP_BOOT_FLAGS_ROW)) };
+    let first = read();
+    let second = read();
 
-    if value == 0xFFFF_FFFF {
-        // Blank / unprogrammed OTP — device is not provisioned.
-        Ok(false)
-    } else {
-        Ok(value & BOOT_FLAG_PRODUCTION_MODE != 0)
+    // Fail closed.  Unprogrammed fuses read 0, so all-ones is an access
+    // error or a glitch, not "blank"; and a single read is one glitch away
+    // from turning production protections off.  Either way: production.
+    if first != second || first == 0xFFFF_FFFF {
+        return Ok(true);
     }
+    Ok(first & BOOT_FLAG_PRODUCTION_MODE != 0)
 }
 
 /// Check if the RP2350 is running in secure boot mode.
