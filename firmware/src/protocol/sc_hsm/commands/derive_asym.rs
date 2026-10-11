@@ -56,7 +56,7 @@ pub fn handle(
     };
 
     // Use private_key bytes (works for both EC and symmetric keys)
-    let mut key_bytes: heapless::Vec<u8, 66> = heapless::Vec::new();
+    let mut key_bytes = crate::security::zeroize::WipeOnDrop::<66>::new();
     if key_bytes.extend_from_slice(&key_obj.private_key).is_err() {
         return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED);
     }

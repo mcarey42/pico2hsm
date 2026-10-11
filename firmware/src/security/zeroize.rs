@@ -62,3 +62,33 @@ pub fn key_buf<const N: usize>(key: &[u8]) -> Option<zeroize::Zeroizing<[u8; N]>
     buf.get_mut(..key.len())?.copy_from_slice(key);
     Some(buf)
 }
+
+/// A `heapless::Vec` of secret bytes that is wiped (volatile) when dropped.
+/// `heapless::Vec` has no `Zeroize` impl, so `Zeroizing` cannot wrap it.
+pub struct WipeOnDrop<const N: usize>(pub heapless::Vec<u8, N>);
+
+impl<const N: usize> WipeOnDrop<N> {
+    /// An empty buffer.
+    pub fn new() -> Self {
+        WipeOnDrop(heapless::Vec::new())
+    }
+}
+
+impl<const N: usize> core::ops::Deref for WipeOnDrop<N> {
+    type Target = heapless::Vec<u8, N>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<const N: usize> core::ops::DerefMut for WipeOnDrop<N> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl<const N: usize> Drop for WipeOnDrop<N> {
+    fn drop(&mut self) {
+        self.0.as_mut_slice().zeroize();
+    }
+}

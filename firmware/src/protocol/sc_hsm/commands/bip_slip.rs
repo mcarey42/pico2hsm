@@ -90,8 +90,8 @@ pub fn handle(
         None => return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
     };
 
-    let raw_key: heapless::Vec<u8, 66> = {
-        let mut v: heapless::Vec<u8, 66> = heapless::Vec::new();
+    let raw_key = {
+        let mut v = crate::security::zeroize::WipeOnDrop::<66>::new();
         if v.extend_from_slice(&key_obj.private_key).is_err() {
             return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED);
         }

@@ -65,7 +65,7 @@ pub fn handle(
         _ => return ApduResponse::err(SW_FILE_NOT_FOUND),
     };
 
-    let mut private_key_bytes: heapless::Vec<u8, 2400> = heapless::Vec::new();
+    let mut private_key_bytes = crate::security::zeroize::WipeOnDrop::<2400>::new();
     let _ = private_key_bytes.extend_from_slice(&key_obj.private_key);
     let algo_byte = meta.algo;
     let key_flags = meta.key_flags;

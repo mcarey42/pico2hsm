@@ -110,7 +110,7 @@ pub fn handle(
 
     // Unwrap key blob under DKEK.
     let (key_material, algo_id, key_flags) = match state.dkek.unwrap(&blob_data) {
-        Ok(result) => result,
+        Ok((key, algo, flags)) => (crate::security::zeroize::WipeOnDrop(key), algo, flags),
         Err(_) => return ApduResponse::err(SW_WRONG_DATA),
     };
 
