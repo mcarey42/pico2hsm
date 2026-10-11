@@ -495,7 +495,13 @@ impl<Chip: FlashChip> KeyFilesystem<Chip> {
         // (DELETE, INITIALIZE) must not believe a removal is durable when
         // the old directory — still listing the key — is what's on flash.
         let mut result = Ok(());
+        let mut written = 0usize;
         for chip in self.chips.iter_mut() {
+            // A chip already known bad holds no current directory: skip it,
+            // as allocation does, so a dead mirror can't fail every save.
+            if chip.is_degraded() {
+                continue;
+            }
             let addr = DIR_SLOTS[target] * SECTOR_SIZE as u32;
             if let Err(e) = chip.erase_sector(addr) {
                 defmt::warn!(
@@ -505,13 +511,19 @@ impl<Chip: FlashChip> KeyFilesystem<Chip> {
                 result = Err(e);
                 continue;
             }
-            if let Err(e) = write_sector(chip, addr, &buf) {
-                defmt::warn!(
-                    "KeyFilesystem: write directory sector failed: {:?}",
-                    defmt::Debug2Format(&e)
-                );
-                result = Err(e);
+            match write_sector(chip, addr, &buf) {
+                Ok(()) => written += 1,
+                Err(e) => {
+                    defmt::warn!(
+                        "KeyFilesystem: write directory sector failed: {:?}",
+                        defmt::Debug2Format(&e)
+                    );
+                    result = Err(e);
+                }
             }
+        }
+        if written == 0 && result.is_ok() {
+            result = Err(StorageError::WriteError);
         }
         if result.is_ok() {
             self.directory.dirty = false;
@@ -702,7 +714,23 @@ impl<Chip: FlashChip> KeyFilesystem<Chip> {
             .find(key_id)
             .map(|e| (e.chip_index as usize, e.sector_index, e.sector_count as u32));
         self.directory.insert(new_entry)?;
-        self.flush_directory()?;
+        if let Err(e) = self.flush_directory() {
+            // RAM must not keep a change flash doesn't have: the next
+            // unrelated flush would commit a save the caller was told
+            // failed, and the old sectors — still referenced on flash —
+            // would look free.
+            match superseded {
+                Some((chip, sector, count)) => {
+                    let _ = self
+                        .directory
+                        .insert(dir_entry(key_id, chip, sector, count));
+                }
+                None => {
+                    self.directory.remove(key_id);
+                }
+            }
+            return Err(e);
+        }
         // Only once the new copy is what the directory points at: erase the
         // old one, so a replaced key's ciphertext doesn't linger in a free
         // sector.  The save itself already succeeded; a failed erase here
@@ -736,9 +764,16 @@ impl<Chip: FlashChip> KeyFilesystem<Chip> {
         // it deleted.
         self.erase_data_sectors(chip_index, sector_index, sector_count)?;
 
-        // Remove from directory.
+        // Remove from directory.  If that can't be written, keep RAM as
+        // flash has it (the entry, now pointing at erased sectors).
         self.directory.remove(key_id);
-        self.flush_directory()
+        if let Err(e) = self.flush_directory() {
+            let _ =
+                self.directory
+                    .insert(dir_entry(key_id, chip_index, sector_index, sector_count));
+            return Err(e);
+        }
+        Ok(())
     }
 
     fn erase_data_sectors(
@@ -950,6 +985,18 @@ impl<Chip: FlashChip> KeyFilesystem<Chip> {
 }
 
 // ─── Free functions ───────────────────────────────────────────────────────────
+
+/// A live directory entry.
+fn dir_entry(key_id: KeyId, chip: usize, sector: u32, count: u32) -> DirectoryEntry {
+    DirectoryEntry {
+        key_id: key_id.0,
+        chip_index: chip as u8,
+        sector_index: sector,
+        sector_count: count as u8,
+        flags: 0,
+        _pad: [0],
+    }
+}
 
 /// Write a full 4096-byte sector to a chip using 16 × 256-byte page writes.
 pub fn write_sector<C: FlashChip>(

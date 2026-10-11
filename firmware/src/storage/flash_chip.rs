@@ -494,7 +494,12 @@ impl FlashChip for QmiFlash {
                 addr,
                 sector,
             );
-            let _ = self.mark_bad_sector(sector);
+            // Never retire a directory copy (sectors below DATA_START): one
+            // failed verify would then fail every save until reboot.  The
+            // error is reported and the next flush simply tries again.
+            if sector >= pico2hsm_core::storage::DATA_START_SECTOR {
+                let _ = self.mark_bad_sector(sector);
+            }
             return Err(StorageError::BadBlock { chip: 0, sector });
         }
         Ok(())
