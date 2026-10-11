@@ -107,8 +107,14 @@ pub struct OpenPgpState {
     pub pw3_verified: bool,
 
     // --- Signature counter ---
-    /// Digital signature counter (incremented on each PSO:CDS). 3-byte BE.
+    /// Digital signature counter (DO 93): incremented on each PSO:CDS,
+    /// persisted before the signature is returned, reset when a new
+    /// signature key is generated.  3 bytes, saturating.
     pub sig_counter: u32,
+
+    /// PW status byte 1 (DO C4): 00 = PW1 (mode 81) valid for one PSO:CDS
+    /// only, 01 = for several.  Set by PUT DATA C4 (PW3), persisted.
+    pub pw1_status: u8,
 
     // --- Key storage (in-memory volatile) ---
     /// SIG key: private scalar (up to 66 bytes for P-521).
@@ -290,6 +296,7 @@ impl OpenPgpState {
             pw1_verified_other: false,
             pw3_verified: false,
             sig_counter: 0,
+            pw1_status: 0x00,
             sig_private: None,
             sig_public: None,
             dec_private: None,
@@ -548,6 +555,23 @@ impl OpenPgp {
             generate_keypair::INS_GENERATE_KEYPAIR
                 if cmd.p1 == 0x80
                     && self.state.pw3_verified
+                    && cmd.data.first() == Some(&0xB6)
+                    && self.state.sig_counter != 0 =>
+            {
+                // A new signature key starts a new signature count (DO 93,
+                // OpenPGP Card 3.4 §4.4.3.9).  Reset on flash first.
+                let before = self.state.sig_counter;
+                self.state.sig_counter = 0;
+                if put_data::save_sig_counter(&self.state, store).is_err() {
+                    self.state.sig_counter = before;
+                    return ApduResponse::err(pico2hsm_core::apdu::SW_MEMORY_FAILURE);
+                }
+                self.route_with_store(cmd, store)
+            }
+            pso::INS_PSO => pso::handle_with_store(&mut self.state, store, cmd),
+            generate_keypair::INS_GENERATE_KEYPAIR
+                if cmd.p1 == 0x80
+                    && self.state.pw3_verified
                     && !self.state.credentials_persisted =>
             {
                 // First key for this card: PW1/PW3 go to flash first (see
@@ -726,17 +750,29 @@ impl OpenPgp {
         let mut has_keys = false;
         // Persisted DOs (fingerprints, cardholder data) hold no secrets and
         // may be written before any key; they don't count.
-        let mut do_ids: Vec<pico2hsm_core::key::KeyId, 18> = Vec::new();
+        let mut do_ids: Vec<pico2hsm_core::key::KeyId, 20> = Vec::new();
         store.for_each_key(&mut |kid| {
             if kid.applet_byte() != AppletId::OpenPgp as u8 {
                 return;
             }
             if put_data::tag_of_record(kid).is_some() {
                 let _ = do_ids.push(kid);
+            } else if kid == put_data::sig_counter_key_id() {
+                // Holds no secret, like the DOs.
             } else if kid != OPENPGP_PW1_KEY_ID && kid != OPENPGP_PW3_KEY_ID {
                 has_keys = true;
             }
         });
+        // Signature counter (DO 93).  An unreadable record loads as the
+        // largest count rather than 0: the counter must never go back.
+        self.state.sig_counter = match store.fetch_key(put_data::sig_counter_key_id()) {
+            Ok(None) => 0,
+            Ok(Some(rec)) => match rec.private_key[..] {
+                [a, b, c] => u32::from_be_bytes([0, a, b, c]),
+                _ => put_data::SIG_COUNTER_MAX,
+            },
+            Err(_) => put_data::SIG_COUNTER_MAX,
+        };
         for kid in do_ids.iter() {
             if let (Some(tag), Ok(Some(rec))) =
                 (put_data::tag_of_record(*kid), store.fetch_key(*kid))
@@ -1381,3 +1417,6 @@ mod pw_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod policy_tests;

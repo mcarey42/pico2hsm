@@ -11,6 +11,11 @@
 //! - 00C7/C8/C9: Key Fingerprints (SIG, DEC, AUTH)
 //! - 00CA/CB/CC: CA Fingerprints
 //! - 00CE/CF/D0: Generation Timestamps
+//! - 00C4: PW Status Bytes — byte 1 only (00 = PW1 valid for one PSO:CDS,
+//!   01 = for several); OpenPGP Card 3.4 §4.4.3.6
+//!
+//! Not writable (6A88): the UIF DOs D6–D8 — this device has no button, so
+//! user interaction flags are not supported.
 
 use pico2hsm_core::apdu::{
     ApduCommand, ApduResponse, SW_SECURITY_STATUS, SW_WRONG_DATA, SW_WRONG_LENGTH,
@@ -45,10 +50,43 @@ pub fn handle(state: &mut OpenPgpState, cmd: &ApduCommand<'_>) -> ApduResponse {
 }
 
 /// The DOs PUT DATA can write; each is persisted as its own record.
-pub const PERSISTED_TAGS: [u16; 18] = [
+pub const PERSISTED_TAGS: [u16; 19] = [
     0x005B, 0x005E, 0x5F2D, 0x5F35, 0x00C1, 0x00C2, 0x00C3, 0x00C7, 0x00C8, 0x00C9, 0x00CA, 0x00CB,
-    0x00CC, 0x00CE, 0x00CF, 0x00D0, 0x5F50, 0x7F21,
+    0x00CC, 0x00CE, 0x00CF, 0x00D0, 0x5F50, 0x7F21, 0x00C4,
 ];
+
+/// Largest digital signature counter (DO 93 is 3 bytes); it saturates.
+pub const SIG_COUNTER_MAX: u32 = 0x00FF_FFFF;
+
+/// KeyId of the persisted digital signature counter (DO 93).  Not a PUT
+/// DATA DO: only PSO:CDS and key generation change it.
+pub fn sig_counter_key_id() -> pico2hsm_core::key::KeyId {
+    do_key_id(0x0093)
+}
+
+/// Persist the signature counter (3 bytes BE); 0 is stored as no record.
+pub fn save_sig_counter(
+    state: &OpenPgpState,
+    store: &mut dyn crate::storage::KeyStore,
+) -> Result<(), pico2hsm_core::error::HsmError> {
+    use crate::security::key_management::{AlgorithmId, KeyObject, KeyType as KmKeyType};
+    if state.sig_counter == 0 {
+        return match store.fetch_key(sig_counter_key_id())? {
+            None => Ok(()),
+            Some(_) => store.erase_key(sig_counter_key_id()),
+        };
+    }
+    let mut rec = KeyObject::new(
+        KmKeyType::Generic,
+        sig_counter_key_id().0,
+        pico2hsm_core::key::AppletId::OpenPgp,
+        AlgorithmId::AesGcm,
+    );
+    let _ = rec
+        .private_key
+        .extend_from_slice(&state.sig_counter.min(SIG_COUNTER_MAX).to_be_bytes()[1..]);
+    store.save_key(&rec)
+}
 
 /// KeyId of a persisted DO: 0xD0 in bits 15–8 keeps these apart from the
 /// key slots (0x90–0x92) and PW records (0xFE/0xFF); the low byte is the
@@ -91,6 +129,8 @@ pub fn get_do(state: &OpenPgpState, tag: u16, out: &mut heapless::Vec<u8, 1024>)
         0x00D0 => &state.ts_auth,
         0x5F50 => &state.url,
         0x7F21 => &state.cardholder_cert,
+        // PW1 status byte; 00 (the default) is stored as no record.
+        0x00C4 if state.pw1_status != 0 => core::slice::from_ref(&state.pw1_status),
         _ => &[],
     };
     let _ = out.extend_from_slice(v);
@@ -184,9 +224,23 @@ pub fn set_do(state: &mut OpenPgpState, tag: u16, data: &[u8]) -> ApduResponse {
             ApduResponse::ok(&[])
         }
 
+        // 00C4 — PW Status Bytes: only byte 1 (PW1 for one / several
+        // PSO:CDS) is writable.  An empty value restores the default
+        // (loading a deleted record).
+        0x00C4 => {
+            match cmd.data {
+                [] => state.pw1_status = 0x00,
+                [b @ (0x00 | 0x01), ..] if cmd.data.len() == 1 || cmd.data.len() == 7 => {
+                    state.pw1_status = *b
+                }
+                _ => return ApduResponse::err(SW_WRONG_DATA),
+            }
+            ApduResponse::ok(&[])
+        }
+
         // 00C1 — Algorithm Attributes SIG
         0x00C1 => {
-            if cmd.data.is_empty() || cmd.data.len() > 12 {
+            if !role_allows(Role::Sig, cmd.data) {
                 return ApduResponse::err(SW_WRONG_DATA);
             }
             state.algo_sig.clear();
@@ -196,7 +250,7 @@ pub fn set_do(state: &mut OpenPgpState, tag: u16, data: &[u8]) -> ApduResponse {
 
         // 00C2 — Algorithm Attributes DEC
         0x00C2 => {
-            if cmd.data.is_empty() || cmd.data.len() > 12 {
+            if !role_allows(Role::Dec, cmd.data) {
                 return ApduResponse::err(SW_WRONG_DATA);
             }
             state.algo_dec.clear();
@@ -206,7 +260,7 @@ pub fn set_do(state: &mut OpenPgpState, tag: u16, data: &[u8]) -> ApduResponse {
 
         // 00C3 — Algorithm Attributes AUTH
         0x00C3 => {
-            if cmd.data.is_empty() || cmd.data.len() > 12 {
+            if !role_allows(Role::Aut, cmd.data) {
                 return ApduResponse::err(SW_WRONG_DATA);
             }
             state.algo_auth.clear();
@@ -316,5 +370,43 @@ pub fn set_do(state: &mut OpenPgpState, tag: u16, data: &[u8]) -> ApduResponse {
         }
 
         _ => ApduResponse::err(SW_DO_NOT_FOUND),
+    }
+}
+
+/// The three key roles of OpenPGP Card 3.4.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Role {
+    Sig,
+    Dec,
+    Aut,
+}
+
+/// Whether algorithm attributes `attrs` (DO C1/C2/C3) are valid for `role`
+/// on this card (OpenPGP Card 3.4 §4.4.3.10): the signature and
+/// authentication keys sign (ECDSA 13, EdDSA 16), the decryption key does
+/// key agreement (ECDH 12).  Only the curves the card can generate are
+/// accepted (RSA is not offered by this applet).  A trailing format byte
+/// (00 / FF, "with public key") is allowed after the OID.
+fn role_allows(role: Role, attrs: &[u8]) -> bool {
+    const P256: &[u8] = &[0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07];
+    const P384: &[u8] = &[0x2B, 0x81, 0x04, 0x00, 0x22];
+    const P521: &[u8] = &[0x2B, 0x81, 0x04, 0x00, 0x23];
+    const ED25519: &[u8] = &[0x2B, 0x06, 0x01, 0x04, 0x01, 0xDA, 0x47, 0x0F, 0x01];
+    const X25519: &[u8] = &[0x2B, 0x06, 0x01, 0x04, 0x01, 0x97, 0x55, 0x01, 0x05, 0x01];
+    let Some((&algo, oid)) = attrs.split_first() else {
+        return false;
+    };
+    let oid = match oid {
+        [rest @ .., 0x00 | 0xFF] if !rest.is_empty() && [P256, P384, P521].contains(&rest) => rest,
+        [rest @ .., 0x00 | 0xFF] if rest == ED25519 || rest == X25519 => rest,
+        o => o,
+    };
+    let nist = [P256, P384, P521].contains(&oid);
+    let curve25519 = cfg!(feature = "applet-openpgp-curve25519");
+    match (role, algo) {
+        (Role::Sig | Role::Aut, 0x13) => nist,
+        (Role::Sig | Role::Aut, 0x16) => curve25519 && oid == ED25519,
+        (Role::Dec, 0x12) => nist || (curve25519 && oid == X25519),
+        _ => false,
     }
 }

@@ -4,8 +4,9 @@
 //! - PSO:CDS (P1=0x9E, P2=0x9A) — Compute Digital Signature using SIG key
 //! - PSO:DECIPHER (P1=0x80, P2=0x86) — ECDH key agreement using DEC key
 //!
-//! PSO:CDS requires PW1 verified (mode 81 or 82).
-//! After PSO:CDS, if PW1 was verified with mode 81, the flag is cleared.
+//! PSO:CDS requires PW1 verified in mode 81 (mode 82 does not sign).
+//! After PSO:CDS the mode-81 verification is used up unless PW1 status
+//! byte 1 (DO C4) is 01; the signature counter (DO 93) is persisted first.
 //!
 //! PSO:DECIPHER requires PW1 verified with mode 82.
 //! Input for ECDH: A6 [ 7F49 [ 86 [len] <04 X Y> ] ]
@@ -31,6 +32,39 @@ pub fn handle(state: &mut OpenPgpState, cmd: &ApduCommand<'_>) -> ApduResponse {
         (0x80, 0x86) => handle_decipher(state, cmd),
         _ => ApduResponse::err(SW_WRONG_DATA),
     }
+}
+
+/// After a signature: count it (DO 93, saturating at 3 bytes) and, when
+/// PW1 status byte 1 is 00 (C4), use up the mode-81 verification — one
+/// signature per VERIFY (OpenPGP Card 3.4 §4.4.3.6, §7.2.10).
+fn count_signature(state: &mut OpenPgpState) {
+    state.sig_counter = (state.sig_counter + 1).min(super::put_data::SIG_COUNTER_MAX);
+    if state.pw1_status == 0x00 {
+        state.pw1_verified_sign = false;
+    }
+}
+
+/// PSO with the keystore: a PSO:CDS signature is returned only once the
+/// incremented signature counter is on flash (6581 otherwise, and the
+/// signature is dropped), so a reset can never roll the counter back
+/// below the signatures that left the card.
+pub fn handle_with_store(
+    state: &mut OpenPgpState,
+    store: &mut dyn crate::storage::KeyStore,
+    cmd: &ApduCommand<'_>,
+) -> ApduResponse {
+    if (cmd.p1, cmd.p2) != (0x9E, 0x9A) {
+        return handle(state, cmd);
+    }
+    let before = state.sig_counter;
+    let resp = handle_cds(state, cmd);
+    if resp.sw == pico2hsm_core::apdu::SW_OK
+        && super::put_data::save_sig_counter(state, store).is_err()
+    {
+        state.sig_counter = before;
+        return ApduResponse::err(pico2hsm_core::apdu::SW_MEMORY_FAILURE);
+    }
+    resp
 }
 
 /// Handle PSO:CDS — sign with the SIG key.
@@ -73,8 +107,7 @@ fn handle_cds(state: &mut OpenPgpState, cmd: &ApduCommand<'_>) -> ApduResponse {
             Err(_) => return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
         };
 
-        state.sig_counter = state.sig_counter.saturating_add(1);
-        state.pw1_verified_sign = false;
+        count_signature(state);
 
         return ApduResponse::ok(&raw_sig);
     }
@@ -96,11 +129,7 @@ fn handle_cds(state: &mut OpenPgpState, cmd: &ApduCommand<'_>) -> ApduResponse {
         None => return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
     };
 
-    // Increment signature counter
-    state.sig_counter = state.sig_counter.saturating_add(1);
-
-    // Clear PW1 mode 81 flag (one-shot per spec)
-    state.pw1_verified_sign = false;
+    count_signature(state);
 
     ApduResponse::ok(&raw_sig)
 }
