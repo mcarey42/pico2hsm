@@ -108,8 +108,10 @@ pub fn handle(
                 }
             };
             let der_len = key_obj.private_key.len();
-            let mut der_buf = [0u8; 2400];
-            der_buf[..der_len].copy_from_slice(&key_obj.private_key);
+            let Some(der_buf) = crate::security::zeroize::key_buf::<2400>(&key_obj.private_key)
+            else {
+                return ApduResponse::err(pico2hsm_core::apdu::SW_CONDITIONS_NOT_SATISFIED);
+            };
 
             let sig = match algo {
                 0x20 => {
@@ -188,9 +190,10 @@ pub fn handle(
     };
 
     // Copy private key bytes to a local buffer
-    let mut priv_buf = [0u8; 66];
     let priv_len = key_obj.private_key.len();
-    priv_buf[..priv_len].copy_from_slice(&key_obj.private_key);
+    let Some(priv_buf) = crate::security::zeroize::key_buf::<66>(&key_obj.private_key) else {
+        return ApduResponse::err(pico2hsm_core::apdu::SW_CONDITIONS_NOT_SATISFIED);
+    };
 
     // For card-hash algorithms (0x71–0x75) the host sends the raw message;
     // we must hash it here before passing to the sign_prehash primitive.

@@ -56,9 +56,10 @@ fn handle_cds(state: &mut OpenPgpState, cmd: &ApduCommand<'_>) -> ApduResponse {
     }
 
     // Copy private key to local buffer
-    let mut priv_buf = [0u8; 66];
     let priv_len = priv_key.len();
-    priv_buf[..priv_len].copy_from_slice(priv_key);
+    let Some(priv_buf) = crate::security::zeroize::key_buf::<66>(priv_key) else {
+        return ApduResponse::err(pico2hsm_core::apdu::SW_CONDITIONS_NOT_SATISFIED);
+    };
 
     // Sign: input is the pre-hashed digest (raw hash bytes, no DigestInfo for ECC)
 
@@ -126,9 +127,10 @@ fn handle_decipher(state: &mut OpenPgpState, cmd: &ApduCommand<'_>) -> ApduRespo
     }
 
     // Copy private key
-    let mut priv_buf = [0u8; 66];
     let priv_len = priv_key.len();
-    priv_buf[..priv_len].copy_from_slice(priv_key);
+    let Some(priv_buf) = crate::security::zeroize::key_buf::<66>(priv_key) else {
+        return ApduResponse::err(pico2hsm_core::apdu::SW_CONDITIONS_NOT_SATISFIED);
+    };
 
     // X25519 path: peer key is 32 bytes, shared secret is 32 bytes
     #[cfg(feature = "applet-openpgp-curve25519")]

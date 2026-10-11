@@ -26,6 +26,20 @@ pub const INS_IMPORT_KEY: u8 = 0x74;
 /// P2 value for key import operation.
 pub const P2_IMPORT: u8 = 0x93;
 
+/// Whether `len` is a valid private-key length for SC-HSM algorithm `algo`.
+fn key_len_matches(algo: u8, len: usize) -> bool {
+    match algo {
+        0x13 | 0x23 | 0x19 | 0x53 | 0x20 | 0x21 => len == 32,
+        0x15 | 0x25 | 0x54 => len == 48,
+        0x55 => len == 64,
+        0x17 | 0x27 => len == 66,
+        0x60..=0x63 => matches!(len, 16 | 24 | 32),
+        // RSA: PKCS#1 DER, parsed (and bounds-checked) when used.
+        0x05 | 0x07 | 0x31..=0x34 | 0x41 => (64..=2400).contains(&len),
+        _ => false,
+    }
+}
+
 /// Handle an IMPORT KEY APDU command.
 pub fn handle(
     state: &mut ScHsmState,
@@ -100,6 +114,12 @@ pub fn handle(
         Err(_) => return ApduResponse::err(SW_WRONG_DATA),
     };
 
+    // The blob is authenticated, but its contents still have to match the
+    // algorithm: handlers copy EC keys into fixed 66-byte buffers.
+    if !key_len_matches(algo_id, key_material.len()) {
+        return ApduResponse::err(SW_WRONG_DATA);
+    }
+
     // Clear EF 0x2F10 now that we have consumed the blob.
     let ef_key_id_2f10 = KeyId::sc_hsm_ef(0, 0x2F, 0x10);
     let _ = store.erase_key(ef_key_id_2f10);
@@ -128,9 +148,10 @@ pub fn handle(
     key_obj.key_flags = key_flags;
     let _ = key_obj.private_key.extend_from_slice(&key_material);
 
-    // Persist to flash (best-effort; flash writes fail with InvalidCore on Core1
-    // and the key remains available in the in-memory store for the session).
-    let _ = store.save_key(&key_obj);
+    // Persist to flash; an import that is not stored did not happen.
+    if store.save_key(&key_obj).is_err() {
+        return ApduResponse::err(pico2hsm_core::apdu::SW_MEMORY_FAILURE);
+    }
     state.generation = state.generation.wrapping_add(1);
 
     // Map algo byte to CoreKeyType for metadata.
@@ -260,6 +281,21 @@ mod tests {
         assert!(found.is_some(), "imported key should be in key_index");
         let meta = found.unwrap();
         assert_eq!(meta.algo, 0x13);
+    }
+
+    #[test]
+    fn test_import_oversized_ec_key_rejected() {
+        // An authenticated blob whose "P-256 key" is 100 bytes used to be
+        // stored and then panic core1 on the fixed 66-byte copy at use.
+        let mut state = state_with_dkek();
+        let wrapped = wrap_test_key(&state, &[0x42u8; 100], 0x13);
+        let cmd = make_cmd(0x01, P2_IMPORT, &wrapped);
+        let resp = handle(&mut state, &mut NullStore, &cmd);
+        assert_eq!(resp.sw, SW_WRONG_DATA);
+        assert!(!state
+            .key_index
+            .iter()
+            .any(|m| m.key_id == KeyId::sc_hsm(0, 0x01).0));
     }
 
     #[test]

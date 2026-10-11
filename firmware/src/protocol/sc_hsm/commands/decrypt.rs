@@ -111,9 +111,11 @@ pub fn handle(
             };
 
             // RSA-2048 PKCS#1 DER is ≤1200 bytes; RSA-4096 is ≤2400 bytes.
-            let mut der_buf = [0u8; 2400];
             let der_len = key_obj.private_key.len();
-            der_buf[..der_len].copy_from_slice(&key_obj.private_key);
+            let Some(der_buf) = crate::security::zeroize::key_buf::<2400>(&key_obj.private_key)
+            else {
+                return ApduResponse::err(pico2hsm_core::apdu::SW_CONDITIONS_NOT_SATISFIED);
+            };
 
             // Raw RSA: result = ciphertext^d mod n. OpenSC handles all unpadding.
             return match rsa_private_raw(&der_buf[..der_len], cmd.data) {
@@ -167,9 +169,10 @@ pub fn handle(
         _ => return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
     };
 
-    let mut priv_buf = [0u8; 66];
     let priv_len = key_obj.private_key.len();
-    priv_buf[..priv_len].copy_from_slice(&key_obj.private_key);
+    let Some(priv_buf) = crate::security::zeroize::key_buf::<66>(&key_obj.private_key) else {
+        return ApduResponse::err(pico2hsm_core::apdu::SW_CONDITIONS_NOT_SATISFIED);
+    };
 
     let shared =
         match crate::crypto::asymmetric::ecdh_agree(key_type, &priv_buf[..priv_len], cmd.data) {

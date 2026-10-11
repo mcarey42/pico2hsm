@@ -222,9 +222,11 @@ fn handle_asymmetric_auth(
             };
 
             // Copy private key to stack buffer
-            let mut priv_buf = [0u8; 66];
             let priv_len = key_obj.private_key.len();
-            priv_buf[..priv_len].copy_from_slice(&key_obj.private_key);
+            let Some(priv_buf) = crate::security::zeroize::key_buf::<66>(&key_obj.private_key)
+            else {
+                return ApduResponse::err(pico2hsm_core::apdu::SW_CONDITIONS_NOT_SATISFIED);
+            };
 
             // Sign with ECDSA. Input is the raw hash digest.
             let mut rng = FwRng;

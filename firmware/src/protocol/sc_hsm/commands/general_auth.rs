@@ -119,8 +119,9 @@ pub fn handle(
 
     // Copy key data to local stack buffers.
     let priv_len = key_obj.private_key.len();
-    let mut priv_buf = [0u8; 66];
-    priv_buf[..priv_len].copy_from_slice(&key_obj.private_key);
+    let Some(priv_buf) = crate::security::zeroize::key_buf::<66>(&key_obj.private_key) else {
+        return ApduResponse::err(pico2hsm_core::apdu::SW_CONDITIONS_NOT_SATISFIED);
+    };
 
     // Hash the challenge with SHA-256 before signing.
     let hash = sha2::Sha256::digest(challenge);

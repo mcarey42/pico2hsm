@@ -51,3 +51,14 @@ impl<'a> Drop for ZeroizeGuard<'a> {
         self.buf.zeroize();
     }
 }
+
+/// Copy a private key into a zeroizing fixed-size buffer.
+///
+/// Returns `None` when the key does not fit — e.g. an over-long imported
+/// key — instead of panicking (and hard-faulting core1) on the slice copy.
+/// The buffer is wiped when dropped, so no key copy lingers on the stack.
+pub fn key_buf<const N: usize>(key: &[u8]) -> Option<zeroize::Zeroizing<[u8; N]>> {
+    let mut buf = zeroize::Zeroizing::new([0u8; N]);
+    buf.get_mut(..key.len())?.copy_from_slice(key);
+    Some(buf)
+}

@@ -116,9 +116,11 @@ fn pso_compute_digital_signature(
                     _ => pico2hsm_core::key::KeyType::RsaPrivate4096,
                 },
             };
-            let mut der_buf = [0u8; 2400];
             let der_len = key_obj.private_key.len();
-            der_buf[..der_len].copy_from_slice(&key_obj.private_key);
+            let Some(der_buf) = crate::security::zeroize::key_buf::<2400>(&key_obj.private_key)
+            else {
+                return ApduResponse::err(pico2hsm_core::apdu::SW_CONDITIONS_NOT_SATISFIED);
+            };
 
             let sig = match algo {
                 0x20 => {
@@ -196,9 +198,10 @@ fn pso_compute_digital_signature(
     };
 
     // Copy private key bytes to a local buffer
-    let mut priv_buf = [0u8; 66];
     let priv_len = key_obj.private_key.len();
-    priv_buf[..priv_len].copy_from_slice(&key_obj.private_key);
+    let Some(priv_buf) = crate::security::zeroize::key_buf::<66>(&key_obj.private_key) else {
+        return ApduResponse::err(pico2hsm_core::apdu::SW_CONDITIONS_NOT_SATISFIED);
+    };
 
     // For card-hash algorithms (0x71–0x75) the host sends the raw message;
     // we must hash it here before passing to the sign_prehash primitive.
@@ -327,9 +330,11 @@ fn pso_decipher(
             };
 
             // RSA-2048 PKCS#1 DER is ≤1200 bytes; RSA-4096 is ≤2400 bytes.
-            let mut der_buf = [0u8; 2400];
             let der_len = key_obj.private_key.len();
-            der_buf[..der_len].copy_from_slice(&key_obj.private_key);
+            let Some(der_buf) = crate::security::zeroize::key_buf::<2400>(&key_obj.private_key)
+            else {
+                return ApduResponse::err(pico2hsm_core::apdu::SW_CONDITIONS_NOT_SATISFIED);
+            };
 
             // Raw RSA: result = ciphertext^d mod n. OpenSC handles all unpadding.
             return match rsa_private_raw(&der_buf[..der_len], cmd.data) {
@@ -383,9 +388,10 @@ fn pso_decipher(
         _ => return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
     };
 
-    let mut priv_buf = [0u8; 66];
     let priv_len = key_obj.private_key.len();
-    priv_buf[..priv_len].copy_from_slice(&key_obj.private_key);
+    let Some(priv_buf) = crate::security::zeroize::key_buf::<66>(&key_obj.private_key) else {
+        return ApduResponse::err(pico2hsm_core::apdu::SW_CONDITIONS_NOT_SATISFIED);
+    };
 
     let shared =
         match crate::crypto::asymmetric::ecdh_agree(key_type, &priv_buf[..priv_len], cmd.data) {
