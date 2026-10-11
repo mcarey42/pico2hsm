@@ -233,7 +233,13 @@ impl pico2hsm_firmware::storage::KeyStore for Core1KeyStore {
         owner: pico2hsm_core::key::AppletId,
     ) -> Result<(), pico2hsm_core::error::HsmError> {
         if Self::is_direct_write() {
-            return self.direct().wipe_by_owner(owner);
+            // SD: the wipe runs here on core1.  In steps, each counting as
+            // progress, so a slow card can't trip the 30 s stall reset
+            // halfway through.
+            while self.direct().wipe_by_owner_step(owner, WIPE_STEP_KEYS)? {
+                WATCHDOG_HEARTBEAT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            }
+            return Ok(());
         }
         // In bounded steps: one long flash op would starve core0's time
         // extensions and let pcscd time out a large INITIALIZE.

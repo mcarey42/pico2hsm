@@ -215,7 +215,7 @@ impl Otp {
         let current = otp::read_raw_word(OTP_BOOT_FLAGS_ROW as usize).map_err(otp_err_to_hsm)?;
         let new_flags = current | BOOT_FLAG_PRODUCTION_MODE | BOOT_FLAG_PROVISIONED;
         otp::write_raw_word(OTP_BOOT_FLAGS_ROW as usize, new_flags).map_err(otp_err_to_hsm)?;
-        defmt::warn!("OTP: production mode flag set — IRREVERSIBLE");
+        // No defmt: this runs on core1 (SET PRODUCTION MODE).
         Ok(())
     }
 
@@ -566,7 +566,9 @@ fn lock_key_page() -> bool {
     locked
 }
 
-/// Whether the storage key IKM (or the PROVISIONED flag) is present.
+/// Whether the storage key IKM is present (`Ok(true)`), the OTP is blank
+/// (`Ok(false)`), or the state is unusable (`Err`: read error, or the
+/// PROVISIONED flag without key material).
 ///
 /// Unlike [`Otp::is_provisioned`], any read error is reported as `Err`
 /// instead of being taken to mean "blank", so callers can fail closed.
@@ -577,8 +579,15 @@ fn provisioning_state() -> Result<bool, ()> {
             return Ok(true);
         }
     }
+    // Key rows all zero.  With the PROVISIONED flag set, the key material
+    // is missing (or was destroyed): not "blank" — deriving from zero rows
+    // would give a public key — and not usable either.  Report it as
+    // unknown, which locks the page and disables the keystore.
     let flags = otp::read_raw_word(OTP_BOOT_FLAGS_ROW as usize).map_err(|_| ())?;
-    Ok(flags & BOOT_FLAG_PROVISIONED != 0)
+    if flags & BOOT_FLAG_PROVISIONED != 0 {
+        return Err(());
+    }
+    Ok(false)
 }
 
 /// Whether the key page has been read-locked this boot.
