@@ -70,8 +70,8 @@ pub fn handle(
     // as a Case-1 APDU with no inline data.  We must support both paths.
 
     // Copy blob into a local buffer so we can later mutate state.
-    let blob_data: heapless::Vec<u8, 2400> = if !cmd.data.is_empty() {
-        let mut v: heapless::Vec<u8, 2400> = heapless::Vec::new();
+    let blob_data: heapless::Vec<u8, 2480> = if !cmd.data.is_empty() {
+        let mut v: heapless::Vec<u8, 2480> = heapless::Vec::new();
         if v.extend_from_slice(cmd.data).is_err() {
             return ApduResponse::err(SW_WRONG_DATA);
         }
@@ -84,7 +84,7 @@ pub fn handle(
         let ef_key_id = KeyId::sc_hsm_ef(0, 0x2F, 0x10);
         if let Some(data) = state.ef_cache_get(ef_key_id.0) {
             if !data.is_empty() {
-                let mut v: heapless::Vec<u8, 2400> = heapless::Vec::new();
+                let mut v: heapless::Vec<u8, 2480> = heapless::Vec::new();
                 if v.extend_from_slice(data).is_err() {
                     return ApduResponse::err(SW_WRONG_DATA);
                 }
@@ -95,7 +95,7 @@ pub fn handle(
         } else if let Ok(Some(obj)) = store.fetch_key(ef_key_id) {
             if !obj.private_key.is_empty() {
                 state.ef_cache_put(ef_key_id.0, &obj.private_key);
-                let mut v: heapless::Vec<u8, 2400> = heapless::Vec::new();
+                let mut v: heapless::Vec<u8, 2480> = heapless::Vec::new();
                 if v.extend_from_slice(&obj.private_key).is_err() {
                     return ApduResponse::err(SW_WRONG_DATA);
                 }
@@ -346,7 +346,7 @@ mod tests {
 
     /// A store that holds one EF 0x2F10 blob for testing the standard import path.
     struct EfStore {
-        ef_data: Option<heapless::Vec<u8, 2400>>,
+        ef_data: Option<heapless::Vec<u8, 2480>>,
     }
     impl KeyStore for EfStore {
         fn save_key(

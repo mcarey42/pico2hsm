@@ -561,10 +561,13 @@ impl ScHsmState {
             key_id,
             data: Vec::new(),
         };
-        // Truncate to cache entry capacity (1024 bytes).
-        let len = data.len().min(entry.data.capacity());
-        let _ = entry.data.extend_from_slice(&data[..len]);
-        let _ = self.ef_cache.push(entry);
+        // Files larger than an entry are not cached: READ BINARY serves the
+        // cache first, so a truncated entry would be returned as the whole
+        // file (an RSA-4096 certificate request is ~1.1 KB).  Uncached files
+        // are read from flash.
+        if entry.data.extend_from_slice(data).is_ok() {
+            let _ = self.ef_cache.push(entry);
+        }
     }
 
     /// Remove an EF file from the cache.
@@ -1569,5 +1572,17 @@ mod reserved_slot_and_dkek_tests {
             u16::from_be_bytes([r[r.len() - 2], r[r.len() - 1]]),
             SW_MEMORY_FAILURE
         );
+    }
+
+    #[test]
+    fn oversized_ef_is_not_cached_truncated() {
+        let mut st = ScHsmState::new();
+        st.ef_cache_put(0xCE0C, &[0xAB; 1100]);
+        assert!(
+            st.ef_cache_get(0xCE0C).is_none(),
+            "served from flash instead"
+        );
+        st.ef_cache_put(0xCE0D, &[0xCD; 200]);
+        assert_eq!(st.ef_cache_get(0xCE0D).map(<[u8]>::len), Some(200));
     }
 }
