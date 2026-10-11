@@ -33,6 +33,15 @@
 //! The legacy single-copy format (`P2KD` in sector 0, XOR checksum) is
 //! still read, as sequence 0; the first flush writes copy B.
 //!
+//! Falling back to the older copy rolls the directory back by one flush.
+//! Only someone able to corrupt the newer copy can force that, and such an
+//! attacker can already replay a whole old flash image (no anti-rollback
+//! counter; see S-15 in docs/AUDIT_2026-10.md).  What it can resurrect is
+//! limited: deleted and superseded objects have their data sectors erased
+//! before or right after the flush, and every applet loads a credential
+//! record it can't read as blocked or unset, never as a factory default
+//! (SC-HSM: no PIN, so VERIFY refuses; PIV/OpenPGP: blocked).
+//!
 //! Maximum entries per copy: (4096 - 16) / 12 = 340.
 
 use crate::storage::{
