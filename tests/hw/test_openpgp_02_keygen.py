@@ -278,6 +278,9 @@ def test_openpgp_gpg_card_status_shows_sig_fingerprint(
     if gen_sw != "9000":
         pytest.skip(f"Key generation failed (SW={gen_sw!r}); cannot check gpg fingerprint.")
 
+    # scdaemon caches card data while it holds the card; the APDUs above went
+    # through PC/SC behind its back, so restart it to read fresh data.
+    subprocess.run(["gpgconf", "--kill", "scdaemon"], capture_output=True, timeout=30)
     cmd = ["gpg", "--no-tty", "--card-status"]
     log.info("Running: %s", " ".join(cmd))
     try:
