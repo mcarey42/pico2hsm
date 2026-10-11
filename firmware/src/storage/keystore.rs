@@ -97,6 +97,14 @@ impl<Chip: FlashChip> FlashKeyStore<Chip> {
         FlashKeyStore { storage, smk }
     }
 
+    /// One bounded step of `wipe_by_owner`: erase at most `max` of the
+    /// owner's objects; `Ok(true)` if more remain.
+    pub fn wipe_by_owner_step(&mut self, owner: AppletId, max: usize) -> Result<bool, HsmError> {
+        self.storage
+            .delete_where_step(&|k: KeyId| ((k.0 >> 16) & 0xFF) as u8 == owner as u8, max)
+            .map_err(HsmError::Storage)
+    }
+
     fn smk(&self) -> Result<&[u8; 32], HsmError> {
         self.smk
             .as_deref()

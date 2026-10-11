@@ -89,6 +89,14 @@ static RESP_CHANNEL: Channel<SpinlockRawMutex<30>, heapless::Vec<u8, 4098>, 1> =
 /// Uses RP2350 hardware spinlock 27.
 #[cfg(target_arch = "arm")]
 static FLASH_REQ: Channel<SpinlockRawMutex<27>, FlashOp, 1> = Channel::new();
+
+/// Objects erased per `FlashOp::WipeByOwnerStep` (~50 ms each on QMI flash).
+#[cfg(target_arch = "arm")]
+const WIPE_STEP_KEYS: usize = 4;
+
+/// Set by core0 after a `WipeByOwnerStep`: more of the applet's objects remain.
+#[cfg(target_arch = "arm")]
+static WIPE_MORE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 /// Core0 → Core1: flash operation results.
 /// Uses RP2350 hardware spinlock 26.
 #[cfg(target_arch = "arm")]
@@ -115,6 +123,10 @@ enum FlashOp {
     WipeAll,
     /// Wipe only keys owned by the given applet.
     WipeByOwner(pico2hsm_core::key::AppletId),
+    /// Erase a few of the applet's objects (see `WIPE_STEP_KEYS`); sets
+    /// `WIPE_MORE` if any remain.  Core1 loops on it so core0 gets back to
+    /// its loop — and its CCID time extensions — between steps.
+    WipeByOwnerStep(pico2hsm_core::key::AppletId),
     /// Reload keys from flash into the dispatcher (USB reconnect / reset).
     /// Core0 calls `dispatcher.load_keys_from_store(store)` via the raw
     /// pointer while core1 is awaiting the response.
@@ -223,7 +235,14 @@ impl pico2hsm_firmware::storage::KeyStore for Core1KeyStore {
         if Self::is_direct_write() {
             return self.direct().wipe_by_owner(owner);
         }
-        Self::on_core0(FlashOp::WipeByOwner(owner))
+        // In bounded steps: one long flash op would starve core0's time
+        // extensions and let pcscd time out a large INITIALIZE.
+        loop {
+            Self::on_core0(FlashOp::WipeByOwnerStep(owner))?;
+            if !WIPE_MORE.load(core::sync::atomic::Ordering::Acquire) {
+                return Ok(());
+            }
+        }
     }
 
     fn enumerate_keys(&self) -> heapless::Vec<pico2hsm_core::key::KeyId, 64> {
@@ -636,6 +655,14 @@ fn handle_flash_op(
         FlashOp::WipeByOwner(owner) => {
             defmt::info!("FLASH_SVC: wipe_by_owner {:?}", owner as u8);
             store.wipe_by_owner(owner)
+        }
+        FlashOp::WipeByOwnerStep(owner) => {
+            let more = store.wipe_by_owner_step(owner, WIPE_STEP_KEYS);
+            WIPE_MORE.store(
+                matches!(more, Ok(true)),
+                core::sync::atomic::Ordering::Release,
+            );
+            more.map(|_| ())
         }
         FlashOp::ReloadKeys => {
             defmt::info!("FLASH_SVC: reload_keys");

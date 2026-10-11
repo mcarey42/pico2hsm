@@ -772,11 +772,29 @@ impl<Chip: FlashChip> KeyFilesystem<Chip> {
     /// drops the entry; a key whose erase fails stays listed and the call
     /// fails, but the rest are still removed.
     pub fn delete_where(&mut self, pred: &dyn Fn(KeyId) -> bool) -> Result<(), StorageError> {
-        let mut result = Ok(());
+        while self.delete_where_step(pred, usize::MAX)? {}
+        Ok(())
+    }
+
+    /// One bounded step of [`delete_where`](Self::delete_where): erase at
+    /// most `max` matching keys.  Returns `Ok(true)` if matches remain (the
+    /// directory is written on the last step only), so a caller can return
+    /// to its event loop between steps — core0 must keep sending CCID time
+    /// extensions during a long INITIALIZE.  A failed erase writes the
+    /// directory for what was removed and fails (that key stays listed).
+    pub fn delete_where_step(
+        &mut self,
+        pred: &dyn Fn(KeyId) -> bool,
+        max: usize,
+    ) -> Result<bool, StorageError> {
+        let mut done = 0usize;
         for i in 0..self.directory.entries.len() {
             let e = &self.directory.entries[i];
             if e.key_id == 0xFFFF_FFFF || (e.flags & 0x01) != 0 || !pred(KeyId(e.key_id)) {
                 continue;
+            }
+            if done == max {
+                return Ok(true);
             }
             let (kid, chip, sector, count) = (
                 KeyId(e.key_id),
@@ -784,15 +802,15 @@ impl<Chip: FlashChip> KeyFilesystem<Chip> {
                 e.sector_index,
                 e.sector_count as u32,
             );
-            match self.erase_data_sectors(chip, sector, count) {
-                Ok(()) => {
-                    self.directory.remove(kid);
-                }
-                Err(err) => result = Err(err),
+            if let Err(err) = self.erase_data_sectors(chip, sector, count) {
+                let _ = self.flush_directory();
+                return Err(err);
             }
+            self.directory.remove(kid);
+            done += 1;
         }
-        let flushed = self.flush_directory();
-        result.and(flushed)
+        self.flush_directory()?;
+        Ok(false)
     }
 
     // ── Key list ─────────────────────────────────────────────────────────────

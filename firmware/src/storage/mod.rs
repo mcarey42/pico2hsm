@@ -358,6 +358,15 @@ impl<Chip: FlashChip> StorageManager<Chip> {
         self.filesystem.delete_where(pred)
     }
 
+    /// One bounded step; see [`KeyFilesystem::delete_where_step`].
+    pub fn delete_where_step(
+        &mut self,
+        pred: &dyn Fn(KeyId) -> bool,
+        max: usize,
+    ) -> Result<bool, StorageError> {
+        self.filesystem.delete_where_step(pred, max)
+    }
+
     /// Check whether a key ID exists in the directory.
     pub fn key_exists(&self, key_id: KeyId) -> bool {
         self.filesystem.directory.find(key_id).is_some()
