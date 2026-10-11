@@ -131,7 +131,9 @@ fn write_at_offset(
 ) -> ApduResponse {
     let file_id_hi = (file_id >> 8) as u8;
     let file_id_lo = (file_id & 0xFF) as u8;
-    let key_id = KeyId::sc_hsm_ef(0, file_id_hi, file_id_lo);
+    let Some(key_id) = KeyId::sc_hsm_ef_checked(0, file_id_hi, file_id_lo) else {
+        return ApduResponse::err(pico2hsm_core::apdu::SW_FILE_NOT_FOUND);
+    };
 
     // Check if this EF already exists in key_index.
     let exists = state
