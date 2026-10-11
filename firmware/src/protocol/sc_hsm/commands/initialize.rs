@@ -229,7 +229,11 @@ pub fn handle(
     // Wipe only SC-HSM-owned keys from persistent flash keystore.
     // Degraded flash does not fail the INITIALIZE command.
     crate::CORE1_PROGRESS.store(31, core::sync::atomic::Ordering::Relaxed);
-    let _ = store.wipe_by_owner(AppletId::ScHsm); // best-effort; InvalidCore returns Ok(()) on Core1
+    // Old keys must really be gone: otherwise they reappear after a reset
+    // under the new PINs.
+    if store.wipe_by_owner(AppletId::ScHsm).is_err() {
+        return ApduResponse::err(pico2hsm_core::apdu::SW_MEMORY_FAILURE);
+    }
 
     // Generate device identity P-256 keypair for DKEK exchange.
     // Stored at reserved slot 0xFE; public key written to EF 0x2F02.
@@ -256,7 +260,9 @@ pub fn handle(
                 let _ = key_obj.private_key.extend_from_slice(&pair.private_key);
                 let _ = key_obj.public_key.extend_from_slice(&pair.public_key);
                 crate::CORE1_PROGRESS.store(80, core::sync::atomic::Ordering::Relaxed);
-                let _ = store.save_key(&key_obj); // best-effort
+                if store.save_key(&key_obj).is_err() {
+                    return ApduResponse::err(pico2hsm_core::apdu::SW_MEMORY_FAILURE);
+                }
                 crate::CORE1_PROGRESS.store(81, core::sync::atomic::Ordering::Relaxed);
             }
 
@@ -281,7 +287,9 @@ pub fn handle(
                     AlgorithmId::EcdsaP256,
                 );
                 let _ = ef_obj.private_key.extend_from_slice(&pair.public_key);
-                let _ = store.save_key(&ef_obj);
+                if store.save_key(&ef_obj).is_err() {
+                    return ApduResponse::err(pico2hsm_core::apdu::SW_MEMORY_FAILURE);
+                }
                 // Populate ef_cache so READ BINARY can serve this data.
                 state.ef_cache_put(ef_key_id.0, &pair.public_key);
                 // Push EfFile metadata to key_index.

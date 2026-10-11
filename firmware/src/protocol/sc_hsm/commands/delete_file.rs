@@ -58,20 +58,35 @@ pub fn handle(
     if hi == 0xCE {
         // CE xx EF files: look up by EfFile KeyId encoding.
         let ef_key_id = pico2hsm_core::key::KeyId::sc_hsm_ef(0, hi as u8, key_id_proto).0;
-        state
+        let present = state
             .key_index
-            .retain(|m| !(m.key_type == 16 && m.key_id == ef_key_id));
-        // Erase from flash and clear cache.
-        if state.key_index.len() < before_idx {
-            let _ = store.erase_key(pico2hsm_core::key::KeyId(ef_key_id));
+            .iter()
+            .any(|m| m.key_type == 16 && m.key_id == ef_key_id);
+        // Erase from flash first: an entry dropped from RAM but still in
+        // flash would come back after a reset.
+        if present {
+            if store
+                .erase_key(pico2hsm_core::key::KeyId(ef_key_id))
+                .is_err()
+            {
+                return ApduResponse::err(pico2hsm_core::apdu::SW_MEMORY_FAILURE);
+            }
+            state
+                .key_index
+                .retain(|m| !(m.key_type == 16 && m.key_id == ef_key_id));
             state.ef_cache_remove(ef_key_id);
         }
     } else {
         // C4/CC xx crypto key entries.
-        state.key_index.retain(|m| m.key_id != full_key_id);
-        // Erase from flash.
-        if state.key_index.len() < before_idx {
-            let _ = store.erase_key(pico2hsm_core::key::KeyId(full_key_id));
+        let present = state.key_index.iter().any(|m| m.key_id == full_key_id);
+        if present {
+            if store
+                .erase_key(pico2hsm_core::key::KeyId(full_key_id))
+                .is_err()
+            {
+                return ApduResponse::err(pico2hsm_core::apdu::SW_MEMORY_FAILURE);
+            }
+            state.key_index.retain(|m| m.key_id != full_key_id);
             state.generation = state.generation.wrapping_add(1);
         }
     }

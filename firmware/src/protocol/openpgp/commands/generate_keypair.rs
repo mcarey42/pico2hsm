@@ -258,7 +258,17 @@ pub fn handle_with_store(
     };
     let _ = obj.private_key.extend_from_slice(priv_bytes);
     let _ = obj.public_key.extend_from_slice(pub_bytes);
-    let _ = store.save_key(&obj);
+    if store.save_key(&obj).is_err() {
+        // The key was generated into RAM; drop it so RAM matches flash.
+        let (private, public) = match slot {
+            0 => (&mut state.sig_private, &mut state.sig_public),
+            1 => (&mut state.dec_private, &mut state.dec_public),
+            _ => (&mut state.auth_private, &mut state.auth_public),
+        };
+        crate::protocol::openpgp::wipe_key(private);
+        *public = None;
+        return ApduResponse::err(pico2hsm_core::apdu::SW_MEMORY_FAILURE);
+    }
 
     resp
 }

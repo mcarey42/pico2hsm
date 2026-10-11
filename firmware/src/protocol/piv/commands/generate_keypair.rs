@@ -113,7 +113,9 @@ pub fn handle_with_store(
         let mut obj = KeyObject::new(KmKeyType::Ec, key_id.0, AppletId::Piv, algorithm);
         let _ = obj.private_key.extend_from_slice(&keypair.private_key);
         let _ = obj.public_key.extend_from_slice(&keypair.public_key);
-        let _ = store.save_key(&obj);
+        if store.save_key(&obj).is_err() {
+            return ApduResponse::err(pico2hsm_core::apdu::SW_MEMORY_FAILURE);
+        }
     }
 
     // Update key_index metadata (replace any existing entry for this slot).

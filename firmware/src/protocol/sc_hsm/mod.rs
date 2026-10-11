@@ -1486,4 +1486,68 @@ mod reserved_slot_and_dkek_tests {
         assert_eq!(fresh.state.dkek.get_dkek(), Some(&[0xFFu8; 32]));
         assert_eq!(fresh.state.dkek.shares_total(), 2);
     }
+
+    /// Store whose writes all fail.
+    struct FailStore;
+
+    impl crate::storage::KeyStore for FailStore {
+        fn save_key(&mut self, _: &KeyObject) -> Result<(), HsmError> {
+            Err(HsmError::NotSupported)
+        }
+        fn fetch_key(&mut self, _: KeyId) -> Result<Option<KeyObject>, HsmError> {
+            Ok(None)
+        }
+        fn erase_key(&mut self, _: KeyId) -> Result<(), HsmError> {
+            Err(HsmError::NotSupported)
+        }
+        fn wipe_all(&mut self) -> Result<(), HsmError> {
+            Err(HsmError::NotSupported)
+        }
+        fn wipe_by_owner(&mut self, _: AppletId) -> Result<(), HsmError> {
+            Err(HsmError::NotSupported)
+        }
+        fn enumerate_keys(&self) -> heapless::Vec<KeyId, 64> {
+            heapless::Vec::new()
+        }
+        fn for_each_key(&self, _: &mut dyn FnMut(KeyId)) {}
+    }
+
+    #[test]
+    fn delete_keeps_key_when_flash_erase_fails() {
+        let mut hsm = logged_in();
+        let kid = KeyId::sc_hsm(0, 0x01).0;
+        hsm.state
+            .key_index
+            .push(KeyMeta {
+                key_id: kid,
+                key_type: CoreKeyType::EcPrivateP256 as u8,
+                algo: 0x13,
+                key_flags: 0,
+            })
+            .unwrap();
+        let r = hsm
+            .process_apdu_with_store(&[0x00, 0xE4, 0x02, 0x00, 0x02, 0xCC, 0x01], &mut FailStore);
+        assert_eq!(
+            u16::from_be_bytes([r[r.len() - 2], r[r.len() - 1]]),
+            SW_MEMORY_FAILURE
+        );
+        assert!(
+            hsm.state.key_index.iter().any(|m| m.key_id == kid),
+            "still indexed: still in flash"
+        );
+    }
+
+    #[test]
+    fn initialize_fails_when_old_keys_cannot_be_wiped() {
+        let mut hsm = ScHsm::new();
+        let apdu = [
+            0x80, 0x50, 0x00, 0x00, 0x12, 0x81, 0x06, b'6', b'4', b'8', b'2', b'1', b'9', 0x82,
+            0x08, b'5', b'7', b'6', b'2', b'1', b'8', b'8', b'0',
+        ];
+        let r = hsm.process_apdu_with_store(&apdu, &mut FailStore);
+        assert_eq!(
+            u16::from_be_bytes([r[r.len() - 2], r[r.len() - 1]]),
+            SW_MEMORY_FAILURE
+        );
+    }
 }

@@ -806,7 +806,9 @@ pub fn handle(
             let _ = key_obj.public_key.push(mod_len as u8);
             let _ = key_obj.public_key.extend_from_slice(&pair.modulus);
             let _ = key_obj.public_key.extend_from_slice(&pair.exponent);
-            let _ = store.save_key(&key_obj); // best-effort; InvalidCore is silent on Core1
+            if store.save_key(&key_obj).is_err() {
+                return ApduResponse::err(pico2hsm_core::apdu::SW_MEMORY_FAILURE);
+            }
         }
         state.generation = state.generation.wrapping_add(1);
 
@@ -860,7 +862,10 @@ pub fn handle(
         key_obj.key_flags = key_flags;
         let _ = key_obj.private_key.extend_from_slice(&pair.private_key);
         let _ = key_obj.public_key.extend_from_slice(&pair.public_key);
-        let _ = store.save_key(&key_obj); // best-effort; InvalidCore is silent on Core1
+        // Persist before indexing: a key the host is told about must survive reset.
+        if store.save_key(&key_obj).is_err() {
+            return ApduResponse::err(pico2hsm_core::apdu::SW_MEMORY_FAILURE);
+        }
     }
     state.generation = state.generation.wrapping_add(1);
 
