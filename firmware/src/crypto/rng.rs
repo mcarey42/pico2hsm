@@ -162,7 +162,8 @@ impl Rng {
             self.adc_sample_count = 0;
             self.adc_accumulator = [0u8; ADC_POOL_SAMPLES];
 
-            defmt::debug!("RNG: ADC entropy pool refreshed");
+            // Not defmt: this runs on core1, which must not block on RTT.
+            crate::cdc_log!("RNG: ADC entropy pool refreshed");
         }
     }
 }
@@ -268,7 +269,7 @@ pub fn fill_random(buf: &mut [u8]) -> Result<(), CryptoError> {
         // Best-effort: log on failure but do not propagate the error so that
         // callers are not broken by a transient TRNG timeout.
         if reseed().is_err() {
-            defmt::warn!("RNG: periodic reseed failed — continuing with existing CSPRNG state");
+            crate::cdc_warn!("RNG: periodic reseed failed — continuing with existing CSPRNG state");
         }
     }
 
@@ -297,7 +298,8 @@ pub fn fill_random(buf: &mut [u8]) -> Result<(), CryptoError> {
 /// only state known to be safe.
 pub fn fill_or_reset(buf: &mut [u8]) {
     if fill_random(buf).is_err() {
-        defmt::error!("RNG: TRNG failure — resetting");
+        // No log: core1 must not block on RTT, and a queued CDC line would
+        // never be sent before the reset.
         cortex_m::peripheral::SCB::sys_reset();
     }
 }
