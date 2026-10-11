@@ -62,11 +62,27 @@ Security and robustness release from the October 2026 audit
 - OTP key page read-locked at boot; failures fail closed.
 - Secrets wiped in place: reset, DKEK copies, key buffers, response buffers.
 
+### Added
+- **Hardware watchdog armed on every board** (8 s timeout, paused while a
+  debugger halts either core).  Core0 feeds it from an executor task only
+  while core1 is idle, making progress, or under the RSA-keygen
+  suppression; a core1 stuck for 30 s on any path (including the
+  USB-disconnect drain) or a hung core0 now resets the whole chip — both
+  cores, USB and all peripherals.  Long flash/SD work and key loads feed it
+  as they go.  The reason for the previous reset (watchdog timeout,
+  deliberate reset with cause, or other) and a consecutive-watchdog-reset
+  count are logged at boot (defmt and the CDC log).  Debug builds
+  (`debug` feature) add test hooks: DEBUG APDU `80 FE 10/11/12 00` wedges
+  core1, wedges core0, or resets through the watchdog.
+
 ### Fixed
 - USB-disconnect reset deadlock on QMI-flash boards.
 - Core1 stack: worst path ~123 KB → ~70 KB of 128 KB.
 - Responses with ≥4095 data bytes lost their status word.
 - Watchdog abort left core1 running (replies off by one); now resets.
+- Deliberate resets (core1 stall, TRNG failure, failed boot check) use the
+  watchdog trigger instead of `SYSRESETREQ`, which on RP2350 is only a
+  processor warm reset.
 - CCID time extensions are sent on time during long flash work.
 - Oversized CCID messages no longer desync the bulk pipe.
 - Storage write errors are reported instead of ignored.

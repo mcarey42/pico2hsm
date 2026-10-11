@@ -158,6 +158,10 @@ impl<Chip: FlashChip> KeyStore for FlashKeyStore<Chip> {
             return Ok(None);
         }
         self.smk()?;
+        // Each load is a read + AES-GCM decrypt (tens of ms in debug
+        // builds); a full keystore load at boot / reload must keep the
+        // hardware watchdog fed (core0) or the heartbeat moving (core1).
+        crate::watchdog::progress();
 
         let blob = self.storage.read_key(key_id).map_err(HsmError::Storage)?;
 

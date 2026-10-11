@@ -188,6 +188,8 @@ where
         let sd_sector_idx = physical_addr / SD_SECTOR_BYTES;
         let byte_offset = (physical_addr % SD_SECTOR_BYTES) as usize;
 
+        // Feeds the hardware watchdog on core0 / bumps core1's heartbeat.
+        crate::watchdog::progress();
         // Step 1: read existing 512-byte sector.
         let mut block = [Block::new()];
         self.card
@@ -243,6 +245,8 @@ where
         let blocks = [blank_block];
 
         for i in 0..SD_SECTORS_PER_LOGICAL {
+            // A slow card can take up to 250 ms per block write.
+            crate::watchdog::progress();
             self.card
                 .write(&blocks, BlockIdx(first_sd_sector + i))
                 .map_err(|_| StorageError::EraseError)?;
