@@ -114,7 +114,8 @@ where
     pub fn from_initialized(card: SdCard<SPI, DELAY>, capacity_bytes: u64) -> Self {
         SdCardFlash {
             card,
-            capacity_bytes,
+            // Same cap as `new`: u32 addresses must not wrap on big cards.
+            capacity_bytes: capacity_bytes.min(SD_KEYSTORE_MAX_BYTES),
             degraded: false,
             write_errors: 0,
         }
@@ -397,7 +398,9 @@ where
     /// The usable capacity exposed to the filesystem is reduced by the
     /// reserved signature region.
     pub fn from_card(card: SdCard<SPI, DELAY>, total_bytes: u64) -> Self {
-        let capacity_bytes = total_bytes.saturating_sub(SD_BYTE_OFFSET as u64);
+        let capacity_bytes = total_bytes
+            .saturating_sub(SD_BYTE_OFFSET as u64)
+            .min(SD_KEYSTORE_MAX_BYTES);
         defmt::info!(
             "SdCardFlash::from_card: total={} B usable={} B ({} MiB)",
             total_bytes,
