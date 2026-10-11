@@ -167,6 +167,16 @@ pub fn handle(
         .and_then(|v| v.first().copied())
         .unwrap_or(0);
 
+    // Wipe SC-HSM's keys from flash first, before any credential in RAM
+    // changes.  Old keys must really be gone, or they would reappear after
+    // a reset under the new PINs; and if the wipe fails, RAM still holds
+    // the old credentials — a later VERIFY must not persist new ones next
+    // to keys the wipe left behind.
+    crate::CORE1_PROGRESS.store(31, core::sync::atomic::Ordering::Relaxed);
+    if store.wipe_by_owner(AppletId::ScHsm).is_err() {
+        return ApduResponse::err(pico2hsm_core::apdu::SW_MEMORY_FAILURE);
+    }
+
     // Generate fresh random salts for all credentials.
     let so_salt = gen_salt();
     let user_salt = gen_salt();
@@ -177,11 +187,14 @@ pub fn handle(
     state.so_pin_hash = Some(hash_pin_pbkdf2(init_code, &so_salt));
 
     // Store User PIN hash if provided, using PBKDF2.
+    // Without one, the previous owner's PIN must not survive re-INITIALIZE.
     if let Some(up) = user_pin {
         state.user_pin_salt = user_salt;
         state.user_pin_hash = Some(hash_pin_pbkdf2(up, &user_salt));
-        state.pin_retry_count = retry_counter;
+    } else {
+        state.user_pin_hash = None;
     }
+    state.pin_retry_count = retry_counter;
 
     // Tag 0x93: PUK (optional, 8–16 bytes), using PBKDF2.
     if let Some(puk) = puk {
@@ -235,15 +248,6 @@ pub fn handle(
 
     // Clear the enrolled peer pubkey (re-enroll with ENROLL_PEER_PUBKEY).
     state.noise_enrolled_peer_pubkey = None;
-
-    // Wipe only SC-HSM-owned keys from persistent flash keystore.
-    // Degraded flash does not fail the INITIALIZE command.
-    crate::CORE1_PROGRESS.store(31, core::sync::atomic::Ordering::Relaxed);
-    // Old keys must really be gone: otherwise they reappear after a reset
-    // under the new PINs.
-    if store.wipe_by_owner(AppletId::ScHsm).is_err() {
-        return ApduResponse::err(pico2hsm_core::apdu::SW_MEMORY_FAILURE);
-    }
 
     // Generate device identity P-256 keypair for DKEK exchange.
     // Stored at reserved slot 0xFE; public key written to EF 0x2F02.
