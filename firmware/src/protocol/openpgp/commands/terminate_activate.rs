@@ -43,7 +43,9 @@ pub fn handle_terminate_with_store(
     store: &mut dyn crate::storage::KeyStore,
     cmd: &ApduCommand<'_>,
 ) -> ApduResponse {
-    if !state.pw3_verified {
+    // PW3 verified, or blocked (OpenPGP 3.4 §7.2.16): otherwise anyone
+    // could lock the card for good with three wrong admin PINs.
+    if !state.pw3_verified && state.pw3_retries != 0 {
         return ApduResponse::err(SW_SECURITY_STATUS);
     }
     if store
@@ -57,8 +59,9 @@ pub fn handle_terminate_with_store(
 
 /// Handle TERMINATE DF — mark card as terminated, wipe keys and PINs.
 pub fn handle_terminate(state: &mut OpenPgpState, _cmd: &ApduCommand<'_>) -> ApduResponse {
-    // Requires PW3 authenticated
-    if !state.pw3_verified {
+    // PW3 verified, or blocked (OpenPGP 3.4 §7.2.16): otherwise anyone
+    // could lock the card for good with three wrong admin PINs.
+    if !state.pw3_verified && state.pw3_retries != 0 {
         return ApduResponse::err(SW_SECURITY_STATUS);
     }
 

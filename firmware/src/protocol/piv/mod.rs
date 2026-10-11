@@ -49,6 +49,9 @@ const DEFAULT_PIV_PIN: &[u8] = b"123456";
 const DEFAULT_PIV_PUK: &[u8] = b"12345678";
 
 /// Default 3DES management key (24 bytes, three identical 8-byte DES keys).
+/// PIV reset (Yubico extension; `ykman piv reset`).
+pub const INS_PIV_RESET: u8 = 0xFB;
+
 const DEFAULT_MGMT_KEY: [u8; 24] = [
     0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
     0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
@@ -137,6 +140,11 @@ pub struct PivState {
     pub key_index: Vec<crate::protocol::sc_hsm::KeyMeta, MAX_PIV_KEYS>,
     /// Stored data objects (certificates, etc.).
     pub data_objects: Vec<PivDataObject, MAX_PIV_DATA_OBJECTS>,
+    /// The PIN and management-key records are on flash.  They must be
+    /// before any key or data object is: on load, missing records next to
+    /// stored content mean tampering, not a fresh applet (see
+    /// `load_pin_state_from_store`).
+    pub credentials_persisted: bool,
 }
 
 #[cfg(feature = "applet-piv")]
@@ -158,6 +166,27 @@ impl PivState {
             device_id,
             key_index: Vec::new(),
             data_objects: Vec::new(),
+            credentials_persisted: false,
+        }
+    }
+
+    /// No credential is usable: PIN and PUK blocked, management key
+    /// unknown.  The only way out is the PIV reset (INS FB), which wipes
+    /// the applet.
+    pub fn lock_out(&mut self) {
+        let ps = &mut self.pin_state;
+        ps.pin_retries_remaining = 0;
+        ps.pin_blocked = true;
+        ps.puk_retries_remaining = 0;
+        ps.puk_blocked = true;
+        self.pin_verified = false;
+        self.mgmt_key_authenticated = false;
+        // Not the public default: an unknown key nobody can authenticate with.
+        #[cfg(target_arch = "arm")]
+        crate::crypto::rng::fill_or_reset(&mut self.mgmt_key);
+        #[cfg(not(target_arch = "arm"))]
+        {
+            self.mgmt_key = [0x5A; 24];
         }
     }
 }
@@ -398,8 +427,37 @@ impl Piv {
     /// Load PIN/PUK state from flash into `state`.
     #[cfg(feature = "applet-piv")]
     fn load_pin_state_from_store(state: &mut PivState, store: &mut dyn crate::storage::KeyStore) {
-        let kid = Self::piv_pin_key_id();
-        if let Ok(Some(obj)) = store.fetch_key(kid) {
+        // A missing record is a fresh applet only while the applet stores
+        // nothing; the records are written before its first key or object.
+        // Missing next to stored content, unreadable, or malformed means
+        // the flash was tampered with (the directory has no MAC): fail
+        // closed instead of falling back to the public factory defaults.
+        let mut has_content = false;
+        let pin_kid = Self::piv_pin_key_id();
+        let mgmt_kid = Self::piv_mgmt_key_id();
+        store.for_each_key(&mut |kid| {
+            if kid.applet_byte() == AppletId::Piv as u8 && kid != pin_kid && kid != mgmt_kid {
+                has_content = true;
+            }
+        });
+        let pin = store.fetch_key(pin_kid);
+        let mgmt = store.fetch_key(mgmt_kid);
+        let pin_ok = matches!(&pin, Ok(Some(o)) if o.private_key.len() >= 101);
+        let mgmt_ok = matches!(&mgmt, Ok(Some(o)) if o.private_key.len() == 24);
+        let pin_fresh = matches!(pin, Ok(None)) && !has_content;
+        let mgmt_fresh = matches!(mgmt, Ok(None)) && !has_content;
+        if !(pin_ok || pin_fresh) || !(mgmt_ok || mgmt_fresh) {
+            state.lock_out();
+            state.credentials_persisted = true;
+            return;
+        }
+        state.credentials_persisted = pin_ok && mgmt_ok;
+        if let Ok(Some(obj)) = mgmt {
+            if mgmt_ok {
+                state.mgmt_key.copy_from_slice(&obj.private_key);
+            }
+        }
+        if let Ok(Some(obj)) = pin {
             let b = &obj.private_key;
             if b.len() >= 101 {
                 state.pin_state.pin_hash.copy_from_slice(&b[0..32]);
@@ -493,10 +551,24 @@ impl Piv {
                 }
                 resp
             }
+            put_data::INS_PUT_DATA | generate_keypair::INS_GENERATE_KEYPAIR
+                if self.state.mgmt_key_authenticated && !self.state.credentials_persisted =>
+            {
+                // First content for this applet: its credentials go to flash
+                // first (see `PivState::credentials_persisted`).
+                if Self::save_pin_to_store(&self.state, store).is_err()
+                    || Self::save_mgmt_key_to_store(&self.state, store).is_err()
+                {
+                    return ApduResponse::err(pico2hsm_core::apdu::SW_MEMORY_FAILURE);
+                }
+                self.state.credentials_persisted = true;
+                self.route_with_store(cmd, store)
+            }
             put_data::INS_PUT_DATA => put_data::handle_with_store(&mut self.state, store, cmd),
             generate_keypair::INS_GENERATE_KEYPAIR => {
                 generate_keypair::handle_with_store(&mut self.state, store, cmd)
             }
+            INS_PIV_RESET => self.reset_applet(cmd, store),
             general_authenticate::INS_GENERAL_AUTHENTICATE => {
                 general_authenticate::handle_with_store(&mut self.state, store, cmd)
             }
@@ -513,6 +585,39 @@ impl Piv {
                 self.dispatch(cmd)
             }
         }
+    }
+
+    /// PIV reset (Yubico extension, INS FB; `ykman piv reset`): wipe every
+    /// PIV key, object and credential and return to factory defaults.
+    /// Allowed only once both PIN and PUK are blocked, so it can't be used
+    /// to get around them — only to recover a locked-out applet.
+    #[cfg(feature = "applet-piv")]
+    fn reset_applet(
+        &mut self,
+        cmd: &ApduCommand<'_>,
+        store: &mut dyn crate::storage::KeyStore,
+    ) -> ApduResponse {
+        if cmd.p1 != 0 || cmd.p2 != 0 {
+            return ApduResponse::err(0x6A86);
+        }
+        let ps = &self.state.pin_state;
+        if ps.pin_retries_remaining != 0 || ps.puk_retries_remaining != 0 {
+            return ApduResponse::err(pico2hsm_core::apdu::SW_CONDITIONS_NOT_SATISFIED);
+        }
+        // Flash first: if the wipe fails, RAM still says "locked out".
+        if store.wipe_by_owner(AppletId::Piv).is_err() {
+            return ApduResponse::err(pico2hsm_core::apdu::SW_MEMORY_FAILURE);
+        }
+        let st = &mut self.state;
+        st.pin_state = default_pin_state();
+        st.pin_verified = false;
+        st.mgmt_key = DEFAULT_MGMT_KEY;
+        st.mgmt_key_authenticated = false;
+        st.mgmt_challenge = None;
+        st.key_index.clear();
+        st.data_objects.clear();
+        st.credentials_persisted = false;
+        ApduResponse::ok(&[])
     }
 
     /// Process a raw APDU with access to persistent storage.
@@ -542,12 +647,8 @@ impl Piv {
         #[cfg(feature = "applet-piv")]
         {
             // Load PIN state first.
+            // PIN, PUK and management key (fail closed on tampering).
             Self::load_pin_state_from_store(&mut self.state, store);
-            if let Ok(Some(obj)) = store.fetch_key(Self::piv_mgmt_key_id()) {
-                if obj.private_key.len() == 24 {
-                    self.state.mgmt_key.copy_from_slice(&obj.private_key);
-                }
-            }
 
             // Load key objects for PIV slots.
             let mut piv_ids: Vec<pico2hsm_core::key::KeyId, 16> = Vec::new();
@@ -810,7 +911,8 @@ mod data_object_tests {
         fn wipe_all(&mut self) -> Result<(), HsmError> {
             Ok(())
         }
-        fn wipe_by_owner(&mut self, _: AppletId) -> Result<(), HsmError> {
+        fn wipe_by_owner(&mut self, owner: AppletId) -> Result<(), HsmError> {
+            self.records.retain(|(k, _)| k.applet_byte() != owner as u8);
             Ok(())
         }
         fn enumerate_keys(&self) -> heapless::Vec<KeyId, 64> {
@@ -878,7 +980,74 @@ mod data_object_tests {
         // 2046 bytes of content + 4-byte 53 wrapper > 2048.
         let r = piv.process_apdu_with_store(&put_data(0x05, &[0u8; 2046]), &mut store);
         assert_eq!(sw(&r), 0x6A84);
-        assert!(store.records.is_empty());
+        let obj_id = Piv::piv_data_object_key_id(0x05);
+        assert!(store.records.iter().all(|(k, _)| *k != obj_id));
+    }
+
+    #[test]
+    fn credentials_reach_flash_before_first_object() {
+        let mut piv = Piv::new();
+        piv.state.mgmt_key_authenticated = true;
+        let mut store = MemStore {
+            records: heapless::Vec::new(),
+        };
+        assert_eq!(
+            sw(&piv.process_apdu_with_store(&put_data(0x05, &[1u8; 10]), &mut store)),
+            0x9000
+        );
+        let ids: heapless::Vec<KeyId, 4> = store.records.iter().map(|(k, _)| *k).collect();
+        assert_eq!(
+            &ids[..],
+            &[Piv::piv_pin_key_id(), Piv::piv_mgmt_key_id(), Piv::piv_data_object_key_id(0x05)]
+        );
+    }
+
+    #[test]
+    fn missing_pin_record_next_to_content_locks_out() {
+        let mut piv = Piv::new();
+        piv.state.mgmt_key_authenticated = true;
+        let mut store = MemStore {
+            records: heapless::Vec::new(),
+        };
+        piv.process_apdu_with_store(&put_data(0x05, &[1u8; 10]), &mut store);
+        // Attacker with flash access deletes the PIN record.
+        store.records.retain(|(k, _)| *k != Piv::piv_pin_key_id());
+
+        let mut fresh = Piv::new();
+        fresh.load_from_store(&mut store);
+        assert_eq!(fresh.state.pin_state.pin_retries_remaining, 0);
+        assert_eq!(fresh.state.pin_state.puk_retries_remaining, 0);
+        assert_ne!(fresh.state.mgmt_key, DEFAULT_MGMT_KEY);
+    }
+
+    #[test]
+    fn empty_applet_loads_factory_defaults() {
+        let mut store = MemStore {
+            records: heapless::Vec::new(),
+        };
+        let mut fresh = Piv::new();
+        fresh.load_from_store(&mut store);
+        assert!(fresh.state.pin_state.pin_retries_remaining > 0);
+        assert_eq!(fresh.state.mgmt_key, DEFAULT_MGMT_KEY);
+    }
+
+    #[test]
+    fn piv_reset_only_when_pin_and_puk_blocked() {
+        let mut piv = Piv::new();
+        piv.state.mgmt_key_authenticated = true;
+        let mut store = MemStore {
+            records: heapless::Vec::new(),
+        };
+        piv.process_apdu_with_store(&put_data(0x05, &[1u8; 10]), &mut store);
+        let reset = [0x00, 0xFB, 0x00, 0x00];
+        assert_eq!(sw(&piv.process_apdu_with_store(&reset, &mut store)), 0x6985);
+        assert!(!store.records.is_empty());
+
+        piv.state.lock_out();
+        assert_eq!(sw(&piv.process_apdu_with_store(&reset, &mut store)), 0x9000);
+        assert!(store.records.is_empty(), "applet wiped");
+        assert_eq!(piv.state.mgmt_key, DEFAULT_MGMT_KEY);
+        assert!(piv.state.data_objects.is_empty());
     }
 
     #[test]

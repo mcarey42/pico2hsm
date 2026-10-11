@@ -93,6 +93,10 @@ pub struct OpenPgpState {
     pub pw1_retries: u8,
     /// PW3 remaining retries.
     pub pw3_retries: u8,
+    /// PW1 and PW3 records are on flash.  They must be before any key is:
+    /// on load, missing records next to stored keys mean tampering, not a
+    /// fresh card (see `load_from_store`).
+    pub credentials_persisted: bool,
 
     // --- PIN verification flags ---
     /// PW1 verified for signing (P2=0x81). Cleared after each PSO:CDS.
@@ -269,6 +273,7 @@ impl OpenPgpState {
             pw3_hash: Some(pw3_hash),
             pw1_retries: PW1_MAX_RETRIES,
             pw3_retries: PW3_MAX_RETRIES,
+            credentials_persisted: false,
             pw1_verified_sign: false,
             pw1_verified_other: false,
             pw3_verified: false,
@@ -502,6 +507,19 @@ impl OpenPgp {
         store: &mut dyn crate::storage::KeyStore,
     ) -> ApduResponse {
         match cmd.ins {
+            generate_keypair::INS_GENERATE_KEYPAIR
+                if cmd.p1 == 0x80 && self.state.pw3_verified && !self.state.credentials_persisted =>
+            {
+                // First key for this card: PW1/PW3 go to flash first (see
+                // `OpenPgpState::credentials_persisted`).
+                if Self::save_pw1_to_store(&self.state, store).is_err()
+                    || Self::save_pw3_to_store(&self.state, store).is_err()
+                {
+                    return ApduResponse::err(pico2hsm_core::apdu::SW_MEMORY_FAILURE);
+                }
+                self.state.credentials_persisted = true;
+                generate_keypair::handle_with_store(&mut self.state, store, cmd)
+            }
             generate_keypair::INS_GENERATE_KEYPAIR => {
                 generate_keypair::handle_with_store(&mut self.state, store, cmd)
             }
@@ -610,23 +628,39 @@ impl OpenPgp {
         use crate::security::key_management::{AlgorithmId, KeyType as KmKeyType};
         use pico2hsm_core::key::{AppletId, KeyType as CoreKeyType};
 
-        // Load PW1 state.
-        if let Ok(Some(obj)) = store.fetch_key(OPENPGP_PW1_KEY_ID) {
-            let b = &obj.private_key;
-            if let Some((hash, retries)) = decode_pw(b) {
-                self.state.pw1_hash = hash;
-                self.state.pw1_retries = retries;
+        // PW1/PW3.  A missing record is a fresh card only while no key is
+        // stored (records are written before the first key).  Missing next
+        // to a key, unreadable, or malformed means the flash was tampered
+        // with: that password loads blocked instead of as the public
+        // factory default.  TERMINATE (allowed once PW3 is blocked) is the
+        // way out.
+        let mut has_keys = false;
+        store.for_each_key(&mut |kid| {
+            if kid.applet_byte() == AppletId::OpenPgp as u8
+                && kid != OPENPGP_PW1_KEY_ID
+                && kid != OPENPGP_PW3_KEY_ID
+            {
+                has_keys = true;
+            }
+        });
+        let mut persisted = true;
+        for (kid, hash, retries) in [
+            (OPENPGP_PW1_KEY_ID, &mut self.state.pw1_hash, &mut self.state.pw1_retries),
+            (OPENPGP_PW3_KEY_ID, &mut self.state.pw3_hash, &mut self.state.pw3_retries),
+        ] {
+            match store.fetch_key(kid) {
+                Ok(Some(obj)) => match decode_pw(&obj.private_key) {
+                    Some((h, r)) => {
+                        *hash = h;
+                        *retries = r;
+                    }
+                    None => *retries = 0,
+                },
+                Ok(None) if !has_keys => persisted = false,
+                _ => *retries = 0,
             }
         }
-
-        // Load PW3 state.
-        if let Ok(Some(obj)) = store.fetch_key(OPENPGP_PW3_KEY_ID) {
-            let b = &obj.private_key;
-            if let Some((hash, retries)) = decode_pw(b) {
-                self.state.pw3_hash = hash;
-                self.state.pw3_retries = retries;
-            }
-        }
+        self.state.credentials_persisted = persisted;
 
         // Load key objects for OpenPGP slots.
         let mut openpgp_ids: Vec<pico2hsm_core::key::KeyId, 8> = Vec::new();
@@ -930,6 +964,51 @@ mod pw_tests {
             sw(&mut fresh, &mut store, &apdu(0x20, 0x81, b"123456")),
             0x9000
         );
+    }
+
+    #[test]
+    fn missing_pw_record_next_to_a_key_loads_blocked() {
+        let mut store = MemStore {
+            records: heapless::Vec::new(),
+        };
+        // A stored signature key with no PW1/PW3 records: tampered flash.
+        let sig = KeyId(OPENPGP_PW1_KEY_ID.0 & 0xFFFF_FF00 | SLOT_SIG as u32);
+        store.records.push((sig, heapless::Vec::new())).unwrap();
+        let mut pgp = OpenPgp::new();
+        pgp.load_from_store(&mut store);
+        assert_eq!(pgp.state.pw1_retries, 0);
+        assert_eq!(pgp.state.pw3_retries, 0);
+        assert_eq!(
+            sw(&mut pgp, &mut store, &apdu(0x20, 0x81, b"123456")),
+            0x6983,
+            "factory default PIN must not work"
+        );
+        // ...but the card can still be reset.
+        assert_eq!(
+            sw(&mut pgp, &mut store, &[0x00, 0xE6, 0x00, 0x00]),
+            0x9000,
+            "TERMINATE allowed once PW3 is blocked"
+        );
+    }
+
+    #[test]
+    fn empty_card_loads_factory_defaults() {
+        let mut store = MemStore {
+            records: heapless::Vec::new(),
+        };
+        let mut pgp = OpenPgp::new();
+        pgp.load_from_store(&mut store);
+        assert_eq!(pgp.state.pw1_retries, PW1_MAX_RETRIES);
+        assert!(!pgp.state.credentials_persisted);
+    }
+
+    #[test]
+    fn terminate_needs_pw3_unless_blocked() {
+        let mut store = MemStore {
+            records: heapless::Vec::new(),
+        };
+        let mut pgp = OpenPgp::new();
+        assert_eq!(sw(&mut pgp, &mut store, &[0x00, 0xE6, 0x00, 0x00]), 0x6982);
     }
 
     #[test]

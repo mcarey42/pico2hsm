@@ -29,6 +29,16 @@ Security and robustness release from the October 2026 audit
 - **Release builds on unprovisioned OTP disable the keystore** instead of
   using a fixed public key (debug builds, or the `insecure-dev-keystore`
   feature, keep the development key with a boot warning).
+- **PIV GENERATE KEY PAIR requires the management key** (the PIN alone
+  was accepted).
+- **Missing or unreadable PIN records load as blocked** (PIV PIN/PUK and
+  management key; OpenPGP PW1/PW3) when the applet holds keys, instead of
+  falling back to the factory defaults.  The records are now written
+  before an applet's first key.  A board that already has PIV keys from
+  earlier firmware, without a stored management key, comes up locked out:
+  run `ykman piv reset` (APDU `00 FB 00 00`, newly supported, allowed only
+  while PIN and PUK are blocked).  OpenPGP TERMINATE is now allowed once
+  PW3 is blocked (`gpg --card-edit` → `factory-reset`).
 
 ### Security
 - PIN / SO-PIN / PUK retry counters (SC-HSM, PIV, OpenPGP) are written to
