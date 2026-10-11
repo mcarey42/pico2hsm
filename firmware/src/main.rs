@@ -350,7 +350,7 @@ fn dispatcher_loop(ptr_wrapper: DispatcherPtr) -> ! {
     let dispatcher = unsafe { &mut *dispatcher_ptr };
 
     loop {
-        let apdu_bytes = blocking_receive(&APDU_CHANNEL);
+        let mut apdu_bytes = blocking_receive(&APDU_CHANNEL);
         // No defmt logging inside the receive loop.  All embassy_rp TRACE logs
         // from Core0 fill the RTT buffer rapidly; any defmt write from Core1
         // here would block on BLOCK_IF_FULL mode and deadlock both cores.
@@ -379,6 +379,8 @@ fn dispatcher_loop(ptr_wrapper: DispatcherPtr) -> ! {
             CORE1_PROGRESS.store(10, core::sync::atomic::Ordering::Relaxed);
             let mut ks = Core1KeyStore::new(store_ptr);
             let response = dispatcher.dispatch_with_store(&apdu_bytes, &mut ks);
+            // The command may carry PINs or key material; don't leave it on the stack.
+            zeroize::Zeroize::zeroize(&mut apdu_bytes[..]);
             CORE1_PROGRESS.store(60, core::sync::atomic::Ordering::Relaxed);
             blocking_send(&RESP_CHANNEL, response);
             CORE1_PROGRESS.store(0, core::sync::atomic::Ordering::Relaxed);
@@ -723,6 +725,20 @@ async fn await_core1_response<'d, D: embassy_usb::driver::Driver<'d>>(
     }
 }
 
+/// Send a response to the host, then wipe its data: responses can carry
+/// secrets (decrypted plaintext, ECDH output, wrapped keys).
+#[cfg(target_arch = "arm")]
+async fn send_and_wipe<'d, D: embassy_usb::driver::Driver<'d>>(
+    ccid: &mut pico2hsm_firmware::transport::CcidTransport<'d, D>,
+    response: &mut heapless::Vec<u8, 4098>,
+) -> Result<(), pico2hsm_firmware::transport::ccid::CcidError> {
+    let result = ccid.send_response(response).await;
+    // Keep the trailing SW (not secret): display boards show status from it.
+    let data_len = response.len().saturating_sub(2);
+    zeroize::Zeroize::zeroize(&mut response[..data_len]);
+    result
+}
+
 /// Core1 is stuck: tell the host (SW 6F00) and reset the whole chip.
 ///
 /// Core1 cannot be safely abandoned — it would still own the dispatcher and
@@ -889,12 +905,12 @@ async fn run_one_board(p: embassy_rp::Peripherals) {
                         board.led().set_status(LedStatus::Busy);
                         let _ = APDU_CHANNEL.send(apdu_bytes).await;
                         cortex_m::asm::sev(); // wake core1 from WFE
-                        let response =
+                        let mut response =
                             match await_core1_response(&mut ccid, store, dispatcher_ptr).await {
                                 Some(r) => r,
                                 None => watchdog_reset(&mut ccid).await,
                             };
-                        match ccid.send_response(&response).await {
+                        match send_and_wipe(&mut ccid, &mut response).await {
                             Ok(()) => {
                                 for _ in 0..16 {
                                     pico2hsm_firmware::transport::cdc_serial::drain_one(
@@ -1263,12 +1279,12 @@ async fn run_geek_board(p: embassy_rp::Peripherals) {
                         cortex_m::asm::sev(); // wake core1 from WFE
 
                         // Wait for core1 response (with time extensions every 1.5s)
-                        let response =
+                        let mut response =
                             match await_core1_response(&mut ccid, store, dispatcher_ptr).await {
                                 Some(r) => r,
                                 None => watchdog_reset(&mut ccid).await,
                             };
-                        match ccid.send_response(&response).await {
+                        match send_and_wipe(&mut ccid, &mut response).await {
                             Ok(()) => {
                                 display_state.status = LedStatus::Ready;
                                 display_state.uptime_secs =
@@ -1537,12 +1553,12 @@ async fn run_pico2_board(p: embassy_rp::Peripherals) {
                         // the APDU reaches Core1, causing a permanent hang.
                         let _ = APDU_CHANNEL.send(apdu_bytes).await;
                         cortex_m::asm::sev(); // wake core1 from WFE
-                        let response =
+                        let mut response =
                             match await_core1_response(&mut ccid, store, dispatcher_ptr).await {
                                 Some(r) => r,
                                 None => watchdog_reset(&mut ccid).await,
                             };
-                        match ccid.send_response(&response).await {
+                        match send_and_wipe(&mut ccid, &mut response).await {
                             Ok(()) => {
                                 for _ in 0..16 {
                                     pico2hsm_firmware::transport::cdc_serial::drain_one(
@@ -1991,12 +2007,12 @@ async fn run_waveshare_lcd_board(p: embassy_rp::Peripherals) {
                         let _ = APDU_CHANNEL.send(apdu_bytes).await;
                         cortex_m::asm::sev(); // wake core1 from WFE
                                               // Wait for response with time-extension support.
-                        let response =
+                        let mut response =
                             match await_core1_response(&mut ccid, store, dispatcher_ptr).await {
                                 Some(r) => r,
                                 None => watchdog_reset(&mut ccid).await,
                             };
-                        match ccid.send_response(&response).await {
+                        match send_and_wipe(&mut ccid, &mut response).await {
                             Ok(()) => {
                                 display_state.status = LedStatus::Ready;
                                 display_state.uptime_secs =

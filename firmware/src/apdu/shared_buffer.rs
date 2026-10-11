@@ -45,8 +45,10 @@ impl SharedResponseBuffer {
         }
     }
 
-    /// Clear the buffer to Empty state.
+    /// Clear the buffer to Empty state, wiping the held response bytes —
+    /// they can be secrets (decrypted plaintext, ECDH output, key blobs).
     pub fn invalidate(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.data[..self.len]);
         self.state = SharedBufState::Empty;
         self.len = 0;
         self.offset = 0;
