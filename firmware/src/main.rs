@@ -988,7 +988,7 @@ async fn run_one_board(p: embassy_rp::Peripherals) {
                                 let _ = recv_core1_response(store, dispatcher_ptr).await;
                                 break;
                             }
-                            Err(_) => {}
+                            Err(e) => defmt::error!("CCID: response not sent: {:?}", defmt::Debug2Format(&e)),
                         }
                         board.led().set_status(LedStatus::Ready);
                     }
@@ -1446,7 +1446,7 @@ async fn run_geek_board(p: embassy_rp::Peripherals) {
                                 display_state.status = LedStatus::Ready;
                                 break;
                             }
-                            Err(_) => {}
+                            Err(e) => defmt::error!("CCID: response not sent: {:?}", defmt::Debug2Format(&e)),
                         }
                     }
 
@@ -1639,7 +1639,7 @@ async fn run_pico2_board(p: embassy_rp::Peripherals) {
                                 let _ = recv_core1_response(store, dispatcher_ptr).await;
                                 break;
                             }
-                            Err(_) => {}
+                            Err(e) => defmt::error!("CCID: response not sent: {:?}", defmt::Debug2Format(&e)),
                         }
                         board.led().set_status(LedStatus::Ready);
                     }
@@ -2182,7 +2182,7 @@ async fn run_waveshare_lcd_board(p: embassy_rp::Peripherals) {
                                 display_state.status = LedStatus::Ready;
                                 break;
                             }
-                            Err(_) => {}
+                            Err(e) => defmt::error!("CCID: response not sent: {:?}", defmt::Debug2Format(&e)),
                         }
                     }
                     Err(CcidError::UsbDisconnected) => {

@@ -28,6 +28,10 @@ use pico2hsm_core::{
 
 use super::shared_buffer::SharedResponseBuffer;
 
+/// Most response data one CCID message carries: dwMaxCCIDMessageLength
+/// (4096) minus the 10-byte header and the 2-byte status word.
+pub const MAX_RESPONSE_DATA: usize = 4096 - 10 - 2;
+
 /// INS byte for GET RESPONSE (ISO 7816-4 §7.6.1).
 const INS_GET_RESPONSE: u8 = 0xC0;
 
@@ -364,22 +368,15 @@ impl Dispatcher {
             return out;
         }
 
+        // Never more data than one CCID message can carry: the descriptor
+        // advertises dwMaxCCIDMessageLength 4096 (10-byte header + data +
+        // SW).  Larger responses used to overflow the transport buffer and
+        // were dropped, leaving the host waiting; the rest is now chained
+        // with 61xx / GET RESPONSE, even when the host asked for "all".
         let le_val = match le {
-            None => {
-                // No Le — no truncation.
-                let mut out: Vec<u8, 4098> = Vec::new();
-                let _ = out.extend_from_slice(&raw_resp);
-                return out;
-            }
-            Some(0) => {
-                // Extended APDUs: Le=0x0000 stored as 0, meaning 65536 — don't truncate.
-                // Short APDUs: Le=0x00 is pre-resolved to 256 by parser.
-                // If we get 0 here it's from extended APDU → return all.
-                let mut out: Vec<u8, 4098> = Vec::new();
-                let _ = out.extend_from_slice(&raw_resp);
-                return out;
-            }
-            Some(n) => n as usize,
+            // No Le, or extended Le = 0x0000 (65536): as much as fits.
+            None | Some(0) => MAX_RESPONSE_DATA,
+            Some(n) => (n as usize).min(MAX_RESPONSE_DATA),
         };
 
         if data_len <= le_val {
@@ -688,6 +685,20 @@ mod tests {
             )
         };
         assert!(!bytes.windows(32).any(|w| w == pattern));
+    }
+
+    #[test]
+    fn oversized_response_is_chained_not_dropped() {
+        let mut slot = core::mem::MaybeUninit::<Dispatcher>::uninit();
+        let d = Dispatcher::init_in_place(&mut slot);
+        let mut raw: Vec<u8, 4098> = Vec::new();
+        raw.resize(4096, 0xAB).unwrap();
+        raw.extend_from_slice(&[0x90, 0x00]).unwrap();
+        for le in [None, Some(0)] {
+            let out = d.apply_le_truncation(raw.clone(), le);
+            assert_eq!(out.len(), MAX_RESPONSE_DATA + 2, "fits one CCID message");
+            assert_eq!(&out[out.len() - 2..], &[0x61, 12], "12 bytes left for GET RESPONSE");
+        }
     }
 
     #[test]
