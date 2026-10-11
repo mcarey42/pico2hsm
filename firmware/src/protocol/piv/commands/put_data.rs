@@ -70,11 +70,15 @@ pub fn handle_with_store(
     resp
 }
 
+/// Low bytes of the SP 800-73-4 data objects 5FC101–5FC123.
+const PIV_OBJECT_MIN: u8 = 0x01;
+const PIV_OBJECT_MAX: u8 = 0x23;
+
 /// The stored-object tag (low byte) a GET/PUT DATA body names:
 /// `5C 03 5F C1 xx` or `5C 01 7E` (discovery object).
 pub fn object_tag_low(data: &[u8]) -> Option<u8> {
     match data {
-        [0x5C, 0x03, 0x5F, 0xC1, low, ..] => Some(*low),
+        [0x5C, 0x03, 0x5F, 0xC1, low @ PIV_OBJECT_MIN..=PIV_OBJECT_MAX, ..] => Some(*low),
         [0x5C, 0x01, 0x7E, ..] => Some(0x7E),
         _ => None,
     }
@@ -108,8 +112,12 @@ pub fn handle(state: &mut PivState, cmd: &ApduCommand<'_>) -> ApduResponse {
     let tag_bytes = &data[2..2 + tag_len];
 
     // Determine tag_low for storage
+    // SP 800-73-4 objects only (5FC101–5FC123, 7E).  Any 5FC1xx used to be
+    // stored, so the (by default public) management key could fill the
+    // keystore directory shared with SC-HSM and OpenPGP; and 5FC17E
+    // collided with the discovery object 7E.
     let tag_low = match tag_bytes {
-        [0x5F, 0xC1, low] => *low,
+        [0x5F, 0xC1, low @ PIV_OBJECT_MIN..=PIV_OBJECT_MAX] => *low,
         [0x7E] => 0x7E,
         _ => return ApduResponse::err(0x6A82), // unrecognised tag
     };

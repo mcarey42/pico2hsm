@@ -610,11 +610,16 @@ impl Piv {
                 // object overrides whether or not it is cached.
                 if let Some(tag_low) = put_data::object_tag_low(cmd.data) {
                     let cached = self.state.data_objects.iter().any(|o| o.tag_low == tag_low);
-                    if !cached && get_data::readable(&self.state, tag_low) {
-                        if let Ok(Some(rec)) =
-                            store.fetch_key(Self::piv_data_object_key_id(tag_low))
-                        {
-                            return ApduResponse::ok(&rec.private_key);
+                    let p1p2_ok = cmd.p1 == 0x3F && cmd.p2 == 0xFF;
+                    if !cached && p1p2_ok && get_data::readable(&self.state, tag_low) {
+                        match store.fetch_key(Self::piv_data_object_key_id(tag_low)) {
+                            Ok(Some(rec)) => return ApduResponse::ok(&rec.private_key),
+                            Ok(None) => {}
+                            // Unreadable: not the built-in default instead
+                            // (a CHUID with a different GUID).
+                            Err(_) => {
+                                return ApduResponse::err(pico2hsm_core::apdu::SW_MEMORY_FAILURE)
+                            }
                         }
                     }
                 }
@@ -1105,6 +1110,26 @@ mod data_object_tests {
             sw(&piv.process_apdu_with_store(&get(1), &mut store)),
             0x6A82
         );
+    }
+
+    #[test]
+    fn only_sp800_73_objects_are_stored() {
+        let mut piv = Piv::new();
+        piv.state.mgmt_key_authenticated = true;
+        let mut store = MemStore {
+            records: heapless::Vec::new(),
+        };
+        for low in [0x00u8, 0x24, 0x7E, 0xFF] {
+            assert_eq!(
+                sw(&piv.process_apdu_with_store(&put_data(low, &[1u8; 4]), &mut store)),
+                0x6A82,
+                "5FC1{low:02X}"
+            );
+        }
+        assert!(store
+            .records
+            .iter()
+            .all(|(k, _)| (k.0 >> 8) & 0xFF != 0xD0));
     }
 
     #[test]

@@ -325,10 +325,12 @@ impl Dispatcher {
 
     /// Handle GET RESPONSE (INS=0xC0): serve the next chunk from `shared_buf`.
     fn handle_get_response(&mut self, le: Option<u16>) -> ApduResponse {
+        // Capped like every response (see MAX_RESPONSE_DATA).  The parser
+        // already turns a short Le=00 into 256, so 0 here is an extended
+        // Le=0000: as much as fits.
         let max_len = match le {
-            None => 4096,   // no Le — return all remaining
-            Some(0) => 256, // short APDU Le=0x00 → 256
-            Some(n) => n as usize,
+            None | Some(0) => MAX_RESPONSE_DATA,
+            Some(n) => (n as usize).min(MAX_RESPONSE_DATA),
         };
         match self.shared_buf.get_response_chunk(max_len) {
             Some((chunk, more)) => {
