@@ -45,6 +45,15 @@ _SELECT_OPENPGP_CLEAN = ("00A40400 06" + OPENPGP_AID_PREFIX + "00").replace(" ",
 # Default PW3 (admin) PIN
 _PW3_DEFAULT = "3132333435363738"   # "12345678"
 _VERIFY_PW3  = f"002000830 8{_PW3_DEFAULT}".replace(" ", "")
+# Algorithm attributes persist on the card (as on a real OpenPGP card), so
+# an earlier test (e.g. curve25519) may have left Ed25519/X25519 set:
+# put P-256 back explicitly before generating.  Needs PW3.
+_P256_OID = "2A8648CE3D030107"
+_SET_P256_ATTRS = (
+    f"00DA00C1 09 13{_P256_OID}".replace(" ", ""),  # SIG: ECDSA P-256
+    f"00DA00C2 09 12{_P256_OID}".replace(" ", ""),  # DEC: ECDH P-256
+    f"00DA00C3 09 13{_P256_OID}".replace(" ", ""),  # AUTH: ECDSA P-256
+)
 
 # GENERATE KEY PAIR — SIG slot (B6):
 #   00 47 80 00 02 B6 00 00  — generate new key
@@ -120,6 +129,7 @@ def test_openpgp_genkey_sig_succeeds(runner: CLIRunner, run_dir: Path) -> None:
         runner,
         _SELECT_OPENPGP_CLEAN,
         _VERIFY_PW3,
+        *_SET_P256_ATTRS,
         _GENKEY_SIG,
         save_as="openpgp_02_genkey_sig",
         timeout=120,
@@ -156,6 +166,7 @@ def test_openpgp_genkey_sig_returns_7f49_tlv(runner: CLIRunner) -> None:
         runner,
         _SELECT_OPENPGP_CLEAN,
         _VERIFY_PW3,
+        *_SET_P256_ATTRS,
         _GENKEY_SIG,
         timeout=120,
     )
@@ -186,6 +197,7 @@ def test_openpgp_genkey_sig_public_key_is_valid_p256(runner: CLIRunner) -> None:
         runner,
         _SELECT_OPENPGP_CLEAN,
         _VERIFY_PW3,
+        *_SET_P256_ATTRS,
         _GENKEY_SIG,
         timeout=120,
     )
@@ -225,7 +237,8 @@ def test_openpgp_read_pubkey_sig_after_genkey(runner: CLIRunner) -> None:
     """READ PUBLIC KEY (P1=0x81) for SIG slot must return the same key as GENKEY."""
     # Generate key and capture the point
     result_gen = _send_apdus(
-        runner, _SELECT_OPENPGP_CLEAN, _VERIFY_PW3, _GENKEY_SIG, timeout=120,
+        runner, _SELECT_OPENPGP_CLEAN, _VERIFY_PW3,
+        *_SET_P256_ATTRS, _GENKEY_SIG, timeout=120,
     )
     gen_sw = _sw_from_output(result_gen.stdout + result_gen.stderr)
     if gen_sw != "9000":
@@ -272,7 +285,8 @@ def test_openpgp_gpg_card_status_shows_sig_fingerprint(
     fingerprint = bytes(range(0xA0, 0xB4))  # 20 recognisable bytes
     put_fp_sig = f"00DA00C714{fingerprint.hex()}"
     result_gen = _send_apdus(
-        runner, _SELECT_OPENPGP_CLEAN, _VERIFY_PW3, _GENKEY_SIG, put_fp_sig, timeout=120,
+        runner, _SELECT_OPENPGP_CLEAN, _VERIFY_PW3,
+        *_SET_P256_ATTRS, _GENKEY_SIG, put_fp_sig, timeout=120,
     )
     gen_sw = _sw_from_output(result_gen.stdout + result_gen.stderr)
     if gen_sw != "9000":
