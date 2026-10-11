@@ -56,7 +56,7 @@ const DIR_MAX_ENTRIES: usize = (SECTOR_SIZE - DIR_HEADER_SIZE) / DIR_ENTRY_SIZE;
 /// Maximum entries tracked in the in-RAM `Directory` — exactly what one
 /// directory sector can hold, so RAM can never accept an entry that
 /// `serialize` would then fail to persist (was 512 vs. 340 on flash).
-const MAX_DIRECTORY_ENTRIES: usize = DIR_MAX_ENTRIES;
+pub const MAX_DIRECTORY_ENTRIES: usize = DIR_MAX_ENTRIES;
 
 // ─── Directory ────────────────────────────────────────────────────────────────
 

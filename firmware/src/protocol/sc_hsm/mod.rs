@@ -151,6 +151,14 @@ pub enum OpBufState {
     Dirty(u32),
 }
 
+/// Capacity of the SC-HSM key/EF index.  At least the flash directory's,
+/// so an object that fits on flash always fits here: with 32 entries the
+/// 33rd key or file was saved (9000) yet unreachable until a reset.
+/// 8 bytes per entry.
+pub const MAX_KEY_INDEX: usize = 340;
+#[cfg(target_arch = "arm")]
+const _: () = assert!(MAX_KEY_INDEX >= crate::storage::filesystem::MAX_DIRECTORY_ENTRIES);
+
 /// Lightweight metadata for a key or EF file stored in flash.
 /// Kept in RAM so LIST KEYS, SELECT, MSE SET, and PRKD generation
 /// can answer without touching flash.
@@ -396,7 +404,7 @@ pub struct ScHsmState {
     /// Lightweight metadata index for all keys and EF files in flash.
     /// Replaces the previous `keys`, `rsa_keys`, `sym_keys`, and `ef_files`
     /// Vec fields. Key material stays in flash; only metadata lives in RAM.
-    pub key_index: Vec<KeyMeta, 32>,
+    pub key_index: Vec<KeyMeta, MAX_KEY_INDEX>,
 
     /// Single operational buffer for key/EF data access.
     /// Loaded on-demand from flash; flushed back when dirty.

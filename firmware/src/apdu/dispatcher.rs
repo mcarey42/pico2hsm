@@ -180,7 +180,10 @@ impl Dispatcher {
     /// preventing core0 stack overflow on display boards.
     #[inline(never)]
     pub fn load_keys_from_store(&mut self, store: &mut dyn crate::storage::KeyStore) {
-        let mut sc_hsm_ids: Vec<pico2hsm_core::key::KeyId, 64> = Vec::new();
+        // Room for every SC-HSM object the directory can hold (~1.4 KB of
+        // core0 stack); a 64-entry list silently skipped the rest.
+        let mut sc_hsm_ids: Vec<pico2hsm_core::key::KeyId, { crate::protocol::sc_hsm::MAX_KEY_INDEX }> =
+            Vec::new();
         store.for_each_key(&mut |kid| {
             // Skip firmware records that are not keys: PIN record (0xFF),
             // persisted DKEK (0xFD) and enrolled peer key (0xFC).  The
