@@ -54,7 +54,7 @@ pub const INS_READ_BINARY_ODD: u8 = 0xB1;
 //     30 xx                         -- CommonObjectAttributes (SEQUENCE)
 //       03 02 06 C0                 -- flags BIT STRING (sign + keyAgreement)
 //     30 xx                         -- CommonKeyAttributes (SEQUENCE)
-//       04 01 <key_id>              -- iD
+//       04 14 <SHA-1(x)>            -- iD (CKA_ID; see `prkd_id`)
 //       03 02 06 C0                 -- usage BIT STRING
 //       01 01 FF                    -- native TRUE
 //     A1 xx                         -- [1] typeAttributes: PrivateECKeyAttributes
@@ -80,7 +80,7 @@ fn ec_field_size(algo: u8) -> u16 {
     }
 }
 
-fn build_ec_prkd(key_id: u8, algo: u8) -> Vec<u8, 256> {
+fn build_ec_prkd(key_id: u8, algo: u8, id: &[u8]) -> Vec<u8, 256> {
     // CommonObjectFlags BIT STRING: private (bit 0) + modifiable (bit 1).
     let coa_flags: [u8; 4] = [0x03, 0x02, 0x06, 0xC0];
 
@@ -98,14 +98,15 @@ fn build_ec_prkd(key_id: u8, algo: u8) -> Vec<u8, 256> {
     let _ = coa_seq.extend_from_slice(&coa_inner);
 
     // CommonKeyAttributes: raw SEQUENCE (tag 0x30)
-    let mut cka_inner: Vec<u8, 32> = Vec::new();
+    let mut cka_inner: Vec<u8, 48> = Vec::new();
     // iD (required)
-    let _ = cka_inner.extend_from_slice(&[0x04, 0x01, key_id]);
+    let _ = cka_inner.extend_from_slice(&[0x04, id.len() as u8]);
+    let _ = cka_inner.extend_from_slice(id);
     // usage (required)
     let _ = cka_inner.extend_from_slice(&key_usage);
     // native (optional)
     let _ = cka_inner.extend_from_slice(&[0x01, 0x01, 0xFF]);
-    let mut cka_seq: Vec<u8, 48> = Vec::new();
+    let mut cka_seq: Vec<u8, 56> = Vec::new();
     let _ = cka_seq.push(0x30);
     let _ = cka_seq.push(cka_inner.len() as u8);
     let _ = cka_seq.extend_from_slice(&cka_inner);
@@ -164,7 +165,7 @@ fn build_ec_prkd(key_id: u8, algo: u8) -> Vec<u8, 256> {
 //     30 xx                         -- CommonObjectAttributes (SEQUENCE)
 //       03 02 05 C0                 -- flags BIT STRING (sign + decrypt)
 //     30 xx                         -- CommonKeyAttributes (SEQUENCE)
-//       04 01 <key_id>              -- iD
+//       04 14 <SHA-1(n)>            -- iD (CKA_ID; see `prkd_id`)
 //       03 02 05 C0                 -- usage BIT STRING
 //       01 01 FF                    -- native TRUE
 //     A1 xx                         -- [1] typeAttributes: PrivateRSAKeyAttributes
@@ -185,7 +186,7 @@ fn rsa_modulus_length(algo: u8) -> u16 {
 }
 
 #[cfg(feature = "rsa")]
-fn build_rsa_prkd(key_id: u8, algo: u8) -> Vec<u8, 256> {
+fn build_rsa_prkd(key_id: u8, algo: u8, id: &[u8]) -> Vec<u8, 256> {
     let modulus_len = rsa_modulus_length(algo);
 
     // keyUsageFlags BIT STRING: sign (bit 1) + decrypt (bit 3) = 0xC0 in the usage byte,
@@ -200,11 +201,12 @@ fn build_rsa_prkd(key_id: u8, algo: u8) -> Vec<u8, 256> {
     let _ = coa_seq.extend_from_slice(&coa_inner);
 
     // CommonKeyAttributes: raw SEQUENCE (tag 0x30)
-    let mut cka_inner: Vec<u8, 32> = Vec::new();
-    let _ = cka_inner.extend_from_slice(&[0x04, 0x01, key_id]);
+    let mut cka_inner: Vec<u8, 48> = Vec::new();
+    let _ = cka_inner.extend_from_slice(&[0x04, id.len() as u8]);
+    let _ = cka_inner.extend_from_slice(id);
     let _ = cka_inner.extend_from_slice(&key_usage_bs);
     let _ = cka_inner.extend_from_slice(&[0x01, 0x01, 0xFF]);
-    let mut cka_seq: Vec<u8, 40> = Vec::new();
+    let mut cka_seq: Vec<u8, 56> = Vec::new();
     let _ = cka_seq.push(0x30);
     let _ = cka_seq.push(cka_inner.len() as u8);
     let _ = cka_seq.extend_from_slice(&cka_inner);
@@ -252,6 +254,24 @@ fn build_rsa_prkd(key_id: u8, algo: u8) -> Vec<u8, 256> {
     let _ = out.extend_from_slice(&rsa_attr);
 
     out
+}
+
+/// The CKA_ID of a synthesised PRKD (a key with no PRKD written by
+/// OpenSC): the key's global object ID — the intrinsic ID OpenSC itself
+/// would compute, SHA-1(x) for EC and SHA-1(n) for RSA
+/// (`domain::object_id`) — so it is the same on every member, whatever
+/// the slot.  Keys without one (and unreadable keys) keep the key
+/// reference, as before.
+fn prkd_id(store: &mut dyn KeyStore, key_id: u8) -> ([u8; 20], usize) {
+    let mut out = [0u8; 20];
+    if let Ok(Some(obj)) = store.fetch_key(KeyId::sc_hsm(0, key_id)) {
+        if let Some(id) = crate::domain::object_id::intrinsic(&obj) {
+            out.copy_from_slice(&id.bytes);
+            return (out, usize::from(id.len));
+        }
+    }
+    out[0] = key_id;
+    (out, 1)
 }
 
 // ---------------------------------------------------------------------------
@@ -410,10 +430,13 @@ fn read_file(
                 .iter()
                 .find(|m| m.key_id == full_key_id && m.key_type != 16);
             if let Some(meta) = meta {
-                if is_rsa_algo(meta.algo) {
+                let algo = meta.algo;
+                let (id, id_len) = prkd_id(store, key_id_proto);
+                let id = &id[..id_len];
+                if is_rsa_algo(algo) {
                     #[cfg(feature = "rsa")]
                     {
-                        let prkd = build_rsa_prkd(key_id_proto, meta.algo);
+                        let prkd = build_rsa_prkd(key_id_proto, algo, id);
                         let start = offset.min(prkd.len());
                         let slice = &prkd[start..prkd.len().min(start + max_len)];
                         return ApduResponse::ok(slice);
@@ -421,7 +444,7 @@ fn read_file(
                     #[cfg(not(feature = "rsa"))]
                     return ApduResponse::err(SW_FILE_NOT_FOUND);
                 } else {
-                    let prkd = build_ec_prkd(key_id_proto, meta.algo);
+                    let prkd = build_ec_prkd(key_id_proto, algo, id);
                     let start = offset.min(prkd.len());
                     let slice = &prkd[start..prkd.len().min(start + max_len)];
                     return ApduResponse::ok(slice);

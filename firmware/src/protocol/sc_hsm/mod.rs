@@ -106,6 +106,79 @@ impl RetryCounter {
     const ALL: [Self; 3] = [Self::UserPin, Self::SoPin, Self::Puk];
 }
 
+/// A command that changes SC-HSM's objects, numbered by the Lamport
+/// counter (see `ScHsm::numbered_change`).
+#[derive(Clone, Copy, Debug)]
+enum Change {
+    /// GENERATE KEY PAIR, GENERATE KEY or UNWRAP into a key slot
+    /// (`None`: the card picks the slot).
+    Key { key_ref: Option<u8> },
+    /// DELETE FILE of a key (CC xx) or an EF.
+    Delete { local: KeyId },
+    /// WRITE DATA / UPDATE BINARY of an EF, which `existed` before.
+    WriteEf { local: KeyId, existed: bool },
+}
+
+impl Change {
+    /// The change `cmd` would make, if its session may make one.  Mirrors
+    /// each handler's own file addressing; a command it cannot address is
+    /// left to the handler to refuse.
+    fn of(cmd: &ApduCommand<'_>, state: &ScHsmState) -> Option<Self> {
+        if !state.pin_verified && !state.so_pin_verified {
+            return None;
+        }
+        let ef = |fid: u16| KeyId::sc_hsm_ef_checked(0, (fid >> 8) as u8, fid as u8);
+        let existed = |kid: KeyId| {
+            state
+                .key_index
+                .iter()
+                .any(|m| m.key_type == 16 && m.key_id == kid.0)
+        };
+        match cmd.ins {
+            generate_keypair::INS_GENERATE_KEYPAIR => Some(Change::Key {
+                key_ref: (cmd.p1 != 0xFF).then_some(cmd.p1),
+            }),
+            generate_key::INS_GENERATE_KEY | import_key::INS_IMPORT_KEY => Some(Change::Key {
+                key_ref: Some(cmd.p1),
+            }),
+            delete_file::INS_DELETE_FILE => {
+                let fid = match cmd.p1 {
+                    0x02 => u16::from_be_bytes([*cmd.data.first()?, *cmd.data.get(1)?]),
+                    0x00 => state.current_file?,
+                    _ => return None,
+                };
+                let local = if (fid >> 8) as u8 == delete_file::KEY_PREFIX {
+                    KeyId::sc_hsm(0, fid as u8)
+                } else {
+                    ef(fid)?
+                };
+                Some(Change::Delete { local })
+            }
+            write_data::INS_WRITE_DATA => {
+                let addressed = u16::from_be_bytes([cmd.p1, cmd.p2]);
+                let fid = if addressed != 0 {
+                    addressed
+                } else {
+                    state.current_file?
+                };
+                let local = ef(fid)?;
+                Some(Change::WriteEf {
+                    local,
+                    existed: existed(local),
+                })
+            }
+            update_binary::INS_UPDATE_BINARY => {
+                let local = ef(state.current_file?)?;
+                Some(Change::WriteEf {
+                    local,
+                    existed: existed(local),
+                })
+            }
+            _ => None,
+        }
+    }
+}
+
 /// Local no-op `KeyStore` used by the legacy `dispatch()` path.
 ///
 /// On the firmware this path is never reached for store-mutating commands
@@ -163,6 +236,12 @@ impl RetryCounterBackend for LocalNullStore {
         &mut self,
         _: &[(Credential, CounterState)],
     ) -> Result<(), pico2hsm_core::error::StorageError> {
+        Ok(())
+    }
+    fn lamport(&mut self) -> Result<u64, pico2hsm_core::error::StorageError> {
+        Ok(0)
+    }
+    fn put_lamport(&mut self, _: u64) -> Result<(), pico2hsm_core::error::StorageError> {
         Ok(())
     }
 }
@@ -477,13 +556,20 @@ pub struct ScHsmState {
     /// Incremented unconditionally on every write; mod 16 gives the slot.
     pub exchange_challenge_cache_write_idx: u8,
 
-    /// Monotonic generation counter, incremented on key generate/import/delete.
-    pub generation: u64,
+    /// Highest Lamport version seen in a record from another member
+    /// (cluster plan V3 §6.1; raised by record import in P3).  The counter
+    /// itself is persisted in the retry-counter log, never cached here.
+    pub lamport_seen: u64,
 
-    /// Enrolled peer device static public key (65-byte uncompressed P-256).
-    /// Used by V2 DKEK exchange to verify the peer's ECDSA signature.
-    /// None = unauthenticated mode (signature verification skipped).
-    pub noise_enrolled_peer_pubkey: Option<[u8; 65]>,
+    /// The domain key, derived from the DKEK whenever the DKEK is loaded
+    /// or completed (`crate::domain::key`).  `None` without a DKEK.
+    pub domain: Option<crate::domain::key::DomainKey>,
+
+    /// The peer device's static public key (65-byte uncompressed P-256),
+    /// pinned with ENROLL_PEER_PUBKEY for the next V2 DKEK exchange only
+    /// (§5.2 step 3): the exchange that completes with it consumes it.
+    /// Persisted at `domain::records::PINNED_PEER`.
+    pub pinned_peer: Option<[u8; 65]>,
 
     /// In-memory EF file data cache.
     ///
@@ -539,8 +625,9 @@ impl ScHsmState {
             exchange_challenge_cache: [[0u8; 32]; MAX_EXCHANGE_CHALLENGE_CACHE],
             exchange_challenge_cache_count: 0,
             exchange_challenge_cache_write_idx: 0,
-            generation: 0,
-            noise_enrolled_peer_pubkey: None,
+            lamport_seen: 0,
+            domain: None,
+            pinned_peer: None,
             ef_cache: Vec::new(),
         }
     }
@@ -589,8 +676,9 @@ impl ScHsmState {
                 .write([[0u8; 32]; MAX_EXCHANGE_CHALLENGE_CACHE]);
             addr_of_mut!((*dest).exchange_challenge_cache_count).write(0);
             addr_of_mut!((*dest).exchange_challenge_cache_write_idx).write(0);
-            addr_of_mut!((*dest).generation).write(0);
-            addr_of_mut!((*dest).noise_enrolled_peer_pubkey).write(None);
+            addr_of_mut!((*dest).lamport_seen).write(0);
+            addr_of_mut!((*dest).domain).write(None);
+            addr_of_mut!((*dest).pinned_peer).write(None);
             addr_of_mut!((*dest).ef_cache).write(Vec::new());
         }
     }
@@ -724,9 +812,10 @@ impl ScHsm {
         resp: ApduResponse,
         store: &mut dyn crate::storage::KeyStore,
     ) -> ApduResponse {
-        if self.state.dkek.is_ready() != had_dkek
-            && Self::save_dkek_to_store(&self.state, store).is_err()
-        {
+        if self.state.dkek.is_ready() == had_dkek {
+            return resp;
+        }
+        if Self::save_dkek_to_store(&self.state, store).is_err() {
             // A DKEK flash doesn't hold must not be used: anything wrapped
             // under it this session could never be unwrapped after a
             // reboot.  (A cleared DKEK stays cleared — the stricter side.)
@@ -734,9 +823,94 @@ impl ScHsm {
                 self.state.dkek.clear();
                 self.state.dkek_shares_imported = 0;
             }
+            Self::derive_domain(&mut self.state);
+            return ApduResponse::err(SW_MEMORY_FAILURE);
+        }
+        // The domain follows the DKEK (cluster plan V3 §4.1, §5.1).
+        Self::derive_domain(&mut self.state);
+        if Self::ensure_self_member(&self.state, store).is_err() {
+            // The DKEK is on flash and stays; the self certificate is
+            // retried at the next boot (`load_domain_from_store`).
             return ApduResponse::err(SW_MEMORY_FAILURE);
         }
         resp
+    }
+
+    /// Number a change with the Lamport counter (cluster plan V3 §6.1),
+    /// then run it, then keep the object IDs (§6.2) in step with it.
+    ///
+    /// The counter is persisted *before* the change: a failure to persist
+    /// refuses the command (6581) and nothing changes.  A refused or failed
+    /// command leaves a gap in the numbering, which is harmless — the
+    /// counter only has to grow.  Only sessions that may change something
+    /// (user PIN or SO-PIN verified) spend a counter record, so
+    /// unauthenticated APDUs cannot wear the log.
+    fn numbered_change(
+        &mut self,
+        change: Change,
+        cmd: &ApduCommand<'_>,
+        store: &mut dyn crate::storage::KeyStore,
+    ) -> ApduResponse {
+        use crate::domain::object_id;
+
+        if retry_counter::advance_lamport(store, self.state.lamport_seen).is_err() {
+            return ApduResponse::err(SW_MEMORY_FAILURE);
+        }
+        let resp = self.route_handler(cmd, store);
+        if resp.sw != SW_OK {
+            return resp;
+        }
+        match change {
+            Change::Key { key_ref: Some(r) } => {
+                let local = KeyId::sc_hsm(0, r);
+                let symmetric = self.state.key_index.iter().any(|m| {
+                    m.key_id == local.0
+                        && (m.key_type == CoreKeyType::Aes128 as u8
+                            || m.key_type == CoreKeyType::Aes192 as u8
+                            || m.key_type == CoreKeyType::Aes256 as u8)
+                });
+                // Asymmetric keys have an intrinsic ID and need no sidecar.
+                if symmetric && object_id::assign_random(store, local, object_id::KIND_KEY).is_err()
+                {
+                    self.undo_create(store, local);
+                    return ApduResponse::err(SW_MEMORY_FAILURE);
+                }
+            }
+            Change::Key { key_ref: None } => {}
+            Change::Delete { local } => {
+                // An orphaned sidecar is harmless: creating an object at
+                // this address always writes a fresh one, and asymmetric
+                // keys never read theirs.  The delete itself succeeded.
+                match object_id::erase_sidecar(store, local) {
+                    Ok(()) | Err(_) => {}
+                }
+            }
+            Change::WriteEf { local, existed } => {
+                let created = !existed
+                    && self
+                        .state
+                        .key_index
+                        .iter()
+                        .any(|m| m.key_type == 16 && m.key_id == local.0);
+                if created
+                    && object_id::is_standalone_ef((local.0 & 0xFFFF) as u16)
+                    && object_id::assign_random(store, local, object_id::KIND_FILE).is_err()
+                {
+                    self.undo_create(store, local);
+                    return ApduResponse::err(SW_MEMORY_FAILURE);
+                }
+            }
+        }
+        resp
+    }
+
+    /// Roll back an object just created whose ID could not be stored.  If
+    /// even the erase fails, the object stays and gets its ID lazily.
+    fn undo_create(&mut self, store: &mut dyn crate::storage::KeyStore, local: KeyId) {
+        if store.erase_key(local).is_ok() {
+            self.state.key_index.retain(|m| m.key_id != local.0);
+            self.state.ef_cache_remove(local.0);
+        }
     }
 
     /// Spend one retry of `counter` on flash, run the command, then persist
@@ -817,6 +991,18 @@ impl ScHsm {
         if Self::targets_reserved_slot(cmd) {
             return ApduResponse::err(SW_INCORRECT_P1P2);
         }
+        match Change::of(cmd, &self.state) {
+            Some(change) => self.numbered_change(change, cmd, store),
+            None => self.route_handler(cmd, store),
+        }
+    }
+
+    /// The handler for `cmd`.
+    fn route_handler(
+        &mut self,
+        cmd: &ApduCommand<'_>,
+        store: &mut dyn crate::storage::KeyStore,
+    ) -> ApduResponse {
         match cmd.ins {
             initialize::INS_INITIALIZE => initialize::handle(&mut self.state, store, cmd),
             // Credential checks: persistence is handled by with_persisted_attempt.
@@ -1253,61 +1439,185 @@ impl ScHsm {
         }
     }
 
-    /// KeyId for the enrolled peer public key in flash.
+    /// KeyId of the legacy permanent peer slot (before the member list).
+    /// Read once by the boot migration, then erased; still reserved.
     pub fn sc_hsm_peer_pubkey_key_id() -> KeyId {
         KeyId::sc_hsm(0, 0xFC)
     }
 
-    /// Persist the enrolled peer public key to flash.
+    /// Persist the pinned peer (or erase the record when there is none).
     ///
-    /// Stored as a Generic key object at `KeyId::sc_hsm(0, 0xFC)`.
-    /// Layout:
+    /// Stored as a Generic key object at `domain::records::PINNED_PEER`:
     ///   [0..65]  peer P-256 uncompressed public key (04 || x || y)
-    ///   [65]     reserved (0; formerly the unauthenticated-exchange flag)
-    pub fn save_peer_pubkey_to_store(
+    ///   [65]     reserved (0)
+    #[inline(never)] // keeps its KeyObject temporaries off the caller's frame (core1 stack)
+    pub fn save_pinned_peer(
         state: &ScHsmState,
         store: &mut dyn crate::storage::KeyStore,
     ) -> Result<(), HsmError> {
         use crate::security::key_management::{AlgorithmId, KeyObject, KeyType as KmKeyType};
-        use pico2hsm_core::key::AppletId;
 
-        let kid = Self::sc_hsm_peer_pubkey_key_id();
+        let kid = crate::domain::records::PINNED_PEER;
+        let Some(ref pubkey) = state.pinned_peer else {
+            if store.fetch_key(kid)?.is_some() {
+                return store.erase_key(kid);
+            }
+            return Ok(());
+        };
+        let mut obj = KeyObject::new(
+            KmKeyType::Generic,
+            kid.0,
+            AppletId::Domain,
+            AlgorithmId::AesGcm,
+        );
+        let _ = obj.private_key.extend_from_slice(pubkey);
+        let _ = obj.private_key.push(0);
+        store.save_key(&obj)
+    }
 
-        if let Some(ref pubkey) = state.noise_enrolled_peer_pubkey {
-            let mut buf: Vec<u8, 128> = Vec::new();
-            let _ = buf.extend_from_slice(pubkey);
-            let _ = buf.push(0);
+    /// Spend the pinned peer: erase it from flash, then from RAM.  Called
+    /// by the exchange step that releases or installs the DKEK, *before*
+    /// it does so — a pin that cannot be erased stops the exchange.
+    #[inline(never)] // keeps its KeyObject temporaries off the caller's frame (core1 stack)
+    pub fn consume_pinned_peer(
+        state: &mut ScHsmState,
+        store: &mut dyn crate::storage::KeyStore,
+    ) -> Result<(), HsmError> {
+        // A legacy 0xFC record not yet moved (`migrate_domain`) is the
+        // same pin and goes too, or it would come back at the next boot.
+        for kid in [
+            crate::domain::records::PINNED_PEER,
+            Self::sc_hsm_peer_pubkey_key_id(),
+        ] {
+            if store.fetch_key(kid)?.is_some() {
+                store.erase_key(kid)?;
+            }
+        }
+        state.pinned_peer = None;
+        Ok(())
+    }
 
-            let mut obj = KeyObject::new(
-                KmKeyType::Generic,
-                kid.0,
-                AppletId::ScHsm,
-                AlgorithmId::AesGcm,
-            );
-            let _ = obj.private_key.extend_from_slice(&buf);
-            store.save_key(&obj)
-        } else {
-            // No peer enrolled — erase from flash if present.
-            store.erase_key(kid)
+    /// A stored peer record's key, if it is a valid P-256 point.
+    fn peer_from_record(b: &[u8]) -> Option<[u8; 65]> {
+        let pubkey: [u8; 65] = b.get(..65)?.try_into().ok()?;
+        p256::ecdsa::VerifyingKey::from_sec1_bytes(&pubkey)
+            .is_ok()
+            .then_some(pubkey)
+    }
+
+    /// Load the pinned peer into `state` (read only).  A peer enrolled in
+    /// the legacy permanent slot 0xFC, not yet moved by `migrate_domain`,
+    /// is the pin for the next exchange.
+    #[inline(never)] // keeps its KeyObject temporaries off the caller's frame (core1 stack)
+    pub fn load_pinned_peer(state: &mut ScHsmState, store: &mut dyn crate::storage::KeyStore) {
+        state.pinned_peer = None;
+        for kid in [
+            crate::domain::records::PINNED_PEER,
+            Self::sc_hsm_peer_pubkey_key_id(),
+        ] {
+            if let Ok(Some(obj)) = store.fetch_key(kid) {
+                state.pinned_peer = Self::peer_from_record(&obj.private_key);
+                return;
+            }
         }
     }
 
-    /// Load the enrolled peer public key from flash into `state`.
-    pub fn load_peer_pubkey_from_store(
+    /// Move a legacy 0xFC enrollment into the pinned-peer record: write
+    /// the new record, then erase 0xFC.  Either step failing leaves a state
+    /// `load_pinned_peer` reads the same way; the move is retried at the
+    /// next boot.
+    #[inline(never)]
+    fn migrate_legacy_peer(state: &ScHsmState, store: &mut dyn crate::storage::KeyStore) {
+        let legacy = Self::sc_hsm_peer_pubkey_key_id();
+        if state.pinned_peer.is_none() || !matches!(store.fetch_key(legacy), Ok(Some(_))) {
+            return;
+        }
+        if Self::save_pinned_peer(state, store).is_ok() {
+            // If the erase fails both records hold the same key, and
+            // consuming the pin erases both.
+            match store.erase_key(legacy) {
+                Ok(()) | Err(_) => {}
+            }
+        }
+    }
+
+    /// The device identity (member) public key, from key ref 0xFE.
+    #[inline(never)] // keeps its KeyObject temporaries off the caller's frame (core1 stack)
+    pub fn device_member_pub(store: &mut dyn crate::storage::KeyStore) -> Option<[u8; 65]> {
+        match store.fetch_key(KeyId::sc_hsm(0, 0xFE)) {
+            Ok(Some(obj)) => obj.public_key.as_slice().try_into().ok(),
+            _ => None,
+        }
+    }
+
+    /// Derive the domain key from the DKEK in `state` (or drop it if there
+    /// is no DKEK).
+    pub fn derive_domain(state: &mut ScHsmState) {
+        state.domain = state
+            .dkek
+            .get_dkek()
+            .and_then(|d| crate::domain::key::DomainKey::derive(d).ok());
+    }
+
+    /// A device that holds the DKEK and has no member list yet issues its
+    /// own member certificate (§5.1): sponsor = itself, may sponsor.  The
+    /// Lamport counter is advanced first; the certificate carries the new
+    /// value.  `Ok(false)`: nothing to do (no domain key, no identity key,
+    /// or a list already exists).
+    pub fn ensure_self_member(
+        state: &ScHsmState,
+        store: &mut dyn crate::storage::KeyStore,
+    ) -> Result<bool, HsmError> {
+        use crate::domain::member;
+
+        let Some(domain) = state.domain.as_ref() else {
+            return Ok(false);
+        };
+        let Some(own) = Self::device_member_pub(store) else {
+            return Ok(false);
+        };
+        if member::count(store)? > 0 {
+            return Ok(false);
+        }
+        let lamport = retry_counter::advance_lamport(store, state.lamport_seen)?;
+        Self::save_self_cert(domain, &own, lamport, store)?;
+        Ok(true)
+    }
+
+    #[inline(never)]
+    fn save_self_cert(
+        domain: &crate::domain::key::DomainKey,
+        own: &[u8; 65],
+        lamport: u64,
+        store: &mut dyn crate::storage::KeyStore,
+    ) -> Result<(), HsmError> {
+        use crate::domain::member::{self, MemberCert, MemberEntry, FLAG_MAY_SPONSOR};
+        let id = member::member_id(own);
+        let cert = MemberCert::issue(domain, own, &id, lamport, FLAG_MAY_SPONSOR)
+            .map_err(|_| HsmError::Crypto(pico2hsm_core::error::CryptoError::SignFailure))?;
+        member::save(store, 0, &MemberEntry::active(cert))
+    }
+
+    /// Boot / reset, read only: the pinned peer and the domain key.  Runs
+    /// after `load_dkek_from_store`.  (On the SD-card boards a USB reset
+    /// reloads on core1, which must not write the counter log on internal
+    /// flash — so all writes are in [`Self::migrate_domain`].)
+    pub fn load_domain_from_store(
         state: &mut ScHsmState,
         store: &mut dyn crate::storage::KeyStore,
     ) {
-        let kid = Self::sc_hsm_peer_pubkey_key_id();
-        if let Ok(Some(obj)) = store.fetch_key(kid) {
-            let b = &obj.private_key;
-            if b.len() >= 66 {
-                let mut pubkey = [0u8; 65];
-                pubkey.copy_from_slice(&b[0..65]);
-                // Validate the key is still a valid P-256 point before trusting it.
-                if p256::ecdsa::VerifyingKey::from_sec1_bytes(&pubkey).is_ok() {
-                    state.noise_enrolled_peer_pubkey = Some(pubkey);
-                }
-            }
+        Self::load_pinned_peer(state, store);
+        Self::derive_domain(state);
+    }
+
+    /// Boot only, on core0, after the load: move a legacy 0xFC enrollment
+    /// into the pinned-peer record, and let a device that held a DKEK
+    /// before this firmware certify itself.  Failures are retried at the
+    /// next boot (DOMAIN_STATUS shows a missing self certificate).
+    pub fn migrate_domain(state: &ScHsmState, store: &mut dyn crate::storage::KeyStore) {
+        Self::migrate_legacy_peer(state, store);
+        match Self::ensure_self_member(state, store) {
+            Ok(_) | Err(_) => {}
         }
     }
 
@@ -2049,3 +2359,6 @@ mod reserved_slot_and_dkek_tests {
 
 #[cfg(test)]
 pub(crate) mod policy_tests;
+
+#[cfg(test)]
+mod domain_tests;

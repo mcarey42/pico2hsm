@@ -9,16 +9,18 @@
 //! - P1=0x06: HMAC-SHA256
 //! - P1=0x30: GET_DEVICE_PUBLIC_KEY
 //! - P1=0x31–0x33: (removed — V1 DKEK exchange, returns SW_INS_NOT_SUPPORTED)
-//! - P1=0x34: GET_GENERATION (V1 compat, returns low 4 bytes of generation counter)
+//! - P1=0x34: GET_GENERATION (V1 compat, low 4 bytes of the Lamport counter)
 //! - P1=0x35: NOISE_TARGET_INIT (V2 mutual-auth DKEK exchange, SO-PIN)
 //! - P1=0x36: NOISE_SOURCE_RESPOND (V2, SO-PIN)
 //! - P1=0x37: NOISE_FINALIZE_SEND_V2 (SO-PIN)
 //! - P1=0x38: NOISE_FINALIZE_RECV_V2 (SO-PIN)
-//! - P1=0x39: GET_KEY_MANIFEST (user PIN)
+//! - P1=0x39: GET_KEY_MANIFEST (user PIN; paged, P2 = first key ref)
 //! - P1=0x3A: GET_STATE_HASH
 //! - P1=0x3B: SIGN_ENROLLMENT
-//! - P1=0x3C: GET_GENERATION_V2
-//! - P1=0x3D: ENROLL_PEER_PUBKEY (SO-PIN required)
+//! - P1=0x3C: GET_GENERATION_V2 (the persisted Lamport counter, u64)
+//! - P1=0x3D: ENROLL_PEER_PUBKEY (SO-PIN; pins the peer for one exchange)
+//! - P1=0x40: DOMAIN_STATUS (no auth)
+//! - P1=0x47: GET_MEMBERS (no auth; paged, P2 = first slot)
 
 use pico2hsm_core::apdu::{
     ApduCommand, ApduResponse, SW_CONDITIONS_NOT_SATISFIED, SW_SECURITY_STATUS, SW_WRONG_DATA,
@@ -43,9 +45,11 @@ pub fn handle(
     match cmd.p1 {
         // No-PIN sub-commands.
         0x30 => handle_get_device_public_key(state, store, cmd),
-        0x34 => handle_get_generation(state, cmd),
+        0x34 => handle_get_generation(store),
         0x3A => handle_get_state_hash(state, store, cmd),
-        0x3C => handle_get_generation_v2(state, cmd),
+        0x3C => handle_get_generation_v2(store),
+        0x40 => handle_domain_status(state, store),
+        0x47 => handle_get_members(store, cmd),
 
         // SO-PIN required.
         0x3B => {
@@ -137,9 +141,12 @@ fn handle_get_device_public_key(
 // P1=0x34  GET_GENERATION
 // ---------------------------------------------------------------------------
 
-fn handle_get_generation(state: &mut ScHsmState, _cmd: &ApduCommand<'_>) -> ApduResponse {
-    // Return the low 4 bytes of the generation counter (V1 compat).
-    ApduResponse::ok(&(state.generation as u32).to_be_bytes())
+fn handle_get_generation(store: &mut dyn KeyStore) -> ApduResponse {
+    // The low 4 bytes of the Lamport counter (V1 compat).
+    match crate::storage::retry_counter::lamport(store) {
+        Ok(v) => ApduResponse::ok(&(v as u32).to_be_bytes()),
+        Err(_) => ApduResponse::err(pico2hsm_core::apdu::SW_MEMORY_FAILURE),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -147,8 +154,12 @@ fn handle_get_generation(state: &mut ScHsmState, _cmd: &ApduCommand<'_>) -> Apdu
 // ---------------------------------------------------------------------------
 //
 // SOURCE (holds the DKEK) sends it to TARGET (has none).  Both devices must
-// have the other's static P-256 key enrolled via ENROLL_PEER_PUBKEY (0x3D);
+// have the other's static P-256 key pinned via ENROLL_PEER_PUBKEY (0x3D);
 // there is no unauthenticated mode.  All four steps require the SO-PIN.
+// The pin is single-use (cluster plan V3 §5.2 step 3): SOURCE spends it
+// before releasing the encrypted DKEK (step 3), TARGET before installing
+// it (step 4).  Steps that fail keep it, so an aborted exchange can be
+// run again.
 //
 //   1. TARGET 0x35 (source_static_pub)        → ephem_T || chal || Sig_T
 //   2. SOURCE 0x36 (ephem_T || chal || Sig_T) → ephem_S || Sig_S
@@ -240,7 +251,7 @@ fn handle_noise_target_init(
     if cmd.data.len() != 65 {
         return abort_exchange(state, SW_WRONG_DATA);
     }
-    let Some(peer) = state.noise_enrolled_peer_pubkey else {
+    let Some(peer) = state.pinned_peer else {
         return abort_exchange(state, SW_CONDITIONS_NOT_SATISFIED);
     };
     if cmd.data != peer.as_slice() {
@@ -290,7 +301,7 @@ fn handle_noise_source_respond(
     if !state.dkek.is_ready() {
         return abort_exchange(state, SW_CONDITIONS_NOT_SATISFIED);
     }
-    let Some(peer) = state.noise_enrolled_peer_pubkey else {
+    let Some(peer) = state.pinned_peer else {
         return abort_exchange(state, SW_CONDITIONS_NOT_SATISFIED);
     };
     if !peer_signed(&peer, ephem_t_pub, challenge, sig_t) {
@@ -340,7 +351,7 @@ fn handle_noise_finalize_send_v2(
 
     // Armed only by a successful step 2, and only for what it verified.
     let (Some(peer), Some(peer_ephem), Some(stored_challenge), Some(ephem_priv), Some(ephem_pub)) = (
-        state.noise_enrolled_peer_pubkey,
+        state.pinned_peer,
         state.exchange_peer_ephem_pub,
         state.exchange_challenge,
         state.exchange_ephem_priv.take(),
@@ -382,6 +393,11 @@ fn handle_noise_finalize_send_v2(
         return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED);
     };
 
+    // Single use: the pin is spent before the DKEK leaves the device.
+    if crate::protocol::sc_hsm::ScHsm::consume_pinned_peer(state, _store).is_err() {
+        return ApduResponse::err(pico2hsm_core::apdu::SW_MEMORY_FAILURE);
+    }
+
     // nonce(12) || ciphertext(32) || tag(16) = 60 bytes
     let mut out = [0u8; 60];
     out[..12].copy_from_slice(&nonce_buf);
@@ -413,7 +429,7 @@ fn handle_noise_finalize_recv_v2(
 
     // TARGET state from step 1 (a SOURCE-armed state has a peer ephemeral).
     let (Some(peer), Some(ephem_priv), Some(ephem_pub), Some(challenge), None) = (
-        state.noise_enrolled_peer_pubkey,
+        state.pinned_peer,
         state.exchange_ephem_priv.take(),
         state.exchange_ephem_pub,
         state.exchange_challenge,
@@ -462,6 +478,10 @@ fn handle_noise_finalize_recv_v2(
         return ApduResponse::err(SW_SECURITY_STATUS);
     }
 
+    // Single use: the pin is spent before the DKEK is installed.
+    if crate::protocol::sc_hsm::ScHsm::consume_pinned_peer(state, store).is_err() {
+        return ApduResponse::err(pico2hsm_core::apdu::SW_MEMORY_FAILURE);
+    }
     state.dkek.set_dkek_direct(&dkek_buf);
     state.dkek_shares_imported = state.dkek.shares_total();
     ApduResponse::ok(&[])
@@ -471,56 +491,136 @@ fn handle_noise_finalize_recv_v2(
 // P1=0x39  GET_KEY_MANIFEST
 // ---------------------------------------------------------------------------
 
+/// Manifest entry formats: 1 = legacy 44-byte entries, 2 = with object ID.
+const MANIFEST_V1_ENTRY: usize = 44;
+const MANIFEST_V2_ENTRY: usize = 64;
+
+/// One page of the key manifest.
+///
+/// P2 = the first key reference to list; data = absent or `01` for the
+/// legacy format, `02` for the format with global object IDs.  Keys are
+/// listed in ascending key-reference order, as many as fit in one
+/// response (`MAX_RESPONSE_DATA`, sent with GET RESPONSE chaining); the
+/// host asks again with P2 = last listed reference + 1 until a page comes
+/// back empty.  Built straight into the response buffer, so nothing large
+/// sits on the core1 stack.
+///
+/// ```text
+/// v1 entry: key_ref(1) algo(1) key_flags(1) 00(1) timestamp_ms(8 BE)
+///           SHA-256(public key)(32)                                  44 bytes
+/// v2 entry: key_ref(1) algo(1) key_flags(1) id_len(1) timestamp_ms(8 BE)
+///           SHA-256(public key)(32) object_id(20, zero-padded)       64 bytes
+/// ```
+///
+/// In v2 a key without an ID yet (a symmetric key from before this
+/// firmware) gets its random ID now (§6.2, lazy assignment); a write
+/// failure fails the page (6581).
+#[inline(never)]
 fn handle_get_key_manifest(
     state: &mut ScHsmState,
     store: &mut dyn KeyStore,
-    _cmd: &ApduCommand<'_>,
+    cmd: &ApduCommand<'_>,
 ) -> ApduResponse {
-    use sha2::{Digest, Sha256};
+    use crate::apdu::dispatcher::MAX_RESPONSE_DATA;
 
-    // Each entry: key_ref(1) || algo(1) || key_flags(1) || deleted(1) || timestamp_ms_BE(8) || pubkey_hash(32) = 44 bytes
-    // Max: 256 entries * 44 = 11264 — but realistically we have at most ~16 in-memory + flash keys.
-    // Use a heapless Vec with reasonable max.
-    let mut manifest: heapless::Vec<u8, 1408> = heapless::Vec::new(); // 32 entries * 44
-
-    // Iterate key_index for crypto keys (not EfFile entries).
-    for meta in state.key_index.iter() {
-        // Skip EfFile entries.
-        if meta.key_type == 16 {
+    let v2 = match cmd.data {
+        [] | [0x01] => false,
+        [0x02] => true,
+        _ => return ApduResponse::err(SW_WRONG_DATA),
+    };
+    let entry_len = if v2 {
+        MANIFEST_V2_ENTRY
+    } else {
+        MANIFEST_V1_ENTRY
+    };
+    let mut resp = ApduResponse::ok(&[]);
+    // User keys only: 0x00 is the device sentinel, 0xFC.. are records.
+    let first = cmd.p2.max(0x01);
+    for key_ref in first..crate::protocol::sc_hsm::RESERVED_KEY_REF_MIN {
+        let kid = KeyId::sc_hsm(0, key_ref);
+        let Some(meta) = state
+            .key_index
+            .iter()
+            .find(|m| m.key_id == kid.0 && m.key_type != 16)
+            .copied()
+        else {
             continue;
-        }
-        let key_ref = (meta.key_id & 0xFF) as u8;
-        // Exclude device-internal keys: 0x00 (device cluster signing key) and
-        // 0xFE (device auth cert key).  Only user keys 0x01–0xFD are synced.
-        if key_ref == 0x00 || key_ref >= 0xFE {
-            continue;
-        }
-        let algo = meta.algo;
-        let key_flags = meta.key_flags;
-        let deleted = 0u8;
-
-        // Fetch from flash to get timestamp and pubkey hash.
-        let kid = KeyId(meta.key_id);
-        let (timestamp_ms, pubkey_hash) = if let Ok(Some(key_obj)) = store.fetch_key(kid) {
-            let h = if !key_obj.public_key.is_empty() {
-                Sha256::digest(&key_obj.public_key).into()
-            } else {
-                [0u8; 32]
-            };
-            (key_obj.timestamp_ms, h)
-        } else {
-            (0u64, [0u8; 32])
         };
-
-        let _ = manifest.push(key_ref);
-        let _ = manifest.push(algo);
-        let _ = manifest.push(key_flags);
-        let _ = manifest.push(deleted);
-        let _ = manifest.extend_from_slice(&timestamp_ms.to_be_bytes());
-        let _ = manifest.extend_from_slice(&pubkey_hash);
+        if resp.data.len() + entry_len > MAX_RESPONSE_DATA {
+            break;
+        }
+        let (timestamp_ms, pubkey_hash, intrinsic, found) = key_summary(store, kid);
+        let id = if !v2 || !found {
+            None
+        } else if intrinsic.is_some() {
+            intrinsic
+        } else {
+            // No intrinsic ID: the sidecar's, assigned now if missing.
+            match sidecar_id(store, kid) {
+                Ok(id) => Some(id),
+                Err(_) => return ApduResponse::err(pico2hsm_core::apdu::SW_MEMORY_FAILURE),
+            }
+        };
+        let mut e = [0u8; MANIFEST_V2_ENTRY];
+        e[0] = key_ref;
+        e[1] = meta.algo;
+        e[2] = meta.key_flags;
+        e[3] = if v2 { id.map_or(0, |i| i.len) } else { 0 };
+        e[4..12].copy_from_slice(&timestamp_ms.to_be_bytes());
+        e[12..44].copy_from_slice(&pubkey_hash);
+        if let Some(id) = id {
+            e[44..64].copy_from_slice(&id.bytes);
+        }
+        if resp.data.extend_from_slice(&e[..entry_len]).is_err() {
+            break;
+        }
     }
+    resp
+}
 
-    ApduResponse::ok(&manifest)
+/// `(timestamp_ms, SHA-256(public key), intrinsic ID, found)` of the key
+/// at `kid`.  Its own frame: the fetched `KeyObject` is gone before the
+/// caller touches the store again (core1 stack).
+#[inline(never)]
+fn key_summary(
+    store: &mut dyn KeyStore,
+    kid: KeyId,
+) -> (
+    u64,
+    [u8; 32],
+    Option<crate::domain::object_id::ObjectId>,
+    bool,
+) {
+    use sha2::{Digest, Sha256};
+    match store.fetch_key(kid) {
+        Ok(Some(obj)) => {
+            let h: [u8; 32] = if obj.public_key.is_empty() {
+                [0u8; 32]
+            } else {
+                Sha256::digest(&obj.public_key).into()
+            };
+            (
+                obj.timestamp_ms,
+                h,
+                crate::domain::object_id::intrinsic(&obj),
+                true,
+            )
+        }
+        _ => (0, [0u8; 32], None, false),
+    }
+}
+
+/// The sidecar ID of `kid`, assigned (random, kind key) if it has none.
+#[inline(never)]
+fn sidecar_id(
+    store: &mut dyn KeyStore,
+    kid: KeyId,
+) -> Result<crate::domain::object_id::ObjectId, pico2hsm_core::error::HsmError> {
+    use crate::domain::object_id;
+    match object_id::load_sidecar(store, kid)? {
+        Some(sc) => Ok(sc.id),
+        None => object_id::assign_random(store, kid, object_id::KIND_KEY),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -563,7 +663,9 @@ fn handle_get_state_hash(
     }
 
     let state_root: [u8; 32] = root_hasher.finalize().into();
-    let generation = state.generation;
+    let Ok(generation) = crate::storage::retry_counter::lamport(store) else {
+        return ApduResponse::err(pico2hsm_core::apdu::SW_MEMORY_FAILURE);
+    };
 
     // Sign: Sig = P256_RFC6979_ECDSA_sign(device_static_priv, SHA-256(generation_BE(8) || state_root(32)))
     let mut sig_hasher = Sha256::new();
@@ -617,16 +719,16 @@ fn handle_sign_enrollment(
 // P1=0x3D  ENROLL_PEER_PUBKEY (SO-PIN required)
 // ---------------------------------------------------------------------------
 
-/// Enroll (or re-enroll) a peer device's static P-256 public key for V2
-/// Noise mutual authentication.  Once enrolled, unauthenticated DKEK
-/// exchanges are permanently locked out.
+/// Pin a peer device's static P-256 public key for the next V2 DKEK
+/// exchange (cluster plan V3 §5.2 step 3).  The exchange that completes
+/// with it spends it; pinning again replaces it.  The operator checks the
+/// key out of band (short authentication string) before pinning.
 ///
 /// Input: 65-byte uncompressed P-256 public key (0x04 || x || y).
 /// Returns: SW 9000 on success.
 ///
 /// SO-PIN VERIFY is required before calling this command (checked in the
-/// dispatch match above).  Re-enrollment (overwriting an existing peer)
-/// is allowed with SO-PIN to support HSM replacement scenarios.
+/// dispatch match above).
 fn handle_enroll_peer_pubkey(
     state: &mut ScHsmState,
     store: &mut dyn KeyStore,
@@ -642,14 +744,13 @@ fn handle_enroll_peer_pubkey(
         return ApduResponse::err(SW_WRONG_DATA);
     }
 
-    // Store the peer pubkey in volatile state.
     let mut pubkey = [0u8; 65];
     pubkey.copy_from_slice(cmd.data);
-    state.noise_enrolled_peer_pubkey = Some(pubkey);
+    let before = state.pinned_peer.replace(pubkey);
 
-    // Persist to flash so the enrollment survives power cycles.
-    if crate::protocol::sc_hsm::ScHsm::save_peer_pubkey_to_store(state, store).is_err() {
-        state.noise_enrolled_peer_pubkey = None;
+    // Persist so the pin survives a reset between pinning and the exchange.
+    if crate::protocol::sc_hsm::ScHsm::save_pinned_peer(state, store).is_err() {
+        state.pinned_peer = before;
         return ApduResponse::err(pico2hsm_core::apdu::SW_MEMORY_FAILURE);
     }
 
@@ -660,8 +761,132 @@ fn handle_enroll_peer_pubkey(
 // P1=0x3C  GET_GENERATION_V2
 // ---------------------------------------------------------------------------
 
-fn handle_get_generation_v2(state: &mut ScHsmState, _cmd: &ApduCommand<'_>) -> ApduResponse {
-    ApduResponse::ok(&state.generation.to_be_bytes())
+fn handle_get_generation_v2(store: &mut dyn KeyStore) -> ApduResponse {
+    match crate::storage::retry_counter::lamport(store) {
+        Ok(v) => ApduResponse::ok(&v.to_be_bytes()),
+        Err(_) => ApduResponse::err(pico2hsm_core::apdu::SW_MEMORY_FAILURE),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// P1=0x40  DOMAIN_STATUS
+// ---------------------------------------------------------------------------
+
+/// DOMAIN_STATUS response format version.
+pub const DOMAIN_STATUS_VERSION: u8 = 1;
+/// DOMAIN_STATUS response length.
+pub const DOMAIN_STATUS_LEN: usize = 117;
+/// DOMAIN_STATUS flags: the device holds a DKEK (and so a domain key).
+pub const DS_DKEK: u8 = 0x01;
+/// DOMAIN_STATUS flags: OTP production mode (else development mode).
+pub const DS_PRODUCTION: u8 = 0x02;
+/// DOMAIN_STATUS flags: the member list holds this device's certificate.
+pub const DS_SELF_MEMBER: u8 = 0x04;
+/// DOMAIN_STATUS flags: a peer is pinned for the next DKEK exchange.
+pub const DS_PINNED_PEER: u8 = 0x08;
+
+/// Public domain state; no authentication (cluster plan V3 §7.4, §8).
+///
+/// ```text
+/// [0]        version 1
+/// [1]        flags (DS_*)
+/// [2..18]    domain_id         zeros without a DKEK
+/// [18..26]   KCV               SHA-256(DKEK)[0..8], zeros without a DKEK
+/// [26..91]   Q_domain          uncompressed P-256, zeros without a DKEK
+/// [91..107]  own member ID     SHA-256(device key)[0..16], zeros if none
+/// [107..115] Lamport counter   u64 BE
+/// [115]      member-list entries
+/// [116]      member-list capacity (32)
+/// ```
+#[inline(never)]
+fn handle_domain_status(state: &mut ScHsmState, store: &mut dyn KeyStore) -> ApduResponse {
+    use crate::domain::member;
+
+    let Ok(lamport) = crate::storage::retry_counter::lamport(store) else {
+        return ApduResponse::err(pico2hsm_core::apdu::SW_MEMORY_FAILURE);
+    };
+    let Ok(members) = member::count(store) else {
+        return ApduResponse::err(pico2hsm_core::apdu::SW_MEMORY_FAILURE);
+    };
+    let own =
+        crate::protocol::sc_hsm::ScHsm::device_member_pub(store).map(|p| member::member_id(&p));
+
+    let mut out = [0u8; DOMAIN_STATUS_LEN];
+    out[0] = DOMAIN_STATUS_VERSION;
+    let mut flags = 0u8;
+    if let Some(domain) = state.domain.as_ref() {
+        flags |= DS_DKEK;
+        out[2..18].copy_from_slice(&domain.id);
+        if let Ok(kcv) = state.dkek.compute_kcv() {
+            out[18..26].copy_from_slice(&kcv);
+        }
+        out[26..91].copy_from_slice(&domain.q);
+    }
+    if crate::protocol::sc_hsm::commands::provisioning::production_mode() {
+        flags |= DS_PRODUCTION;
+    }
+    if let Some(id) = own {
+        out[91..107].copy_from_slice(&id);
+        for slot in 0..members {
+            match member::load(store, slot) {
+                Ok(Some(e)) if e.cert.member_id == id => {
+                    flags |= DS_SELF_MEMBER;
+                    break;
+                }
+                Ok(_) => {}
+                Err(_) => return ApduResponse::err(pico2hsm_core::apdu::SW_MEMORY_FAILURE),
+            }
+        }
+    }
+    if state.pinned_peer.is_some() {
+        flags |= DS_PINNED_PEER;
+    }
+    out[1] = flags;
+    out[107..115].copy_from_slice(&lamport.to_be_bytes());
+    out[115] = members;
+    out[116] = member::MAX_MEMBERS;
+    ApduResponse::ok(&out)
+}
+
+// ---------------------------------------------------------------------------
+// P1=0x47  GET_MEMBERS
+// ---------------------------------------------------------------------------
+
+/// Member-list entries per GET_MEMBERS page.
+pub const MEMBERS_PER_PAGE: u8 = 16;
+
+/// The member list, a page at a time; no authentication (certificates are
+/// public and signed).  P2 = first slot.
+///
+/// ```text
+/// [0]  total entries      [1]  first slot (= P2)     [2]  n entries here
+/// n × 197-byte entries (`domain::member`: version, status,
+///      revoked_lamport, certificate)
+/// ```
+/// The host asks again with P2 = first + n while first + n < total.
+#[inline(never)]
+fn handle_get_members(store: &mut dyn KeyStore, cmd: &ApduCommand<'_>) -> ApduResponse {
+    use crate::domain::member;
+
+    let Ok(total) = member::count(store) else {
+        return ApduResponse::err(pico2hsm_core::apdu::SW_MEMORY_FAILURE);
+    };
+    let first = cmd.p2;
+    if first > total {
+        return ApduResponse::err(pico2hsm_core::apdu::SW_INCORRECT_P1P2);
+    }
+    let n = (total - first).min(MEMBERS_PER_PAGE);
+    let mut resp = ApduResponse::ok(&[total, first, n]);
+    for slot in first..first + n {
+        let entry = match member::load(store, slot) {
+            Ok(Some(e)) => e,
+            _ => return ApduResponse::err(pico2hsm_core::apdu::SW_MEMORY_FAILURE),
+        };
+        if resp.data.extend_from_slice(&entry.encode()).is_err() {
+            return ApduResponse::err(pico2hsm_core::apdu::SW_MEMORY_FAILURE);
+        }
+    }
+    resp
 }
 
 // ---------------------------------------------------------------------------
@@ -1191,27 +1416,47 @@ mod tests {
         copy
     }
 
-    /// Test key store that holds a device identity key and optionally an EF 0x2F02.
+    extern crate std;
+
+    /// Test key store that holds a device identity key, optionally an EF
+    /// 0x2F02, any other object, and the counter log (Lamport counter).
     struct DevKeyStore {
         dev_key: Option<KeyObject>,
         ef_key: Option<KeyObject>,
+        others: std::vec::Vec<KeyObject>,
+        counters: crate::storage::retry_counter::MemCounters,
+        fail_saves: bool,
     }
     impl DevKeyStore {
         fn new() -> Self {
             DevKeyStore {
                 dev_key: None,
                 ef_key: None,
+                others: std::vec::Vec::new(),
+                counters: Default::default(),
+                fail_saves: false,
             }
+        }
+        fn has(&self, kid: KeyId) -> bool {
+            self.others.iter().any(|o| o.key_id == kid.0)
         }
     }
     impl KeyStore for DevKeyStore {
         fn save_key(&mut self, obj: &KeyObject) -> Result<(), pico2hsm_core::error::HsmError> {
             let dev_key_id = KeyId::sc_hsm(0, 0xFE).0;
             let ef_key_id = KeyId::sc_hsm_ef(0, 0x2F, 0x02).0;
+            if self.fail_saves {
+                return Err(pico2hsm_core::error::HsmError::Storage(
+                    pico2hsm_core::error::StorageError::WriteError,
+                ));
+            }
             if obj.key_id == dev_key_id {
                 self.dev_key = Some(copy_key_object(obj));
             } else if obj.key_id == ef_key_id {
                 self.ef_key = Some(copy_key_object(obj));
+            } else {
+                self.others.retain(|o| o.key_id != obj.key_id);
+                self.others.push(copy_key_object(obj));
             }
             Ok(())
         }
@@ -1227,9 +1472,19 @@ mod tests {
             if kid.0 == ef_key_id {
                 return Ok(self.ef_key.as_ref().map(copy_key_object));
             }
-            Ok(None)
+            Ok(self
+                .others
+                .iter()
+                .find(|o| o.key_id == kid.0)
+                .map(copy_key_object))
         }
-        fn erase_key(&mut self, _: KeyId) -> Result<(), pico2hsm_core::error::HsmError> {
+        fn erase_key(&mut self, kid: KeyId) -> Result<(), pico2hsm_core::error::HsmError> {
+            if self.fail_saves {
+                return Err(pico2hsm_core::error::HsmError::Storage(
+                    pico2hsm_core::error::StorageError::WriteError,
+                ));
+            }
+            self.others.retain(|o| o.key_id != kid.0);
             Ok(())
         }
         fn wipe_all(&mut self) -> Result<(), pico2hsm_core::error::HsmError> {
@@ -1242,6 +1497,11 @@ mod tests {
             heapless::Vec::new()
         }
         fn for_each_key(&self, _f: &mut dyn FnMut(KeyId)) {}
+        fn retry_counters(
+            &mut self,
+        ) -> Option<&mut dyn crate::storage::retry_counter::RetryCounterBackend> {
+            Some(&mut self.counters)
+        }
     }
 
     /// Create a ScHsmState with a device static key (key_ref=0xFE) and PIN verified,
@@ -1488,8 +1748,8 @@ mod tests {
         assert_eq!(resp.data.len(), 8);
         assert_eq!(&resp.data[..], &[0u8; 8]);
 
-        // Increment and check again.
-        state.generation = 42;
+        // The persisted counter, not RAM.
+        store.counters.lamport = 42;
         let resp2 = handle(&mut state, &mut store, &cmd);
         assert_eq!(resp2.sw, 0x9000);
         assert_eq!(&resp2.data[..], &42u64.to_be_bytes());
@@ -1680,10 +1940,10 @@ mod tests {
             le: None,
         };
 
-        assert!(state.noise_enrolled_peer_pubkey.is_none());
+        assert!(state.pinned_peer.is_none());
         let resp = handle(&mut state, &mut store, &cmd);
         assert_eq!(resp.sw, 0x9000, "enrollment should succeed");
-        assert_eq!(state.noise_enrolled_peer_pubkey.unwrap(), pubkey);
+        assert_eq!(state.pinned_peer.unwrap(), pubkey);
     }
 
     #[test]
@@ -1704,7 +1964,7 @@ mod tests {
         };
         let resp1 = handle(&mut state, &mut store, &cmd1);
         assert_eq!(resp1.sw, 0x9000);
-        assert_eq!(state.noise_enrolled_peer_pubkey.unwrap(), pubkey1);
+        assert_eq!(state.pinned_peer.unwrap(), pubkey1);
 
         // Re-enroll with second key (SO-PIN still verified).
         let cmd2 = ApduCommand {
@@ -1718,7 +1978,7 @@ mod tests {
         let resp2 = handle(&mut state, &mut store, &cmd2);
         assert_eq!(resp2.sw, 0x9000);
         assert_eq!(
-            state.noise_enrolled_peer_pubkey.unwrap(),
+            state.pinned_peer.unwrap(),
             pubkey2,
             "re-enrollment should overwrite"
         );
@@ -1788,6 +2048,247 @@ mod tests {
         assert_eq!(tgt.dkek.get_dkek(), Some(&[0x5Cu8; 32]));
         // One-shot: both sides are disarmed.
         assert!(src.exchange_ephem_priv.is_none() && tgt.exchange_ephem_priv.is_none());
+        // Single-use pins (§5.2 step 3): spent on both sides, in RAM and
+        // on flash, so a second exchange needs a new pin.
+        assert!(src.pinned_peer.is_none() && tgt.pinned_peer.is_none());
+        assert!(!ss.has(crate::domain::records::PINNED_PEER));
+        assert!(!ts.has(crate::domain::records::PINNED_PEER));
+        assert_eq!(
+            extras(&mut src, &mut ss, 0x36, &init.data).sw,
+            SW_CONDITIONS_NOT_SATISFIED
+        );
+    }
+
+    #[test]
+    fn pin_that_cannot_be_spent_keeps_the_dkek_home() {
+        let ((mut src, mut ss), (mut tgt, mut ts)) = enrolled_pair();
+        let (src_pub, tgt_pub) = (static_pub(&ss), static_pub(&ts));
+        let init = extras(&mut tgt, &mut ts, 0x35, &src_pub);
+        assert_eq!(extras(&mut src, &mut ss, 0x36, &init.data).sw, 0x9000);
+        ss.fail_saves = true; // the pin's erase fails
+        let send = extras(
+            &mut src,
+            &mut ss,
+            0x37,
+            &make_data(&[&init.data[..65], &tgt_pub, &init.data[65..97]]),
+        );
+        assert_eq!(send.sw, pico2hsm_core::apdu::SW_MEMORY_FAILURE);
+        assert!(send.data.is_empty(), "no ciphertext released");
+        assert!(src.pinned_peer.is_some());
+    }
+
+    #[test]
+    fn pin_is_persisted_and_replaced() {
+        let (mut st, mut store) = state_with_device_key();
+        let a = generate_test_p256_pubkey();
+        let b = generate_test_p256_pubkey();
+        assert_eq!(extras(&mut st, &mut store, 0x3D, &a).sw, 0x9000);
+        assert_eq!(extras(&mut st, &mut store, 0x3D, &b).sw, 0x9000);
+        let mut fresh = ScHsmState::new();
+        crate::protocol::sc_hsm::ScHsm::load_pinned_peer(&mut fresh, &mut store);
+        assert_eq!(fresh.pinned_peer, Some(b));
+    }
+
+    #[test]
+    fn legacy_peer_slot_becomes_the_pin() {
+        let (_, mut store) = state_with_device_key();
+        let peer = generate_test_p256_pubkey();
+        let legacy = crate::protocol::sc_hsm::ScHsm::sc_hsm_peer_pubkey_key_id();
+        let mut obj = KeyObject::new(
+            KmType::Generic,
+            legacy.0,
+            AppletId::ScHsm,
+            AlgorithmId::AesGcm,
+        );
+        obj.private_key.extend_from_slice(&peer).unwrap();
+        obj.private_key.push(0).unwrap();
+        store.save_key(&obj).unwrap();
+
+        let mut st = ScHsmState::new();
+        crate::protocol::sc_hsm::ScHsm::load_pinned_peer(&mut st, &mut store);
+        assert_eq!(st.pinned_peer, Some(peer), "read before the move");
+        assert!(!store.has(crate::domain::records::PINNED_PEER));
+        crate::protocol::sc_hsm::ScHsm::migrate_domain(&st, &mut store);
+        assert!(store.has(crate::domain::records::PINNED_PEER), "moved");
+        assert!(!store.has(legacy), "legacy slot erased");
+        let mut again = ScHsmState::new();
+        crate::protocol::sc_hsm::ScHsm::load_pinned_peer(&mut again, &mut store);
+        assert_eq!(again.pinned_peer, Some(peer));
+    }
+
+    #[test]
+    fn spending_an_unmoved_legacy_pin_erases_it() {
+        let (mut st, mut store) = state_with_device_key();
+        let peer = generate_test_p256_pubkey();
+        let legacy = crate::protocol::sc_hsm::ScHsm::sc_hsm_peer_pubkey_key_id();
+        let mut obj = KeyObject::new(
+            KmType::Generic,
+            legacy.0,
+            AppletId::ScHsm,
+            AlgorithmId::AesGcm,
+        );
+        obj.private_key.extend_from_slice(&peer).unwrap();
+        store.save_key(&obj).unwrap();
+        crate::protocol::sc_hsm::ScHsm::load_pinned_peer(&mut st, &mut store);
+        crate::protocol::sc_hsm::ScHsm::consume_pinned_peer(&mut st, &mut store).unwrap();
+        assert!(!store.has(legacy));
+        crate::protocol::sc_hsm::ScHsm::load_pinned_peer(&mut st, &mut store);
+        assert_eq!(st.pinned_peer, None, "single use, even unmoved");
+    }
+
+    // -----------------------------------------------------------------------
+    // DOMAIN_STATUS (P1=0x40) and GET_MEMBERS (P1=0x47)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn domain_status_before_and_after_the_dkek() {
+        let (mut st, mut store) = state_with_device_key();
+        st.pin_verified = false;
+        st.so_pin_verified = false; // no authentication needed
+        let own = crate::domain::member::member_id(&static_pub(&store));
+
+        let r = extras(&mut st, &mut store, 0x40, &[]);
+        assert_eq!(r.sw, 0x9000);
+        assert_eq!(r.data.len(), DOMAIN_STATUS_LEN);
+        assert_eq!(r.data[0], 1);
+        assert_eq!(r.data[1] & DS_DKEK, 0);
+        assert_eq!(&r.data[2..91], &[0u8; 89][..], "no domain yet");
+        assert_eq!(&r.data[91..107], &own);
+        assert_eq!(r.data[115], 0);
+        assert_eq!(r.data[116], 32);
+
+        // DKEK arrives (as persist_dkek_change does it).
+        st.dkek.set_dkek_direct(&[0x5C; 32]);
+        crate::protocol::sc_hsm::ScHsm::derive_domain(&mut st);
+        assert!(crate::protocol::sc_hsm::ScHsm::ensure_self_member(&st, &mut store).unwrap());
+        assert!(
+            !crate::protocol::sc_hsm::ScHsm::ensure_self_member(&st, &mut store).unwrap(),
+            "only while no list exists"
+        );
+
+        let r = extras(&mut st, &mut store, 0x40, &[]);
+        assert_eq!(r.sw, 0x9000);
+        let domain = crate::domain::key::DomainKey::derive(&[0x5C; 32]).unwrap();
+        assert_eq!(
+            r.data[1] & (DS_DKEK | DS_SELF_MEMBER),
+            DS_DKEK | DS_SELF_MEMBER
+        );
+        assert_eq!(&r.data[2..18], &domain.id);
+        assert_eq!(&r.data[18..26], &st.dkek.compute_kcv().unwrap());
+        assert_eq!(&r.data[26..91], &domain.q[..]);
+        assert_eq!(u64::from_be_bytes(r.data[107..115].try_into().unwrap()), 1);
+        assert_eq!(r.data[115], 1);
+
+        // The list holds a self-issued certificate that verifies.
+        let m = extras(&mut st, &mut store, 0x47, &[]);
+        assert_eq!(m.sw, 0x9000);
+        assert_eq!(&m.data[..3], &[1, 0, 1]);
+        let e = crate::domain::member::MemberEntry::decode(&m.data[3..]).unwrap();
+        assert_eq!(e.status, crate::domain::member::STATUS_ACTIVE);
+        assert_eq!(e.cert.member_id, own);
+        assert_eq!(e.cert.sponsor_id, own);
+        assert_eq!(e.cert.issued_lamport, 1);
+        assert_eq!(e.cert.verify(&domain.q), Ok(()));
+        assert_eq!(
+            extras(&mut st, &mut store, 0x47, &[]).data.len(),
+            3 + crate::domain::member::ENTRY_LEN
+        );
+    }
+
+    #[test]
+    fn get_members_pages() {
+        let (mut st, mut store) = state_with_device_key();
+        st.dkek.set_dkek_direct(&[0x33; 32]);
+        crate::protocol::sc_hsm::ScHsm::derive_domain(&mut st);
+        let domain = crate::domain::key::DomainKey::derive(&[0x33; 32]).unwrap();
+        for i in 0..20u8 {
+            let p = generate_test_p256_pubkey();
+            let id = crate::domain::member::member_id(&p);
+            let c = crate::domain::member::MemberCert::issue(&domain, &p, &id, u64::from(i), 1)
+                .unwrap();
+            crate::domain::member::upsert(
+                &mut store,
+                &crate::domain::member::MemberEntry::active(c),
+            )
+            .unwrap();
+        }
+        let first = ApduCommand {
+            cla: 0x80,
+            ins: INS_EXTRAS,
+            p1: 0x47,
+            p2: 0,
+            data: &[],
+            le: None,
+        };
+        let r = handle(&mut st, &mut store, &first);
+        assert_eq!(r.sw, 0x9000);
+        assert_eq!(&r.data[..3], &[20, 0, MEMBERS_PER_PAGE]);
+        assert!(r.data.len() <= crate::apdu::dispatcher::MAX_RESPONSE_DATA);
+        let next = ApduCommand { p2: 16, ..first };
+        let r = handle(&mut st, &mut store, &next);
+        assert_eq!(&r.data[..3], &[20, 16, 4]);
+        let past = ApduCommand { p2: 21, ..first };
+        assert_eq!(handle(&mut st, &mut store, &past).sw, 0x6A86);
+    }
+
+    #[test]
+    fn manifest_pages_past_32_keys_with_object_ids() {
+        let (mut st, mut store) = state_with_device_key();
+        let mut rng = crate::protocol::sc_hsm::FwRng;
+        for r in 1..=100u8 {
+            let pair = crate::crypto::asymmetric::generate_ec_keypair(
+                CoreKeyType::EcPrivateP256,
+                &mut rng,
+            )
+            .unwrap();
+            let kid = KeyId::sc_hsm(0, r);
+            let mut obj =
+                KeyObject::new(KmType::Ec, kid.0, AppletId::ScHsm, AlgorithmId::EcdsaP256);
+            obj.public_key.extend_from_slice(&pair.public_key).unwrap();
+            store.save_key(&obj).unwrap();
+            st.key_index
+                .push(KeyMeta {
+                    key_id: kid.0,
+                    key_type: CoreKeyType::EcPrivateP256 as u8,
+                    algo: 0x13,
+                    key_flags: 0,
+                })
+                .unwrap();
+        }
+        let cmd = |p2: u8, data: &'static [u8]| ApduCommand {
+            cla: 0x80,
+            ins: INS_EXTRAS,
+            p1: 0x39,
+            p2,
+            data,
+            le: None,
+        };
+        let mut seen = 0usize;
+        let mut p2 = 0u8;
+        loop {
+            let r = handle(&mut st, &mut store, &cmd(p2, &[0x02]));
+            assert_eq!(r.sw, 0x9000);
+            assert!(r.data.len() <= crate::apdu::dispatcher::MAX_RESPONSE_DATA);
+            assert_eq!(r.data.len() % MANIFEST_V2_ENTRY, 0);
+            if r.data.is_empty() {
+                break;
+            }
+            for e in r.data.chunks(MANIFEST_V2_ENTRY) {
+                seen += 1;
+                assert_eq!(e[0] as usize, seen, "ascending key refs");
+                assert_eq!(e[3], 20, "intrinsic ID");
+                let obj = store.fetch_key(KeyId::sc_hsm(0, e[0])).unwrap().unwrap();
+                assert_eq!(
+                    &e[44..64],
+                    &crate::crypto::symmetric::sha1(&obj.public_key[1..33])
+                );
+            }
+            p2 = r.data[r.data.len() - MANIFEST_V2_ENTRY] + 1;
+        }
+        assert_eq!(seen, 100, "no 32-entry cap");
+        // Legacy format: 44-byte entries, first page as large as fits.
+        let r = handle(&mut st, &mut store, &cmd(0, &[]));
+        assert_eq!(r.data.len(), 92 * MANIFEST_V1_ENTRY);
     }
 
     #[test]

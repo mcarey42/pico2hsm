@@ -14,7 +14,7 @@ use zeroize::Zeroize;
 ///
 /// Encoding (bits 31–0):
 /// - bits 31–24: `partition_id` (u8) — 0 = default partition
-/// - bits 23–16: `applet_id`    (u8) — 0=SC-HSM, 1=PIV, 2=OpenPGP
+/// - bits 23–16: `applet_id`    (u8) — 0=SC-HSM, 1=PIV, 2=OpenPGP, 0x10=domain
 /// - bits 15–8:  reserved          — always 0
 /// - bits  7–0:  `proto_ref`    (u8) — protocol-level key reference
 ///
@@ -30,6 +30,9 @@ pub enum AppletId {
     ScHsm = 0x00,
     Piv = 0x01,
     OpenPgp = 0x02,
+    /// Domain records (cluster plan V3): object sidecars, member
+    /// certificates, the pinned peer.  Never a user key.
+    Domain = 0x10,
 }
 
 impl Zeroize for AppletId {

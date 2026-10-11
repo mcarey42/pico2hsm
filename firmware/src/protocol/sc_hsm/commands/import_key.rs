@@ -142,7 +142,6 @@ pub fn handle(
     if store.save_key(&key_obj).is_err() {
         return ApduResponse::err(pico2hsm_core::apdu::SW_MEMORY_FAILURE);
     }
-    state.generation = state.generation.wrapping_add(1);
 
     // Store metadata in key_index (replacing any existing entry with the same ID).
     state.key_index.retain(|m| m.key_id != full_key_id.0);

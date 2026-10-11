@@ -632,6 +632,7 @@ impl KeyObject {
         let owner = match ((key_id >> 16) & 0xFF) as u8 {
             0x01 => AppletId::Piv,
             0x02 => AppletId::OpenPgp,
+            0x10 => AppletId::Domain,
             _ => AppletId::ScHsm,
         };
 
@@ -784,6 +785,7 @@ impl KeyObject {
         let owner = match ((key_id >> 16) & 0xFF) as u8 {
             0x01 => AppletId::Piv,
             0x02 => AppletId::OpenPgp,
+            0x10 => AppletId::Domain,
             _ => AppletId::ScHsm,
         };
 

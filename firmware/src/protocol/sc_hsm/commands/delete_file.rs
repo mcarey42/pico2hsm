@@ -22,7 +22,7 @@ use crate::protocol::sc_hsm::ScHsmState;
 pub const INS_DELETE_FILE: u8 = 0xE4;
 
 /// File-ID high byte of key objects (OpenSC `KEY_PREFIX`).
-const KEY_PREFIX: u8 = 0xCC;
+pub const KEY_PREFIX: u8 = 0xCC;
 
 /// Handle a DELETE FILE APDU command.
 pub fn handle(
@@ -71,7 +71,6 @@ pub fn handle(
                 return ApduResponse::err(pico2hsm_core::apdu::SW_MEMORY_FAILURE);
             }
             state.key_index.retain(|m| m.key_id != full_key_id);
-            state.generation = state.generation.wrapping_add(1);
         }
     } else {
         // Any other FID is an EF stored under its full file ID — C4 (PrKD),

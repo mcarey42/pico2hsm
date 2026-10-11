@@ -225,8 +225,16 @@ impl Dispatcher {
         self.piv.load_from_store(store);
         self.openpgp.load_from_store(store);
         ScHsm::load_pin_state_from_store(&mut self.sc_hsm.state, store);
-        ScHsm::load_peer_pubkey_from_store(&mut self.sc_hsm.state, store);
         ScHsm::load_dkek_from_store(&mut self.sc_hsm.state, store);
+        ScHsm::load_domain_from_store(&mut self.sc_hsm.state, store);
+    }
+
+    /// Boot-time domain migration (cluster plan V3 P1), after
+    /// [`Self::load_keys_from_store`], on core0 only: see
+    /// `ScHsm::migrate_domain`.
+    #[inline(never)]
+    pub fn migrate_domain(&mut self, store: &mut dyn crate::storage::KeyStore) {
+        ScHsm::migrate_domain(&self.sc_hsm.state, store);
     }
 
     /// One-time migration of the PIN/PUK retry counts into the retry-counter

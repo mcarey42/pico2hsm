@@ -1209,6 +1209,96 @@ Response: 32-byte HMAC-SHA256 tag.
 | `6985` | Computation failed |
 | `6A80` | Unknown P1 |
 
+#### Domain and sync sub-commands (pico2hsm vendor, cluster plan V3)
+
+`docs/CLUSTER_PLAN_V3.md` describes the design; this is the wire format.
+CLA `0x80`.  Responses longer than the short-APDU Le are chained with GET
+RESPONSE (`61xx`); no response exceeds 4084 bytes.
+
+| P1 | Name | Auth | Data | Response |
+|---|---|---|---|---|
+| `0x30` | GET_DEVICE_PUBLIC_KEY | none | — | 65-byte P-256 point (the member key) |
+| `0x34` | GET_GENERATION | none | — | low 32 bits of the Lamport counter, BE |
+| `0x35`–`0x38` | V2 DKEK exchange | SO-PIN | see §Security notes | consumes the pinned peer |
+| `0x39` | GET_KEY_MANIFEST | user PIN | absent/`01` (v1) or `02` (v2); P2 = first key ref | entries, see below |
+| `0x3A` | GET_STATE_HASH | none | — | `lamport(8) ‖ root(32) ‖ sig(64)` |
+| `0x3C` | GET_GENERATION_V2 | none | — | Lamport counter, u64 BE |
+| `0x3D` | ENROLL_PEER_PUBKEY | SO-PIN | 65-byte point | pins the peer for the next exchange |
+| `0x40` | DOMAIN_STATUS | none | — | 117 bytes, see below |
+| `0x47` | GET_MEMBERS | none | P2 = first slot | page, see below |
+
+**Lamport counter (`0x34`, `0x3C`, `0x3A`).** Persisted on internal flash
+(retry-counter log, record kind `'L'`) and never decreasing; it replaces
+the RAM-only generation counter, which restarted at 0 on every boot.  It
+is advanced *before* every change it numbers — GENERATE KEY PAIR (`46`),
+GENERATE KEY (`48`), UNWRAP (`74`), DELETE FILE (`E4`), WRITE DATA (`D7`),
+UPDATE BINARY (`D6`) in a session with the user PIN or SO-PIN verified,
+and the member self certificate.  If the counter cannot be written the
+command is refused with `6581` and nothing changes.  INITIALIZE does not
+reset it.  A failed command may leave a gap.
+
+**GET_KEY_MANIFEST (`0x39`).** Keys in ascending key-reference order,
+from P2 (default 1), as many as fit in one response; ask again with
+P2 = last listed reference + 1 until a page comes back empty.  There is no
+fixed cap (it used to stop at 32 keys).
+
+```
+v1 entry (44 bytes): key_ref(1) algo(1) key_flags(1) 00(1) timestamp_ms(8 BE)
+                     SHA-256(public key)(32)
+v2 entry (64 bytes): key_ref(1) algo(1) key_flags(1) id_len(1) timestamp_ms(8 BE)
+                     SHA-256(public key)(32) object_id(20, zero-padded)
+```
+
+The object ID (v2) is the key's global ID: for EC and RSA keys OpenSC's
+intrinsic CKA_ID, SHA-1 of the X coordinate / of the modulus (`id_len`
+20); for others a random 16-byte ID kept in the key's sidecar, assigned on
+this call if the key predates it (`6581` if that write fails).
+
+**ENROLL_PEER_PUBKEY (`0x3D`).** Pins the peer's key for **one** V2 DKEK
+exchange: SOURCE spends the pin before it returns the encrypted DKEK
+(`0x37`), TARGET before it installs the DKEK (`0x38`); a pin that cannot be
+erased stops the exchange with `6581`.  Failed steps keep the pin.
+Pinning again replaces it.  A peer enrolled by earlier firmware in key
+reference `0xFC` becomes the pin at the first boot (0xFC is then erased;
+the reference stays reserved).
+
+**DOMAIN_STATUS (`0x40`)**, 117 bytes:
+
+| Offset | Size | Field |
+|---|---|---|
+| 0 | 1 | format version, 1 |
+| 1 | 1 | flags: `01` DKEK present, `02` OTP production mode (else development), `04` this device's certificate is in the member list, `08` a peer is pinned |
+| 2 | 16 | domain_id = SHA-256(Q_domain)[0..16] (zeros without a DKEK) |
+| 18 | 8 | KCV = SHA-256(DKEK)[0..8] (zeros without a DKEK) |
+| 26 | 65 | Q_domain, uncompressed P-256 (zeros without a DKEK) |
+| 91 | 16 | own member ID = SHA-256(device public key)[0..16] (zeros before INITIALIZE) |
+| 107 | 8 | Lamport counter, u64 BE |
+| 115 | 1 | member-list entries |
+| 116 | 1 | member-list capacity (32) |
+
+The domain key is `d = OS2IP(HKDF-SHA256(ikm=DKEK, salt="pico2hsm-domain-v1",
+info="sign", L=48)) mod n` on P-256; every device with the same DKEK
+reports the same domain_id.  Reference: `tools/python/pico2hsm/domain.py`,
+vectors `firmware/tests/vectors/domain_v1.txt`.
+
+**GET_MEMBERS (`0x47`).** `total(1) ‖ first(1) = P2 ‖ n(1) ‖ n × entry`,
+at most 16 entries per page; ask again with P2 = first + n while
+first + n < total.  `6A86` if P2 > total.  Entry (197 bytes):
+
+```
+version(1) = 1 | status(1) 0 active / 1 revoked | revoked_lamport(8 BE)
+| certificate(187):
+    version(1) = 1 | domain_id(16) | member_id(16) = SHA-256(member_pub)[0..16]
+    | member_pub(65) | sponsor_id(16) | issued_lamport(8 BE) | flags(1) bit0 may sponsor
+    | sig(64) = ECDSA-P256(d_domain, r‖s) over
+                SHA-256("pico2hsm-member-cert-v1" ‖ the 123 bytes before it)
+```
+
+A device that holds the DKEK and has no member list certifies itself
+(sponsor = itself): when the last DKEK share is imported or an exchange
+installs the DKEK, and at boot if it held a DKEK before this firmware.
+SC-HSM INITIALIZE erases the member list, the object sidecars and the pin.
+
 ---
 
 ### 3.30 DEBUG DUMP (INS = 0xFE)
@@ -1573,14 +1663,15 @@ See `docs/AUDIT_2026-10.md` for the full list and commits.
   are rejected without spending a retry). Re-INITIALIZE spends the SO-PIN
   counter and is refused while the SO-PIN is blocked. Minimum user PIN
   length is 6.
-- **Reserved key references `0xFC`–`0xFF`** (enrolled peer, DKEK, device
-  identity key, PIN record) are refused by SIGN, DECIPHER, PSO via MSE,
+- **Reserved key references `0xFC`–`0xFF`** (legacy enrolled peer, DKEK,
+  device identity key, PIN record) are refused by SIGN, DECIPHER, PSO via MSE,
   GENERAL AUTHENTICATE, BIP/SLIP, GENERATE KEY [PAIR], IMPORT/EXPORT KEY and
   DELETE FILE.
 - **EXTRAS DKEK exchange (`0x35`–`0x38`)** requires the SO-PIN and a peer
-  enrolled with `0x3D` on both devices; there is no unauthenticated mode.
+  pinned with `0x3D` on both devices; there is no unauthenticated mode.
   SOURCE encrypts the DKEK only to the ephemeral key whose signature it
-  verified in `0x36`; TARGET never overwrites an existing DKEK.
+  verified in `0x36`; TARGET never overwrites an existing DKEK.  The pin
+  is single use: a second exchange needs a new pin.
 - **EXTRAS `0x39` GET_KEY_MANIFEST** requires the user PIN (`0x3A` state hash
   stays open: it is a device-signed attestation).
 - **EXTERNAL AUTHENTICATE (`0x82`)** is removed (returns `6D00`).
