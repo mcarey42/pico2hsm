@@ -44,11 +44,34 @@ Security and robustness release from the October 2026 audit
   longer lose every key.  Existing keystores are read and upgraded on the
   first write; firmware older than this can't read the new format, so
   don't downgrade a board after it has written keys.
+- **PIN/PUK retry counters moved to a dedicated counter log** on internal
+  flash (`0x1FC000`–`0x200000`, the top 16 KB of the firmware partition,
+  on every board including the SD-card ones; see
+  `firmware/src/storage/retry_counter.rs`).  The firmware image limit
+  shrinks by 16 KB accordingly (`boards/*.x`).  **Migration:** the first
+  boot of this firmware copies the counts from the existing PIN records
+  (SC-HSM user PIN / SO-PIN / PUK, PIV PIN / PUK, OpenPGP PW1 / PW3) into
+  the log, then zeroes them in the records; nothing to do by hand.  If
+  that boot can't read a record, every credential loads blocked for that
+  boot and the migration runs again on the next one.  **Don't downgrade
+  afterwards:** older firmware reads the zeroed records as "every
+  credential blocked".  A PIN record without a counter entry (e.g. the
+  counter sectors erased on their own) also loads blocked.
 
 ### Security
 - PIN / SO-PIN / PUK retry counters (SC-HSM, PIV, OpenPGP) are written to
   flash before the credential is compared; a reset no longer restores
   guesses. Re-INITIALIZE counts against the SO-PIN.
+- Credential checks no longer wear out the keystore directory (audit
+  R2-4).  A failed attempt now programs one 16-byte record into the
+  append-only counter log (no erase), a success one more; PIN records and
+  the keystore directory are rewritten only when a credential changes.  A
+  4 KB counter sector is erased once per ~248 records, rotating over four
+  sectors: roughly 50 million successful VERIFYs before the sectors reach
+  100k erase cycles, against ~100k VERIFYs before.  The counters are kept
+  as a monotonic failure total plus a snapshot at the last success, so a
+  later OTP-backed total can make flash-image rollback reduce, never
+  restore, the remaining tries.
 - DKEK exchange only encrypts the DKEK to the ephemeral key the enrolled peer
   signed; the DKEK is persisted (it was lost on every reset).
 - Reserved key refs 0xFC–0xFF can no longer be used, exported or overwritten
