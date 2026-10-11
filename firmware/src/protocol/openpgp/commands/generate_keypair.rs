@@ -261,8 +261,8 @@ pub fn handle_with_store(
     if store.save_key(&obj).is_err() {
         // The key was generated into RAM; drop it so RAM matches flash.
         let (private, public) = match slot {
-            0 => (&mut state.sig_private, &mut state.sig_public),
-            1 => (&mut state.dec_private, &mut state.dec_public),
+            SLOT_SIG => (&mut state.sig_private, &mut state.sig_public),
+            SLOT_DEC => (&mut state.dec_private, &mut state.dec_public),
             _ => (&mut state.auth_private, &mut state.auth_public),
         };
         crate::protocol::openpgp::wipe_key(private);

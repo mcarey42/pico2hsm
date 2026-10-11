@@ -767,4 +767,54 @@ mod terminate_tests {
         );
         assert!(pgp.state.sig_private.is_some(), "RAM still matches flash");
     }
+
+    /// Store whose key writes fail.
+    struct FailSaveStore;
+
+    impl crate::storage::KeyStore for FailSaveStore {
+        fn save_key(&mut self, _: &KeyObject) -> Result<(), HsmError> {
+            Err(HsmError::NotSupported)
+        }
+        fn fetch_key(&mut self, _: KeyId) -> Result<Option<KeyObject>, HsmError> {
+            Ok(None)
+        }
+        fn erase_key(&mut self, _: KeyId) -> Result<(), HsmError> {
+            Ok(())
+        }
+        fn wipe_all(&mut self) -> Result<(), HsmError> {
+            Ok(())
+        }
+        fn wipe_by_owner(&mut self, _: AppletId) -> Result<(), HsmError> {
+            Ok(())
+        }
+        fn enumerate_keys(&self) -> heapless::Vec<KeyId, 64> {
+            heapless::Vec::new()
+        }
+        fn for_each_key(&self, _: &mut dyn FnMut(KeyId)) {}
+    }
+
+    #[test]
+    fn failed_keygen_save_drops_only_the_new_key() {
+        let mut pgp = OpenPgp::new();
+        pgp.state.pw3_verified = true;
+        let mut auth = heapless::Vec::new();
+        auth.extend_from_slice(&[0x77u8; 32]).unwrap();
+        pgp.state.auth_private = Some(auth.clone());
+
+        // GENERATE KEY PAIR for the signature slot (CRT B6).
+        let r = pgp.process_apdu_with_store(
+            &[0x00, 0x47, 0x80, 0x00, 0x02, 0xB6, 0x00],
+            &mut FailSaveStore,
+        );
+        assert_eq!(&r[r.len() - 2..], &[0x65, 0x81]);
+        assert!(
+            pgp.state.sig_private.is_none(),
+            "unsaved signature key dropped"
+        );
+        assert_eq!(
+            pgp.state.auth_private,
+            Some(auth),
+            "authentication key untouched"
+        );
+    }
 }
