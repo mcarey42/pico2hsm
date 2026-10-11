@@ -73,6 +73,7 @@ pub struct InMemoryPivKey {
 
 /// A stored PIV data object (certificate, CHUID, CCC, etc.).
 #[cfg(feature = "applet-piv")]
+#[derive(Clone)]
 pub struct PivDataObject {
     /// Low byte of the 3-byte tag (e.g. 0x02 for CHUID=5FC102, 0x05 for cert 9A=5FC105).
     pub tag_low: u8,
@@ -286,6 +287,31 @@ impl Piv {
         pico2hsm_core::key::KeyId(0x000100FF)
     }
 
+    /// KeyId of a persisted PIV data object (`5FC1xx` / `7E`): 0xD0 in
+    /// bits 15–8 keeps these apart from the key slots (bits 15–8 = 0).
+    pub fn piv_data_object_key_id(tag_low: u8) -> pico2hsm_core::key::KeyId {
+        pico2hsm_core::key::KeyId(pico2hsm_core::key::KeyId::piv(tag_low).0 | 0xD000)
+    }
+
+    /// Persist one PIV data object (keystore-encrypted like keys).
+    pub fn save_data_object_to_store(
+        obj: &PivDataObject,
+        store: &mut dyn crate::storage::KeyStore,
+    ) -> Result<(), pico2hsm_core::error::HsmError> {
+        use crate::security::key_management::{AlgorithmId, KeyObject, KeyType as KmKeyType};
+        use pico2hsm_core::key::AppletId;
+        let mut rec = KeyObject::new(
+            KmKeyType::Generic,
+            Self::piv_data_object_key_id(obj.tag_low).0,
+            AppletId::Piv,
+            AlgorithmId::AesGcm,
+        );
+        rec.private_key
+            .extend_from_slice(&obj.data)
+            .map_err(|_| pico2hsm_core::error::HsmError::InvalidInput)?;
+        store.save_key(&rec)
+    }
+
     /// KeyId of the persisted management key (slot reference 9B).
     pub fn piv_mgmt_key_id() -> pico2hsm_core::key::KeyId {
         pico2hsm_core::key::KeyId::piv(0x9B)
@@ -457,6 +483,7 @@ impl Piv {
                 }
                 resp
             }
+            put_data::INS_PUT_DATA => put_data::handle_with_store(&mut self.state, store, cmd),
             generate_keypair::INS_GENERATE_KEYPAIR => {
                 generate_keypair::handle_with_store(&mut self.state, store, cmd)
             }
@@ -514,11 +541,35 @@ impl Piv {
 
             // Load key objects for PIV slots.
             let mut piv_ids: heapless::Vec<pico2hsm_core::key::KeyId, 16> = heapless::Vec::new();
+            let mut object_ids: heapless::Vec<pico2hsm_core::key::KeyId, MAX_PIV_DATA_OBJECTS> =
+                heapless::Vec::new();
             store.for_each_key(&mut |kid| {
-                if kid.applet_byte() == AppletId::Piv as u8 && kid.proto_ref() != 0xFF {
-                    let _ = piv_ids.push(kid);
+                if kid.applet_byte() != AppletId::Piv as u8 {
+                    return;
+                }
+                match (kid.0 >> 8) & 0xFF {
+                    0xD0 => {
+                        let _ = object_ids.push(kid);
+                    }
+                    0x00 if kid.proto_ref() != 0xFF => {
+                        let _ = piv_ids.push(kid);
+                    }
+                    _ => {}
                 }
             });
+            for kid in object_ids.iter() {
+                if let Ok(Some(rec)) = store.fetch_key(*kid) {
+                    let mut data = heapless::Vec::new();
+                    if data.extend_from_slice(&rec.private_key).is_ok() {
+                        let tag_low = kid.proto_ref();
+                        self.state.data_objects.retain(|o| o.tag_low != tag_low);
+                        let _ = self
+                            .state
+                            .data_objects
+                            .push(PivDataObject { tag_low, data });
+                    }
+                }
+            }
             for kid in piv_ids.iter() {
                 if let Ok(Some(obj)) = store.fetch_key(*kid) {
                     use crate::security::key_management::{AlgorithmId, KeyType as KmKeyType};
@@ -694,5 +745,127 @@ mod retry_persistence_tests {
         let r = piv.process_apdu_with_store(&apdu, &mut store);
         assert_eq!(&r[r.len() - 2..], &[0x90, 0x00]);
         assert_eq!(piv.state.mgmt_key, new_key);
+    }
+}
+
+#[cfg(all(test, feature = "applet-piv"))]
+mod data_object_tests {
+    use super::*;
+    use crate::security::key_management::{AlgorithmId, KeyObject, KeyType as KmKeyType};
+    use pico2hsm_core::error::HsmError;
+    use pico2hsm_core::key::{AppletId, KeyId};
+
+    struct MemStore {
+        records: heapless::Vec<(KeyId, heapless::Vec<u8, 2100>), 4>,
+    }
+
+    impl crate::storage::KeyStore for MemStore {
+        fn save_key(&mut self, obj: &KeyObject) -> Result<(), HsmError> {
+            let kid = KeyId(obj.key_id);
+            self.records.retain(|(k, _)| *k != kid);
+            let mut b = heapless::Vec::new();
+            b.extend_from_slice(&obj.private_key)
+                .map_err(|_| HsmError::InvalidInput)?;
+            self.records
+                .push((kid, b))
+                .map_err(|_| HsmError::InvalidInput)
+        }
+        fn fetch_key(&mut self, kid: KeyId) -> Result<Option<KeyObject>, HsmError> {
+            Ok(self.records.iter().find(|(k, _)| *k == kid).map(|(_, b)| {
+                let mut o = KeyObject::new(
+                    KmKeyType::Generic,
+                    kid.0,
+                    AppletId::Piv,
+                    AlgorithmId::AesGcm,
+                );
+                o.private_key.extend_from_slice(b).unwrap();
+                o
+            }))
+        }
+        fn erase_key(&mut self, _: KeyId) -> Result<(), HsmError> {
+            Ok(())
+        }
+        fn wipe_all(&mut self) -> Result<(), HsmError> {
+            Ok(())
+        }
+        fn wipe_by_owner(&mut self, _: AppletId) -> Result<(), HsmError> {
+            Ok(())
+        }
+        fn enumerate_keys(&self) -> heapless::Vec<KeyId, 64> {
+            heapless::Vec::new()
+        }
+        fn for_each_key(&self, f: &mut dyn FnMut(KeyId)) {
+            for (k, _) in self.records.iter() {
+                f(*k);
+            }
+        }
+    }
+
+    /// Extended-length PUT DATA for tag 5FC1<low> with `content`.
+    fn put_data(low: u8, content: &[u8]) -> heapless::Vec<u8, 2200> {
+        let mut body: heapless::Vec<u8, 2100> = heapless::Vec::new();
+        body.extend_from_slice(&[0x5C, 0x03, 0x5F, 0xC1, low, 0x53, 0x82])
+            .unwrap();
+        body.extend_from_slice(&(content.len() as u16).to_be_bytes())
+            .unwrap();
+        body.extend_from_slice(content).unwrap();
+        let mut a = heapless::Vec::new();
+        a.extend_from_slice(&[0x00, 0xDB, 0x3F, 0xFF, 0x00])
+            .unwrap();
+        a.extend_from_slice(&(body.len() as u16).to_be_bytes())
+            .unwrap();
+        a.extend_from_slice(&body).unwrap();
+        a
+    }
+
+    fn sw(r: &[u8]) -> u16 {
+        u16::from_be_bytes([r[r.len() - 2], r[r.len() - 1]])
+    }
+
+    #[test]
+    fn put_data_survives_reset() {
+        let mut piv = Piv::new();
+        piv.state.mgmt_key_authenticated = true;
+        let mut store = MemStore {
+            records: heapless::Vec::new(),
+        };
+        let cert = [0xC3u8; 300];
+        assert_eq!(
+            sw(&piv.process_apdu_with_store(&put_data(0x05, &cert), &mut store)),
+            0x9000
+        );
+
+        let mut fresh = Piv::new();
+        fresh.load_from_store(&mut store);
+        let obj = fresh
+            .state
+            .data_objects
+            .iter()
+            .find(|o| o.tag_low == 0x05)
+            .unwrap();
+        assert_eq!(&obj.data[4..], &cert[..], "53 82 01 2C || cert");
+    }
+
+    #[test]
+    fn oversized_object_is_refused_not_truncated() {
+        let mut piv = Piv::new();
+        piv.state.mgmt_key_authenticated = true;
+        let mut store = MemStore {
+            records: heapless::Vec::new(),
+        };
+        // 2046 bytes of content + 4-byte 53 wrapper > 2048.
+        let r = piv.process_apdu_with_store(&put_data(0x05, &[0u8; 2046]), &mut store);
+        assert_eq!(sw(&r), 0x6A84);
+        assert!(store.records.is_empty());
+    }
+
+    #[test]
+    fn chuid_guid_is_not_all_zero() {
+        let mut piv = Piv::new();
+        let r = piv.process_apdu(&[
+            0x00, 0xCB, 0x3F, 0xFF, 0x05, 0x5C, 0x03, 0x5F, 0xC1, 0x02, 0x00,
+        ]);
+        let guid_at = r.windows(2).position(|w| w == [0x34, 0x10]).unwrap() + 2;
+        assert_ne!(&r[guid_at..guid_at + 16], &[0u8; 16]);
     }
 }

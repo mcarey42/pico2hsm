@@ -17,6 +17,43 @@ use crate::protocol::piv::{PivDataObject, PivState, MAX_PIV_DATA_SIZE};
 /// INS byte for PUT DATA.
 pub const INS_PUT_DATA: u8 = 0xDB;
 
+/// PUT DATA with persistence: the object is written to flash, so PIV
+/// certificates, CHUID etc. survive a reset.  A failed write restores the
+/// previous object in RAM and returns 6581.
+pub fn handle_with_store(
+    state: &mut PivState,
+    store: &mut dyn crate::storage::KeyStore,
+    cmd: &ApduCommand<'_>,
+) -> ApduResponse {
+    let tag_low = match cmd.data.get(..5) {
+        Some([0x5C, 0x03, 0x5F, 0xC1, low]) => *low,
+        Some([0x5C, 0x01, 0x7E, ..]) => 0x7E,
+        _ => return handle(state, cmd),
+    };
+    let previous = state
+        .data_objects
+        .iter()
+        .find(|o| o.tag_low == tag_low)
+        .cloned();
+    let resp = handle(state, cmd);
+    if resp.sw != pico2hsm_core::apdu::SW_OK {
+        return resp;
+    }
+    let saved = state
+        .data_objects
+        .iter()
+        .find(|o| o.tag_low == tag_low)
+        .map(|o| crate::protocol::piv::Piv::save_data_object_to_store(o, store));
+    if !matches!(saved, Some(Ok(()))) {
+        state.data_objects.retain(|o| o.tag_low != tag_low);
+        if let Some(old) = previous {
+            let _ = state.data_objects.push(old);
+        }
+        return ApduResponse::err(pico2hsm_core::apdu::SW_MEMORY_FAILURE);
+    }
+    resp
+}
+
 /// Handle a PUT DATA APDU command.
 pub fn handle(state: &mut PivState, cmd: &ApduCommand<'_>) -> ApduResponse {
     // P1=0x3F, P2=0xFF
@@ -76,25 +113,25 @@ pub fn handle(state: &mut PivState, cmd: &ApduCommand<'_>) -> ApduResponse {
 
     let content = &rest[content_start..content_start + content_len];
 
-    if content.len() > MAX_PIV_DATA_SIZE {
+    // Build the complete stored object (including the 53 wrapper) so GET
+    // DATA can return it directly.  The wrapper counts against the capacity:
+    // refuse rather than silently truncate the object.
+    let mut obj_data = heapless::Vec::<u8, MAX_PIV_DATA_SIZE>::new();
+    let header: &[u8] = if content_len < 128 {
+        &[0x53, content_len as u8]
+    } else if content_len < 256 {
+        &[0x53, 0x81, content_len as u8]
+    } else {
+        &[
+            0x53,
+            0x82,
+            (content_len >> 8) as u8,
+            (content_len & 0xFF) as u8,
+        ]
+    };
+    if obj_data.extend_from_slice(header).is_err() || obj_data.extend_from_slice(content).is_err() {
         return ApduResponse::err(0x6A84); // not enough memory
     }
-
-    // Build the complete stored object (including the 53 wrapper)
-    let mut obj_data = heapless::Vec::<u8, MAX_PIV_DATA_SIZE>::new();
-    // Store the raw 53-wrapped content so GET DATA can return it directly
-    let _ = obj_data.push(0x53);
-    if content_len < 128 {
-        let _ = obj_data.push(content_len as u8);
-    } else if content_len < 256 {
-        let _ = obj_data.push(0x81);
-        let _ = obj_data.push(content_len as u8);
-    } else {
-        let _ = obj_data.push(0x82);
-        let _ = obj_data.push((content_len >> 8) as u8);
-        let _ = obj_data.push((content_len & 0xFF) as u8);
-    }
-    let _ = obj_data.extend_from_slice(content);
 
     // Remove existing object with this tag
     state.data_objects.retain(|o| o.tag_low != tag_low);

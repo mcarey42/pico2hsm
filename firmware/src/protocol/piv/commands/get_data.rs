@@ -69,7 +69,28 @@ pub fn handle(state: &PivState, cmd: &ApduCommand<'_>) -> ApduResponse {
 /// - Expiration Date (tag 0x35) - 8 bytes ASCII "YYYYMMDD"
 /// - Issuer Asymmetric Signature (tag 0x3E) - empty (no PKI)
 /// - Error Detection Code (tag 0xFE) - empty
-fn build_chuid(state: &PivState) -> ApduResponse {
+/// Per-device CHUID GUID: SHA-256("pico2hsm-piv-guid" || chip id), first
+/// 16 bytes, with RFC 4122 version-4/variant bits.  (Was `device_id`, which
+/// is all zeros on every device; `device_id` stays the PIN KDF context so
+/// stored PIV PINs keep verifying.)
+fn chuid_guid() -> [u8; 16] {
+    use sha2::{Digest, Sha256};
+    #[cfg(target_arch = "arm")]
+    let chip_id = embassy_rp::otp::get_chipid().unwrap_or(0);
+    #[cfg(not(target_arch = "arm"))]
+    let chip_id = 0u64;
+    let mut h = Sha256::new();
+    h.update(b"pico2hsm-piv-guid");
+    h.update(chip_id.to_be_bytes());
+    let digest = h.finalize();
+    let mut guid = [0u8; 16];
+    guid.copy_from_slice(&digest[..16]);
+    guid[6] = (guid[6] & 0x0F) | 0x40;
+    guid[8] = (guid[8] & 0x3F) | 0x80;
+    guid
+}
+
+fn build_chuid(_state: &PivState) -> ApduResponse {
     let mut resp = heapless::Vec::<u8, 256>::new();
 
     // Outer tag 0x53 (content wrapper)
@@ -92,10 +113,10 @@ fn build_chuid(state: &PivState) -> ApduResponse {
     ];
     let _ = resp.extend_from_slice(&fascn);
 
-    // GUID (tag 0x34) - 16 bytes from device_id
+    // GUID (tag 0x34) - 16 bytes, unique per device (hosts cache by CHUID)
     let _ = resp.push(0x34);
     let _ = resp.push(16);
-    let _ = resp.extend_from_slice(&state.device_id);
+    let _ = resp.extend_from_slice(&chuid_guid());
 
     // Expiration Date (tag 0x35) - 8 bytes ASCII "20301231"
     let _ = resp.push(0x35);
