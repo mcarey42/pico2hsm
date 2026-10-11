@@ -331,14 +331,16 @@ impl PwCounter {
         let well_formed = cmd.p1 == 0x00
             && match (cmd.ins, cmd.p2) {
                 (verify::INS_VERIFY, _) => (6..=127).contains(&n),
-                (change_pin::INS_CHANGE_PIN, 0x81) => {
-                    change_pin::split_at(state.pw1_hash.as_ref(), n, change_pin::PW1_MIN_LEN)
-                        .is_some()
-                }
-                (change_pin::INS_CHANGE_PIN, 0x83) => {
-                    change_pin::split_at(state.pw3_hash.as_ref(), n, change_pin::PW3_MIN_LEN)
-                        .is_some()
-                }
+                (change_pin::INS_CHANGE_PIN, 0x81) => change_pin::counts_as_attempt(
+                    state.pw1_hash.as_ref(),
+                    n,
+                    change_pin::PW1_MIN_LEN,
+                ),
+                (change_pin::INS_CHANGE_PIN, 0x83) => change_pin::counts_as_attempt(
+                    state.pw3_hash.as_ref(),
+                    n,
+                    change_pin::PW3_MIN_LEN,
+                ),
                 _ => false,
             };
         if !well_formed {
@@ -993,5 +995,27 @@ mod pw_tests {
             sw(&mut pgp, &mut store, &apdu(0x24, 0x81, b"123456654321")),
             0x9000
         );
+    }
+
+    #[test]
+    fn change_pin_does_not_reveal_pin_length() {
+        // Wrong total length and wrong old PIN must look identical: same SW,
+        // same retry cost.  (Default PW1 is 6 bytes.)
+        let mut pgp = OpenPgp::new();
+        let mut store = MemStore {
+            records: heapless::Vec::new(),
+        };
+        // Correct old PIN, but 134 trailing bytes: no valid split at length 6.
+        let mut long = [b'9'; 140];
+        long[..6].copy_from_slice(b"123456");
+        let mut cmd: heapless::Vec<u8, 160> = heapless::Vec::new();
+        cmd.extend_from_slice(&[0x00, 0x24, 0x00, 0x81, long.len() as u8])
+            .unwrap();
+        cmd.extend_from_slice(&long).unwrap();
+        let r = pgp.process_apdu_with_store(&cmd, &mut store);
+        let r1 = u16::from_be_bytes([r[r.len() - 2], r[r.len() - 1]]);
+        assert_eq!(r1, 0x63C2, "bad split fails like a wrong PIN, not 6700");
+        let r2 = sw(&mut pgp, &mut store, &apdu(0x24, 0x81, b"000000654321")); // right split, wrong PIN
+        assert_eq!(r2, 0x63C1);
     }
 }

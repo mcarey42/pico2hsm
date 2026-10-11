@@ -24,12 +24,21 @@ fn sw_retry(remaining: u8) -> u16 {
 pub const PW1_MIN_LEN: usize = 6;
 pub const PW3_MIN_LEN: usize = 8;
 
-/// Where `old || new` splits: the stored password length, if the request
-/// is well formed (so the old password would actually be compared).
-pub fn split_at(stored: Option<&PwHash>, data_len: usize, min_len: usize) -> Option<usize> {
-    let old_len = stored?.len()?;
+/// Where `old || new` splits: the stored password length, if the new
+/// password that leaves is a valid length.
+fn split_at(stored: &PwHash, data_len: usize, min_len: usize) -> Option<usize> {
+    let old_len = stored.len()?;
     let new_len = data_len.checked_sub(old_len)?;
     (min_len..=127).contains(&new_len).then_some(old_len)
+}
+
+/// Whether a CHANGE REFERENCE DATA attempt counts against the retry
+/// counter.  Deliberately independent of the stored password length: any
+/// plausibly sized request is an attempt, and one that does not split at
+/// the stored length fails exactly like a wrong password.  Otherwise the
+/// free 6700 vs. retry-costing 63Cx responses would reveal the length.
+pub fn counts_as_attempt(stored: Option<&PwHash>, data_len: usize, min_len: usize) -> bool {
+    stored.is_some_and(|s| s.len().is_some()) && (2 * min_len..=2 * 127).contains(&data_len)
 }
 
 /// CHANGE REFERENCE DATA for one password.  `old || new` is split at the
@@ -52,18 +61,31 @@ fn change(
         // Legacy record of unknown length: a VERIFY records it first.
         return ApduResponse::err(pico2hsm_core::apdu::SW_CONDITIONS_NOT_SATISFIED);
     }
-    let Some(old_len) = split_at(Some(stored), data.len(), min_len) else {
+    if !(2 * min_len..=2 * 127).contains(&data.len()) {
         return ApduResponse::err(SW_WRONG_LENGTH);
+    }
+    // A request that does not split at the stored length fails like a
+    // wrong password (same SW, same retry cost) — see counts_as_attempt.
+    let matched = match split_at(stored, data.len(), min_len) {
+        Some(old_len) => {
+            let (old, new) = data.split_at(old_len);
+            stored.matches(old).then_some(new)
+        }
+        None => {
+            // Same KDF work as a real comparison, so timing doesn't reveal
+            // whether the request split at the stored length either.
+            let _ = stored.matches(&data[..min_len]);
+            None
+        }
     };
-    let (old, new) = data.split_at(old_len);
-    if !stored.matches(old) {
+    let Some(new) = matched else {
         *retries = retries.saturating_sub(1);
         return if *retries == 0 {
             ApduResponse::err(SW_AUTH_BLOCKED)
         } else {
             ApduResponse::err(sw_retry(*retries))
         };
-    }
+    };
     *slot = Some(PwHash::new(new));
     *retries = max_retries;
     ApduResponse::ok(&[])
