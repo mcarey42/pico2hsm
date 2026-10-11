@@ -1,6 +1,6 @@
 # pico2hsm Domains and Multi-Way Sync: Design Plan V3
 
-*Supersedes the domain, enrollment and sync parts of `CLUSTER_PLAN_V2.md`. The V2 DKEK exchange (§1) is kept and generalised. Date: 2026-10-11. Status: approved by the owner on 2026-10-11 (§12). P0 is in progress.*
+*Supersedes the domain, enrollment and sync parts of `CLUSTER_PLAN_V2.md`. The V2 DKEK exchange (§1) is kept and generalised. Date: 2026-10-11. Status: approved by the owner on 2026-10-11 (§12). P0 firmware is implemented on `feat/p0-cardcontact-wrap` (host-tested; hardware run pending).*
 
 ---
 
@@ -37,7 +37,7 @@ The production daemon is a new `pico2hsm-syncd` crate in the `pico2hsm-tool` rep
 | Generation counter | `u64` held **in RAM only**; it is reset on every boot. |
 | `GET_KEY_MANIFEST` (`0x54/P1=39`) | At most 32 entries; needs the user PIN. |
 | `GET_STATE_HASH` (`0x54/P1=3A`) | A SHA-256 root over the keys; no on-device signature. |
-| WRAP / UNWRAP (`0x72` / `0x74`) | **Not CardContact format.** It uses a pico2hsm encrypt-then-MAC format (KCV = CMAC over zeros, version byte 0x02, HMAC-SHA256 tag). Real SmartCard-HSM and `sc-hsm-tool` blobs don't import, and ours don't export to them. |
+| WRAP / UNWRAP (`0x72` / `0x74`) | **CardContact key blob** (P0, `feat/p0-cardcontact-wrap`): KCV = SHA-256(DKEK)[0..8], AES-256-CBC + AES-CMAC under SHA-256(DKEK‖counter) keys; EC P-256/384/521 and secp256k1, RSA (CRT out; CRT and plain in), AES; algorithm list in the blob's field. Known-answer tests against an independent Python reference and against pico-hsm's own `kek.c`. The old pico2hsm v2/v3 blobs still UNWRAP (deprecated, one release). KEY DOMAIN status/KCV follow OpenSC. Layout: `SC_HSM_APDU_REFERENCE.md` §3.32. |
 | Tombstones | Designed in V2 §2d but not implemented. |
 | Per-key policy (algorithm list 0x91, use counter 0x90) | In progress on branch `feat/key-usage-policy`. |
 | Host side | Python daemon and library in `tools/python` (TCP/TLS, USB auto-sync, health checks). Rust `pico2hsm-tool` is a CLI and library with no sync code yet. |
@@ -75,16 +75,16 @@ Everything else depends on this layer, and it is also the main gap against the o
 
 1. **CardContact wrap format for WRAP KEY (0x72) and UNWRAP KEY (0x74).**
    - Implement the SmartCard-HSM key-backup blob:
-     - KCV = the first 8 bytes of SHA-256(DKEK);
+     - KCV = the first 8 bytes of SHA-256(DKEK) (confirmed: pico-hsm `kek.c` `dkek_kcv`);
      - key type;
      - key OID, allowed-algorithm list and access conditions, as length-prefixed fields;
-     - AES-256-CBC encryption with K_enc derived from the DKEK;
-     - CMAC with K_mac derived from the DKEK.
+     - AES-256-CBC encryption (IV = 0, 8-byte random prefix) with K_enc = SHA-256(DKEK ‖ 00000001);
+     - AES-CMAC with K_mac = SHA-256(DKEK ‖ 00000002).
    - **Verify the exact layout against OpenSC `src/tools/sc-hsm-tool.c` (wrap and unwrap) and the CardContact documentation before coding.** Add known-answer tests from blobs produced by `sc-hsm-tool` and, if one is available, a real SmartCard-HSM.
    - The current pico2hsm-format blobs (version 0x02) stay importable for one release, with an UNWRAP compatibility path, then they are dropped. WRAP only produces the CardContact format.
    - The per-key policy from S-10 (allowed algorithms, use counter where the format allows it) travels in the blob's own fields, so backup and restore keeps the policy.
 2. **KCV everywhere.** Use CardContact's KCV, the first 8 bytes of SHA-256(DKEK), in `KEY DOMAIN` responses and status, so `sc-hsm-tool` prints a check value the owner can compare across devices.
-3. **DKEK shares.** The current behaviour stays: `sc-hsm-tool` decrypts the password-protected share file on the host and sends the raw 32-byte share. Shares combine as in the SmartCard-HSM specification; check whether that is XOR or a sum against `sc-hsm-tool`.
+3. **DKEK shares.** The current behaviour stays: `sc-hsm-tool` decrypts the password-protected share file on the host and sends the raw 32-byte share. Shares combine by XOR (pico-hsm `import_dkek_share`), which the firmware already did. The KEY DOMAIN response had its first two bytes swapped and P1=00 without data (the status query) was refused; both fixed in P0.
 
 **Acceptance test:**
 1. Create shares with `sc-hsm-tool --create-dkek-share`.
@@ -325,7 +325,7 @@ crates/
 
 | Phase | Firmware | Host | Done when |
 |---|---|---|---|
-| **P0 Compatibility** | CardContact wrap format and KCV (§3); compatibility UNWRAP for v0x02 | `pico2hsm-proto` known-answer vectors | `sc-hsm-tool` wrap/unwrap round trip across two devices |
+| **P0 Compatibility** — firmware done, hardware run pending | CardContact wrap format and KCV (§3); compatibility UNWRAP for v0x02/v0x03 | Known-answer vectors in `firmware/tests/vectors/` (Python reference + pico-hsm) for `pico2hsm-proto` to reuse | `sc-hsm-tool` wrap/unwrap round trip across two devices (`tests/hw/test_11_dkek_roundtrip.py::TestCardContactInterop` covers one device) |
 | **P1 Foundations** | Persisted Lamport counter; global IDs and PKCS#15 CKA_ID kept on import; domain key; member list replacing 0xFC; DOMAIN_STATUS | libpico2hsm APDUs; `domain status` | Two devices from the same shares report the same domain_id |
 | **P2 Enrollment** | ISSUE/REVOKE member cert; single-use pinned peer for the existing exchange | `domain enroll` with the short string; `domain revoke` | Enroll C through B, then A accepts C's records |
 | **P3 Records** | Sidecars, EXPORT/IMPORT_RECORD, tombstones, signed GET_STATE, buckets | proto codecs and fuzzing | Create, delete and re-create converge across 3 devices on one host |

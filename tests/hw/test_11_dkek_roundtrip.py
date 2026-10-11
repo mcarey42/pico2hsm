@@ -1,30 +1,30 @@
-"""Hardware integration tests for DKEK wrap/unwrap key backup round-trip.
+"""Hardware integration tests for DKEK key backup (WRAP / UNWRAP KEY).
 
-Status: implementation complete; requires hardware validation with a physical device.
+WRAP KEY (80 72) writes, and UNWRAP KEY (80 74) reads, the SmartCard-HSM
+(CardContact) key blob, as real SmartCard-HSMs and `sc-hsm-tool` do
+(docs/SC_HSM_APDU_REFERENCE.md, "Key backup blob").  The KCV that KEY
+DOMAIN reports (and `sc-hsm-tool` prints) is SHA-256(DKEK)[0..8].
 
-The firmware DKEK subsystem (DkekManager::wrap/unwrap, export_key::handle INS=0x72,
-import_key::handle INS=0x74) is fully implemented with real AES-256-CBC crypto,
-KCV verification, PKCS#7 padding, and persistent key storage.  Unit tests in
-firmware/src/security/dkek.rs and firmware/src/protocol/sc_hsm/commands/ pass.
-This hardware integration test exercises the end-to-end sc-hsm-tool workflow.
-
-Tests the standard sc-hsm-tool DKEK key backup workflow:
-  1. Initialize device with DKEK shares=1
-  2. Create and import a DKEK share
-  3. Generate a key on the device
-  4. Wrap (export) the key via --wrap-key
-  5. Re-initialize device (wipes all keys)
-  6. Re-import the same DKEK share
-  7. Unwrap (import) the key via --unwrap-key
-  8. Verify the restored key works (sign + verify with original public key)
-
-Also tests that a key wrapped under one DKEK cannot be unwrapped with a
-different DKEK (share mismatch).
+TestDkekWrapUnwrapRoundtrip:
+  generate -> wrap -> re-initialize -> re-import share -> unwrap -> sign.
+TestDkekDifferentSharesIncompatible:
+  a blob does not unwrap under another DKEK.
+TestCardContactInterop:
+  1. INITIALIZE with two DKEK shares created by sc-hsm-tool;
+  2. the KCV sc-hsm-tool prints equals SHA-256(share1 XOR share2)[0..8],
+     computed on the host from the decrypted share files;
+  3. sc-hsm-tool --wrap-key: the blob in the .wky file opens with the host
+     reference (tools/python/pico2hsm/cardcontact_wrap.py) and holds the
+     private key of the public key the device reports;
+  4. delete the key, sc-hsm-tool --unwrap-key it back, sign, verify;
+  5. a blob made on the host by the reference unwraps with sc-hsm-tool
+     and signs.
 
 Wire format (sc-hsm-tool standard):
   - Import DKEK share:  80 52 00 00 20 <32 raw bytes>
+  - Key domain status:  80 52 00 00 00
   - Wrap key:           80 72 <key_ref> 92 00
-  - Unwrap key:         80 74 <key_ref> 93 Lc <blob>
+  - Unwrap key:         WRITE EF 2F10 <blob>; 80 74 <key_ref> 93
 """
 
 from __future__ import annotations
@@ -435,3 +435,231 @@ class TestDkekDifferentSharesIncompatible:
             "Unwrap correctly rejected with mismatched DKEK (rc=%d)",
             unwrap.returncode,
         )
+
+
+# ---------------------------------------------------------------------------
+# CardContact interoperability (P0)
+# ---------------------------------------------------------------------------
+
+def _load_reference():
+    """The host reference implementation of the CardContact key blob."""
+    import importlib.util
+    import sys
+
+    path = Path(__file__).resolve().parents[2] / "tools" / "python" / "pico2hsm" / "cardcontact_wrap.py"
+    spec = importlib.util.spec_from_file_location("cardcontact_wrap", path)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules["cardcontact_wrap"] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _evp_bytes_to_key_md5(password: bytes, salt: bytes, count: int, n: int) -> bytes:
+    """OpenSSL EVP_BytesToKey(MD5, count) — what sc-hsm-tool uses for share files."""
+    import hashlib
+
+    out, prev = b"", b""
+    while len(out) < n:
+        d = hashlib.md5(prev + password + salt).digest()
+        for _ in range(count - 1):
+            d = hashlib.md5(d).digest()
+        out += d
+        prev = d
+    return out[:n]
+
+
+def _decrypt_share_file(path: Path, password: str) -> bytes:
+    """The 32-byte share in an sc-hsm-tool DKEK share file.
+
+    File: "Salted__" | salt(8) | AES-256-CBC(EVP_BytesToKey(MD5, 10^7)) of
+    the share, PKCS#7 padded (OpenSC sc-hsm-tool.c create_dkek_share).
+    About 30 s of MD5 on the host per share.
+    """
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+
+    data = path.read_bytes()
+    assert len(data) == 64 and data[:8] == b"Salted__", "not a DKEK share file"
+    kiv = _evp_bytes_to_key_md5(password.encode(), data[8:16], 10_000_000, 48)
+    dec = Cipher(algorithms.AES(kiv[:32]), modes.CBC(kiv[32:])).decryptor()
+    plain = dec.update(data[16:]) + dec.finalize()
+    assert plain[32:] == bytes([16]) * 16, "wrong share password"
+    return plain[:32]
+
+
+def _der_items(data: bytes) -> list[tuple[int, bytes]]:
+    """Top-level (tag, value) items of a DER string (one-byte tags)."""
+    items, i = [], 0
+    while i < len(data):
+        tag, l0 = data[i], data[i + 1]
+        i += 2
+        if l0 & 0x80:
+            n = l0 & 0x7F
+            length = int.from_bytes(data[i:i + n], "big")
+            i += n
+        else:
+            length = l0
+        items.append((tag, data[i:i + length]))
+        i += length
+    return items
+
+
+def _wky_blob(path: Path) -> bytes:
+    """The key blob inside a .wky file: SEQUENCE { OCTET STRING blob, [PRKD], [cert] }."""
+    [(tag, seq)] = _der_items(path.read_bytes())
+    assert tag == 0x30
+    items = _der_items(seq)
+    assert items[0][0] == 0x04
+    return items[0][1]
+
+
+def _printed_kcv(text: str) -> str:
+    import re
+
+    found = re.findall(r"Key Check Value\s*:\s*([0-9A-Fa-f ]+)", text)
+    assert found, f"no Key Check Value in:\n{text}"
+    return found[-1].replace(" ", "").strip().lower()
+
+
+class TestCardContactInterop:
+    """SmartCard-HSM / OpenSC compatibility of DKEK shares, KCV and key blobs."""
+
+    def test_cardcontact_wrap_unwrap_and_kcv(
+        self, runner: CLIRunner, config: dict, tmp_path: Path,
+    ) -> None:
+        if not _wait_for_device(timeout=10.0):
+            pytest.skip("No HSM device found")
+        cc = _load_reference()
+
+        # 1. Two shares from sc-hsm-tool, INITIALIZE for two, import both.
+        shares = [(tmp_path / f"share{i}.pbe", f"cc-interop-share-{i}") for i in (1, 2)]
+        for path, pw in shares:
+            _create_dkek_share(path, pw)
+        _initialize_with_dkek(config, dkek_shares=2)
+        for path, pw in shares:
+            _import_dkek_share(path, pw)
+
+        # 2. The KCV sc-hsm-tool prints is SHA-256(share1 ^ share2)[0..8].
+        info = runner.sc_hsm_tool(save_as="11cc_info")
+        assert info.returncode == 0, info.stderr[-2000:]
+        assert "DKEK shares     : 2" in info.stdout, info.stdout
+        printed = _printed_kcv(info.stdout)
+        dkek = cc.combine_shares(*(_decrypt_share_file(p, pw) for p, pw in shares))
+        assert printed == cc.kcv(dkek).hex(), (printed, cc.kcv(dkek).hex())
+        log.info("KCV %s matches SHA-256(DKEK)[0..8]", printed)
+
+        # 3. Generate, wrap with sc-hsm-tool, open the blob on the host.
+        keygen = runner.pkcs11_tool(
+            "--login", "--pin", config["pin"], "--keypairgen",
+            "--key-type", "EC:prime256v1", "--id", "31", "--label", "cc-interop",
+            save_as="11cc_keygen",
+        )
+        assert keygen.returncode == 0, keygen.stderr[-2000:]
+        slot = _get_first_key_slot(reader=0)
+        assert slot is not None
+        pub_der_path = tmp_path / "pub.der"
+        export = runner.pkcs11_tool(
+            "--login", "--pin", config["pin"], "--read-object", "--type", "pubkey",
+            "--id", "31", "--output-file", str(pub_der_path), save_as="11cc_pub",
+        )
+        assert export.returncode == 0, export.stderr[-2000:]
+        pub = serialization.load_der_public_key(pub_der_path.read_bytes())
+
+        wky = tmp_path / "cc.wky"
+        wrap = runner.sc_hsm_tool(
+            "--wrap-key", str(wky), "--key-reference", str(slot), "--pin", config["pin"],
+            save_as="11cc_wrap",
+        )
+        assert wrap.returncode == 0, wrap.stderr[-2000:]
+        blob = _wky_blob(wky)
+        assert blob[:8] == cc.kcv(dkek), "blob KCV"
+        assert blob[8] == cc.KEY_TYPE_EC, "CardContact EC key blob"
+        opened = cc.unwrap(dkek, blob)
+        d = int.from_bytes(opened.fields[5], "big")
+        assert ec.derive_private_key(d, ec.SECP256R1()).public_key().public_numbers() \
+            == pub.public_numbers(), "blob holds the device's key"
+        log.info("Device blob (%d bytes) opened with the host reference", len(blob))
+
+        # 4. Delete the key, unwrap it back with sc-hsm-tool, sign, verify.
+        delete = runner.pkcs11_tool(
+            "--login", "--pin", config["pin"], "--delete-object", "--type", "privkey",
+            "--id", "31", save_as="11cc_delete",
+        )
+        log.info("delete privkey rc=%d", delete.returncode)
+        unwrap = runner.sc_hsm_tool(
+            "--unwrap-key", str(wky), "--key-reference", str(slot), "--pin", config["pin"],
+            "--force", save_as="11cc_unwrap",
+        )
+        assert unwrap.returncode == 0, unwrap.stdout + unwrap.stderr[-2000:]
+        self._sign_and_verify(runner, config, tmp_path, "31", pub, "11cc_sign")
+
+        # 5. A blob made on the host unwraps on the device and signs.
+        d2 = int.from_bytes(os.urandom(32), "big") % (cc.CURVES["P-256"].n - 1) + 1
+        size, mat = cc.ec_material(cc.CURVES["P-256"], d2)
+        host_blob = cc.wrap(dkek, cc.KEY_TYPE_EC, cc.OID_ECDSA_SHA256, size, mat, os.urandom(8))
+        host_wky = tmp_path / "host.wky"
+        inner = bytes([0x04, 0x82]) + len(host_blob).to_bytes(2, "big") + host_blob
+        host_wky.write_bytes(bytes([0x30, 0x82]) + len(inner).to_bytes(2, "big") + inner)
+        slot2 = slot + 1
+        unwrap2 = runner.sc_hsm_tool(
+            "--unwrap-key", str(host_wky), "--key-reference", str(slot2),
+            "--pin", config["pin"], "--force", save_as="11cc_unwrap_host",
+        )
+        assert unwrap2.returncode == 0, unwrap2.stdout + unwrap2.stderr[-2000:]
+        # No PRKD came with the host blob: sign with the raw SC-HSM APDU
+        # (80 68 <ref> 70: ECDSA over a SHA-256 hash) and verify on the host.
+        import hashlib
+
+        msg = b"host-made CardContact blob"
+        digest = hashlib.sha256(msg).digest()
+        pin = config["pin"].encode("ascii")
+        apdus = [
+            "00A404000BE82B0601040181C31F020100",
+            f"00200081{len(pin):02X}{pin.hex()}",
+        ]
+        apdus.append(f"8068{slot2:02X}7020{digest.hex()}00")
+        args = ["opensc-tool", "-r0"]
+        for a in apdus:
+            args += ["-s", a]
+        res = runner.run(args, save_as="11cc_host_sign")
+        assert res.returncode == 0, res.stderr[-2000:]
+        sig = _last_response(res.stdout)
+        pub2 = ec.derive_private_key(d2, ec.SECP256R1()).public_key()
+        pub2.verify(sig, msg, ec.ECDSA(hashes.SHA256()))
+        log.info("Host-made blob unwrapped and signed on the device")
+
+    @staticmethod
+    def _sign_and_verify(runner, config, tmp_path, key_id, pub, save_as) -> None:
+        msg_file = tmp_path / f"{save_as}.msg"
+        sig_file = tmp_path / f"{save_as}.sig"
+        msg_file.write_bytes(b"CardContact interop " + save_as.encode())
+        sign = runner.pkcs11_tool(
+            "--login", "--pin", config["pin"], "--sign", "--mechanism", "ECDSA-SHA256",
+            "--id", key_id, "--input-file", str(msg_file), "--output-file", str(sig_file),
+            save_as=save_as,
+        )
+        assert sign.returncode == 0, sign.stderr[-2000:]
+        raw = sig_file.read_bytes()
+        r = int.from_bytes(raw[: len(raw) // 2], "big")
+        s_ = int.from_bytes(raw[len(raw) // 2:], "big")
+        pub.verify(utils.encode_dss_signature(r, s_), msg_file.read_bytes(),
+                   ec.ECDSA(hashes.SHA256()))
+
+
+def _last_response(stdout: str) -> bytes:
+    """Data bytes of the last opensc-tool response (SW 9000 required)."""
+    blocks, cur = [], None
+    for line in stdout.splitlines():
+        t = line.strip()
+        if t.startswith("Received"):
+            assert "SW1=0x90, SW2=0x00" in t, t
+            cur = bytearray()
+            blocks.append(cur)
+        elif t.startswith("Sending"):
+            cur = None
+        elif cur is not None:
+            for tok in t.split()[:16]:
+                if len(tok) == 2 and all(c in "0123456789abcdefABCDEF" for c in tok):
+                    cur.append(int(tok, 16))
+    assert blocks, stdout
+    return bytes(blocks[-1])
+

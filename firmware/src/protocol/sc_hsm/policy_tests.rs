@@ -331,7 +331,7 @@ fn policy_survives_wrap_and_unwrap() {
     assert_eq!(generate(&mut hsm, &mut store, 0x10, &attrs), SW_OK);
     let (sw, blob) = run(&mut hsm, &mut store, &apdu(0x80, 0x72, 0x10, 0x92, &[]));
     assert_eq!(sw, SW_OK);
-    assert_eq!(blob[8], 0x03, "wrap format version 3");
+    assert_eq!(blob[8], 12, "CardContact EC key blob");
     // Restore into another slot: same list and domain.
     assert_eq!(import(&mut hsm, &mut store, 0x11, &blob), SW_OK);
     let restored = store.load(KeyId::sc_hsm(0, 0x11)).unwrap();
@@ -361,15 +361,15 @@ fn counter_limited_key_is_not_exportable() {
     assert_eq!(generate(&mut hsm, &mut store, 0x15, &attrs), SW_OK);
     let (sw, _) = run(&mut hsm, &mut store, &apdu(0x80, 0x72, 0x15, 0x92, &[]));
     assert_eq!(sw, SW_CONDITIONS_NOT_SATISFIED);
-    // A blob that does carry a counter (made by a DKEK holder) is imported
-    // with it: a counter in a blob can only restrict.
+    // A (deprecated v3) blob that does carry a counter (made by a DKEK
+    // holder) is imported with it: a counter in a blob can only restrict.
     let mut policy = KeyPolicy::default();
     policy.use_counter = Some(1);
     let key = store.load(KeyId::sc_hsm(0, 0x14)).unwrap();
     let blob = hsm
         .state
         .dkek
-        .wrap_with_policy(&key.private_key, 0x13, 0, &policy, &mut FwRng)
+        .wrap_legacy(&key.private_key, 0x13, 0, &policy, &mut FwRng)
         .unwrap();
     assert_eq!(import(&mut hsm, &mut store, 0x16, &blob), SW_OK);
     assert_eq!(sign(&mut hsm, &mut store, 0x16, ALGO_EC_RAW), SW_OK);
@@ -434,7 +434,7 @@ fn proprietary_codes_are_checked_as_their_cardcontact_operation() {
 }
 
 #[test]
-fn list_without_wrap_forbids_export_and_plain_keys_keep_version_2() {
+fn list_without_wrap_forbids_export_and_plain_keys_export_cardcontact() {
     let (mut hsm, mut store) = (logged_in(), BlobStore::new());
     with_dkek(&mut hsm);
     assert_eq!(
@@ -446,10 +446,10 @@ fn list_without_wrap_forbids_export_and_plain_keys_keep_version_2() {
     assert_eq!(generate(&mut hsm, &mut store, 0x13, &[]), SW_OK);
     let (sw, blob) = run(&mut hsm, &mut store, &apdu(0x80, 0x72, 0x13, 0x92, &[]));
     assert_eq!(sw, SW_OK);
-    assert_eq!(
-        blob[8], 0x02,
-        "unrestricted key: format every firmware reads"
-    );
+    // CardContact EC blob, empty algorithm list and access conditions.
+    assert_eq!(blob[8], 12);
+    assert_eq!(&blob[9..11], &[0x00, 0x0A]);
+    assert_eq!(&blob[21..27], &[0, 0, 0, 0, 0, 0]);
 }
 
 #[test]

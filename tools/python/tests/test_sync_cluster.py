@@ -74,7 +74,7 @@ def compute_state_root(entries):
 
 
 # Valid 40-byte wrapped blob
-VALID_BLOB_40 = bytes(range(40))
+VALID_BLOB_40 = bytes(range(8)) + bytes([12]) + bytes(range(9, 40))  # byte 8: CardContact EC
 
 
 # ---------------------------------------------------------------------------

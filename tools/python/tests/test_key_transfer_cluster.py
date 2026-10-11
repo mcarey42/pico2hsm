@@ -49,11 +49,11 @@ class SyncResult:
     error: Optional[str] = None
 
 
-# A valid 40-byte wrapped blob: KCV(8) + IV(16) + one CBC block(16)
-VALID_BLOB_40 = bytes(range(40))
+# Structurally valid wrapped blobs: KCV(8), key type 12 (CardContact EC
+# key blob), then filler.  The device authenticates the content.
+VALID_BLOB_40 = bytes(range(8)) + bytes([12]) + bytes(range(9, 40))
 
-# A valid 56-byte blob: KCV(8) + IV(16) + two CBC blocks(32)
-VALID_BLOB_56 = bytes(range(56))
+VALID_BLOB_56 = bytes(range(8)) + bytes([12]) + bytes(range(9, 56))
 
 
 # ---------------------------------------------------------------------------
@@ -118,13 +118,19 @@ class TestImportKeyToDevice:
         with pytest.raises(ValueError, match="too short"):
             import_key_to_device(hsm, key_ref=1, wrapped_blob=bytes(10))
 
-    def test_import_key_validates_cbc_alignment(self):
-        """41-byte blob (payload=17, not 16-aligned) should raise ValueError."""
+    def test_import_key_validates_type_byte(self):
+        """A blob whose byte 8 is no known key type / format should raise."""
         hsm = MockPico2HSM()
-        # KCV(8) + IV(16) + 17 bytes = 41 total; 17 % 16 != 0
-        blob = bytes(41)
-        with pytest.raises(ValueError, match="not a multiple of 16"):
+        blob = bytes(8) + bytes([0x07]) + bytes(40)
+        with pytest.raises(ValueError, match="unknown key type"):
             import_key_to_device(hsm, key_ref=1, wrapped_blob=blob)
+
+    def test_import_key_accepts_legacy_and_cardcontact(self):
+        """CardContact types and the deprecated v2/v3 pass validation."""
+        for t in (5, 6, 12, 15, 2, 3):
+            hsm = MockPico2HSM()
+            hsm.queue_response(b"", sw=0x9000)
+            import_key_to_device(hsm, key_ref=1, wrapped_blob=bytes(8) + bytes([t]) + bytes(40))
 
     def test_import_key_validates_blob_too_large(self):
         """Blob > 4096 bytes should raise ValueError."""

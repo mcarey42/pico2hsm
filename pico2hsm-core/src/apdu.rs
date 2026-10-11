@@ -36,6 +36,9 @@ pub const SW_CONDITIONS_NOT_SATISFIED: u16 = 0x6985;
 /// Wrong data in command data field.
 pub const SW_WRONG_DATA: u16 = 0x6A80;
 
+/// Function not supported (e.g. a key type a format cannot express).
+pub const SW_FUNC_NOT_SUPPORTED: u16 = 0x6A81;
+
 /// File or application not found.
 pub const SW_FILE_NOT_FOUND: u16 = 0x6A82;
 

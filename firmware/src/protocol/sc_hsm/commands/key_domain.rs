@@ -9,9 +9,10 @@
 //! - P1=0x04: Query domain status
 //! - P1=0x05: Assign key to domain
 
+use crate::security::key_policy::SW_REFERENCE_NOT_FOUND;
 use pico2hsm_core::apdu::{
-    ApduCommand, ApduResponse, SW_CONDITIONS_NOT_SATISFIED, SW_INS_NOT_SUPPORTED,
-    SW_SECURITY_STATUS, SW_WRONG_DATA,
+    ApduCommand, ApduResponse, SW_CONDITIONS_NOT_SATISFIED, SW_INCORRECT_P1P2,
+    SW_INS_NOT_SUPPORTED, SW_SECURITY_STATUS, SW_WRONG_DATA,
 };
 
 use crate::protocol::sc_hsm::ScHsmState;
@@ -20,12 +21,46 @@ use crate::security::dkek::{DkekImportResult, SHARE_BLOB_SIZE};
 /// INS byte for KEY DOMAIN.
 pub const INS_KEY_DOMAIN: u8 = 0x52;
 
+/// `[shares, missing, KCV(8)]` for key domain 0.
+fn domain_status(state: &ScHsmState) -> [u8; 10] {
+    let mut resp = [0u8; 10];
+    if state.dkek.is_ready() {
+        resp[0] = state.dkek.shares_total();
+        resp[1] = 0;
+        if let Ok(kcv) = state.dkek.compute_kcv() {
+            resp[2..10].copy_from_slice(&kcv);
+        }
+    } else {
+        let total = state.dkek.shares_total();
+        resp[0] = total;
+        resp[1] = total.saturating_sub(state.dkek.shares_received());
+    }
+    resp
+}
+
 /// Handle a KEY DOMAIN APDU command.
 pub fn handle(state: &mut ScHsmState, cmd: &ApduCommand<'_>) -> ApduResponse {
-    // P1=0x00: IMPORT DKEK SHARE (raw 32-byte share, no auth required).
-    // sc-hsm-tool decrypts the PBE-protected share on the host and sends
-    // the raw 32-byte value with CLA=0x80 INS=0x52 P1=0x00 P2=0x00.
+    // P1=0x00: key domain status (no data) or IMPORT DKEK SHARE (raw
+    // 32-byte share, no auth required).  sc-hsm-tool decrypts the
+    // PBE-protected share on the host and sends the raw value with
+    // CLA=0x80 INS=0x52 P1=0x00 P2=<domain>; without data it asks for the
+    // status (`sc-hsm-tool` with no command, for each domain 0..255).
+    //
+    // Response, as OpenSC `sc_hsm_manage_key_domain` reads it:
+    //   [shares in the DKEK(1), shares still missing(1), KCV(8)]
+    // KCV = SHA-256(DKEK)[0..8] (CardContact), zeros until complete.
     if cmd.p1 == 0x00 {
+        // One key domain (0).  6A86 ends sc-hsm-tool's domain loop.
+        if cmd.p2 != 0x00 {
+            return ApduResponse::err(SW_INCORRECT_P1P2);
+        }
+        if cmd.data.is_empty() {
+            if !state.dkek.is_ready() && state.dkek_shares_required == 0 {
+                // No DKEK configured: sc-hsm-tool prints "Empty".
+                return ApduResponse::err(SW_REFERENCE_NOT_FOUND);
+            }
+            return ApduResponse::ok(&domain_status(state));
+        }
         if cmd.data.len() != 32 {
             return ApduResponse::err(SW_WRONG_DATA);
         }
@@ -42,28 +77,13 @@ pub fn handle(state: &mut ScHsmState, cmd: &ApduCommand<'_>) -> ApduResponse {
                     "KEY_DOMAIN DKEK Complete: is_ready={}",
                     state.dkek.is_ready()
                 );
-                // sc-hsm-tool asserts apdu.resplen >= sizeof(key_check_value) + 2.
-                // key_check_value is 8 bytes, so we must return at least 10 bytes:
-                //   [remaining(1), total(1), kcv(8)]
-                let mut resp = [0u8; 10];
-                resp[0] = 0x00; // 0 shares remaining
-                resp[1] = state.dkek.shares_total();
-                if let Ok(kcv) = state.dkek.compute_kcv() {
-                    resp[2..10].copy_from_slice(&kcv);
-                }
-                return ApduResponse::ok(&resp);
             }
-            Ok(DkekImportResult::MoreSharesNeeded { received, total }) => {
+            Ok(DkekImportResult::MoreSharesNeeded { received, .. }) => {
                 state.dkek_shares_imported = received;
-                let remaining = total - received;
-                // KCV is not yet computable; return zeros for the 8 KCV bytes.
-                let mut resp = [0u8; 10];
-                resp[0] = remaining;
-                resp[1] = total;
-                return ApduResponse::ok(&resp);
             }
             Err(_) => return ApduResponse::err(SW_WRONG_DATA),
         }
+        return ApduResponse::ok(&domain_status(state));
     }
 
     // All other P1 values require SO-PIN for domain management
@@ -220,16 +240,53 @@ mod tests {
             10,
             "response must be 10 bytes for sc-hsm-tool compatibility"
         );
-        assert_eq!(resp.data[0], 0x00, "remaining shares should be 0");
-        assert_eq!(resp.data[1], 0x01, "total shares should be 1");
-        // KCV bytes [2..10] must be non-zero (real DKEK was loaded)
-        assert_ne!(
-            &resp.data[2..10],
-            &[0u8; 8],
-            "KCV must not be all zeros when DKEK is ready"
-        );
+        assert_eq!(resp.data[0], 0x01, "shares in the DKEK");
+        assert_eq!(resp.data[1], 0x00, "no shares missing");
+        // CardContact KCV: SHA-256(DKEK)[0..8]; one share, so DKEK = share.
+        let h = <sha2::Sha256 as sha2::Digest>::digest([0x42u8; 32]);
+        assert_eq!(&resp.data[2..10], &h[..8]);
         // DKEK should now be ready
         assert!(state.dkek.is_ready());
         assert_eq!(state.dkek_shares_imported, 1);
+    }
+
+    #[test]
+    fn status_and_two_share_import_match_opensc_layout() {
+        let mut state = make_state_with_dkek_shares(2);
+        let status = |state: &mut ScHsmState| {
+            let apdu = build_apdu(0x00, 0x00, &[]);
+            let cmd = ApduCommand::parse(&apdu[..4]).unwrap();
+            handle(state, &cmd)
+        };
+        let r = status(&mut state);
+        assert_eq!(r.sw, SW_OK);
+        assert_eq!(&r.data[..], &[2, 2, 0, 0, 0, 0, 0, 0, 0, 0]);
+
+        let s1 = [0x11u8; 32];
+        let s2 = [0x5Cu8; 32];
+        let apdu = build_apdu(0x00, 0x00, &s1);
+        let r = handle(&mut state, &ApduCommand::parse(&apdu).unwrap());
+        assert_eq!(&r.data[..2], &[2, 1]);
+        assert_eq!(&r.data[2..], &[0u8; 8]);
+        let apdu = build_apdu(0x00, 0x00, &s2);
+        let r = handle(&mut state, &ApduCommand::parse(&apdu).unwrap());
+        // Shares combine by XOR.
+        let dkek = [0x11u8 ^ 0x5C; 32];
+        let h = <sha2::Sha256 as sha2::Digest>::digest(dkek);
+        assert_eq!(&r.data[..2], &[2, 0]);
+        assert_eq!(&r.data[2..], &h[..8]);
+        assert_eq!(status(&mut state).data, r.data);
+    }
+
+    #[test]
+    fn status_of_other_domains_and_no_dkek() {
+        let mut state = make_state_with_dkek_shares(1);
+        let apdu = build_apdu(0x00, 0x01, &[]);
+        let r = handle(&mut state, &ApduCommand::parse(&apdu[..4]).unwrap());
+        assert_eq!(r.sw, SW_INCORRECT_P1P2);
+        let mut state = ScHsmState::new();
+        let apdu = build_apdu(0x00, 0x00, &[]);
+        let r = handle(&mut state, &ApduCommand::parse(&apdu[..4]).unwrap());
+        assert_eq!(r.sw, SW_REFERENCE_NOT_FOUND);
     }
 }

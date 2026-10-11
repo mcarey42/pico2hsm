@@ -10,9 +10,32 @@ Security and robustness release from the October 2026 audit
 (`docs/AUDIT_2026-10.md` lists every finding with its commit).
 
 ### Breaking
-- **DKEK-wrapped key blobs use a new authenticated format (v2):**
-  `KCV || 0x02 || IV || CBC || HMAC-SHA256-128`. v1 blobs (no MAC) are
-  refused; re-export backups made with earlier firmware.
+- **WRAP / UNWRAP KEY use the SmartCard-HSM (CardContact) key blob** —
+  KCV = SHA-256(DKEK)[0..8], AES-256-CBC under SHA-256(DKEK‖00000001) with
+  an 8-byte random prefix, AES-CMAC under SHA-256(DKEK‖00000002) — so
+  backups move between pico2hsm, real SmartCard-HSMs, pico-hsm and
+  `sc-hsm-tool --wrap-key` / `--unwrap-key` files.  EC (P-256, P-384,
+  P-521, secp256k1), RSA (written as RSA-CRT; RSA and RSA-CRT read) and AES
+  keys; the key's algorithm list travels in the blob's own field.
+  Ed25519, X25519, brainpool and BIP32 keys have no CardContact encoding:
+  WRAP refuses them with 6A81.  Layout and sources:
+  `docs/SC_HSM_APDU_REFERENCE.md` §3.32.
+- **The KCV changes** to the CardContact value SHA-256(DKEK)[0..8] (it was
+  AES-CMAC(DKEK, 0¹⁶)[0..8]): KEY DOMAIN and `sc-hsm-tool` now show the
+  same check value as a SmartCard-HSM loaded with the same shares.
+  Compare KCVs only between devices on this firmware.
+- **KEY DOMAIN P1=00 response follows OpenSC:** `[shares, missing, KCV]`
+  (bytes 0 and 1 were swapped, so `sc-hsm-tool` reported the share count
+  wrong), and P1=00 without data now answers the status query
+  (`sc-hsm-tool` with no command) instead of 6A80; P2≠0 is 6A86, no DKEK
+  configured is 6A88.
+- **Deprecated: the pico2hsm wrap formats v2 and v3** (`KCV' || 0x02/0x03
+  || IV || CBC || HMAC`).  UNWRAP still imports them for this release; the
+  next release drops them.  WRAP no longer writes them: re-wrap backups
+  made with earlier firmware (unwrap the old blob, wrap again).  v1 blobs
+  (no MAC) stay refused.
+- **GENERATE KEY PAIR, P-521:** the order (CVC tag 85) was one byte short;
+  it is now the 66-byte order.
 - **SC-HSM EF file IDs** are stored under new KeyIds (the full 16-bit FID).
   Certificates written by OpenSC must be re-imported; INITIALIZE regenerates
   the device-key EF 2F02.
@@ -75,8 +98,8 @@ Security and robustness release from the October 2026 audit
   EdDSA, C2 ECDH; other values (and RSA) are 6A80.
 - **Keys with a usage policy use the new object magic `P2KP`**: firmware
   before this release refuses them (keys without a policy stay `P2K4`).
-  WRAP of a key with a policy produces wrap format version 3, which older
-  firmware cannot import.
+  (Wrap format version 3, which carried the policy, is superseded by the
+  CardContact blob above; UNWRAP still reads it this release.)
 
 ### Security
 - **Per-key usage policy (audit S-10).** SC-HSM keys take the CardContact
@@ -84,7 +107,8 @@ Security and robustness release from the October 2026 audit
   generation and unwrap; every use is checked against the list and spends
   the counter on flash before the operation (6A84 when exhausted, 6985 when
   the algorithm is not allowed); SELECT CCxx reports them; WRAP/UNWRAP
-  carry the list and domain, keys with a counter are not exportable.  PIV
+  carry the list (CardContact blob field), keys with a counter are not
+  exportable.  PIV
   stores and enforces the Yubico PIN policy (AA) with the SP 800-73-4 slot
   defaults, accepts touch policy only default/never (no button), and "PIN
   always" is used up by the next GENERAL AUTHENTICATE of any slot.

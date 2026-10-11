@@ -18,6 +18,7 @@
 //!   all equality comparisons involving secrets
 
 pub mod asymmetric;
+pub mod ec_params;
 pub mod kdf;
 pub mod symmetric;
 

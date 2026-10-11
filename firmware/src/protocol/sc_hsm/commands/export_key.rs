@@ -1,6 +1,9 @@
 //! EXPORT KEY / WRAP KEY command handler (INS = 0x72).
 //!
-//! Exports a key object wrapped under the DKEK for HSM-to-HSM backup.
+//! Exports a key object wrapped under the DKEK for HSM-to-HSM backup, as a
+//! SmartCard-HSM (CardContact) key blob that `sc-hsm-tool --unwrap-key`
+//! and a real SmartCard-HSM can import (`security::key_blob`,
+//! docs/SC_HSM_APDU_REFERENCE.md).
 //! This command does NOT export plaintext key material.
 //!
 //! sc-hsm-tool sends: `80 72 <key_ref> 92 00` (P1=key_ref, P2=0x92).
@@ -8,12 +11,13 @@
 //! Requires active PIN session. Keys marked with NO-EXPORT flag are rejected.
 
 use pico2hsm_core::apdu::{
-    ApduCommand, ApduResponse, SW_CONDITIONS_NOT_SATISFIED, SW_FILE_NOT_FOUND, SW_SECURITY_STATUS,
-    SW_WRONG_DATA,
+    ApduCommand, ApduResponse, SW_CONDITIONS_NOT_SATISFIED, SW_FILE_NOT_FOUND,
+    SW_FUNC_NOT_SUPPORTED, SW_SECURITY_STATUS, SW_WRONG_DATA,
 };
 use pico2hsm_core::key::KeyId;
 
 use crate::protocol::sc_hsm::{FwRng, ScHsmState};
+use crate::security::dkek::DkekError;
 use crate::storage::KeyStore;
 
 /// INS byte for EXPORT KEY (WRAP KEY).
@@ -65,9 +69,6 @@ pub fn handle(
         _ => return ApduResponse::err(SW_FILE_NOT_FOUND),
     };
 
-    let mut private_key_bytes = crate::security::zeroize::WipeOnDrop::<2400>::new();
-    let _ = private_key_bytes.extend_from_slice(&key_obj.private_key);
-    let algo_byte = meta.algo;
     let key_flags = meta.key_flags;
 
     // Enforce NO_EXPORT flag: reject wrapping if the key was generated with
@@ -96,17 +97,13 @@ pub fn handle(
         return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED);
     }
 
-    // Wrap key under DKEK, with its usage policy (wrap format version 3
-    // when it has one).
+    // Wrap the key under the DKEK as a SmartCard-HSM (CardContact) key
+    // blob; its algorithm list and key flags travel in the blob header.
     let mut rng = FwRng;
-    match state.dkek.wrap_with_policy(
-        &private_key_bytes,
-        algo_byte,
-        key_flags,
-        &key_obj.policy,
-        &mut rng,
-    ) {
+    match state.dkek.wrap(&key_obj, key_flags, &mut rng) {
         Ok(wrapped) => ApduResponse::ok(&wrapped),
+        // Ed25519, X25519, brainpool, BIP32 masters: no CardContact encoding.
+        Err(DkekError::UnsupportedKey) => ApduResponse::err(SW_FUNC_NOT_SUPPORTED),
         Err(_) => ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
     }
 }
@@ -309,5 +306,25 @@ mod tests {
             resp.sw, SW_OK,
             "EXPORT KEY must allow keys without NO_EXPORT flag"
         );
+        // CardContact blob; the flags travel in the access conditions.
+        assert_eq!(&resp.data[..8], &state.dkek.compute_kcv().unwrap());
+        assert_eq!(resp.data[8], 12);
+        assert_eq!(&resp.data[23..27], &[0, 1, 0x03, 0]);
+    }
+
+    #[test]
+    fn test_export_key_without_cardcontact_encoding_is_6a81() {
+        let mut state = state_with_dkek();
+        let key_id = KeyId::sc_hsm(0, 0x04);
+        let _ = state.key_index.push(KeyMeta {
+            key_id: key_id.0,
+            key_type: CoreKeyType::Ed25519 as u8,
+            algo: 0x20,
+            key_flags: 0,
+        });
+        let mut store = TestStore::new();
+        store.add_key(key_id.0, AlgorithmId::Ed25519, 0, &[0x42u8; 32]);
+        let resp = handle(&mut state, &mut store, &make_cmd(0x04, 0x92, &[]));
+        assert_eq!(resp.sw, SW_FUNC_NOT_SUPPORTED);
     }
 }
