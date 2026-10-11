@@ -138,7 +138,7 @@ pub fn handle(
     let km_type = match algo_id {
         0x13 | 0x15 | 0x17 | 0x19 | 0x23 | 0x25 | 0x27 | 0x53 | 0x54 | 0x55 => KmType::Ec,
         0x05 | 0x07 | 0x31 | 0x32 | 0x33 | 0x34 | 0x41 => KmType::Rsa,
-        0x60 | 0x61 | 0x62 | 0x63 => KmType::Aes,
+        0x60..=0x63 => KmType::Aes,
         0x20 | 0x21 => KmType::Ec, // Ed25519/X25519 stored as EC family
         _ => return ApduResponse::err(SW_WRONG_DATA),
     };
@@ -168,7 +168,7 @@ pub fn handle(
         0x05 | 0x07 | 0x31 | 0x32 | 0x33 | 0x34 | 0x41 => {
             pico2hsm_core::key::KeyType::RsaPrivate2048
         } // RSA family placeholder
-        0x60 | 0x61 | 0x62 | 0x63 => pico2hsm_core::key::KeyType::Aes256,
+        0x60..=0x63 => pico2hsm_core::key::KeyType::Aes256,
         _ => {
             crate::cdc_log!(
                 "SC-HSM IMPORT KEY done key=0x{:08x} algo=0x{:02x}",

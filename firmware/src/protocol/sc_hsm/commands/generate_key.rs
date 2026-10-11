@@ -43,7 +43,7 @@ pub fn handle(
 
     // Data field must contain the algorithm tag
     let algo_tag = match cmd.data.first().copied() {
-        Some(t @ (0x82 | 0x83 | 0x84)) => t,
+        Some(t @ (0x82..=0x84)) => t,
         _ => return ApduResponse::err(SW_WRONG_DATA),
     };
 

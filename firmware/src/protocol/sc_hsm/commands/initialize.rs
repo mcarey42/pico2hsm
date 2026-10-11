@@ -36,7 +36,7 @@ pub fn init_code<'a>(cmd: &ApduCommand<'a>) -> Option<&'a [u8]> {
     find_tlv(cmd.data, 0x82).filter(|c| c.len() == 8)
 }
 
-fn find_tlv<'a>(data: &'a [u8], tag: u8) -> Option<&'a [u8]> {
+fn find_tlv(data: &[u8], tag: u8) -> Option<&[u8]> {
     let mut i = 0;
     while i + 1 < data.len() {
         let t = data[i];

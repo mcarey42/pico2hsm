@@ -90,7 +90,7 @@ pub fn handle(
     };
 
     // Load key material from flash
-    let key_obj = match store.fetch_key(pico2hsm_core::key::KeyId(full_key_id)) {
+    let key_obj = match store.fetch_key(KeyId(full_key_id)) {
         Ok(Some(obj)) => obj,
         _ => return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
     };

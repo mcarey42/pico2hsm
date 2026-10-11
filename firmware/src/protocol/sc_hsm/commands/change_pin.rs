@@ -43,7 +43,7 @@ fn verify_pin_pbkdf2(pin: &[u8], salt: &[u8; 16], stored: &[u8; 32]) -> bool {
     computed.ct_eq(stored).into()
 }
 
-fn find_tlv<'a>(data: &'a [u8], tag: u8) -> Option<&'a [u8]> {
+fn find_tlv(data: &[u8], tag: u8) -> Option<&[u8]> {
     let mut i = 0;
     while i + 1 < data.len() {
         let t = data[i];

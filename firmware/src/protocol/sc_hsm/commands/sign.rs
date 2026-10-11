@@ -110,7 +110,7 @@ pub fn handle(
             let der_len = key_obj.private_key.len();
             let Some(der_buf) = crate::security::zeroize::key_buf::<2400>(&key_obj.private_key)
             else {
-                return ApduResponse::err(pico2hsm_core::apdu::SW_CONDITIONS_NOT_SATISFIED);
+                return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED);
             };
 
             let sig = match algo {
@@ -192,7 +192,7 @@ pub fn handle(
     // Copy private key bytes to a local buffer
     let priv_len = key_obj.private_key.len();
     let Some(priv_buf) = crate::security::zeroize::key_buf::<66>(&key_obj.private_key) else {
-        return ApduResponse::err(pico2hsm_core::apdu::SW_CONDITIONS_NOT_SATISFIED);
+        return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED);
     };
 
     // For card-hash algorithms (0x71–0x75) the host sends the raw message;

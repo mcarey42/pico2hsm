@@ -176,7 +176,7 @@ impl<'a, C: FlashChip> Wal<'a, C> {
         // the *next* page slot of the WAL sector.  To keep alignment
         // simple we write the whole sector in 256-byte pages, fitting
         // 4080 bytes of payload across 16 pages (last one is partial).
-        let pages = (SECTOR_SIZE + PAGE_SIZE - 1) / PAGE_SIZE; // ceil(4096/256) = 16
+        let pages = SECTOR_SIZE.div_ceil(PAGE_SIZE); // ceil(4096/256) = 16
         for p in 0..pages {
             let src_start = p * PAGE_SIZE;
             let src_end = core::cmp::min(src_start + PAGE_SIZE, SECTOR_SIZE);
@@ -322,7 +322,7 @@ impl<'a, C: FlashChip> Wal<'a, C> {
     /// Call this after the destination sector has been successfully written.
     pub fn complete(&mut self) -> Result<(), StorageError> {
         self.erase_slot(self.active_slot)?;
-        self.active_slot = self.active_slot ^ 1;
+        self.active_slot ^= 1;
         Ok(())
     }
 }

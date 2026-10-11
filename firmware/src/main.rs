@@ -1115,11 +1115,7 @@ async fn run_geek_board(p: embassy_rp::Peripherals) {
             Mutex<
                 CriticalSectionRawMutex,
                 core::cell::RefCell<
-                    embassy_rp::spi::Spi<
-                        'static,
-                        embassy_rp::peripherals::SPI0,
-                        embassy_rp::spi::Blocking,
-                    >,
+                    Spi<'static, embassy_rp::peripherals::SPI0, embassy_rp::spi::Blocking>,
                 >,
             >,
         > = StaticCell::new();
@@ -1649,11 +1645,7 @@ fn init_sd_keystore(
         Mutex<
             CriticalSectionRawMutex,
             core::cell::RefCell<
-                embassy_rp::spi::Spi<
-                    'static,
-                    embassy_rp::peripherals::SPI1,
-                    embassy_rp::spi::Blocking,
-                >,
+                Spi<'static, embassy_rp::peripherals::SPI1, embassy_rp::spi::Blocking>,
             >,
         >,
     > = StaticCell::new();

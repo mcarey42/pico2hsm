@@ -26,7 +26,7 @@ pub const INS_GENERAL_AUTH: u8 = 0x86;
 /// Scan a flat TLV list and return the value slice for the first matching tag.
 ///
 /// Uses simple one-byte tag / one-byte length encoding (BER-TLV subset).
-fn find_tlv<'a>(data: &'a [u8], tag: u8) -> Option<&'a [u8]> {
+fn find_tlv(data: &[u8], tag: u8) -> Option<&[u8]> {
     let mut i = 0;
     while i + 1 < data.len() {
         let t = data[i];
@@ -120,7 +120,7 @@ pub fn handle(
     // Copy key data to local stack buffers.
     let priv_len = key_obj.private_key.len();
     let Some(priv_buf) = crate::security::zeroize::key_buf::<66>(&key_obj.private_key) else {
-        return ApduResponse::err(pico2hsm_core::apdu::SW_CONDITIONS_NOT_SATISFIED);
+        return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED);
     };
 
     // Hash the challenge with SHA-256 before signing.

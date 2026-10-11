@@ -91,13 +91,11 @@ pub fn handle(state: &mut ScHsmState, cmd: &ApduCommand<'_>) -> ApduResponse {
             }
             // Password is empty (shares are pre-encrypted by the host ceremony tool).
             match state.dkek.import_share(cmd.data, b"") {
-                Ok(crate::security::dkek::DkekImportResult::Complete) => {
+                Ok(DkekImportResult::Complete) => {
                     state.dkek_shares_imported = state.dkek.shares_total();
                     ApduResponse::ok(&[])
                 }
-                Ok(crate::security::dkek::DkekImportResult::MoreSharesNeeded {
-                    received, ..
-                }) => {
+                Ok(DkekImportResult::MoreSharesNeeded { received, .. }) => {
                     state.dkek_shares_imported = received;
                     // SW_6985 = conditions not satisfied (more shares needed)
                     ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED)

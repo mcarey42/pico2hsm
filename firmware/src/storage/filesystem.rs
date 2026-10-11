@@ -436,8 +436,7 @@ impl<Chip: FlashChip> KeyFilesystem<Chip> {
     pub fn read_key(
         &mut self,
         key_id: KeyId,
-    ) -> Result<heapless::Vec<u8, { crate::security::key_management::MAX_BLOB_SIZE }>, StorageError>
-    {
+    ) -> Result<Vec<u8, { crate::security::key_management::MAX_BLOB_SIZE }>, StorageError> {
         let entry = self.directory.find(key_id).ok_or(StorageError::ReadError)?;
 
         let chip_index = entry.chip_index as usize;
@@ -448,8 +447,7 @@ impl<Chip: FlashChip> KeyFilesystem<Chip> {
             return Err(StorageError::ReadError);
         }
 
-        let mut out: heapless::Vec<u8, { crate::security::key_management::MAX_BLOB_SIZE }> =
-            heapless::Vec::new();
+        let mut out: Vec<u8, { crate::security::key_management::MAX_BLOB_SIZE }> = Vec::new();
         // The total plaintext length is stored in the header; read it from the
         // first sector and use it to truncate the output (sector data is padded
         // to 256-byte alignment for CRC, but the caller needs the exact blob).
@@ -652,8 +650,8 @@ impl<Chip: FlashChip> KeyFilesystem<Chip> {
     /// Returns a `Vec` of `KeyRecord` objects.  The `label` and
     /// `access_counter` fields are left at their defaults since they are
     /// not stored by the filesystem layer.
-    pub fn list_keys(&self) -> heapless::Vec<KeyRecord, 64> {
-        let mut out = heapless::Vec::new();
+    pub fn list_keys(&self) -> Vec<KeyRecord, 64> {
+        let mut out = Vec::new();
         for key_id in self.directory.list_keys() {
             if let Some(entry) = self.directory.find(key_id) {
                 let key_type = key_type_from_u8(entry.flags >> 4); // top nibble = type tag

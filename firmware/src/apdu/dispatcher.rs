@@ -180,7 +180,7 @@ impl Dispatcher {
     /// preventing core0 stack overflow on display boards.
     #[inline(never)]
     pub fn load_keys_from_store(&mut self, store: &mut dyn crate::storage::KeyStore) {
-        let mut sc_hsm_ids: heapless::Vec<pico2hsm_core::key::KeyId, 64> = heapless::Vec::new();
+        let mut sc_hsm_ids: Vec<pico2hsm_core::key::KeyId, 64> = Vec::new();
         store.for_each_key(&mut |kid| {
             // Skip firmware records that are not keys: PIN record (0xFF),
             // persisted DKEK (0xFD) and enrolled peer key (0xFC).  The
@@ -230,14 +230,9 @@ impl Dispatcher {
         store: &mut dyn crate::storage::KeyStore,
     ) -> Vec<u8, 4098> {
         // Parse the APDU
-        let cmd = match pico2hsm_core::apdu::ApduCommand::parse(raw_apdu) {
+        let cmd = match ApduCommand::parse(raw_apdu) {
             Ok(c) => c,
-            Err(_) => {
-                return pico2hsm_core::apdu::ApduResponse::err(
-                    pico2hsm_core::apdu::SW_INS_NOT_SUPPORTED,
-                )
-                .serialize()
-            }
+            Err(_) => return ApduResponse::err(SW_INS_NOT_SUPPORTED).serialize(),
         };
 
         // Intercept SELECT by AID before forwarding.
@@ -262,12 +257,7 @@ impl Dispatcher {
             ActiveProtocol::ScHsm => self.sc_hsm.process_apdu_with_store(raw_apdu, store),
             ActiveProtocol::Piv => self.piv.process_apdu_with_store(raw_apdu, store),
             ActiveProtocol::OpenPgp => self.openpgp.process_apdu_with_store(raw_apdu, store),
-            ActiveProtocol::None => {
-                return pico2hsm_core::apdu::ApduResponse::err(
-                    pico2hsm_core::apdu::SW_INS_NOT_SUPPORTED,
-                )
-                .serialize()
-            }
+            ActiveProtocol::None => return ApduResponse::err(SW_INS_NOT_SUPPORTED).serialize(),
         };
 
         // Apply Le-truncation with GET RESPONSE chaining.
@@ -610,7 +600,7 @@ fn build_piv_fci() -> ApduResponse {
 ///   A5 xx
 ///     9F6E 04 03 04 00 00   — version 3.4
 /// ```
-fn build_openpgp_fci(openpgp: &mut crate::protocol::openpgp::OpenPgp) -> ApduResponse {
+fn build_openpgp_fci(openpgp: &mut OpenPgp) -> ApduResponse {
     use crate::protocol::openpgp::OPENPGP_AID;
 
     openpgp.state.reset_security_state();

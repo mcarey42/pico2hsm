@@ -263,7 +263,10 @@ impl St7789StatusDisplay {
 
         // SAFETY: FRAMEBUF is only accessed from core0; no concurrent mutation.
         // DMA write: yields to executor during the ~13 ms transfer.
-        let _ = self.spi.write(unsafe { &*(&raw const FRAMEBUF) }).await;
+        let _ = self
+            .spi
+            .write(unsafe { &*core::ptr::addr_of!(FRAMEBUF) })
+            .await;
 
         self.cs_deassert();
     }
@@ -601,7 +604,7 @@ impl DrawTarget for St7789StatusDisplay {
         I: IntoIterator<Item = Pixel<Self::Color>>,
     {
         // SAFETY: FRAMEBUF is only accessed from core0 display code; no concurrent access.
-        let fb = unsafe { &mut *(&raw mut FRAMEBUF) };
+        let fb = unsafe { &mut *core::ptr::addr_of_mut!(FRAMEBUF) };
         for Pixel(coord, color) in pixels {
             if coord.x < 0
                 || coord.y < 0
@@ -632,7 +635,7 @@ impl DrawTarget for St7789StatusDisplay {
         }
 
         // SAFETY: FRAMEBUF is only accessed from core0 display code; no concurrent access.
-        let fb = unsafe { &mut *(&raw mut FRAMEBUF) };
+        let fb = unsafe { &mut *core::ptr::addr_of_mut!(FRAMEBUF) };
         let x0 = area.top_left.x as usize;
         let y0 = area.top_left.y as usize;
         let w = area.size.width as usize;
@@ -669,7 +672,7 @@ impl DrawTarget for St7789StatusDisplay {
         let (r, g, b) = rgb565_to_rgb444(color);
 
         // SAFETY: FRAMEBUF is only accessed from core0 display code; no concurrent access.
-        let fb = unsafe { &mut *(&raw mut FRAMEBUF) };
+        let fb = unsafe { &mut *core::ptr::addr_of_mut!(FRAMEBUF) };
         let x0 = area.top_left.x as usize;
         let y0 = area.top_left.y as usize;
         let w = area.size.width as usize;

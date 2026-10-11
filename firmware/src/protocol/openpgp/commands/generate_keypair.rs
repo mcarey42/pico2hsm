@@ -186,7 +186,7 @@ pub fn handle_with_store(
         return resp;
     }
 
-    if cmd.data.len() < 1 {
+    if cmd.data.is_empty() {
         return resp;
     }
     let crt_tag = cmd.data[0];

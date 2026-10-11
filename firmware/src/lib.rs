@@ -9,6 +9,18 @@
 //! modules (crypto, security, apdu, protocol) can be tested on x86_64.
 #![no_std]
 #![allow(unused)]
+// Style lints that do not fit this no_std firmware: constructors are
+// explicit `new()`s (several build large structs in place), and the display
+// and storage APIs mirror their hardware.
+#![allow(
+    clippy::new_without_default,
+    clippy::len_without_is_empty,
+    clippy::too_many_arguments,
+    clippy::result_large_err,
+    async_fn_in_trait,
+    clippy::doc_lazy_continuation,
+    clippy::doc_overindented_list_items
+)]
 
 pub mod allocator;
 pub mod apdu;

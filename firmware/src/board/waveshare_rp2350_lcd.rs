@@ -330,6 +330,12 @@ pub struct St7789V3StatusDisplay {
     current_status: LedStatus,
 }
 
+impl Default for St7789V3StatusDisplay {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl St7789V3StatusDisplay {
     pub fn new() -> Self {
         Self {
@@ -432,7 +438,7 @@ impl DrawTarget for St7789V3StatusDisplay {
         I: IntoIterator<Item = Pixel<Self::Color>>,
     {
         // SAFETY: FRAMEBUF is only accessed from core0 display code; no concurrent access.
-        let fb = unsafe { &mut *(&raw mut FRAMEBUF) };
+        let fb = unsafe { &mut *core::ptr::addr_of_mut!(FRAMEBUF) };
         for Pixel(coord, color) in pixels {
             if coord.x < 0 || coord.y < 0 || coord.x >= FB_W as i32 || coord.y >= FB_H as i32 {
                 continue;
@@ -454,7 +460,7 @@ impl DrawTarget for St7789V3StatusDisplay {
         if area.size.width == 0 || area.size.height == 0 {
             return Ok(());
         }
-        let fb = unsafe { &mut *(&raw mut FRAMEBUF) };
+        let fb = unsafe { &mut *core::ptr::addr_of_mut!(FRAMEBUF) };
         let x0 = area.top_left.x as usize;
         let y0 = area.top_left.y as usize;
         let w = area.size.width as usize;
@@ -484,7 +490,7 @@ impl DrawTarget for St7789V3StatusDisplay {
             return Ok(());
         }
         let (r, g, b) = rgb565_to_rgb444(color);
-        let fb = unsafe { &mut *(&raw mut FRAMEBUF) };
+        let fb = unsafe { &mut *core::ptr::addr_of_mut!(FRAMEBUF) };
         let x0 = area.top_left.x as usize;
         let y0 = area.top_left.y as usize;
         let w = area.size.width as usize;
@@ -877,7 +883,7 @@ pub async fn flush_display(
 
     // SAFETY: FRAMEBUF is only accessed from core0; no concurrent mutation.
     // DMA write: yields to executor during the ~17 ms transfer.
-    let _ = spi.write(unsafe { &*(&raw const FRAMEBUF) }).await;
+    let _ = spi.write(unsafe { &*core::ptr::addr_of!(FRAMEBUF) }).await;
 
     cs.set_high();
 }
@@ -1003,6 +1009,7 @@ where
         let rgb_bytes: [u8; 3] = [grb.0, grb.1, grb.2]; // [G, R, B] → wire GRB
                                                         // SAFETY: `smart_leds::RGB8` is `#[repr(C)]` with fields `r, g, b: u8`
                                                         // in that order, making it layout-identical to `[u8; 3]`.
+        #[allow(clippy::missing_transmute_annotations)] // target type is the inferred RGB8
         let pixels: [_; 1] = [unsafe { core::mem::transmute::<[u8; 3], _>(rgb_bytes) }];
         self.inner.write(&pixels).await;
     }

@@ -149,8 +149,8 @@ impl Rng {
         if self.adc_sample_count >= ADC_POOL_SAMPLES {
             // Hash the accumulated samples.
             let mut hasher = Sha256::new();
-            hasher.update(&self.adc_accumulator);
-            hasher.update(&self.adc_pool); // chain previous pool
+            hasher.update(self.adc_accumulator);
+            hasher.update(self.adc_pool); // chain previous pool
             let digest = hasher.finalize();
 
             // XOR digest into the pool.
@@ -267,7 +267,7 @@ pub fn fill_random(buf: &mut [u8]) -> Result<(), CryptoError> {
     if prev % RESEED_INTERVAL == 0 && prev != 0 {
         // Best-effort: log on failure but do not propagate the error so that
         // callers are not broken by a transient TRNG timeout.
-        if let Err(_) = reseed() {
+        if reseed().is_err() {
             defmt::warn!("RNG: periodic reseed failed — continuing with existing CSPRNG state");
         }
     }

@@ -90,7 +90,7 @@ pub fn handle(state: &mut ScHsmState, cmd: &ApduCommand<'_>) -> ApduResponse {
 
     let fid: u16 = match cmd.p1 {
         // SELECT by file ID (child of current DF) or from MF/parent
-        0x00 | 0x01 | 0x02 => {
+        0x00..=0x02 => {
             if cmd.data.len() >= 2 {
                 (cmd.data[0] as u16) << 8 | (cmd.data[1] as u16)
             } else if cmd.data.is_empty() {
@@ -111,12 +111,8 @@ pub fn handle(state: &mut ScHsmState, cmd: &ApduCommand<'_>) -> ApduResponse {
         }
 
         // SELECT by AID — dispatcher should have intercepted this, but handle gracefully
-        0x04 => {
-            if cmd.data == crate::protocol::sc_hsm::SC_HSM_AID {
-                return ApduResponse::ok(&[]);
-            } else {
-                return ApduResponse::err(SW_FILE_NOT_FOUND);
-            }
+        0x04 if cmd.data == crate::protocol::sc_hsm::SC_HSM_AID => {
+            return ApduResponse::ok(&[]);
         }
 
         _ => return ApduResponse::err(SW_FILE_NOT_FOUND),

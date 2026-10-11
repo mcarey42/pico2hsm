@@ -13,13 +13,13 @@ use zeroize::Zeroize;
 /// A key object identifier — 4 bytes with a structured encoding scheme.
 ///
 /// Encoding (bits 31–0):
-/// - bits 31–24: partition_id (u8) — 0 = default partition
-/// - bits 23–16: applet_id    (u8) — 0=SC-HSM, 1=PIV, 2=OpenPGP
+/// - bits 31–24: `partition_id` (u8) — 0 = default partition
+/// - bits 23–16: `applet_id`    (u8) — 0=SC-HSM, 1=PIV, 2=OpenPGP
 /// - bits 15–8:  reserved          — always 0
-/// - bits  7–0:  proto_ref    (u8) — protocol-level key reference
+/// - bits  7–0:  `proto_ref`    (u8) — protocol-level key reference
 ///
 /// SC-HSM partition-0 keys: `KeyId(proto_ref as u32)` — e.g. key 0x01 → `KeyId(0x00000001)`.
-/// Key ID 0x00000000 and 0xFFFF_FFFF are reserved.
+/// Key ID 0x00000000 and `0xFFFF_FFFF` are reserved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct KeyId(pub u32);
 
@@ -32,7 +32,7 @@ pub enum AppletId {
     OpenPgp = 0x02,
 }
 
-impl zeroize::Zeroize for AppletId {
+impl Zeroize for AppletId {
     fn zeroize(&mut self) {
         *self = AppletId::ScHsm;
     }
@@ -75,20 +75,20 @@ impl PinSlot {
 impl KeyId {
     /// SC-HSM key on the given partition (partition=0 for default).
     pub fn sc_hsm(partition: u8, key_ref: u8) -> Self {
-        KeyId(((partition as u32) << 24) | (key_ref as u32))
+        KeyId((u32::from(partition) << 24) | u32::from(key_ref))
     }
     /// PIV key reference (always partition 0 — PIV has no partition concept).
     pub fn piv(key_ref: u8) -> Self {
-        KeyId((AppletId::Piv as u32) << 16 | (key_ref as u32))
+        KeyId((AppletId::Piv as u32) << 16 | u32::from(key_ref))
     }
-    /// OpenPGP key slot index (0=SIG, 1=DEC, 2=AUTH).
+    /// `OpenPGP` key slot index (0=SIG, 1=DEC, 2=AUTH).
     pub fn openpgp(slot: u8) -> Self {
-        KeyId((AppletId::OpenPgp as u32) << 16 | (slot as u32))
+        KeyId((AppletId::OpenPgp as u32) << 16 | u32::from(slot))
     }
     /// SC-HSM EF file entry on the given partition.
     ///
     /// Encodes the full 16-bit file ID in bits 15–0, so every FID maps to a
-    /// distinct KeyId.  A non-zero `file_id_hi` (bits 15–8) is what marks an
+    /// distinct `KeyId`.  A non-zero `file_id_hi` (bits 15–8) is what marks an
     /// EF; FIDs with `file_id_hi == 0` would collide with SC-HSM key slots
     /// (`sc_hsm(partition, file_id_lo)`) and must be refused — see
     /// [`KeyId::sc_hsm_ef_checked`].
@@ -96,7 +96,7 @@ impl KeyId {
     /// (Before 2026-10 only the low nibble of `file_id_lo` was kept, so e.g.
     /// CE01 and CE11 aliased, and FID 00Ex overwrote key slot 0xEx.)
     pub fn sc_hsm_ef(partition: u8, file_id_hi: u8, file_id_lo: u8) -> Self {
-        KeyId(((partition as u32) << 24) | ((file_id_hi as u32) << 8) | (file_id_lo as u32))
+        KeyId((u32::from(partition) << 24) | (u32::from(file_id_hi) << 8) | u32::from(file_id_lo))
     }
 
     /// [`KeyId::sc_hsm_ef`] for FIDs that may be created or written: `None`
@@ -159,13 +159,14 @@ pub enum KeyType {
     /// Elementary File (EF) entry stored in flash.
     ///
     /// Used by the operational buffer architecture to represent EF file entries
-    /// (e.g. EF.C.DevAut) alongside crypto keys in the unified key_index.
+    /// (e.g. EF.C.DevAut) alongside crypto keys in the unified `key_index`.
     /// Discriminant 16.
     EfFile,
 }
 
 impl KeyType {
     /// Returns the expected raw key material size in bytes for this key type.
+    #[allow(clippy::match_same_arms)] // one row per key type reads as a table
     pub fn raw_key_len(&self) -> usize {
         match self {
             KeyType::RsaPrivate2048 => 1192, // PKCS#1 DER, ~1192 bytes
@@ -268,8 +269,14 @@ mod ef_id_tests {
 
     #[test]
     fn distinct_fids_never_alias() {
-        assert_ne!(KeyId::sc_hsm_ef(0, 0xCE, 0x01), KeyId::sc_hsm_ef(0, 0xCE, 0x11));
-        assert_ne!(KeyId::sc_hsm_ef(0, 0x2F, 0x02), KeyId::sc_hsm_ef(0, 0x2F, 0xE2));
+        assert_ne!(
+            KeyId::sc_hsm_ef(0, 0xCE, 0x01),
+            KeyId::sc_hsm_ef(0, 0xCE, 0x11)
+        );
+        assert_ne!(
+            KeyId::sc_hsm_ef(0, 0x2F, 0x02),
+            KeyId::sc_hsm_ef(0, 0x2F, 0xE2)
+        );
     }
 
     #[test]

@@ -386,7 +386,7 @@ where
     /// manager writes it to the chip's directory sector — this is handled
     /// at a higher layer.  This call only updates the in-memory table.
     fn mark_bad_sector(&mut self, sector: u32) -> Result<(), StorageError> {
-        if self.bad_block_table.iter().any(|&s| s == sector) {
+        if self.bad_block_table.contains(&sector) {
             return Ok(()); // Already tracked.
         }
         self.bad_block_table
@@ -430,7 +430,7 @@ pub struct QmiFlash {
     >,
     capacity: u64,
     degraded: bool,
-    bad_sectors: heapless::Vec<u32, 256>,
+    bad_sectors: Vec<u32, 256>,
 }
 
 impl QmiFlash {
@@ -450,7 +450,7 @@ impl QmiFlash {
             flash,
             capacity: (QMI_FLASH_SIZE as u64) - (QMI_KEYSTORE_OFFSET as u64),
             degraded: false,
-            bad_sectors: heapless::Vec::new(),
+            bad_sectors: Vec::new(),
         }
     }
 }

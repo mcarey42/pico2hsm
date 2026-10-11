@@ -314,10 +314,8 @@ fn parse_dat_tags(data: &[u8]) -> DatTags<'_> {
                     tags.tag_81 = Some(&data[pos..pos + len]);
                 }
             }
-            0x82 => {
-                if len == 0 {
-                    tags.tag_82_empty = true;
-                }
+            0x82 if len == 0 => {
+                tags.tag_82_empty = true;
             }
             _ => {} // skip unknown tags
         }

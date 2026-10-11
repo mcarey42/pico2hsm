@@ -5,7 +5,7 @@
 //! give a stable ABI that the integrity checker can hash deterministically.
 //!
 //! Sector layout per chip (4 KiB sectors):
-//!   Sector 0  — Directory (list of DirectoryEntry records)
+//!   Sector 0  — Directory (list of `DirectoryEntry` records)
 //!   Sector 1  — WAL slot 0 (write-ahead log)
 //!   Sector 2  — WAL slot 1 (write-ahead log, alternate)
 //!   Sector 3+ — Key object data sectors
@@ -42,11 +42,11 @@ pub const DATA_START_SECTOR: u32 = 3;
 /// The magic is NOT included in this struct; it is checked separately.
 #[repr(C)]
 pub struct ObjectHeader {
-    /// SECTOR_MAGIC — *b"P2HM". Redundantly stored for alignment convenience.
+    /// `SECTOR_MAGIC` — *b"P2HM". Redundantly stored for alignment convenience.
     pub magic: [u8; 4],
-    /// Key object identifier (matches DirectoryEntry::key_id).
+    /// Key object identifier (matches `DirectoryEntry::key_id`).
     pub key_id: u32,
-    /// Algorithm tag byte (see KeyType discriminant mapping in firmware).
+    /// Algorithm tag byte (see `KeyType` discriminant mapping in firmware).
     pub key_type: u8,
     /// Access flags bitfield.
     pub flags: u8,
@@ -58,7 +58,7 @@ pub struct ObjectHeader {
     /// Monotonic sequence number (0–255, wraps). Used by WAL replay to
     /// identify the most recent committed version of a key object.
     pub seq_no: u8,
-    /// CRC32 of (ObjectHeader bytes 0..12 || ciphertext). Checked on every read.
+    /// CRC32 of (`ObjectHeader` bytes 0..12 || ciphertext). Checked on every read.
     pub crc32: u32,
     /// BLAKE2s-256 digest of the *decrypted* plaintext. Checked after decrypt.
     pub blake2s: [u8; 32],
@@ -86,6 +86,7 @@ pub struct DirectoryEntry {
     /// Flags (bit 0 = tombstone/deleted, bits 1–7 reserved).
     pub flags: u8,
     /// Alignment padding — must be written as 0x00.
+    #[allow(clippy::pub_underscore_fields)] // on-flash layout field
     pub _pad: [u8; 1],
 }
 
@@ -93,7 +94,7 @@ pub struct DirectoryEntry {
 // Chip and mirror state
 // ---------------------------------------------------------------------------
 
-/// Health state of a single flash chip as tracked by the StorageManager.
+/// Health state of a single flash chip as tracked by the `StorageManager`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChipState {
     /// Chip is present, responding, and passing all integrity checks.

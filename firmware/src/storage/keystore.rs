@@ -17,7 +17,7 @@
 
 use heapless::Vec;
 use pico2hsm_core::{
-    error::HsmError,
+    error::{HsmError, StorageError},
     key::{AppletId, KeyId},
 };
 
@@ -33,10 +33,7 @@ use crate::storage::StorageManager;
 #[cfg(target_arch = "arm")]
 use pico2hsm_core::flash::FlashChip;
 #[cfg(target_arch = "arm")]
-use pico2hsm_core::{
-    error::{CryptoError, StorageError},
-    key::KeyType as CoreKeyType,
-};
+use pico2hsm_core::{error::CryptoError, key::KeyType as CoreKeyType};
 #[cfg(target_arch = "arm")]
 use zeroize::Zeroizing;
 
@@ -339,9 +336,7 @@ impl<P: KeyStore, S: KeyStore> HybridKeyStore<P, S> {
 
         if any_failed {
             crate::cdc_warn!("HYBRID resync partial fail");
-            Err(HsmError::Storage(
-                pico2hsm_core::error::StorageError::WriteError,
-            ))
+            Err(HsmError::Storage(StorageError::WriteError))
         } else {
             self.degraded = false;
             self.flash_error = false;

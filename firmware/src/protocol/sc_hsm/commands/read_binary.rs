@@ -268,7 +268,7 @@ fn build_rsa_prkd(key_id: u8, algo: u8) -> Vec<u8, 256> {
 /// Returns true if the SC-HSM algo byte represents an RSA algorithm.
 fn is_rsa_algo(algo: u8) -> bool {
     // SC-HSM algo bytes: 0x05 = RSA-2048, 0x06 = RSA-3072, 0x07 = RSA-4096
-    matches!(algo, 0x05 | 0x06 | 0x07)
+    matches!(algo, 0x05..=0x07)
 }
 
 fn build_prkdf(state: &ScHsmState) -> Vec<u8, 256> {

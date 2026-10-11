@@ -114,7 +114,7 @@ pub fn handle(
             let der_len = key_obj.private_key.len();
             let Some(der_buf) = crate::security::zeroize::key_buf::<2400>(&key_obj.private_key)
             else {
-                return ApduResponse::err(pico2hsm_core::apdu::SW_CONDITIONS_NOT_SATISFIED);
+                return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED);
             };
 
             // Raw RSA: result = ciphertext^d mod n. OpenSC handles all unpadding.
@@ -171,7 +171,7 @@ pub fn handle(
 
     let priv_len = key_obj.private_key.len();
     let Some(priv_buf) = crate::security::zeroize::key_buf::<66>(&key_obj.private_key) else {
-        return ApduResponse::err(pico2hsm_core::apdu::SW_CONDITIONS_NOT_SATISFIED);
+        return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED);
     };
 
     let shared =

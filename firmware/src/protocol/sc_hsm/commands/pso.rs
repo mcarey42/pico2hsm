@@ -71,7 +71,7 @@ fn pso_compute_digital_signature(
         Some(id) => id,
         None => return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
     };
-    let key_id = pico2hsm_core::key::KeyId::sc_hsm(0, key_id_proto).0; // u32 internal ID
+    let key_id = KeyId::sc_hsm(0, key_id_proto).0; // u32 internal ID
     let algo = match state.current_algo {
         Some(a) => a,
         None => return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
@@ -100,26 +100,26 @@ fn pso_compute_digital_signature(
             };
 
             // Load key material from flash
-            let key_obj = match store.fetch_key(pico2hsm_core::key::KeyId(key_id)) {
+            let key_obj = match store.fetch_key(KeyId(key_id)) {
                 Ok(Some(obj)) => obj,
                 _ => return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
             };
 
             // Infer the core KeyType from the stored keygen algo byte
             let key_type = match rsa_meta.algo {
-                0x05 => pico2hsm_core::key::KeyType::RsaPrivate2048,
-                0x06 => pico2hsm_core::key::KeyType::RsaPrivate3072,
-                0x07 => pico2hsm_core::key::KeyType::RsaPrivate4096,
+                0x05 => KeyType::RsaPrivate2048,
+                0x06 => KeyType::RsaPrivate3072,
+                0x07 => KeyType::RsaPrivate4096,
                 _ => match key_obj.private_key.len() {
-                    n if n <= 1200 => pico2hsm_core::key::KeyType::RsaPrivate2048,
-                    n if n <= 1800 => pico2hsm_core::key::KeyType::RsaPrivate3072,
-                    _ => pico2hsm_core::key::KeyType::RsaPrivate4096,
+                    n if n <= 1200 => KeyType::RsaPrivate2048,
+                    n if n <= 1800 => KeyType::RsaPrivate3072,
+                    _ => KeyType::RsaPrivate4096,
                 },
             };
             let der_len = key_obj.private_key.len();
             let Some(der_buf) = crate::security::zeroize::key_buf::<2400>(&key_obj.private_key)
             else {
-                return ApduResponse::err(pico2hsm_core::apdu::SW_CONDITIONS_NOT_SATISFIED);
+                return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED);
             };
 
             let sig = match algo {
@@ -192,7 +192,7 @@ fn pso_compute_digital_signature(
     };
 
     // Load key material from flash
-    let key_obj = match store.fetch_key(pico2hsm_core::key::KeyId(key_id)) {
+    let key_obj = match store.fetch_key(KeyId(key_id)) {
         Ok(Some(obj)) => obj,
         _ => return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
     };
@@ -200,7 +200,7 @@ fn pso_compute_digital_signature(
     // Copy private key bytes to a local buffer
     let priv_len = key_obj.private_key.len();
     let Some(priv_buf) = crate::security::zeroize::key_buf::<66>(&key_obj.private_key) else {
-        return ApduResponse::err(pico2hsm_core::apdu::SW_CONDITIONS_NOT_SATISFIED);
+        return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED);
     };
 
     // For card-hash algorithms (0x71–0x75) the host sends the raw message;
@@ -297,7 +297,7 @@ fn pso_decipher(
         Some(id) => id,
         None => return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
     };
-    let key_id = pico2hsm_core::key::KeyId::sc_hsm(0, key_id_proto).0; // u32 internal ID
+    let key_id = KeyId::sc_hsm(0, key_id_proto).0; // u32 internal ID
     let algo = match state.current_algo {
         Some(a) => a,
         None => return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
@@ -324,7 +324,7 @@ fn pso_decipher(
             };
 
             // Load key material from flash
-            let key_obj = match store.fetch_key(pico2hsm_core::key::KeyId(key_id)) {
+            let key_obj = match store.fetch_key(KeyId(key_id)) {
                 Ok(Some(obj)) => obj,
                 _ => return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
             };
@@ -333,7 +333,7 @@ fn pso_decipher(
             let der_len = key_obj.private_key.len();
             let Some(der_buf) = crate::security::zeroize::key_buf::<2400>(&key_obj.private_key)
             else {
-                return ApduResponse::err(pico2hsm_core::apdu::SW_CONDITIONS_NOT_SATISFIED);
+                return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED);
             };
 
             // Raw RSA: result = ciphertext^d mod n. OpenSC handles all unpadding.
@@ -383,14 +383,14 @@ fn pso_decipher(
     let needs_04_prefix = algo == 0x80;
 
     // Load key material from flash
-    let key_obj = match store.fetch_key(pico2hsm_core::key::KeyId(key_id)) {
+    let key_obj = match store.fetch_key(KeyId(key_id)) {
         Ok(Some(obj)) => obj,
         _ => return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
     };
 
     let priv_len = key_obj.private_key.len();
     let Some(priv_buf) = crate::security::zeroize::key_buf::<66>(&key_obj.private_key) else {
-        return ApduResponse::err(pico2hsm_core::apdu::SW_CONDITIONS_NOT_SATISFIED);
+        return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED);
     };
 
     let shared =
@@ -463,7 +463,7 @@ fn pso_compute_checksum(
     };
 
     // Load key material from flash
-    let key_obj = match store.fetch_key(pico2hsm_core::key::KeyId(full_key_id)) {
+    let key_obj = match store.fetch_key(KeyId(full_key_id)) {
         Ok(Some(obj)) => obj,
         _ => return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
     };
@@ -515,7 +515,7 @@ fn pso_verify_checksum(
     };
 
     // Load key material from flash
-    let key_obj = match store.fetch_key(pico2hsm_core::key::KeyId(full_key_id)) {
+    let key_obj = match store.fetch_key(KeyId(full_key_id)) {
         Ok(Some(obj)) => obj,
         _ => return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
     };

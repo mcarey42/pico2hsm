@@ -88,7 +88,7 @@ pub fn handle(
                 0x05 => aes_cmac(cmd.data),
                 0x06 => hmac_sha256(cmd.data),
                 // V1 DKEK exchange (P1=0x31–0x33) removed — use V2 (P1=0x35–0x38).
-                0x31 | 0x32 | 0x33 => ApduResponse::err(pico2hsm_core::apdu::SW_INS_NOT_SUPPORTED),
+                0x31..=0x33 => ApduResponse::err(pico2hsm_core::apdu::SW_INS_NOT_SUPPORTED),
                 _ => ApduResponse::err(SW_WRONG_DATA),
             }
         }
@@ -547,19 +547,19 @@ fn handle_get_state_hash(
         match key_info {
             Some((algo, key_flags, timestamp_ms, pubkey_hash)) => {
                 // Alive key: SHA-256(0x01 || key_ref || algo || key_flags || timestamp_ms_BE || pubkey_hash)
-                leaf_hasher.update(&[0x01, slot, algo, key_flags]);
-                leaf_hasher.update(&timestamp_ms.to_be_bytes());
-                leaf_hasher.update(&pubkey_hash);
+                leaf_hasher.update([0x01, slot, algo, key_flags]);
+                leaf_hasher.update(timestamp_ms.to_be_bytes());
+                leaf_hasher.update(pubkey_hash);
             }
             None => {
                 // Empty slot: SHA-256(0x00 || key_ref || [0;43])
-                leaf_hasher.update(&[0x00, slot]);
-                leaf_hasher.update(&[0u8; 43]);
+                leaf_hasher.update([0x00, slot]);
+                leaf_hasher.update([0u8; 43]);
             }
         }
 
         let leaf: [u8; 32] = leaf_hasher.finalize().into();
-        root_hasher.update(&leaf);
+        root_hasher.update(leaf);
     }
 
     let state_root: [u8; 32] = root_hasher.finalize().into();
@@ -567,8 +567,8 @@ fn handle_get_state_hash(
 
     // Sign: Sig = P256_RFC6979_ECDSA_sign(device_static_priv, SHA-256(generation_BE(8) || state_root(32)))
     let mut sig_hasher = Sha256::new();
-    sig_hasher.update(&generation.to_be_bytes());
-    sig_hasher.update(&state_root);
+    sig_hasher.update(generation.to_be_bytes());
+    sig_hasher.update(state_root);
     let sig_msg: [u8; 32] = sig_hasher.finalize().into();
 
     let sig_bytes = match sign_with_device_key(state, store, &sig_msg) {

@@ -1,4 +1,4 @@
-//! `FlashChip` trait — abstraction over any SPI flash chip or SDCard.
+//! `FlashChip` trait — abstraction over any SPI flash chip or `SDCard`.
 //!
 //! Implementations handle 3-byte vs 4-byte address mode internally.
 //! All addresses are byte-aligned. Sector size is always 4096 bytes.
@@ -20,7 +20,7 @@ pub const PAGE_SIZE: usize = 256;
 /// 4 chips per SPI bus × 2 buses (SPI0 + SPI1).
 pub const MAX_CHIPS: usize = 8;
 
-/// Abstraction over any SPI flash chip or SDCard used as keystore storage.
+/// Abstraction over any SPI flash chip or `SDCard` used as keystore storage.
 ///
 /// All addresses are byte-aligned. Sector size is always 4096 bytes.
 /// Implementations handle 3-byte vs 4-byte addressing internally.

@@ -670,7 +670,7 @@ impl CcidHandler {
     /// Process one incoming CCID bulk message.
     ///
     /// Returns the response bytes to be sent on the bulk IN endpoint.
-    pub async fn process_message<'a>(&mut self, _msg: &'a [u8], _out: &mut Vec<u8, 512>) {
+    pub async fn process_message(&mut self, _msg: &[u8], _out: &mut Vec<u8, 512>) {
         // TODO: implement
     }
 }

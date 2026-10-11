@@ -23,7 +23,7 @@ use crate::protocol::sc_hsm::{ScHsmState, SeOperation};
 /// INS byte for MANAGE SECURITY ENVIRONMENT.
 pub const INS_MSE: u8 = 0x22;
 
-fn find_tlv<'a>(data: &'a [u8], tag: u8) -> Option<&'a [u8]> {
+fn find_tlv(data: &[u8], tag: u8) -> Option<&[u8]> {
     let mut i = 0;
     while i + 1 < data.len() {
         let t = data[i];

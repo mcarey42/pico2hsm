@@ -39,7 +39,7 @@ pub fn handle(state: &mut OpenPgpState, cmd: &ApduCommand<'_>) -> ApduResponse {
     // Copy private key
     let priv_len = priv_key.len();
     let Some(priv_buf) = crate::security::zeroize::key_buf::<66>(priv_key) else {
-        return ApduResponse::err(pico2hsm_core::apdu::SW_CONDITIONS_NOT_SATISFIED);
+        return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED);
     };
 
     // Sign: input is the hash/challenge

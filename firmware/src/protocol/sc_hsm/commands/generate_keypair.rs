@@ -225,7 +225,7 @@ fn ec_domain_params(algo: u8) -> Option<EcDomainParams> {
 /// Correctly skips multi-byte tags (ISO 7816-4: first byte has lower 5 bits
 /// all set → second byte is part of the tag number) so that subsequent TLV
 /// entries are found even when preceded by two-byte tags like `5F 29`.
-fn find_tlv<'a>(data: &'a [u8], tag: u8) -> Option<&'a [u8]> {
+fn find_tlv(data: &[u8], tag: u8) -> Option<&[u8]> {
     let mut i = 0;
     while i < data.len() {
         let t = data[i];
@@ -269,7 +269,7 @@ fn find_tlv<'a>(data: &'a [u8], tag: u8) -> Option<&'a [u8]> {
 }
 
 /// Search `data` for two-byte tag `[tag0, tag1]`; return its value slice or `None`.
-fn find_tlv_2<'a>(data: &'a [u8], tag0: u8, tag1: u8) -> Option<&'a [u8]> {
+fn find_tlv_2(data: &[u8], tag0: u8, tag1: u8) -> Option<&[u8]> {
     let mut i = 0;
     while i + 2 < data.len() {
         if data[i] != tag0 || data[i + 1] != tag1 {

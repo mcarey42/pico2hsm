@@ -267,7 +267,7 @@ fn read_ecc_bytes_64(row_start: usize) -> Result<[u8; 64], otp::Error> {
 /// with 0x00 if `data.len()` is odd.
 fn write_ecc_bytes(row_start: usize, data: &[u8]) -> Result<(), otp::Error> {
     let len = data.len();
-    let num_rows = (len + 1) / 2;
+    let num_rows = len.div_ceil(2);
     for i in 0..num_rows {
         let high = data[i * 2] as u16;
         let low = if i * 2 + 1 < len {
@@ -449,7 +449,7 @@ pub fn lock_write(_row_start: u16, _row_count: u16) -> Result<(), StorageError> 
 pub fn read_root_secret() -> Result<[u8; 32], StorageError> {
     let mut out = [0u8; 32];
     let mut byte_idx = 0usize;
-    for row in (OTP_ROOT_SECRET_START as usize)..=(0x3F_usize) {
+    for row in (OTP_ROOT_SECRET_START as usize)..=0x3F_usize {
         if byte_idx >= 32 {
             break;
         }

@@ -243,10 +243,7 @@ pub fn generate_ec_keypair(
 ///
 /// Returns a 64-byte raw signature (`r || s`, each 32 bytes).
 #[cfg(feature = "applet-openpgp-curve25519")]
-pub fn ed25519_sign(
-    private_key: &[u8],
-    message: &[u8],
-) -> Result<heapless::Vec<u8, 64>, CryptoError> {
+pub fn ed25519_sign(private_key: &[u8], message: &[u8]) -> Result<Vec<u8, 64>, CryptoError> {
     use ed25519_dalek::{Signature, Signer, SigningKey};
 
     if private_key.len() != 32 {
@@ -261,7 +258,7 @@ pub fn ed25519_sign(
     let sig: Signature = signing_key.sign(message);
     let sig_bytes = sig.to_bytes(); // 64 bytes (R || S = 32 || 32)
 
-    let mut out: heapless::Vec<u8, 64> = heapless::Vec::new();
+    let mut out: Vec<u8, 64> = Vec::new();
     out.extend_from_slice(&sig_bytes)
         .map_err(|_| CryptoError::BufferTooSmall)?;
     Ok(out)
@@ -518,11 +515,10 @@ where
     C: elliptic_curve::PrimeCurve
         + elliptic_curve::CurveArithmetic
         + ecdsa::hazmat::DigestPrimitive,
-    C::Scalar: elliptic_curve::ops::Invert<Output = elliptic_curve::subtle::CtOption<C::Scalar>>
+    C::Scalar: elliptic_curve::ops::Invert<Output = subtle::CtOption<C::Scalar>>
         + ecdsa::hazmat::SignPrimitive<C>,
     elliptic_curve::FieldBytesSize<C>: elliptic_curve::sec1::ModulusSize,
-    elliptic_curve::AffinePoint<C>:
-        elliptic_curve::sec1::FromEncodedPoint<C> + elliptic_curve::sec1::ToEncodedPoint<C>,
+    elliptic_curve::AffinePoint<C>: elliptic_curve::sec1::FromEncodedPoint<C> + ToEncodedPoint<C>,
     ecdsa::SignatureSize<C>: elliptic_curve::generic_array::ArrayLength<u8>,
     ecdsa::der::MaxSize<C>: elliptic_curve::generic_array::ArrayLength<u8>,
     <elliptic_curve::FieldBytesSize<C> as core::ops::Add>::Output:
@@ -555,7 +551,7 @@ where
 fn ecdsa_sign_p521(
     private_key_raw: &[u8],
     hash_data: &[u8],
-    rng: &mut (impl rand_core::CryptoRng + rand_core::RngCore),
+    rng: &mut (impl rand_core::CryptoRng + RngCore),
 ) -> Result<EcdsaSignature, CryptoError> {
     let mut extra = [0u8; 32];
     rng.try_fill_bytes(&mut extra)
@@ -710,7 +706,7 @@ where
         + ecdsa::hazmat::DigestPrimitive,
     elliptic_curve::AffinePoint<C>: ecdsa::hazmat::VerifyPrimitive<C>
         + elliptic_curve::sec1::FromEncodedPoint<C>
-        + elliptic_curve::sec1::ToEncodedPoint<C>,
+        + ToEncodedPoint<C>,
     elliptic_curve::FieldBytesSize<C>: elliptic_curve::sec1::ModulusSize,
     ecdsa::SignatureSize<C>: elliptic_curve::generic_array::ArrayLength<u8>,
     ecdsa::der::MaxSize<C>: elliptic_curve::generic_array::ArrayLength<u8>,
@@ -785,8 +781,7 @@ fn ecdh_agree_curve<C>(
 ) -> Result<Vec<u8, 66>, CryptoError>
 where
     C: elliptic_curve::CurveArithmetic,
-    elliptic_curve::AffinePoint<C>:
-        elliptic_curve::sec1::FromEncodedPoint<C> + elliptic_curve::sec1::ToEncodedPoint<C>,
+    elliptic_curve::AffinePoint<C>: elliptic_curve::sec1::FromEncodedPoint<C> + ToEncodedPoint<C>,
     elliptic_curve::FieldBytesSize<C>: elliptic_curve::sec1::ModulusSize,
 {
     let secret =
@@ -815,7 +810,7 @@ pub fn generate_keypair(
     key_type: KeyType,
     key_id: KeyId,
     rng: &mut (impl RngCore + rand_core::CryptoRng),
-) -> Result<(KeyMaterial, heapless::Vec<u8, 512>), CryptoError> {
+) -> Result<(KeyMaterial, Vec<u8, 512>), CryptoError> {
     match key_type {
         KeyType::EcPrivateP256
         | KeyType::EcPrivateP384
@@ -823,7 +818,7 @@ pub fn generate_keypair(
         | KeyType::EcPrivateK256 => {
             let pair = generate_ec_keypair(key_type, rng)?;
             let material = ec_private_to_key_material(key_type, key_id, &pair.private_key)?;
-            let mut pub_out: heapless::Vec<u8, 512> = heapless::Vec::new();
+            let mut pub_out: Vec<u8, 512> = Vec::new();
             pub_out
                 .extend_from_slice(&pair.public_key)
                 .map_err(|_| CryptoError::BufferTooSmall)?;
@@ -848,10 +843,7 @@ pub fn sign_ecdsa(
 /// Perform ECDH key agreement (legacy API, operates on `KeyMaterial`).
 ///
 /// `peer_pubkey` is the peer's uncompressed SEC1 point (`0x04 || X || Y`).
-pub fn ecdh(
-    private_key: &KeyMaterial,
-    peer_pubkey: &[u8],
-) -> Result<heapless::Vec<u8, 66>, CryptoError> {
+pub fn ecdh(private_key: &KeyMaterial, peer_pubkey: &[u8]) -> Result<Vec<u8, 66>, CryptoError> {
     ecdh_agree(private_key.key_type, &private_key.raw, peer_pubkey)
 }
 
@@ -873,7 +865,7 @@ pub fn rsa_sign_pkcs1v15(
     hash_data: &[u8],
     hash_algo: HashAlgorithm,
     _rng: &mut impl RngCore,
-) -> Result<heapless::Vec<u8, 512>, CryptoError> {
+) -> Result<Vec<u8, 512>, CryptoError> {
     use ::rsa::pkcs1::DecodeRsaPrivateKey;
     use ::rsa::{Pkcs1v15Sign, RsaPrivateKey};
     use sha1::Sha1;
@@ -895,7 +887,7 @@ pub fn rsa_sign_pkcs1v15(
         .sign_with_rng(&mut crate::protocol::sc_hsm::FwRng, scheme, hash_data)
         .map_err(|_| CryptoError::SignFailure)?;
 
-    let mut out: heapless::Vec<u8, 512> = heapless::Vec::new();
+    let mut out: Vec<u8, 512> = Vec::new();
     out.extend_from_slice(&sig_bytes)
         .map_err(|_| CryptoError::BufferTooSmall)?;
     Ok(out)
@@ -916,7 +908,7 @@ pub fn rsa_sign_pss(
     _hash_algo: HashAlgorithm,
     _salt_len: usize,
     rng: &mut (impl RngCore + rand_core::CryptoRng),
-) -> Result<heapless::Vec<u8, 512>, CryptoError> {
+) -> Result<Vec<u8, 512>, CryptoError> {
     use ::rsa::pkcs1::DecodeRsaPrivateKey;
     use ::rsa::pss::BlindedSigningKey;
     use ::rsa::signature::hazmat::RandomizedPrehashSigner;
@@ -935,7 +927,7 @@ pub fn rsa_sign_pss(
     use ::rsa::signature::SignatureEncoding;
     let sig_bytes = sig.to_bytes();
 
-    let mut out: heapless::Vec<u8, 512> = heapless::Vec::new();
+    let mut out: Vec<u8, 512> = Vec::new();
     out.extend_from_slice(sig_bytes.as_ref())
         .map_err(|_| CryptoError::BufferTooSmall)?;
     Ok(out)
@@ -952,7 +944,7 @@ pub fn rsa_decrypt_pkcs1v15(
     _key_type: KeyType,
     private_key_der: &[u8],
     ciphertext: &[u8],
-) -> Result<heapless::Vec<u8, 512>, CryptoError> {
+) -> Result<Vec<u8, 512>, CryptoError> {
     use ::rsa::pkcs1::DecodeRsaPrivateKey;
     use ::rsa::Pkcs1v15Encrypt;
     use ::rsa::RsaPrivateKey;
@@ -969,7 +961,7 @@ pub fn rsa_decrypt_pkcs1v15(
         )
         .map_err(|_| CryptoError::DecryptFailure)?;
 
-    let mut out: heapless::Vec<u8, 512> = heapless::Vec::new();
+    let mut out: Vec<u8, 512> = Vec::new();
     out.extend_from_slice(&plaintext)
         .map_err(|_| CryptoError::BufferTooSmall)?;
     Ok(out)
@@ -988,7 +980,7 @@ pub fn rsa_decrypt_oaep(
     ciphertext: &[u8],
     _hash_algo: HashAlgorithm,
     _rng: &mut impl RngCore,
-) -> Result<heapless::Vec<u8, 512>, CryptoError> {
+) -> Result<Vec<u8, 512>, CryptoError> {
     use ::rsa::pkcs1::DecodeRsaPrivateKey;
     use ::rsa::Oaep;
     use ::rsa::RsaPrivateKey;
@@ -1002,7 +994,7 @@ pub fn rsa_decrypt_oaep(
         .decrypt_blinded(&mut crate::protocol::sc_hsm::FwRng, scheme, ciphertext)
         .map_err(|_| CryptoError::DecryptFailure)?;
 
-    let mut out: heapless::Vec<u8, 512> = heapless::Vec::new();
+    let mut out: Vec<u8, 512> = Vec::new();
     out.extend_from_slice(&plaintext)
         .map_err(|_| CryptoError::BufferTooSmall)?;
     Ok(out)
@@ -1017,10 +1009,7 @@ pub fn rsa_decrypt_oaep(
 /// Returns the result as big-endian bytes, zero-padded to the modulus length.
 /// For RSA-2048 this is always 256 bytes.
 #[cfg(feature = "rsa")]
-pub fn rsa_private_raw(
-    private_key_der: &[u8],
-    data: &[u8],
-) -> Result<heapless::Vec<u8, 512>, CryptoError> {
+pub fn rsa_private_raw(private_key_der: &[u8], data: &[u8]) -> Result<Vec<u8, 512>, CryptoError> {
     use ::rsa::pkcs1::DecodeRsaPrivateKey;
     use ::rsa::traits::PublicKeyParts;
     use ::rsa::RsaPrivateKey;
@@ -1029,7 +1018,7 @@ pub fn rsa_private_raw(
         RsaPrivateKey::from_pkcs1_der(private_key_der).map_err(|_| CryptoError::WrongKeyLength)?;
 
     let n = priv_key.n();
-    let key_len = (n.bits() + 7) / 8; // modulus length in bytes
+    let key_len = n.bits().div_ceil(8); // modulus length in bytes
 
     // Convert input bytes to BigUint (rsa 0.9 re-exports BigUint)
     let c = ::rsa::BigUint::from_bytes_be(data);
@@ -1046,7 +1035,7 @@ pub fn rsa_private_raw(
 
     // Convert result to big-endian, zero-padded to key_len bytes
     let m_bytes = m.to_bytes_be();
-    let mut out: heapless::Vec<u8, 512> = heapless::Vec::new();
+    let mut out: Vec<u8, 512> = Vec::new();
     for _ in 0..key_len.saturating_sub(m_bytes.len()) {
         let _ = out.push(0x00);
     }
@@ -1057,10 +1046,7 @@ pub fn rsa_private_raw(
 
 /// Legacy RSA PKCS#1v1.5 sign (SHA-256) — operates on `KeyMaterial`.
 #[cfg(feature = "rsa")]
-pub fn rsa_sign(
-    key: &KeyMaterial,
-    hash_data: &[u8],
-) -> Result<heapless::Vec<u8, 512>, CryptoError> {
+pub fn rsa_sign(key: &KeyMaterial, hash_data: &[u8]) -> Result<Vec<u8, 512>, CryptoError> {
     struct DummyRng;
     impl RngCore for DummyRng {
         fn next_u32(&mut self) -> u32 {
@@ -1085,10 +1071,7 @@ pub fn rsa_sign(
 
 /// Legacy RSA PKCS#1v1.5 decrypt — operates on `KeyMaterial`.
 #[cfg(feature = "rsa")]
-pub fn rsa_decrypt(
-    key: &KeyMaterial,
-    ciphertext: &[u8],
-) -> Result<heapless::Vec<u8, 512>, CryptoError> {
+pub fn rsa_decrypt(key: &KeyMaterial, ciphertext: &[u8]) -> Result<Vec<u8, 512>, CryptoError> {
     rsa_decrypt_pkcs1v15(key.key_type, &key.raw, ciphertext)
 }
 
@@ -1109,7 +1092,7 @@ pub fn ec_private_to_key_material(
         return Err(CryptoError::WrongKeyLength);
     }
 
-    let mut raw: heapless::Vec<u8, MAX_KEY_BYTES> = heapless::Vec::new();
+    let mut raw: Vec<u8, MAX_KEY_BYTES> = Vec::new();
     raw.extend_from_slice(private_key_raw)
         .map_err(|_| CryptoError::BufferTooSmall)?;
 
@@ -1370,7 +1353,7 @@ mod p521_rfc6979_tests {
     use super::*;
     use sha2::{Digest, Sha512};
 
-    fn hex(s: &str) -> alloc::vec::Vec<u8> {
+    fn hex(s: &str) -> heapless::Vec<u8, 66> {
         (0..s.len())
             .step_by(2)
             .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())

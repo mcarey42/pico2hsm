@@ -283,7 +283,7 @@ impl<Chip: FlashChip> StorageManager<Chip> {
         }
 
         // Update mirror pair states from chip states.
-        for (_pair_idx, pair) in self.mirror_pairs.iter_mut().enumerate() {
+        for pair in self.mirror_pairs.iter_mut() {
             let primary_state = self.chip_states[pair.primary as usize];
             let mirror_state = self.chip_states[pair.mirror as usize];
             pair.state = match (primary_state, mirror_state) {

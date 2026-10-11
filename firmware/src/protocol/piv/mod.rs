@@ -66,9 +66,9 @@ pub struct InMemoryPivKey {
     /// PIV algorithm ID (0x11 = P-256, 0x14 = P-384).
     pub alg_id: u8,
     /// Raw private key scalar (big-endian), up to 48 bytes for P-384.
-    pub private_key: heapless::Vec<u8, 66>,
+    pub private_key: Vec<u8, 66>,
     /// Uncompressed public key `04 || X || Y`, up to 97 bytes for P-384.
-    pub public_key: heapless::Vec<u8, 133>,
+    pub public_key: Vec<u8, 133>,
 }
 
 /// A stored PIV data object (certificate, CHUID, CCC, etc.).
@@ -78,7 +78,7 @@ pub struct PivDataObject {
     /// Low byte of the 3-byte tag (e.g. 0x02 for CHUID=5FC102, 0x05 for cert 9A=5FC105).
     pub tag_low: u8,
     /// Raw data content (including the 53 wrapper for GET DATA responses).
-    pub data: heapless::Vec<u8, MAX_PIV_DATA_SIZE>,
+    pub data: Vec<u8, MAX_PIV_DATA_SIZE>,
 }
 
 /// PIV protocol state.
@@ -97,9 +97,9 @@ pub struct PivState {
     /// Device ID (16 bytes, used as CHUID GUID and PBKDF2 salt).
     pub device_id: [u8; 16],
     /// Lightweight metadata index for PIV key slots (mirrors SC-HSM key_index).
-    pub key_index: heapless::Vec<crate::protocol::sc_hsm::KeyMeta, MAX_PIV_KEYS>,
+    pub key_index: Vec<crate::protocol::sc_hsm::KeyMeta, MAX_PIV_KEYS>,
     /// Stored data objects (certificates, etc.).
-    pub data_objects: heapless::Vec<PivDataObject, MAX_PIV_DATA_OBJECTS>,
+    pub data_objects: Vec<PivDataObject, MAX_PIV_DATA_OBJECTS>,
 }
 
 #[cfg(feature = "applet-piv")]
@@ -137,8 +137,8 @@ impl PivState {
             mgmt_key_authenticated: false,
             mgmt_challenge: None,
             device_id,
-            key_index: heapless::Vec::new(),
-            data_objects: heapless::Vec::new(),
+            key_index: Vec::new(),
+            data_objects: Vec::new(),
         }
     }
 }
@@ -208,9 +208,13 @@ impl Piv {
     ///
     /// `#[inline(never)]` ensures this frame stays separate from
     /// `Dispatcher::init_in_place`.
+    ///
+    /// # Safety
+    /// `dest` must be non-null, aligned and valid for writes of `Self`.  Any
+    /// value already there is overwritten without being dropped.
     #[cfg(feature = "applet-piv")]
     #[inline(never)]
-    pub fn init_in_place(dest: *mut Self) {
+    pub unsafe fn init_in_place(dest: *mut Self) {
         use core::ptr::addr_of_mut;
 
         let device_id = [0u8; 16];
@@ -242,14 +246,18 @@ impl Piv {
             addr_of_mut!((*state).mgmt_key_authenticated).write(false);
             addr_of_mut!((*state).mgmt_challenge).write(None);
             addr_of_mut!((*state).device_id).write(device_id);
-            addr_of_mut!((*state).key_index).write(heapless::Vec::new());
-            addr_of_mut!((*state).data_objects).write(heapless::Vec::new());
+            addr_of_mut!((*state).key_index).write(Vec::new());
+            addr_of_mut!((*state).data_objects).write(Vec::new());
         }
     }
 
     /// Initialise a `Piv` directly into a destination pointer (no-op without applet-piv).
+    ///
+    /// # Safety
+    /// `dest` must be non-null, aligned and valid for writes of `Self`.  Any
+    /// value already there is overwritten without being dropped.
     #[cfg(not(feature = "applet-piv"))]
-    pub fn init_in_place(dest: *mut Self) {
+    pub unsafe fn init_in_place(dest: *mut Self) {
         let _ = dest;
     }
 
@@ -294,6 +302,7 @@ impl Piv {
     }
 
     /// Persist one PIV data object (keystore-encrypted like keys).
+    #[cfg(feature = "applet-piv")]
     pub fn save_data_object_to_store(
         obj: &PivDataObject,
         store: &mut dyn crate::storage::KeyStore,
@@ -357,7 +366,7 @@ impl Piv {
         use pico2hsm_core::key::AppletId;
 
         let ps = &state.pin_state;
-        let mut buf: heapless::Vec<u8, 128> = heapless::Vec::new();
+        let mut buf: Vec<u8, 128> = Vec::new();
         let _ = buf.extend_from_slice(&ps.pin_hash);
         let _ = buf.extend_from_slice(&ps.pin_salt);
         let _ = buf.push(ps.pin_retries_remaining);
@@ -378,8 +387,8 @@ impl Piv {
             generation: 0,
             key_flags: 0,
             timestamp_ms: 0,
-            private_key: heapless::Vec::new(),
-            public_key: heapless::Vec::new(),
+            private_key: Vec::new(),
+            public_key: Vec::new(),
         };
         let _ = obj.private_key.extend_from_slice(&buf);
         store.save_key(&obj)
@@ -513,7 +522,7 @@ impl Piv {
     ) -> Vec<u8, 4098> {
         #[cfg(feature = "applet-piv")]
         {
-            let resp = match pico2hsm_core::apdu::ApduCommand::parse(apdu) {
+            let resp = match ApduCommand::parse(apdu) {
                 Ok(cmd) => self.dispatch_with_store(&cmd, store),
                 Err(_) => ApduResponse::err(SW_INS_NOT_SUPPORTED),
             };
@@ -540,9 +549,8 @@ impl Piv {
             }
 
             // Load key objects for PIV slots.
-            let mut piv_ids: heapless::Vec<pico2hsm_core::key::KeyId, 16> = heapless::Vec::new();
-            let mut object_ids: heapless::Vec<pico2hsm_core::key::KeyId, MAX_PIV_DATA_OBJECTS> =
-                heapless::Vec::new();
+            let mut piv_ids: Vec<pico2hsm_core::key::KeyId, 16> = Vec::new();
+            let mut object_ids: Vec<pico2hsm_core::key::KeyId, MAX_PIV_DATA_OBJECTS> = Vec::new();
             store.for_each_key(&mut |kid| {
                 if kid.applet_byte() != AppletId::Piv as u8 {
                     return;
@@ -559,7 +567,7 @@ impl Piv {
             });
             for kid in object_ids.iter() {
                 if let Ok(Some(rec)) = store.fetch_key(*kid) {
-                    let mut data = heapless::Vec::new();
+                    let mut data = Vec::new();
                     if data.extend_from_slice(&rec.private_key).is_ok() {
                         let tag_low = kid.proto_ref();
                         self.state.data_objects.retain(|o| o.tag_low != tag_low);

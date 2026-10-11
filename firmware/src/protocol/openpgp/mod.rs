@@ -108,17 +108,17 @@ pub struct OpenPgpState {
 
     // --- Key storage (in-memory volatile) ---
     /// SIG key: private scalar (up to 66 bytes for P-521).
-    pub sig_private: Option<heapless::Vec<u8, 66>>,
+    pub sig_private: Option<Vec<u8, 66>>,
     /// SIG key: uncompressed public point (04 || X || Y).
-    pub sig_public: Option<heapless::Vec<u8, 133>>,
+    pub sig_public: Option<Vec<u8, 133>>,
     /// DEC key: private scalar.
-    pub dec_private: Option<heapless::Vec<u8, 66>>,
+    pub dec_private: Option<Vec<u8, 66>>,
     /// DEC key: uncompressed public point.
-    pub dec_public: Option<heapless::Vec<u8, 133>>,
+    pub dec_public: Option<Vec<u8, 133>>,
     /// AUTH key: private scalar.
-    pub auth_private: Option<heapless::Vec<u8, 66>>,
+    pub auth_private: Option<Vec<u8, 66>>,
     /// AUTH key: uncompressed public point.
-    pub auth_public: Option<heapless::Vec<u8, 133>>,
+    pub auth_public: Option<Vec<u8, 133>>,
 
     // --- Key type per slot (used to select the right crypto primitive) ---
     pub sig_key_type: Option<pico2hsm_core::key::KeyType>,
@@ -127,11 +127,11 @@ pub struct OpenPgpState {
 
     // --- Cardholder data (writable via PUT DATA) ---
     /// Cardholder name (DO 005B), up to 39 bytes.
-    pub cardholder_name: heapless::Vec<u8, 39>,
+    pub cardholder_name: Vec<u8, 39>,
     /// Login data (DO 005E), up to 254 bytes.
-    pub login_data: heapless::Vec<u8, 254>,
+    pub login_data: Vec<u8, 254>,
     /// Language preference (DO 5F2D), up to 8 bytes.
-    pub language: heapless::Vec<u8, 8>,
+    pub language: Vec<u8, 8>,
     /// Sex (DO 5F35), 1 byte.
     pub sex: u8,
 
@@ -152,17 +152,17 @@ pub struct OpenPgpState {
 
     // --- Algorithm attributes per slot (writable via PUT DATA) ---
     /// SIG algorithm attributes (DO C1). Default: ECDSA P-256.
-    pub algo_sig: heapless::Vec<u8, 12>,
+    pub algo_sig: Vec<u8, 12>,
     /// DEC algorithm attributes (DO C2). Default: ECDH P-256.
-    pub algo_dec: heapless::Vec<u8, 12>,
+    pub algo_dec: Vec<u8, 12>,
     /// AUTH algorithm attributes (DO C3). Default: ECDSA P-256.
-    pub algo_auth: heapless::Vec<u8, 12>,
+    pub algo_auth: Vec<u8, 12>,
 
     // --- DO 5F50: URL of public key server (up to 254 bytes) ---
-    pub url: heapless::Vec<u8, 254>,
+    pub url: Vec<u8, 254>,
 
     // --- DO 7F21: Cardholder Certificate (up to 1024 bytes) ---
-    pub cardholder_cert: heapless::Vec<u8, 1024>,
+    pub cardholder_cert: Vec<u8, 1024>,
 
     // --- Termination flag (set by TERMINATE DF, cleared by ACTIVATE FILE) ---
     pub terminated: bool,
@@ -172,7 +172,7 @@ pub struct OpenPgpState {
 ///
 /// Assigning `None` alone only changes the discriminant and leaves the key
 /// bytes in RAM.
-pub(crate) fn wipe_key(slot: &mut Option<heapless::Vec<u8, 66>>) {
+pub(crate) fn wipe_key(slot: &mut Option<Vec<u8, 66>>) {
     if let Some(key) = slot.as_mut() {
         zeroize::Zeroize::zeroize(key.as_mut_slice());
     }
@@ -201,7 +201,7 @@ impl Drop for OpenPgpState {
 /// `[35]` KDF (0 = legacy SHA-256, 1 = PBKDF2), `[36]` length (0 = unknown),
 /// `[37..53]` salt.  Records written before 2026-10 stop at byte 35 and
 /// load as legacy with unknown length.
-fn encode_pw(buf: &mut heapless::Vec<u8, 64>, pw: Option<&pw::PwHash>, retries: u8) {
+fn encode_pw(buf: &mut Vec<u8, 64>, pw: Option<&pw::PwHash>, retries: u8) {
     let empty = pw::PwHash {
         digest: [0; 32],
         salt: [0; 16],
@@ -245,17 +245,23 @@ fn decode_pw(b: &[u8]) -> Option<(Option<pw::PwHash>, u8)> {
     Some((Some(rec), retries))
 }
 
+impl Default for OpenPgpState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl OpenPgpState {
     pub fn new() -> Self {
         // Compute default PW1 and PW3 hashes
         let pw1_hash = pw::PwHash::factory_default(b"123456");
         let pw3_hash = pw::PwHash::factory_default(b"12345678");
 
-        let mut algo_sig = heapless::Vec::new();
+        let mut algo_sig = Vec::new();
         let _ = algo_sig.extend_from_slice(DEFAULT_ECDSA_ALGO_ATTRS);
-        let mut algo_dec = heapless::Vec::new();
+        let mut algo_dec = Vec::new();
         let _ = algo_dec.extend_from_slice(DEFAULT_ECDH_ALGO_ATTRS);
-        let mut algo_auth = heapless::Vec::new();
+        let mut algo_auth = Vec::new();
         let _ = algo_auth.extend_from_slice(DEFAULT_ECDSA_ALGO_ATTRS);
 
         OpenPgpState {
@@ -276,9 +282,9 @@ impl OpenPgpState {
             sig_key_type: None,
             dec_key_type: None,
             auth_key_type: None,
-            cardholder_name: heapless::Vec::new(),
-            login_data: heapless::Vec::new(),
-            language: heapless::Vec::new(),
+            cardholder_name: Vec::new(),
+            login_data: Vec::new(),
+            language: Vec::new(),
             sex: 0x39, // '9' = not stated
             fp_sig: [0u8; 20],
             fp_dec: [0u8; 20],
@@ -292,8 +298,8 @@ impl OpenPgpState {
             algo_sig,
             algo_dec,
             algo_auth,
-            url: heapless::Vec::new(),
-            cardholder_cert: heapless::Vec::new(),
+            url: Vec::new(),
+            cardholder_cert: Vec::new(),
             terminated: false,
         }
     }
@@ -521,7 +527,7 @@ impl OpenPgp {
         apdu: &[u8],
         store: &mut dyn crate::storage::KeyStore,
     ) -> Vec<u8, 4098> {
-        let resp = match pico2hsm_core::apdu::ApduCommand::parse(apdu) {
+        let resp = match ApduCommand::parse(apdu) {
             Ok(cmd) => self.dispatch_with_store(&cmd, store),
             Err(_) => ApduResponse::err(SW_INS_NOT_SUPPORTED),
         };
@@ -544,7 +550,7 @@ impl OpenPgp {
         use crate::security::key_management::{AlgorithmId, KeyObject, KeyType as KmKeyType};
         use pico2hsm_core::key::AppletId;
 
-        let mut buf: heapless::Vec<u8, 64> = heapless::Vec::new();
+        let mut buf: Vec<u8, 64> = Vec::new();
         encode_pw(&mut buf, state.pw1_hash.as_ref(), state.pw1_retries);
 
         let mut obj = KeyObject {
@@ -557,8 +563,8 @@ impl OpenPgp {
             generation: 0,
             key_flags: 0,
             timestamp_ms: 0,
-            private_key: heapless::Vec::new(),
-            public_key: heapless::Vec::new(),
+            private_key: Vec::new(),
+            public_key: Vec::new(),
         };
         let _ = obj.private_key.extend_from_slice(&buf);
         store.save_key(&obj)
@@ -579,7 +585,7 @@ impl OpenPgp {
         use crate::security::key_management::{AlgorithmId, KeyObject, KeyType as KmKeyType};
         use pico2hsm_core::key::AppletId;
 
-        let mut buf: heapless::Vec<u8, 64> = heapless::Vec::new();
+        let mut buf: Vec<u8, 64> = Vec::new();
         encode_pw(&mut buf, state.pw3_hash.as_ref(), state.pw3_retries);
 
         let mut obj = KeyObject {
@@ -592,8 +598,8 @@ impl OpenPgp {
             generation: 0,
             key_flags: 0,
             timestamp_ms: 0,
-            private_key: heapless::Vec::new(),
-            public_key: heapless::Vec::new(),
+            private_key: Vec::new(),
+            public_key: Vec::new(),
         };
         let _ = obj.private_key.extend_from_slice(&buf);
         store.save_key(&obj)
@@ -623,7 +629,7 @@ impl OpenPgp {
         }
 
         // Load key objects for OpenPGP slots.
-        let mut openpgp_ids: heapless::Vec<pico2hsm_core::key::KeyId, 8> = heapless::Vec::new();
+        let mut openpgp_ids: Vec<pico2hsm_core::key::KeyId, 8> = Vec::new();
         store.for_each_key(&mut |kid| {
             if kid.applet_byte() == AppletId::OpenPgp as u8 {
                 let slot = kid.proto_ref();
@@ -651,9 +657,9 @@ impl OpenPgp {
                     _ => continue,
                 };
 
-                let mut priv_vec: heapless::Vec<u8, 66> = heapless::Vec::new();
+                let mut priv_vec: Vec<u8, 66> = Vec::new();
                 let _ = priv_vec.extend_from_slice(&obj.private_key);
-                let mut pub_vec: heapless::Vec<u8, 133> = heapless::Vec::new();
+                let mut pub_vec: Vec<u8, 133> = Vec::new();
                 let _ = pub_vec.extend_from_slice(&obj.public_key);
 
                 match slot {

@@ -40,7 +40,7 @@ pub enum StorageError {
     IntegrityFailure,
     /// The keystore has no free sectors for a new key.
     KeystoreFull,
-    /// The keystore has never been formatted (SECTOR_MAGIC missing).
+    /// The keystore has never been formatted (`SECTOR_MAGIC` missing).
     NotFormatted,
     /// A specific sector on a specific chip has permanently failed.
     BadBlock { chip: u8, sector: u32 },

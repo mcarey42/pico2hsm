@@ -1,6 +1,6 @@
 //! Pluggable HSM protocol trait.
 //!
-//! The firmware supports multiple card protocols (SC-HSM, PIV, OpenPGP)
+//! The firmware supports multiple card protocols (SC-HSM, PIV, `OpenPGP`)
 //! behind a single USB CCID interface. A protocol implementation receives
 //! raw APDU bytes and returns a response buffer including SW1/SW2.
 //!

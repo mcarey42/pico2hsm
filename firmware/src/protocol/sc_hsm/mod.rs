@@ -120,8 +120,8 @@ impl crate::storage::KeyStore for LocalNullStore {
     fn wipe_by_owner(&mut self, _: AppletId) -> Result<(), HsmError> {
         Ok(())
     }
-    fn enumerate_keys(&self) -> heapless::Vec<KeyId, 64> {
-        heapless::Vec::new()
+    fn enumerate_keys(&self) -> Vec<KeyId, 64> {
+        Vec::new()
     }
     fn for_each_key(&self, _f: &mut dyn FnMut(KeyId)) {}
 }
@@ -174,7 +174,7 @@ pub struct EfCacheEntry {
     pub key_id: u32,
     /// File data (certificates, PRKDs, etc.).  1024 bytes covers EC CVCs
     /// for all curves including P-521 (~700 bytes) and RSA-2048 (~900 bytes).
-    pub data: heapless::Vec<u8, 1024>,
+    pub data: Vec<u8, 1024>,
 }
 
 /// Single operational buffer for one-at-a-time key/EF access.
@@ -190,6 +190,12 @@ pub struct OpBuffer {
     pub data: [u8; 4096],
     /// Number of valid bytes in `data`.
     pub len: usize,
+}
+
+impl Default for OpBuffer {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl OpBuffer {
@@ -390,7 +396,7 @@ pub struct ScHsmState {
     /// Lightweight metadata index for all keys and EF files in flash.
     /// Replaces the previous `keys`, `rsa_keys`, `sym_keys`, and `ef_files`
     /// Vec fields. Key material stays in flash; only metadata lives in RAM.
-    pub key_index: heapless::Vec<KeyMeta, 32>,
+    pub key_index: Vec<KeyMeta, 32>,
 
     /// Single operational buffer for key/EF data access.
     /// Loaded on-demand from flash; flushed back when dirty.
@@ -439,7 +445,13 @@ pub struct ScHsmState {
     ///
     /// Populated by: `write_data::write_at_offset` (on write), and
     /// `load_keys_from_store` (on USB reconnect from flash).
-    pub ef_cache: heapless::Vec<EfCacheEntry, 16>,
+    pub ef_cache: Vec<EfCacheEntry, 16>,
+}
+
+impl Default for ScHsmState {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ScHsmState {
@@ -467,7 +479,7 @@ impl ScHsmState {
             puk_hash: None,
             puk_salt: [0u8; 16],
             puk_retry_count: 10,
-            key_index: heapless::Vec::new(),
+            key_index: Vec::new(),
             op_buf: OpBuffer::new(),
             write_target_file: None,
             dkek: DkekManager::new([0u8; 16]),
@@ -480,14 +492,18 @@ impl ScHsmState {
             exchange_challenge_cache_write_idx: 0,
             generation: 0,
             noise_enrolled_peer_pubkey: None,
-            ef_cache: heapless::Vec::new(),
+            ef_cache: Vec::new(),
         }
     }
 
     /// Initialise an `ScHsmState` directly into a destination pointer,
     /// writing each field individually to avoid placing the full struct
     /// (~9 KB with OpBuffer + ef_cache) on the stack.
-    pub fn init_in_place(dest: *mut Self) {
+    ///
+    /// # Safety
+    /// `dest` must be non-null, aligned and valid for writes of `Self`.  Any
+    /// value already there is overwritten without being dropped.
+    pub unsafe fn init_in_place(dest: *mut Self) {
         use core::ptr::addr_of_mut;
         unsafe {
             addr_of_mut!((*dest).current_file).write(None);
@@ -512,7 +528,7 @@ impl ScHsmState {
             addr_of_mut!((*dest).puk_hash).write(None);
             addr_of_mut!((*dest).puk_salt).write([0u8; 16]);
             addr_of_mut!((*dest).puk_retry_count).write(10);
-            addr_of_mut!((*dest).key_index).write(heapless::Vec::new());
+            addr_of_mut!((*dest).key_index).write(Vec::new());
             addr_of_mut!((*dest).op_buf).write(OpBuffer::new());
             addr_of_mut!((*dest).write_target_file).write(None);
             addr_of_mut!((*dest).dkek).write(DkekManager::new([0u8; 16]));
@@ -526,7 +542,7 @@ impl ScHsmState {
             addr_of_mut!((*dest).exchange_challenge_cache_write_idx).write(0);
             addr_of_mut!((*dest).generation).write(0);
             addr_of_mut!((*dest).noise_enrolled_peer_pubkey).write(None);
-            addr_of_mut!((*dest).ef_cache).write(heapless::Vec::new());
+            addr_of_mut!((*dest).ef_cache).write(Vec::new());
         }
     }
 
@@ -543,7 +559,7 @@ impl ScHsmState {
         self.ef_cache.retain(|e| e.key_id != key_id);
         let mut entry = EfCacheEntry {
             key_id,
-            data: heapless::Vec::new(),
+            data: Vec::new(),
         };
         // Truncate to cache entry capacity (1024 bytes).
         let len = data.len().min(entry.data.capacity());
@@ -582,7 +598,11 @@ impl ScHsm {
     /// a large stack temporary.  `ScHsmState` contains ~9 KB of inline
     /// buffers (OpBuffer 4 KB, ef_cache 4 KB) that overflow the stack
     /// when constructed via `ScHsm::new()` in debug builds.
-    pub fn init_in_place(dest: *mut Self) {
+    ///
+    /// # Safety
+    /// `dest` must be non-null, aligned and valid for writes of `Self`.  Any
+    /// value already there is overwritten without being dropped.
+    pub unsafe fn init_in_place(dest: *mut Self) {
         unsafe {
             ScHsmState::init_in_place(core::ptr::addr_of_mut!((*dest).state));
         }
@@ -876,8 +896,8 @@ impl ScHsm {
 
 impl ScHsm {
     /// KeyId for the SC-HSM PIN state sentinel in flash.
-    pub fn sc_hsm_pin_key_id() -> pico2hsm_core::key::KeyId {
-        pico2hsm_core::key::KeyId::sc_hsm(0, 0xFF)
+    pub fn sc_hsm_pin_key_id() -> KeyId {
+        KeyId::sc_hsm(0, 0xFF)
     }
 
     /// Serialize and persist the SC-HSM PIN/SO-PIN/PUK state to flash.
@@ -908,7 +928,7 @@ impl ScHsm {
         use pico2hsm_core::key::AppletId;
 
         crate::CORE1_PROGRESS.store(34, core::sync::atomic::Ordering::Relaxed);
-        let mut buf: heapless::Vec<u8, 256> = heapless::Vec::new();
+        let mut buf: Vec<u8, 256> = Vec::new();
         let user_hash = state.user_pin_hash.unwrap_or([0u8; 32]);
         let _ = buf.extend_from_slice(&user_hash);
         let _ = buf.extend_from_slice(&state.user_pin_salt);
@@ -982,8 +1002,8 @@ impl ScHsm {
     }
 
     /// KeyId for the persisted DKEK.
-    pub fn sc_hsm_dkek_key_id() -> pico2hsm_core::key::KeyId {
-        pico2hsm_core::key::KeyId::sc_hsm(0, 0xFD)
+    pub fn sc_hsm_dkek_key_id() -> KeyId {
+        KeyId::sc_hsm(0, 0xFD)
     }
 
     /// Persist the DKEK (or erase the record when there is none), encrypted
@@ -1026,8 +1046,8 @@ impl ScHsm {
     }
 
     /// KeyId for the enrolled peer public key in flash.
-    pub fn sc_hsm_peer_pubkey_key_id() -> pico2hsm_core::key::KeyId {
-        pico2hsm_core::key::KeyId::sc_hsm(0, 0xFC)
+    pub fn sc_hsm_peer_pubkey_key_id() -> KeyId {
+        KeyId::sc_hsm(0, 0xFC)
     }
 
     /// Persist the enrolled peer public key to flash.
@@ -1046,7 +1066,7 @@ impl ScHsm {
         let kid = Self::sc_hsm_peer_pubkey_key_id();
 
         if let Some(ref pubkey) = state.noise_enrolled_peer_pubkey {
-            let mut buf: heapless::Vec<u8, 128> = heapless::Vec::new();
+            let mut buf: Vec<u8, 128> = Vec::new();
             let _ = buf.extend_from_slice(pubkey);
             let _ = buf.push(0);
 
