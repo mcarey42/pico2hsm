@@ -977,10 +977,9 @@ async fn run_one_board(p: embassy_rp::Peripherals) {
                         match send_and_wipe(&mut ccid, &mut response, epoch).await {
                             Ok(()) => {
                                 for _ in 0..16 {
-                                    pico2hsm_firmware::transport::cdc_serial::drain_one(
-                                        &mut cdc_sender,
-                                    )
-                                    .await;
+                                    if !pico2hsm_firmware::transport::cdc_serial::drain_one(&mut cdc_sender).await {
+                                        break;
+                                    }
                                 }
                             }
                             Err(CcidError::UsbDisconnected) => {
@@ -1435,10 +1434,9 @@ async fn run_geek_board(p: embassy_rp::Peripherals) {
                                     board.led().flush().await;
                                 }
                                 for _ in 0..16 {
-                                    pico2hsm_firmware::transport::cdc_serial::drain_one(
-                                        &mut cdc_sender,
-                                    )
-                                    .await;
+                                    if !pico2hsm_firmware::transport::cdc_serial::drain_one(&mut cdc_sender).await {
+                                        break;
+                                    }
                                 }
                             }
                             Err(CcidError::UsbDisconnected) => {
@@ -1630,10 +1628,9 @@ async fn run_pico2_board(p: embassy_rp::Peripherals) {
                         match send_and_wipe(&mut ccid, &mut response, epoch).await {
                             Ok(()) => {
                                 for _ in 0..16 {
-                                    pico2hsm_firmware::transport::cdc_serial::drain_one(
-                                        &mut cdc_sender,
-                                    )
-                                    .await;
+                                    if !pico2hsm_firmware::transport::cdc_serial::drain_one(&mut cdc_sender).await {
+                                        break;
+                                    }
                                 }
                             }
                             Err(CcidError::UsbDisconnected) => {
@@ -2173,10 +2170,9 @@ async fn run_waveshare_lcd_board(p: embassy_rp::Peripherals) {
                                     .await;
                                 }
                                 for _ in 0..16 {
-                                    pico2hsm_firmware::transport::cdc_serial::drain_one(
-                                        &mut cdc_sender,
-                                    )
-                                    .await;
+                                    if !pico2hsm_firmware::transport::cdc_serial::drain_one(&mut cdc_sender).await {
+                                        break;
+                                    }
                                 }
                             }
                             Err(CcidError::UsbDisconnected) => {
