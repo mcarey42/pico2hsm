@@ -49,7 +49,9 @@ use pico2hsm_firmware::{serial_fmt, serial_print, serial_println};
 use core::ptr::addr_of_mut;
 #[cfg(target_arch = "arm")]
 extern "C" {
-    static __ebss: u8;
+    /// cortex-m-rt: lowest address the main stack may use — above .bss
+    /// *and* .uninit (where defmt-rtt keeps its buffer).
+    static _stack_end: u8;
 }
 #[cfg(target_arch = "arm")]
 use embassy_rp::multicore::{spawn_core1, Stack};
@@ -454,18 +456,14 @@ async fn main(_spawner: Spawner) {
     }
 
     // ── MSPLIM — hardware stack overflow detection for Core0 ──────────────────
-    // Core0 stack grows downward from 0x20082000; BSS ends at __ebss.
-    // MSPLIM set to __ebss — hardware UsageFault fires at the exact BSS
-    // boundary, preventing stack-into-BSS corruption with zero wasted stack
-    // space.  Also enable UsageFault so STKOF surfaces cleanly in probe-rs.
+    // Core0 stack grows downward from 0x20082000 to _stack_end, which lies
+    // above both .bss and .uninit.  (Using __ebss left the 4 KB defmt-rtt
+    // buffer in .uninit unprotected.)  Also enable UsageFault so STKOF
+    // surfaces cleanly in probe-rs.
     #[cfg(target_arch = "arm")]
     unsafe {
-        let ebss = core::ptr::addr_of!(__ebss) as u32;
-        // Core0 stack occupies the full gap between __ebss and 0x20082000 (520 KB SRAM end).
-        // MSPLIM at __ebss — hardware UsageFault fires at exact boundary, no guard waste.
-        // With 128 KB Core1 stack the gap is smaller but still sufficient for
-        // Embassy USB + CCID + init_in_place (~60 KB needed).
-        cortex_m::register::msplim::write(ebss);
+        let stack_end = core::ptr::addr_of!(_stack_end) as u32;
+        cortex_m::register::msplim::write(stack_end);
 
         // Enable UsageFault handler so STKOF fires as UsageFault, not HardFault.
         // SHCSR bit 18 = USGFAULTENA.
@@ -473,11 +471,7 @@ async fn main(_spawner: Spawner) {
             .shcsr
             .modify(|v| v | (1 << 18));
 
-        defmt::info!(
-            "core0: MSPLIM set to 0x{:08X} (__ebss=0x{:08X})",
-            ebss,
-            ebss
-        );
+        defmt::info!("core0: MSPLIM set to 0x{:08X} (_stack_end)", stack_end);
     }
 
     defmt::info!("pico2hsm: peripherals initialised");
