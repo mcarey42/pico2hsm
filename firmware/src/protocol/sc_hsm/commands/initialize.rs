@@ -150,7 +150,7 @@ pub fn handle(
         .and_then(|v| v.first().copied())
         .unwrap_or(3);
     if !(1..=15).contains(&retry_counter) {
-        return ApduResponse::err(pico2hsm_core::apdu::SW_WRONG_DATA);
+        return ApduResponse::err(SW_WRONG_DATA);
     }
 
     // Tag 0x93: PUK (optional, 8–16 bytes).  Validated with everything

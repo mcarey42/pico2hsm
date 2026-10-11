@@ -39,6 +39,11 @@ Security and robustness release from the October 2026 audit
   run `ykman piv reset` (APDU `00 FB 00 00`, newly supported, allowed only
   while PIN and PUK are blocked).  OpenPGP TERMINATE is now allowed once
   PW3 is blocked (`gpg --card-edit` → `factory-reset`).
+- **Keystore directory is kept as two copies (A/B, sectors 0 and 1)** with a
+  sequence number and CRC32, so a power cut during a directory write can no
+  longer lose every key.  Existing keystores are read and upgraded on the
+  first write; firmware older than this can't read the new format, so
+  don't downgrade a board after it has written keys.
 
 ### Security
 - PIN / SO-PIN / PUK retry counters (SC-HSM, PIV, OpenPGP) are written to

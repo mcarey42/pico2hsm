@@ -269,17 +269,20 @@ impl<Chip: FlashChip> StorageManager<Chip> {
             // SAFETY: init() is called once, single-threaded, before dispatch.
             static mut SECTOR0: [u8; SECTOR_SIZE] = [0u8; SECTOR_SIZE];
             let sector0 = unsafe { &mut *core::ptr::addr_of_mut!(SECTOR0) };
-            match chip.read(0, sector0) {
-                Ok(()) if integrity::is_blank(sector0) => {
-                    self.chip_states[idx] = ChipState::Blank;
-                }
-                Ok(()) => {
-                    self.chip_states[idx] = ChipState::Healthy;
-                }
-                Err(_) => {
-                    self.chip_states[idx] = ChipState::Dead;
+            // Blank only if both directory copies are: copy A is legitimately
+            // erased after a power cut mid-flush while copy B is current.
+            let mut state = ChipState::Blank;
+            for &sector in filesystem::DIR_SLOTS.iter() {
+                match chip.read(sector * SECTOR_SIZE as u32, sector0) {
+                    Ok(()) if integrity::is_blank(sector0) => {}
+                    Ok(()) => state = ChipState::Healthy,
+                    Err(_) => {
+                        state = ChipState::Dead;
+                        break;
+                    }
                 }
             }
+            self.chip_states[idx] = state;
         }
 
         // Update mirror pair states from chip states.
