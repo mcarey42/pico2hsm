@@ -262,14 +262,17 @@ def test_openpgp_read_pubkey_sig_after_genkey(runner: CLIRunner) -> None:
 def test_openpgp_gpg_card_status_shows_sig_fingerprint(
     runner: CLIRunner, run_dir: Path
 ) -> None:
-    """After GENERATE KEY PAIR on SIG slot, gpg --card-status must show a fingerprint.
+    """After GENERATE KEY PAIR + PUT DATA C7, gpg --card-status shows the fingerprint.
 
-    The 'Signature key' line in gpg --card-status output changes from
-    '[none]' to a 40-hex-character fingerprint after key generation.
+    Per OpenPGP Card 3.4, GENERATE KEY PAIR does not set the fingerprint DO
+    (C5): the host computes it from the public key and creation time and
+    writes it with PUT DATA C7 (this is what `gpg --card-edit` does).  The
+    test writes a known fingerprint and checks gpg reports exactly that.
     """
-    # Ensure key is generated first
+    fingerprint = bytes(range(0xA0, 0xB4))  # 20 recognisable bytes
+    put_fp_sig = f"00DA00C714{fingerprint.hex()}"
     result_gen = _send_apdus(
-        runner, _SELECT_OPENPGP_CLEAN, _VERIFY_PW3, _GENKEY_SIG, timeout=120,
+        runner, _SELECT_OPENPGP_CLEAN, _VERIFY_PW3, _GENKEY_SIG, put_fp_sig, timeout=120,
     )
     gen_sw = _sw_from_output(result_gen.stdout + result_gen.stderr)
     if gen_sw != "9000":
@@ -313,7 +316,8 @@ def test_openpgp_gpg_card_status_shows_sig_fingerprint(
     assert sig_key_line, (
         f"'Signature key' line not found in gpg --card-status output:\n{stdout}"
     )
-    assert "[none]" not in sig_key_line.lower(), (
-        f"Signature key still shows '[none]' after GENERATE KEY PAIR.\n"
+    shown = sig_key_line.split(":", 1)[-1].replace(" ", "").lower()
+    assert shown == fingerprint.hex(), (
+        f"Signature key should show the PUT DATA fingerprint {fingerprint.hex()}.\n"
         f"Line: {sig_key_line!r}"
     )
