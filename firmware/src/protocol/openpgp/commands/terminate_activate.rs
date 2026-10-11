@@ -5,7 +5,10 @@
 //! TERMINATE DF (INS=0xE6):
 //!   - Requires PW3 (admin) verified.
 //!   - Sets `terminated = true` on `OpenPgpState`.
-//!   - Clears all key material and PIN state.
+//!   - Clears all key material and PIN state, and (store path) erases every
+//!     OpenPGP record from flash.  The terminated flag itself is not
+//!     persisted: after a reset the card comes up factory-fresh, which is
+//!     what ACTIVATE FILE would produce anyway.
 //!
 //! ACTIVATE FILE (INS=0x44):
 //!   - Only allowed when `terminated == true`.
@@ -31,6 +34,25 @@ pub const INS_ACTIVATE_FILE: u8 = 0x44;
 /// SW for "selected file in termination state" (ISO 7816-4).
 pub const SW_FILE_TERMINATED: u16 = 0x6285;
 
+/// TERMINATE DF with persistence: also erase every OpenPGP record (keys,
+/// PW1/PW3) from flash, so a reset cannot bring the old keys back under the
+/// default PINs.  A failed erase still clears RAM but reports 6581.
+pub fn handle_terminate_with_store(
+    state: &mut OpenPgpState,
+    store: &mut dyn crate::storage::KeyStore,
+    cmd: &ApduCommand<'_>,
+) -> ApduResponse {
+    let resp = handle_terminate(state, cmd);
+    if resp.sw == pico2hsm_core::apdu::SW_OK
+        && store
+            .wipe_by_owner(pico2hsm_core::key::AppletId::OpenPgp)
+            .is_err()
+    {
+        return ApduResponse::err(pico2hsm_core::apdu::SW_MEMORY_FAILURE);
+    }
+    resp
+}
+
 /// Handle TERMINATE DF — mark card as terminated, wipe keys and PINs.
 pub fn handle_terminate(state: &mut OpenPgpState, _cmd: &ApduCommand<'_>) -> ApduResponse {
     // Requires PW3 authenticated
@@ -38,12 +60,12 @@ pub fn handle_terminate(state: &mut OpenPgpState, _cmd: &ApduCommand<'_>) -> Apd
         return ApduResponse::err(SW_SECURITY_STATUS);
     }
 
-    // Wipe all key material
-    state.sig_private = None;
+    // Wipe all key material (zeroized in place, not just dropped).
+    crate::protocol::openpgp::wipe_key(&mut state.sig_private);
+    crate::protocol::openpgp::wipe_key(&mut state.dec_private);
+    crate::protocol::openpgp::wipe_key(&mut state.auth_private);
     state.sig_public = None;
-    state.dec_private = None;
     state.dec_public = None;
-    state.auth_private = None;
     state.auth_public = None;
     state.sig_key_type = None;
     state.dec_key_type = None;
@@ -61,8 +83,12 @@ pub fn handle_terminate(state: &mut OpenPgpState, _cmd: &ApduCommand<'_>) -> Apd
     state.ts_auth = [0u8; 4];
 
     // Clear PIN hashes to block all PIN verification
-    state.pw1_hash = None;
-    state.pw3_hash = None;
+    for hash in [&mut state.pw1_hash, &mut state.pw3_hash] {
+        if let Some(h) = hash.as_mut() {
+            zeroize::Zeroize::zeroize(h);
+        }
+        *hash = None;
+    }
     state.pw1_retries = 0;
     state.pw3_retries = 0;
     state.pw1_verified_sign = false;

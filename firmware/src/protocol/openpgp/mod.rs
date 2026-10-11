@@ -167,6 +167,33 @@ pub struct OpenPgpState {
     pub terminated: bool,
 }
 
+/// Zeroize a private key slot in place, then empty it.
+///
+/// Assigning `None` alone only changes the discriminant and leaves the key
+/// bytes in RAM.
+pub(crate) fn wipe_key(slot: &mut Option<heapless::Vec<u8, 66>>) {
+    if let Some(key) = slot.as_mut() {
+        zeroize::Zeroize::zeroize(key.as_mut_slice());
+    }
+    *slot = None;
+}
+
+impl Drop for OpenPgpState {
+    /// Wipe private keys and password hashes when the state is dropped or
+    /// replaced (ACTIVATE, `Dispatcher::reset_in_place`).
+    fn drop(&mut self) {
+        wipe_key(&mut self.sig_private);
+        wipe_key(&mut self.dec_private);
+        wipe_key(&mut self.auth_private);
+        for hash in [&mut self.pw1_hash, &mut self.pw3_hash] {
+            if let Some(h) = hash.as_mut() {
+                zeroize::Zeroize::zeroize(h);
+            }
+            *hash = None;
+        }
+    }
+}
+
 impl OpenPgpState {
     pub fn new() -> Self {
         // Compute default PW1 and PW3 hashes
@@ -423,6 +450,9 @@ impl OpenPgp {
             generate_keypair::INS_GENERATE_KEYPAIR => {
                 generate_keypair::handle_with_store(&mut self.state, store, cmd)
             }
+            terminate_activate::INS_TERMINATE_DF => {
+                terminate_activate::handle_terminate_with_store(&mut self.state, store, cmd)
+            }
             // Password checks: persistence is handled by with_persisted_attempt.
             verify::INS_VERIFY => verify::handle(&mut self.state, cmd),
             change_pin::INS_CHANGE_PIN => change_pin::handle(&mut self.state, cmd),
@@ -650,5 +680,67 @@ impl HsmProtocol for OpenPgp {
 
     fn protocol_name(&self) -> &'static str {
         "OpenPGP"
+    }
+}
+
+#[cfg(test)]
+mod terminate_tests {
+    use super::*;
+    use crate::security::key_management::KeyObject;
+    use pico2hsm_core::error::HsmError;
+    use pico2hsm_core::key::{AppletId, KeyId};
+
+    /// Records which owner was wiped.
+    struct WipeStore {
+        wiped: Option<AppletId>,
+    }
+
+    impl crate::storage::KeyStore for WipeStore {
+        fn save_key(&mut self, _: &KeyObject) -> Result<(), HsmError> {
+            Ok(())
+        }
+        fn fetch_key(&mut self, _: KeyId) -> Result<Option<KeyObject>, HsmError> {
+            Ok(None)
+        }
+        fn erase_key(&mut self, _: KeyId) -> Result<(), HsmError> {
+            Ok(())
+        }
+        fn wipe_all(&mut self) -> Result<(), HsmError> {
+            Ok(())
+        }
+        fn wipe_by_owner(&mut self, owner: AppletId) -> Result<(), HsmError> {
+            self.wiped = Some(owner);
+            Ok(())
+        }
+        fn enumerate_keys(&self) -> heapless::Vec<KeyId, 64> {
+            heapless::Vec::new()
+        }
+        fn for_each_key(&self, _: &mut dyn FnMut(KeyId)) {}
+    }
+
+    #[test]
+    fn terminate_erases_flash_and_zeroizes_keys() {
+        let pattern = [0xA5u8; 32];
+        let mut pgp = OpenPgp::new();
+        pgp.state.pw3_verified = true;
+        let mut key = heapless::Vec::new();
+        key.extend_from_slice(&pattern).unwrap();
+        pgp.state.sig_private = Some(key);
+
+        let mut store = WipeStore { wiped: None };
+        let r = pgp.process_apdu_with_store(&[0x00, 0xE6, 0x00, 0x00], &mut store);
+        assert_eq!(&r[r.len() - 2..], &[0x90, 0x00]);
+        assert_eq!(store.wiped, Some(AppletId::OpenPgp), "flash records erased");
+
+        let bytes = unsafe {
+            core::slice::from_raw_parts(
+                (&pgp.state as *const OpenPgpState).cast::<u8>(),
+                core::mem::size_of::<OpenPgpState>(),
+            )
+        };
+        assert!(
+            !bytes.windows(32).any(|w| w == pattern),
+            "key bytes zeroized in place"
+        );
     }
 }
