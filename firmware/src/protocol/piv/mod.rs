@@ -71,6 +71,43 @@ pub struct InMemoryPivKey {
     pub public_key: Vec<u8, 133>,
 }
 
+/// PBKDF2 hashes of the factory-default PIN "123456" and PUK "12345678"
+/// with PIV's fixed salts and an all-zero KDF context.  The inputs are all
+/// constants, so these are precomputed rather than spending 2 × 10,000
+/// PBKDF2 iterations at every boot and USB reset (the state is usually
+/// replaced from flash immediately afterwards).  `default_hashes_match_kdf`
+/// recomputes them.
+const DEFAULT_PIN_HASH: [u8; 32] = [
+    0x82, 0x10, 0x91, 0x6B, 0x11, 0x02, 0xE7, 0x8C, 0xB8, 0x15, 0xC7, 0xC9, 0xA8, 0x5F, 0xC7, 0xD6,
+    0x63, 0xB7, 0x0C, 0xC7, 0xE9, 0x95, 0x6B, 0xF2, 0x5A, 0xCD, 0x3D, 0x3B, 0xC2, 0x9F, 0x2F, 0x74,
+];
+const DEFAULT_PUK_HASH: [u8; 32] = [
+    0x22, 0x3B, 0x2A, 0x0C, 0x58, 0x58, 0x09, 0x21, 0xC8, 0x0E, 0x87, 0x33, 0x8E, 0x8B, 0xD6, 0x1B,
+    0x90, 0x8A, 0x30, 0x5B, 0x2F, 0xC1, 0xB7, 0xFA, 0xAF, 0x4A, 0x81, 0x3F, 0xC9, 0x94, 0x60, 0xDB,
+];
+/// "PIV-pin-salt-v1\0" / "PIV-puk-salt-v1\0"
+const DEFAULT_PIN_SALT: [u8; 16] = *b"PIV-pin-salt-v1\0";
+const DEFAULT_PUK_SALT: [u8; 16] = *b"PIV-puk-salt-v1\0";
+
+/// Factory-default PIN state, without running the KDF.
+#[cfg(feature = "applet-piv")]
+fn default_pin_state() -> crate::security::pin::PinState {
+    use crate::security::pin::{PinState, MAX_PIN_RETRIES, MAX_PUK_RETRIES};
+    PinState {
+        pin_hash: DEFAULT_PIN_HASH,
+        pin_salt: DEFAULT_PIN_SALT,
+        pin_retries_remaining: MAX_PIN_RETRIES,
+        pin_max_retries: MAX_PIN_RETRIES,
+        pin_blocked: false,
+        puk_hash: DEFAULT_PUK_HASH,
+        puk_salt: DEFAULT_PUK_SALT,
+        puk_retries_remaining: MAX_PUK_RETRIES,
+        puk_blocked: false,
+        session_authenticated: false,
+        session_key: None,
+    }
+}
+
 /// A stored PIV data object (certificate, CHUID, CCC, etc.).
 #[cfg(feature = "applet-piv")]
 #[derive(Clone)]
@@ -109,26 +146,8 @@ impl PivState {
         // Generate deterministic salts for the default state.
         // On real hardware, these would be random. For initial setup,
         // we use fixed salts that will be replaced on first PIN change.
-        let pin_salt = [
-            0x50, 0x49, 0x56, 0x2D, 0x70, 0x69, 0x6E, 0x2D, 0x73, 0x61, 0x6C, 0x74, 0x2D, 0x76,
-            0x31, 0x00,
-        ]; // "PIV-pin-salt-v1\0"
-        let puk_salt = [
-            0x50, 0x49, 0x56, 0x2D, 0x70, 0x75, 0x6B, 0x2D, 0x73, 0x61, 0x6C, 0x74, 0x2D, 0x76,
-            0x31, 0x00,
-        ]; // "PIV-puk-salt-v1\0"
-        let device_id = [0u8; 16]; // Will be overwritten by caller
-
-        let pin_state = crate::security::pin::PinState::new(
-            DEFAULT_PIV_PIN,
-            DEFAULT_PIV_PUK,
-            &device_id,
-            pin_salt,
-            puk_salt,
-            crate::security::pin::MAX_PIN_RETRIES,
-            crate::security::pin::MAX_PUK_RETRIES,
-        )
-        .expect("default PIV PIN/PUK must be valid");
+        let device_id = [0u8; 16]; // PIN KDF context (see chuid_guid for the GUID)
+        let pin_state = default_pin_state();
 
         PivState {
             pin_state,
@@ -217,26 +236,8 @@ impl Piv {
     pub unsafe fn init_in_place(dest: *mut Self) {
         use core::ptr::addr_of_mut;
 
-        let device_id = [0u8; 16];
-        let pin_salt = [
-            0x50, 0x49, 0x56, 0x2D, 0x70, 0x69, 0x6E, 0x2D, 0x73, 0x61, 0x6C, 0x74, 0x2D, 0x76,
-            0x31, 0x00,
-        ];
-        let puk_salt = [
-            0x50, 0x49, 0x56, 0x2D, 0x70, 0x75, 0x6B, 0x2D, 0x73, 0x61, 0x6C, 0x74, 0x2D, 0x76,
-            0x31, 0x00,
-        ];
-
-        let pin_state = crate::security::pin::PinState::new(
-            DEFAULT_PIV_PIN,
-            DEFAULT_PIV_PUK,
-            &device_id,
-            pin_salt,
-            puk_salt,
-            crate::security::pin::MAX_PIN_RETRIES,
-            crate::security::pin::MAX_PUK_RETRIES,
-        )
-        .expect("default PIV PIN/PUK must be valid");
+        let device_id = [0u8; 16]; // PIN KDF context (see chuid_guid for the GUID)
+        let pin_state = default_pin_state();
 
         unsafe {
             let state = addr_of_mut!((*dest).state);
@@ -875,5 +876,21 @@ mod data_object_tests {
         ]);
         let guid_at = r.windows(2).position(|w| w == [0x34, 0x10]).unwrap() + 2;
         assert_ne!(&r[guid_at..guid_at + 16], &[0u8; 16]);
+    }
+
+    #[test]
+    fn default_hashes_match_kdf() {
+        let computed = crate::security::pin::PinState::new(
+            DEFAULT_PIV_PIN,
+            DEFAULT_PIV_PUK,
+            &[0u8; 16],
+            DEFAULT_PIN_SALT,
+            DEFAULT_PUK_SALT,
+            crate::security::pin::MAX_PIN_RETRIES,
+            crate::security::pin::MAX_PUK_RETRIES,
+        )
+        .unwrap();
+        assert_eq!(computed.pin_hash, DEFAULT_PIN_HASH);
+        assert_eq!(computed.puk_hash, DEFAULT_PUK_HASH);
     }
 }
