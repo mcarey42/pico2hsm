@@ -755,6 +755,19 @@ mod retry_persistence_tests {
         assert_eq!(&r[r.len() - 2..], &[0x90, 0x00]);
         assert_eq!(piv.state.mgmt_key, new_key);
     }
+
+    #[test]
+    fn generate_requires_mgmt_key_not_pin() {
+        let mut piv = Piv::new();
+        let mut store = PinStore {
+            saves: heapless::Vec::new(),
+        };
+        assert_eq!(verify(&mut piv, &mut store, DEFAULT_PIV_PIN), 0x9000);
+        // GENERATE 9A, P-256.
+        let apdu = [0x00, 0x47, 0x00, 0x9A, 0x05, 0xAC, 0x03, 0x80, 0x01, 0x11, 0x00];
+        let r = piv.process_apdu_with_store(&apdu, &mut store);
+        assert_eq!(&r[r.len() - 2..], &[0x69, 0x82], "PIN alone is not enough");
+    }
 }
 
 #[cfg(all(test, feature = "applet-piv"))]

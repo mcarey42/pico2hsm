@@ -3,3 +3,4 @@ pytest-html>=4.0
 pytest-json-report>=1.5
 cryptography>=41.0
 gostcrypto>=0.2
+pyscard>=2.0

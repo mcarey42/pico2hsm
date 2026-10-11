@@ -64,6 +64,13 @@ def _send_apdus(runner: CLIRunner, *apdus: str, save_as: str | None = None, time
     return runner.run(args, save_as=save_as, timeout=timeout)
 
 
+def _admin_genkey(runner: CLIRunner, *apdus: str, save_as: str | None = None, timeout: int = 120):
+    """GENERATE KEY PAIR needs the PIV management key (SP 800-73-4), not the PIN."""
+    from helpers.piv_admin import admin_send
+
+    return admin_send(*apdus)
+
+
 def _sw_from_output(output: str) -> str | None:
     return sw_from_output(output)
 
@@ -127,11 +134,7 @@ def _decode_length(data: bytes, idx: int) -> tuple[int, int]:
 
 def test_piv_genkey_9a_p256_succeeds(runner: CLIRunner, run_dir: Path) -> None:
     """GENERATE KEY PAIR for slot 9A (P-256) must return SW=9000."""
-    result = _send_apdus(
-        runner,
-        _SELECT_PIV,
-        _VERIFY_PIN,
-        _GENKEY_9A_P256,
+    result = _admin_genkey(runner, _GENKEY_9A_P256,
         save_as="piv_02_genkey_9a",
         timeout=120,
     )
@@ -163,11 +166,7 @@ def test_piv_genkey_9a_p256_succeeds(runner: CLIRunner, run_dir: Path) -> None:
 
 def test_piv_genkey_9a_returns_public_key_tlv(runner: CLIRunner) -> None:
     """GENERATE KEY PAIR response must contain a 7C→7F49→86 public key TLV."""
-    result = _send_apdus(
-        runner,
-        _SELECT_PIV,
-        _VERIFY_PIN,
-        _GENKEY_9A_P256,
+    result = _admin_genkey(runner, _GENKEY_9A_P256,
         timeout=120,
     )
 
@@ -195,11 +194,7 @@ def test_piv_genkey_9a_returns_public_key_tlv(runner: CLIRunner) -> None:
 
 def test_piv_genkey_9a_public_key_is_valid_p256(runner: CLIRunner) -> None:
     """The public key returned by GENKEY must be a valid uncompressed P-256 point."""
-    result = _send_apdus(
-        runner,
-        _SELECT_PIV,
-        _VERIFY_PIN,
-        _GENKEY_9A_P256,
+    result = _admin_genkey(runner, _GENKEY_9A_P256,
         timeout=120,
     )
 
@@ -253,11 +248,7 @@ def test_piv_genkey_key_persists_after_reselect(runner: CLIRunner, run_dir: Path
         where: 7C 02 82 00 = Dynamic Authentication Template, witness
     """
     # Generate key
-    result_gen = _send_apdus(
-        runner,
-        _SELECT_PIV,
-        _VERIFY_PIN,
-        _GENKEY_9A_P256,
+    result_gen = _admin_genkey(runner, _GENKEY_9A_P256,
         timeout=120,
     )
     gen_sw = _sw_from_output(result_gen.stdout + result_gen.stderr)

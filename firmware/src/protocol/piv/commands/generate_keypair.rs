@@ -71,8 +71,10 @@ pub fn handle_with_store(
         return ApduResponse::err(0x6A86); // incorrect P2
     }
 
-    // Require management key authentication OR PIN verification.
-    if !state.mgmt_key_authenticated && !state.pin_verified {
+    // SP 800-73-4 §3.3.2: GENERATE ASYMMETRIC KEY PAIR requires the PIV
+    // card application administrator (management key).  The cardholder PIN
+    // alone must not be able to replace a slot's key.
+    if !state.mgmt_key_authenticated {
         return ApduResponse::err(0x6982); // security status not satisfied
     }
 

@@ -72,6 +72,13 @@ def _send_apdus(runner: CLIRunner, *apdus: str, save_as: str | None = None, time
     return runner.run(args, save_as=save_as, timeout=timeout)
 
 
+def _admin_genkey(runner: CLIRunner, *apdus: str, save_as: str | None = None, timeout: int = 120):
+    """GENERATE KEY PAIR needs the PIV management key (SP 800-73-4), not the PIN."""
+    from helpers.piv_admin import admin_send
+
+    return admin_send(*apdus)
+
+
 def _sw_from_output(output: str) -> str | None:
     return sw_from_output(output)
 
@@ -167,7 +174,7 @@ def _get_or_generate_p256_pubkey(runner: CLIRunner) -> ec.EllipticCurvePublicKey
 
     Returns None if key generation fails.
     """
-    result = _send_apdus(runner, _SELECT_PIV, _VERIFY_PIN, _GENKEY_9A_P256, timeout=120)
+    result = _admin_genkey(runner, _GENKEY_9A_P256, timeout=120)
     combined = result.stdout + result.stderr
     sw = _sw_from_output(combined)
     if sw != "9000":
