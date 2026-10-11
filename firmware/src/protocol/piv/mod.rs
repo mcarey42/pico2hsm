@@ -214,13 +214,21 @@ impl PivRetryCounter {
         let n = cmd.data.len();
         match (cmd.ins, cmd.p1, cmd.p2) {
             (verify::INS_VERIFY, 0x00, 0x80) if n == 8 => Some(Self::Pin),
-            (change_reference_data::INS_CHANGE_REFERENCE_DATA, _, 0x80) if n == 16 => {
+            // Mirrors the handlers' checks before the compare, so a
+            // malformed request is refused without spending a retry.
+            (change_reference_data::INS_CHANGE_REFERENCE_DATA, 0x00, 0x80)
+                if n == 16 && change_reference_data::valid_new_pin(&cmd.data[8..]) =>
+            {
                 Some(Self::Pin)
             }
-            (change_reference_data::INS_CHANGE_REFERENCE_DATA, _, 0x81) if n == 16 => {
+            (change_reference_data::INS_CHANGE_REFERENCE_DATA, 0x00, 0x81)
+                if n == 16 && change_reference_data::valid_new_puk(&cmd.data[8..]) =>
+            {
                 Some(Self::Puk)
             }
-            (reset_retry_counter::INS_RESET_RETRY_COUNTER, 0x00, 0x80) if n == 16 => {
+            (reset_retry_counter::INS_RESET_RETRY_COUNTER, 0x00, 0x80)
+                if n == 16 && change_reference_data::valid_new_pin(&cmd.data[8..]) =>
+            {
                 Some(Self::Puk)
             }
             _ => None,
@@ -592,6 +600,20 @@ impl Piv {
                 self.route_with_store(cmd, store)
             }
             put_data::INS_PUT_DATA => put_data::handle_with_store(&mut self.state, store, cmd),
+            get_data::INS_GET_DATA => {
+                // RAM caches a few objects; the rest are read from flash —
+                // before the built-in defaults (CHUID, CCC), which a stored
+                // object overrides whether or not it is cached.
+                if let Some(tag_low) = put_data::object_tag_low(cmd.data) {
+                    let cached = self.state.data_objects.iter().any(|o| o.tag_low == tag_low);
+                    if !cached && get_data::readable(&self.state, tag_low) {
+                        if let Ok(Some(rec)) = store.fetch_key(Self::piv_data_object_key_id(tag_low)) {
+                            return ApduResponse::ok(&rec.private_key);
+                        }
+                    }
+                }
+                get_data::handle(&self.state, cmd)
+            }
             generate_keypair::INS_GENERATE_KEYPAIR => {
                 generate_keypair::handle_with_store(&mut self.state, store, cmd)
             }
@@ -905,7 +927,7 @@ mod data_object_tests {
     use pico2hsm_core::key::{AppletId, KeyId};
 
     struct MemStore {
-        records: heapless::Vec<(KeyId, heapless::Vec<u8, 2100>), 4>,
+        records: heapless::Vec<(KeyId, heapless::Vec<u8, 2100>), 10>,
     }
 
     impl crate::storage::KeyStore for MemStore {
@@ -931,7 +953,8 @@ mod data_object_tests {
                 o
             }))
         }
-        fn erase_key(&mut self, _: KeyId) -> Result<(), HsmError> {
+        fn erase_key(&mut self, kid: KeyId) -> Result<(), HsmError> {
+            self.records.retain(|(k, _)| *k != kid);
             Ok(())
         }
         fn wipe_all(&mut self) -> Result<(), HsmError> {
@@ -1008,6 +1031,37 @@ mod data_object_tests {
         assert_eq!(sw(&r), 0x6A84);
         let obj_id = Piv::piv_data_object_key_id(0x05);
         assert!(store.records.iter().all(|(k, _)| *k != obj_id));
+    }
+
+    #[test]
+    fn more_objects_than_ram_cache_and_53_00_deletes() {
+        let mut piv = Piv::new();
+        piv.state.mgmt_key_authenticated = true;
+        let mut store = MemStore {
+            records: heapless::Vec::new(),
+        };
+        let get = |low: u8| [0x00, 0xCB, 0x3F, 0xFF, 0x05, 0x5C, 0x03, 0x5F, 0xC1, low, 0x00];
+        for low in 1..=6u8 {
+            assert_eq!(
+                sw(&piv.process_apdu_with_store(&put_data(low, &[low; 40]), &mut store)),
+                0x9000,
+                "object {low}"
+            );
+        }
+        // 5FC103 (fingerprints) needs the PIN.
+        assert_eq!(sw(&piv.process_apdu_with_store(&get(3), &mut store)), 0x6982);
+        piv.state.pin_verified = true;
+        for low in 1..=6u8 {
+            let r = piv.process_apdu_with_store(&get(low), &mut store);
+            assert_eq!(sw(&r), 0x9000, "object {low} readable");
+            assert_eq!(r[2], low, "content of object {low}");
+        }
+        // 53 00 deletes, from RAM and flash.
+        assert_eq!(
+            sw(&piv.process_apdu_with_store(&put_data(1, &[]), &mut store)),
+            0x9000
+        );
+        assert_eq!(sw(&piv.process_apdu_with_store(&get(1), &mut store)), 0x6A82);
     }
 
     #[test]

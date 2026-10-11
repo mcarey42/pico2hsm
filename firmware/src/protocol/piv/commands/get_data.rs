@@ -37,6 +37,16 @@ pub fn handle(state: &PivState, cmd: &ApduCommand<'_>) -> ApduResponse {
 
     let tag = &data[2..2 + tag_len];
 
+    // A stored object wins over the built-in defaults, for any tag.
+    if let Some(low) = super::put_data::object_tag_low(data) {
+        if !readable(state, low) {
+            return ApduResponse::err(0x6982);
+        }
+        if let Some(obj) = state.data_objects.iter().find(|o| o.tag_low == low) {
+            return ApduResponse::ok(&obj.data);
+        }
+    }
+
     match tag {
         // CHUID: 5FC102
         [0x5F, 0xC1, 0x02] => build_chuid(state),
@@ -263,6 +273,12 @@ fn build_security_object() -> ApduResponse {
     resp[len_pos] = inner_len as u8;
 
     ApduResponse::ok(&resp)
+}
+
+/// Whether the object `5FC1<low>` may be read now: biometrics (03, 08,
+/// 21) and printed information (09) need the PIN (SP 800-73-4 Table 3).
+pub fn readable(state: &PivState, low: u8) -> bool {
+    !matches!(low, 0x03 | 0x08 | 0x09 | 0x21) || state.pin_verified
 }
 
 /// Retrieve a stored data object (certificate etc.) by its tag low byte.

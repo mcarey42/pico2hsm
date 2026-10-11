@@ -25,33 +25,59 @@ pub fn handle_with_store(
     store: &mut dyn crate::storage::KeyStore,
     cmd: &ApduCommand<'_>,
 ) -> ApduResponse {
-    let tag_low = match cmd.data.get(..5) {
-        Some([0x5C, 0x03, 0x5F, 0xC1, low]) => *low,
-        Some([0x5C, 0x01, 0x7E, ..]) => 0x7E,
-        _ => return handle(state, cmd),
+    let Some(tag_low) = object_tag_low(cmd.data) else {
+        return handle(state, cmd);
     };
+    if !state.mgmt_key_authenticated {
+        return handle(state, cmd);
+    }
     let previous = state
         .data_objects
         .iter()
         .find(|o| o.tag_low == tag_low)
         .cloned();
-    let resp = handle(state, cmd);
-    if resp.sw != pico2hsm_core::apdu::SW_OK {
-        return resp;
+    // RAM holds a few objects as a cache; flash holds them all (GET DATA
+    // reads through).  Make room by evicting the oldest cached object —
+    // it is already on flash.
+    let mut evicted = None;
+    if previous.is_none() && state.data_objects.is_full() {
+        evicted = Some(state.data_objects.remove(0));
     }
-    let saved = state
-        .data_objects
-        .iter()
-        .find(|o| o.tag_low == tag_low)
-        .map(|o| crate::protocol::piv::Piv::save_data_object_to_store(o, store));
-    if !matches!(saved, Some(Ok(()))) {
+    let resp = handle(state, cmd);
+    let saved = if resp.sw != pico2hsm_core::apdu::SW_OK {
+        Ok(())
+    } else {
+        let kid = crate::protocol::piv::Piv::piv_data_object_key_id(tag_low);
+        match state.data_objects.iter().find(|o| o.tag_low == tag_low) {
+            Some(o) => crate::protocol::piv::Piv::save_data_object_to_store(o, store),
+            // `53 00`: deleted — remove it from flash too.
+            None => match store.fetch_key(kid) {
+                Ok(None) => Ok(()),
+                Ok(Some(_)) => store.erase_key(kid),
+                Err(e) => Err(e),
+            },
+        }
+    };
+    if resp.sw != pico2hsm_core::apdu::SW_OK || saved.is_err() {
         state.data_objects.retain(|o| o.tag_low != tag_low);
-        if let Some(old) = previous {
+        for old in [previous, evicted].into_iter().flatten() {
             let _ = state.data_objects.push(old);
         }
-        return ApduResponse::err(pico2hsm_core::apdu::SW_MEMORY_FAILURE);
+        if saved.is_err() {
+            return ApduResponse::err(pico2hsm_core::apdu::SW_MEMORY_FAILURE);
+        }
     }
     resp
+}
+
+/// The stored-object tag (low byte) a GET/PUT DATA body names:
+/// `5C 03 5F C1 xx` or `5C 01 7E` (discovery object).
+pub fn object_tag_low(data: &[u8]) -> Option<u8> {
+    match data {
+        [0x5C, 0x03, 0x5F, 0xC1, low, ..] => Some(*low),
+        [0x5C, 0x01, 0x7E, ..] => Some(0x7E),
+        _ => None,
+    }
 }
 
 /// Handle a PUT DATA APDU command.
@@ -112,6 +138,12 @@ pub fn handle(state: &mut PivState, cmd: &ApduCommand<'_>) -> ApduResponse {
     }
 
     let content = &rest[content_start..content_start + content_len];
+
+    // `53 00` deletes the object (ykman, yubico-piv-tool).
+    if content.is_empty() {
+        state.data_objects.retain(|o| o.tag_low != tag_low);
+        return ApduResponse::ok(&[]);
+    }
 
     // Build the complete stored object (including the 53 wrapper) so GET
     // DATA can return it directly.  The wrapper counts against the capacity:

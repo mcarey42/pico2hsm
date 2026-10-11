@@ -49,8 +49,9 @@ pub fn handle(state: &mut PivState, cmd: &ApduCommand<'_>) -> ApduResponse {
                 if state.pin_state.pin_blocked {
                     return ApduResponse::err(0x6983); // auth blocked
                 }
-                // If already authenticated in this session, return 90 00
-                if state.pin_state.session_authenticated {
+                // Verified in this session — the same flag GENERAL
+                // AUTHENTICATE checks, so the answer matches what will work.
+                if state.pin_verified {
                     return ApduResponse::err(SW_OK);
                 }
                 return ApduResponse::err(sw_retry(state.pin_state.pin_retries_remaining));

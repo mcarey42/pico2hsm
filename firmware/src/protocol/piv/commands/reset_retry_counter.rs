@@ -42,6 +42,10 @@ pub fn handle(state: &mut PivState, cmd: &ApduCommand<'_>) -> ApduResponse {
         return ApduResponse::err(0x6700); // wrong length
     }
 
+    // A non-digit PIN would be stored and could never be verified.
+    if !super::change_reference_data::valid_new_pin(&cmd.data[8..16]) {
+        return ApduResponse::err(0x6A80);
+    }
     let puk = strip_pin_padding(&cmd.data[..8]);
     let new_pin = strip_pin_padding(&cmd.data[8..16]);
 
