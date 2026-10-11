@@ -1,6 +1,6 @@
 # pico2hsm Domains and Multi-Way Sync: Design Plan V3
 
-*Supersedes the domain, enrollment and sync parts of `CLUSTER_PLAN_V2.md`. The V2 DKEK exchange (§1) is kept and generalised. Date: 2026-10-11. Status: draft for owner review. No firmware changes have been made against it yet.*
+*Supersedes the domain, enrollment and sync parts of `CLUSTER_PLAN_V2.md`. The V2 DKEK exchange (§1) is kept and generalised. Date: 2026-10-11. Status: approved by the owner on 2026-10-11 (§12). P0 is in progress.*
 
 ---
 
@@ -54,7 +54,7 @@ The production daemon is a new `pico2hsm-syncd` crate in the `pico2hsm-tool` rep
 **Non-goals for this plan**
 - Rollback protection (S-15, on hold).
 - Quorum or M-of-N approval of operations. This is a later small-business feature; see §12.
-- Syncing PIV and OpenPGP applet keys. Their key slots are per-device by design, and their specs have no wrap format. Revisit after SC-HSM sync works.
+- Quorum approval inside PIV/OpenPGP (P6 covers their sync; see §12a).
 - Syncing PINs, retry counters, device identity or OTP state. These are always per-device.
 - DKEK rotation inside a domain. Rotation means migrating to a new domain (§9).
 
@@ -330,19 +330,46 @@ crates/
 | **P2 Enrollment** | ISSUE/REVOKE member cert; single-use pinned peer for the existing exchange | `domain enroll` with the short string; `domain revoke` | Enroll C through B, then A accepts C's records |
 | **P3 Records** | Sidecars, EXPORT/IMPORT_RECORD, tombstones, signed GET_STATE, buckets | proto codecs and fuzzing | Create, delete and re-create converge across 3 devices on one host |
 | **P4 Daemon** | (none) | `pico2hsm-syncd` USB mode, then TCP/mTLS, then bundles | 3 devices, one on another host, one sync by bundle only, all converge; partition and heal tests |
-| **P5 Hardening** | Fencing and TTL enforcement; optional delete grace period | Relay (Model C), metrics, packaging | Chaos tests (kill mid-sync, reorder, replay); external review |
+| **P5 Hardening** | Fencing and TTL enforcement; delete grace period | Relay (Model C), metrics, packaging | Chaos tests (kill mid-sync, reorder, replay); external review |
+| **P6 PIV/OpenPGP** | Per-applet sync opt-in; slot/role records; per-device exclusions (§12a) | `domain applet-sync`; overwrite reporting | `ykman` / `gpg --card-status` show the same keys on every member; signing works on any member |
 
 P0 is useful on its own, since it delivers the compatibility goal, and can ship before the rest.
 
-## 12. Open questions for the owner
+## 12. Owner decisions (2026-10-11)
 
-1. **Import without a PIN:** accept signature-authorised import with no PIN, so the daemon is fully unattended (§7.4)? Recommended: yes.
-2. **Metadata privacy:** should `GET_STATE` and the bucket lists need the user PIN, which would mean an unattended daemon must hold the PIN? Recommended: no, leave them open, with a domain flag to tighten later.
-3. **Who may sponsor:** may every member enroll new devices, or only those whose certificate has the "may sponsor" flag (for example, the first device)? Recommended: a flag, defaulting to on for homelab.
-4. **Tombstone TTL and fencing period:** the default proposed is 90 days.
-5. **Delete grace period (§6.4):** build it in P5 or leave it out?
-6. **Real SmartCard-HSM as a passive member:** a real card can import our wrapped blobs (P0) but can't run sync. Is manual `sc-hsm-tool` import enough for that case?
-7. **Scope of PIV / OpenPGP sync:** confirm it stays out of scope.
+1. **Signature-authorised import without a PIN:** yes. The daemon runs unattended (§7.4).
+2. **State, bucket and id lists readable without a PIN:** yes, with a domain flag to tighten it later.
+3. **Sponsoring:** controlled by the "may sponsor" flag in the member certificate, default on.
+4. **Tombstone TTL and fencing period:** 90 days.
+5. **Delete grace period:** yes, built in P5 (§6.4).
+6. **Real SmartCard-HSM:** a passive member through manual `sc-hsm-tool` import is enough.
+7. **PIV and OpenPGP sync:** **in scope**, as phase P6 (§12a). Distributed PIV/OpenPGP identities that work on any member are a capability no other product offers.
+
+### 12a. PIV / OpenPGP sync (P6)
+
+**What syncs.**
+- PIV: slot keys (9A/9C/9D/9E/82–95) and data objects (certificates, CHUID, CCC, discovery, key history).
+- OpenPGP: SIG/DEC/AUT keys and their algorithm attributes, fingerprints, generation times, cardholder data, URL, the cardholder certificate, and the C4 policy.
+
+**What never syncs (per-device).**
+- PINs, PUK, reset code, retry counters and PIN/PUK lockout.
+- The PIV management key. It is per-device by default; a domain option can share it.
+- The OpenPGP signature counter (DO 93); each card counts its own.
+- Session state.
+- Device-unique identifiers: the PIV GUID in the CHUID stays per-device unless "clone identity" is set, and the OpenPGP AID serial number is per-device.
+
+**How it fits the object model.**
+- `object_id = H("piv" ‖ slot)` or `H("openpgp" ‖ role)`, so the slot or role is the identity.
+- Newest version wins per slot or role, with tombstones for cleared slots.
+- Keys travel as DKEK-wrapped blobs inside SyncRecords. Neither spec defines a wrap format, so this is a vendor extension.
+
+**Spec tension: an explicit opt-in.**
+- Users of PIV and OpenPGP cards expect generated keys never to leave the card. Here they leave only wrapped under the domain DKEK and only to enrolled members; the domain as a whole is the token.
+- Sync is enabled per applet with a domain setting (`domain applet-sync piv|openpgp on`), which needs the SO-PIN plus that applet's admin credential (the PIV management key, or OpenPGP PW3).
+- Keys generated while sync is off stay device-bound and are never exported, matching the NO_EXPORT semantics.
+- Hosts can see the difference: PIV metadata (Yubico `F7` origin) and OpenPGP key information (DO DE) report "imported" for keys received through sync.
+
+**Conflicts.** Two members regenerating the same slot concurrently: the higher version wins and the loser's key is replaced everywhere. The daemon reports the overwrite, because a certificate issued for the losing key becomes invalid. The CLI warns before regenerating a synced slot.
 
 ## 13. What carries over from V2
 
