@@ -736,7 +736,7 @@ impl ScHsm {
             // Flash still holds the spent counter and the old credentials.
             // Make RAM match it rather than report a change that a reset
             // would silently undo, and fail closed.
-            Self::load_pin_state_from_store(&mut self.state, store);
+            Self::restore_pin_record(&mut self.state, store);
             *counter.get(&mut self.state) = spent;
             self.state.pin_verified = false;
             self.state.so_pin_verified = false;
@@ -983,40 +983,67 @@ impl ScHsm {
         state: &mut ScHsmState,
         store: &mut dyn crate::storage::KeyStore,
     ) {
-        let kid = Self::sc_hsm_pin_key_id();
-        if let Ok(Some(obj)) = store.fetch_key(kid) {
-            let b = &obj.private_key;
-            // Require the new 149-byte PBKDF2+salt format.
-            // Blobs ≤101 bytes are old bare-SHA-256 format and are rejected,
-            // requiring re-INITIALIZE (acceptable on pre-production devices).
-            if b.len() >= 149 {
-                let user_hash: [u8; 32] = b[0..32].try_into().unwrap_or([0u8; 32]);
-                state.user_pin_hash = if user_hash == [0u8; 32] {
-                    None
-                } else {
-                    Some(user_hash)
-                };
-                state.user_pin_salt = b[32..48].try_into().unwrap_or([0u8; 16]);
-                state.pin_retry_count = b[48];
-                let so_hash: [u8; 32] = b[49..81].try_into().unwrap_or([0u8; 32]);
-                state.so_pin_hash = if so_hash == [0u8; 32] {
-                    None
-                } else {
-                    Some(so_hash)
-                };
-                state.so_pin_salt = b[81..97].try_into().unwrap_or([0u8; 16]);
-                state.so_pin_retry_count = b[97];
-                let puk_hash: [u8; 32] = b[98..130].try_into().unwrap_or([0u8; 32]);
-                state.puk_hash = if puk_hash == [0u8; 32] {
-                    None
-                } else {
-                    Some(puk_hash)
-                };
-                state.puk_salt = b[130..146].try_into().unwrap_or([0u8; 16]);
-                state.puk_retry_count = b[146];
-                state.initialized = b[147] != 0;
+        // Boot / reset only (needs a store that can enumerate: core0's).
+        // A missing record is a fresh device only while nothing else of
+        // SC-HSM's is stored: INITIALIZE writes it together with the device
+        // key.  Missing next to stored objects, unreadable, or malformed
+        // means the flash was damaged or tampered with: lock out instead of
+        // loading "uninitialized", which let INITIALIZE run without the
+        // SO-PIN and the retry counters reset.
+        let pin_kid = Self::sc_hsm_pin_key_id();
+        let mut has_content = false;
+        store.for_each_key(&mut |kid| {
+            if kid.applet_byte() == AppletId::ScHsm as u8 && kid != pin_kid {
+                has_content = true;
             }
+        });
+        match store.fetch_key(pin_kid) {
+            Ok(Some(obj)) if Self::apply_pin_record(state, &obj.private_key) => {}
+            Ok(None) if !has_content => {}
+            _ => Self::lock_out(state),
         }
+    }
+
+    /// Runtime rollback after a failed PIN-record save: put RAM back to the
+    /// record on flash, or lock out if it can't be read.
+    fn restore_pin_record(state: &mut ScHsmState, store: &mut dyn crate::storage::KeyStore) {
+        match store.fetch_key(Self::sc_hsm_pin_key_id()) {
+            Ok(Some(obj)) if Self::apply_pin_record(state, &obj.private_key) => {}
+            _ => Self::lock_out(state),
+        }
+    }
+
+    /// Every credential blocked, SO-PIN included, so INITIALIZE refuses too.
+    /// Recovery is a full flash erase (physical access), as on a real card.
+    fn lock_out(state: &mut ScHsmState) {
+        state.initialized = true;
+        state.so_pin_hash = Some([0xA5; 32]);
+        state.so_pin_retry_count = 0;
+        state.user_pin_hash = Some([0xA5; 32]);
+        state.pin_retry_count = 0;
+        state.puk_retry_count = 0;
+        state.pin_verified = false;
+        state.so_pin_verified = false;
+    }
+
+    /// Decode a PIN record (149-byte PBKDF2+salt format) into `state`.
+    /// Shorter (legacy bare-SHA-256) records are refused.
+    fn apply_pin_record(state: &mut ScHsmState, b: &[u8]) -> bool {
+        if b.len() < 149 {
+            return false;
+        }
+        let nonzero = |h: [u8; 32]| (h != [0u8; 32]).then_some(h);
+        state.user_pin_hash = nonzero(b[0..32].try_into().unwrap_or([0u8; 32]));
+        state.user_pin_salt = b[32..48].try_into().unwrap_or([0u8; 16]);
+        state.pin_retry_count = b[48];
+        state.so_pin_hash = nonzero(b[49..81].try_into().unwrap_or([0u8; 32]));
+        state.so_pin_salt = b[81..97].try_into().unwrap_or([0u8; 16]);
+        state.so_pin_retry_count = b[97];
+        state.puk_hash = nonzero(b[98..130].try_into().unwrap_or([0u8; 32]));
+        state.puk_salt = b[130..146].try_into().unwrap_or([0u8; 16]);
+        state.puk_retry_count = b[146];
+        state.initialized = b[147] != 0;
+        true
     }
 
     /// KeyId for the persisted DKEK.
@@ -1457,7 +1484,44 @@ mod reserved_slot_and_dkek_tests {
         fn enumerate_keys(&self) -> heapless::Vec<KeyId, 64> {
             heapless::Vec::new()
         }
-        fn for_each_key(&self, _: &mut dyn FnMut(KeyId)) {}
+        fn for_each_key(&self, f: &mut dyn FnMut(KeyId)) {
+            for (k, _) in self.records.iter() {
+                f(*k);
+            }
+        }
+    }
+
+    #[test]
+    fn missing_pin_record_next_to_keys_locks_out() {
+        let mut store = MemStore {
+            records: heapless::Vec::new(),
+        };
+        store
+            .records
+            .push((KeyId::sc_hsm(0, 0x01), heapless::Vec::new()))
+            .unwrap();
+        let mut hsm = ScHsm::new();
+        ScHsm::load_pin_state_from_store(&mut hsm.state, &mut store);
+        assert!(hsm.state.initialized);
+        assert_eq!(hsm.state.so_pin_retry_count, 0);
+        assert_eq!(hsm.state.pin_retry_count, 0);
+        // INITIALIZE without the SO-PIN must not run.
+        let init = [
+            0x80, 0x50, 0x00, 0x00, 0x08, 0x81, 0x06, b'1', b'2', b'3', b'4', b'5', b'6',
+        ];
+        assert_eq!(ApduCommand::parse(&init).map(|c| c.data.len()), Ok(8));
+        assert_ne!(sw(&mut hsm, &mut store, &init), 0x9000);
+        assert!(!store.records.is_empty(), "keys not wiped");
+    }
+
+    #[test]
+    fn empty_store_is_a_fresh_device() {
+        let mut store = MemStore {
+            records: heapless::Vec::new(),
+        };
+        let mut hsm = ScHsm::new();
+        ScHsm::load_pin_state_from_store(&mut hsm.state, &mut store);
+        assert!(!hsm.state.initialized);
     }
 
     fn sw(hsm: &mut ScHsm, store: &mut MemStore, apdu: &[u8]) -> u16 {
