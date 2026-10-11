@@ -1,6 +1,6 @@
 # pico2hsm Domains and Multi-Way Sync: Design Plan V3
 
-*Supersedes the domain, enrollment and sync parts of `CLUSTER_PLAN_V2.md`. The V2 DKEK exchange (§1) is kept and generalised. Date: 2026-10-11. Status: approved by the owner on 2026-10-11 (§12). P0 firmware is implemented on `feat/p0-cardcontact-wrap` (host-tested; hardware run pending).*
+*Supersedes the domain, enrollment and sync parts of `CLUSTER_PLAN_V2.md`. The V2 DKEK exchange (§1) is kept and generalised. Date: 2026-10-11. Status: approved by the owner on 2026-10-11 (§12). P0 is merged and verified on hardware (single device, 2026-10-11).*
 
 ---
 
@@ -325,7 +325,7 @@ crates/
 
 | Phase | Firmware | Host | Done when |
 |---|---|---|---|
-| **P0 Compatibility** — firmware done, hardware run pending | CardContact wrap format and KCV (§3); compatibility UNWRAP for v0x02/v0x03 | Known-answer vectors in `firmware/tests/vectors/` (Python reference + pico-hsm) for `pico2hsm-proto` to reuse | `sc-hsm-tool` wrap/unwrap round trip across two devices (`tests/hw/test_11_dkek_roundtrip.py::TestCardContactInterop` covers one device) |
+| **P0 Compatibility** — done; single-device hardware run passed (full suite 343/0 plus the `sc-hsm-tool` interop test); two-device run pending | CardContact wrap format and KCV (§3); compatibility UNWRAP for v0x02/v0x03 | Known-answer vectors in `firmware/tests/vectors/` (Python reference + pico-hsm) for `pico2hsm-proto` to reuse | `sc-hsm-tool` wrap/unwrap round trip across two devices (`tests/hw/test_11_dkek_roundtrip.py::TestCardContactInterop` covers one device) |
 | **P1 Foundations** | Persisted Lamport counter; global IDs and PKCS#15 CKA_ID kept on import; domain key; member list replacing 0xFC; DOMAIN_STATUS | libpico2hsm APDUs; `domain status` | Two devices from the same shares report the same domain_id |
 | **P2 Enrollment** | ISSUE/REVOKE member cert; single-use pinned peer for the existing exchange | `domain enroll` with the short string; `domain revoke` | Enroll C through B, then A accepts C's records |
 | **P3 Records** | Sidecars, EXPORT/IMPORT_RECORD, tombstones, signed GET_STATE, buckets | proto codecs and fuzzing | Create, delete and re-create converge across 3 devices on one host |

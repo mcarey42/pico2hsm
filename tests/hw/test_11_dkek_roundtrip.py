@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import subprocess
 import time
 from pathlib import Path
@@ -515,7 +516,7 @@ def _wky_blob(path: Path) -> bytes:
 def _printed_kcv(text: str) -> str:
     import re
 
-    found = re.findall(r"Key Check Value\s*:\s*([0-9A-Fa-f ]+)", text)
+    found = re.findall(r"key check value\s*:\s*([0-9A-Fa-f ]+)", text, re.IGNORECASE)
     assert found, f"no Key Check Value in:\n{text}"
     return found[-1].replace(" ", "").strip().lower()
 
@@ -541,7 +542,7 @@ class TestCardContactInterop:
         # 2. The KCV sc-hsm-tool prints is SHA-256(share1 ^ share2)[0..8].
         info = runner.sc_hsm_tool(save_as="11cc_info")
         assert info.returncode == 0, info.stderr[-2000:]
-        assert "DKEK shares     : 2" in info.stdout, info.stdout
+        assert re.search(r"DKEK shares\s*:\s*2\b", info.stdout), info.stdout
         printed = _printed_kcv(info.stdout)
         dkek = cc.combine_shares(*(_decrypt_share_file(p, pw) for p, pw in shares))
         assert printed == cc.kcv(dkek).hex(), (printed, cc.kcv(dkek).hex())
