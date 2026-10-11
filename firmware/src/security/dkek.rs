@@ -103,7 +103,39 @@ const KCV_SIZE: usize = 8;
 /// CBC IV size.
 const CBC_IV_SIZE: usize = 16;
 /// Minimum wrapped blob size: KCV(8) + IV(16) + at least one CBC block(16).
-const WRAP_MIN_SIZE: usize = KCV_SIZE + CBC_IV_SIZE + 16;
+/// Wrap blob format version (encrypt-then-MAC).
+const WRAP_VERSION: u8 = 0x02;
+/// Truncated HMAC-SHA256 tag length.
+const WRAP_MAC_SIZE: usize = 16;
+/// Header: KCV || version || IV.
+const WRAP_HEADER_SIZE: usize = KCV_SIZE + 1 + CBC_IV_SIZE;
+const WRAP_MIN_SIZE: usize = WRAP_HEADER_SIZE + 16 + WRAP_MAC_SIZE;
+
+/// Derive the wrap encryption and MAC keys from the DKEK (never use the
+/// DKEK itself for both).
+fn wrap_keys(dkek: &[u8; 32]) -> (Zeroizing<[u8; 32]>, Zeroizing<[u8; 32]>) {
+    use hmac::{Hmac, Mac};
+    let derive = |label: &[u8]| {
+        let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(dkek).expect("any key length");
+        mac.update(label);
+        Zeroizing::new(<[u8; 32]>::from(mac.finalize().into_bytes()))
+    };
+    (
+        derive(b"pico2hsm-wrap-v2-enc"),
+        derive(b"pico2hsm-wrap-v2-mac"),
+    )
+}
+
+/// HMAC-SHA256 over the blob (header + ciphertext), truncated.
+fn wrap_mac(kmac: &[u8; 32], authenticated: &[u8]) -> [u8; WRAP_MAC_SIZE] {
+    use hmac::{Hmac, Mac};
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(kmac).expect("any key length");
+    mac.update(authenticated);
+    let full = mac.finalize().into_bytes();
+    let mut tag = [0u8; WRAP_MAC_SIZE];
+    tag.copy_from_slice(&full[..WRAP_MAC_SIZE]);
+    tag
+}
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -581,7 +613,7 @@ impl DkekManager {
         algo_id: u8,
         key_flags: u8,
         rng: &mut (impl rand_core::CryptoRng + rand_core::RngCore),
-    ) -> Result<heapless::Vec<u8, 2448>, DkekError> {
+    ) -> Result<heapless::Vec<u8, 2480>, DkekError> {
         let dkek = self.get_dkek().ok_or(DkekError::WrongState)?;
 
         // Compute KCV.
@@ -615,7 +647,8 @@ impl DkekManager {
         let ct_slice = &mut ct_buf[..padded_len];
         ct_slice.copy_from_slice(&pt[..padded_len]);
 
-        let enc = <CbcEncryptor<Aes256> as KeyIvInit>::new_from_slices(dkek, &iv)
+        let (kenc, kmac) = wrap_keys(dkek);
+        let enc = <CbcEncryptor<Aes256> as KeyIvInit>::new_from_slices(kenc.as_ref(), &iv)
             .map_err(|_| DkekError::EncryptFailure)?;
         enc.encrypt_padded_mut::<NoPadding>(ct_slice, padded_len)
             .map_err(|_| DkekError::EncryptFailure)?;
@@ -625,15 +658,20 @@ impl DkekManager {
             *b = 0;
         }
 
-        // Assemble output: KCV(8) || IV(16) || ciphertext(padded_len)
-        let mut out: heapless::Vec<u8, 2448> = heapless::Vec::new();
+        // Assemble output: KCV(8) || 0x02 || IV(16) || ciphertext || MAC(16),
+        // MAC = HMAC-SHA256(kmac, everything before it) — encrypt-then-MAC.
+        let mut out: heapless::Vec<u8, 2480> = heapless::Vec::new();
         out.extend_from_slice(&kcv)
+            .map_err(|_| DkekError::EncryptFailure)?;
+        out.push(WRAP_VERSION)
             .map_err(|_| DkekError::EncryptFailure)?;
         out.extend_from_slice(&iv)
             .map_err(|_| DkekError::EncryptFailure)?;
         out.extend_from_slice(ct_slice)
             .map_err(|_| DkekError::EncryptFailure)?;
-
+        let tag = wrap_mac(&kmac, &out);
+        out.extend_from_slice(&tag)
+            .map_err(|_| DkekError::EncryptFailure)?;
         Ok(out)
     }
 
@@ -648,21 +686,27 @@ impl DkekManager {
         if blob.len() < WRAP_MIN_SIZE {
             return Err(DkekError::InvalidWrapBlob);
         }
-        let ct_len = blob.len() - KCV_SIZE - CBC_IV_SIZE;
-        if ct_len % 16 != 0 {
+        // Layout: KCV(8) || version(1) || IV(16) || ct || MAC(16).
+        // Version-1 blobs (no MAC) are refused: decrypting unauthenticated
+        // CBC is what made IMPORT KEY a padding oracle.
+        let ct_len = blob.len() - WRAP_HEADER_SIZE - WRAP_MAC_SIZE;
+        if ct_len % 16 != 0 || blob[KCV_SIZE] != WRAP_VERSION {
             return Err(DkekError::InvalidWrapBlob);
         }
-
         let kcv_received: &[u8; KCV_SIZE] = blob[..KCV_SIZE].try_into().unwrap();
-        let iv: &[u8; CBC_IV_SIZE] = blob[KCV_SIZE..KCV_SIZE + CBC_IV_SIZE].try_into().unwrap();
-        let ct = &blob[KCV_SIZE + CBC_IV_SIZE..];
-
+        let iv: &[u8; CBC_IV_SIZE] = blob[KCV_SIZE + 1..WRAP_HEADER_SIZE].try_into().unwrap();
+        let (authenticated, tag) = blob.split_at(blob.len() - WRAP_MAC_SIZE);
+        let ct = &authenticated[WRAP_HEADER_SIZE..];
         // Verify KCV.
         let kcv_expected = self.compute_kcv()?;
         if !bool::from(kcv_expected.ct_eq(kcv_received)) {
             return Err(DkekError::KcvMismatch);
         }
-
+        // Verify the MAC before touching the ciphertext.
+        let (kenc, kmac) = wrap_keys(dkek);
+        if !bool::from(wrap_mac(&kmac, authenticated).ct_eq(tag)) {
+            return Err(DkekError::InvalidWrapBlob);
+        }
         // AES-256-CBC decrypt.
         let mut pt_buf = [0u8; 2400];
         if ct_len > pt_buf.len() {
@@ -671,7 +715,7 @@ impl DkekManager {
         let pt_slice = &mut pt_buf[..ct_len];
         pt_slice.copy_from_slice(ct);
 
-        let dec = <CbcDecryptor<Aes256> as KeyIvInit>::new_from_slices(dkek, iv)
+        let dec = <CbcDecryptor<Aes256> as KeyIvInit>::new_from_slices(kenc.as_ref(), iv)
             .map_err(|_| DkekError::DecryptFailure)?;
         dec.decrypt_padded_mut::<NoPadding>(pt_slice)
             .map_err(|_| DkekError::DecryptFailure)?;
@@ -907,6 +951,39 @@ mod tests {
             )
         };
         bytes.windows(32).any(|w| w == pattern)
+    }
+
+    #[test]
+    fn wrap_tampering_is_caught_before_decryption() {
+        let mut mgr = DkekManager::new(test_device_id());
+        mgr.set_dkek_direct(&[0x33u8; 32]);
+        let mut rng = DeterministicRng::seeded(7);
+        let blob = mgr.wrap(&[0x44u8; 32], 0x13, 0x01, &mut rng).unwrap();
+        assert!(mgr.unwrap(&blob).is_ok());
+        // Every bit of IV, ciphertext and tag: the MAC rejects it, so no
+        // padding or algorithm-byte result can ever be observed.
+        for i in KCV_SIZE + 1..blob.len() {
+            for bit in 0..8 {
+                let mut t = blob.clone();
+                t[i] ^= 1 << bit;
+                assert_eq!(
+                    mgr.unwrap(&t),
+                    Err(DkekError::InvalidWrapBlob),
+                    "byte {i} bit {bit}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn version_1_blobs_are_refused() {
+        let mut mgr = DkekManager::new(test_device_id());
+        mgr.set_dkek_direct(&[0x33u8; 32]);
+        // v1 layout: KCV(8) || IV(16) || CBC ciphertext — no version, no MAC.
+        let mut v1: heapless::Vec<u8, 64> = heapless::Vec::new();
+        v1.extend_from_slice(&mgr.compute_kcv().unwrap()).unwrap();
+        v1.extend_from_slice(&[0u8; 16 + 32]).unwrap();
+        assert_eq!(mgr.unwrap(&v1), Err(DkekError::InvalidWrapBlob));
     }
 
     #[test]

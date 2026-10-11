@@ -225,7 +225,7 @@ mod tests {
     }
 
     /// Wrap a known key so we have a valid blob for import tests.
-    fn wrap_test_key(state: &ScHsmState, private_key: &[u8], algo: u8) -> heapless::Vec<u8, 2448> {
+    fn wrap_test_key(state: &ScHsmState, private_key: &[u8], algo: u8) -> heapless::Vec<u8, 2480> {
         let mut rng = FwRng;
         state.dkek.wrap(private_key, algo, 0x01, &mut rng).unwrap()
     }
