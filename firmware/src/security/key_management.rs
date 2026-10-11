@@ -367,12 +367,25 @@ impl KeyObject {
         smk: &[u8; 32],
         nonce: &[u8; NONCE_SIZE],
     ) -> Result<heapless::Vec<u8, MAX_BLOB_SIZE>, KeyError> {
+        self.encrypt_with_generation(smk, nonce, self.generation)
+    }
+
+    /// [`KeyObject::encrypt`] with `generation` written to the header instead
+    /// of `self.generation` — lets the keystore bump the counter without
+    /// copying the whole object (and its private key) first.
+    pub fn encrypt_with_generation(
+        &self,
+        smk: &[u8; 32],
+        nonce: &[u8; NONCE_SIZE],
+        generation: u32,
+    ) -> Result<heapless::Vec<u8, MAX_BLOB_SIZE>, KeyError> {
         // Derive per-key encryption key using the low-byte proto_ref.
         let kek = derive_key_encryption_key(smk, (self.key_id & 0xFF) as u8)?;
 
         // Build AAD = header bytes.
         let mut header = [0u8; P2K4_HEADER_SIZE];
         self.write_header(&mut header);
+        header[16..20].copy_from_slice(&generation.to_be_bytes());
 
         // Build plaintext:
         //   EC  keys (priv ≤ 255): priv_key || pub_len(2) || pub_key
@@ -1004,5 +1017,19 @@ mod tests {
         assert!(domain.record_use()); // third use triggers rotation hint
         domain.reset_use_count();
         assert!(!domain.record_use()); // reset clears counter
+    }
+
+    #[test]
+    fn encrypt_with_generation_round_trips() {
+        let smk = [0x11u8; 32];
+        let mut obj = KeyObject::new(KeyType::Ec, 0x05, AppletId::ScHsm, AlgorithmId::EcdsaP256);
+        obj.private_key.extend_from_slice(&[0x22u8; 32]).unwrap();
+        obj.generation = 6;
+        let blob = obj
+            .encrypt_with_generation(&smk, &[0u8; NONCE_SIZE], 7)
+            .unwrap();
+        let back = KeyObject::decrypt(&blob, 0x05, &smk).unwrap();
+        assert_eq!(back.generation, 7);
+        assert_eq!(&back.private_key[..], &[0x22u8; 32]);
     }
 }

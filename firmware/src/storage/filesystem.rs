@@ -146,6 +146,15 @@ impl Directory {
     ///
     /// Only non-tombstoned entries are written.  Extra space is padded with
     /// 0xFF (erased-flash value).
+    /// Serialize an empty directory (what `Directory::new().serialize()`
+    /// produces) without building the ~8 KB entry table on the stack.
+    pub fn serialize_empty(buf: &mut [u8; SECTOR_SIZE]) {
+        buf.fill(0xFF);
+        buf[0..4].copy_from_slice(&DIR_MAGIC);
+        buf[4..6].copy_from_slice(&0u16.to_le_bytes());
+        buf[6..8].copy_from_slice(&0u16.to_le_bytes());
+    }
+
     pub fn serialize(&self, buf: &mut [u8; SECTOR_SIZE]) -> Result<(), StorageError> {
         buf.fill(0xFF);
         buf[0..4].copy_from_slice(&DIR_MAGIC);
@@ -390,8 +399,7 @@ impl<Chip: FlashChip> KeyFilesystem<Chip> {
 
         // Write empty directory.
         let mut buf = [0xFFu8; SECTOR_SIZE];
-        let empty_dir = Directory::new();
-        empty_dir.serialize(&mut buf)?;
+        Directory::serialize_empty(&mut buf);
         write_sector(chip, DIRECTORY_SECTOR * SECTOR_SIZE as u32, &buf)?;
 
         defmt::info!("KeyFilesystem: chip {} formatted", chip_index);

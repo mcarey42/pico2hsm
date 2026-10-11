@@ -559,26 +559,21 @@ impl<Chip: FlashChip> StorageManager<Chip> {
     /// WAL sectors and the directory sector are always erased and reformatted.
     /// Best-effort: individual erase failures are logged but do not abort.
     pub fn wipe_all(&mut self) -> Result<(), StorageError> {
-        // Collect live entries (non-tombstoned, valid key_id) from RAM directory.
-        // Clone the minimal info we need before we borrow chips mutably.
-        let mut to_erase: heapless::Vec<(u8, u32, u8), 512> = heapless::Vec::new(); // (chip_idx, sector_index, sector_count)
-        for entry in self.filesystem.directory.entries.iter() {
+        // Erase the sectors of every live entry (directory and chips are
+        // disjoint fields, so no copy of the 512-entry table is needed).
+        // A failed erase is an error: INITIALIZE relies on the old keys
+        // really being gone.
+        let fs = &mut self.filesystem;
+        for entry in fs.directory.entries.iter() {
             if entry.key_id == 0xFFFF_FFFF || (entry.flags & 0x01) != 0 {
                 continue; // empty slot or tombstoned
             }
-            let _ = to_erase.push((entry.chip_index, entry.sector_index, entry.sector_count));
-        }
-
-        // Erase only the sectors that contain key data.
-        for (chip_idx, sector_index, sector_count) in to_erase.iter().copied() {
-            let chip_idx = chip_idx as usize;
-            if chip_idx >= self.filesystem.chips.len() {
+            let Some(chip) = fs.chips.get_mut(entry.chip_index as usize) else {
                 continue;
-            }
-            let chip = &mut self.filesystem.chips[chip_idx];
-            for s in 0..sector_count as u32 {
-                let addr = (sector_index + s) * SECTOR_SIZE as u32;
-                let _ = chip.erase_sector(addr); // best-effort; InvalidCore returns Err immediately
+            };
+            for s in 0..u32::from(entry.sector_count) {
+                let addr = (entry.sector_index + s) * SECTOR_SIZE as u32;
+                chip.erase_sector(addr)?;
             }
         }
 
@@ -590,14 +585,15 @@ impl<Chip: FlashChip> StorageManager<Chip> {
                 if chip.is_degraded() || chip.capacity() == 0 {
                     continue;
                 }
-                let _ = chip.erase_sector(WAL_SECTOR_0 * SECTOR_SIZE as u32);
-                let _ = chip.erase_sector(WAL_SECTOR_1 * SECTOR_SIZE as u32);
             }
-            let _ = self.filesystem.format_chip(chip_idx);
+            // format_chip erases the directory and WAL sectors itself.
+            self.filesystem.format_chip(chip_idx)?;
         }
 
-        // Reset the in-RAM directory.
-        self.filesystem.directory = Directory::new();
+        // Reset the in-RAM directory in place (Directory::new() would build
+        // the ~8 KB table on the stack in debug builds).
+        self.filesystem.directory.entries.clear();
+        self.filesystem.directory.dirty = false;
         Ok(())
     }
 
