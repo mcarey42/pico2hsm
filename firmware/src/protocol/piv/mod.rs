@@ -597,13 +597,14 @@ impl Piv {
 
         match cmd.ins {
             set_management_key::INS_SET_MGMT_KEY => {
-                let old = self.state.mgmt_key;
+                // Wiped when dropped, like the key itself.
+                let old = zeroize::Zeroizing::new(self.state.mgmt_key);
                 let resp = set_management_key::handle(&mut self.state, cmd);
                 if resp.sw == pico2hsm_core::apdu::SW_OK
                     && Self::save_mgmt_key_to_store(&self.state, store).is_err()
                 {
                     // Keep RAM consistent with flash.
-                    self.state.mgmt_key = old;
+                    self.state.mgmt_key = *old;
                     return ApduResponse::err(pico2hsm_core::apdu::SW_MEMORY_FAILURE);
                 }
                 resp

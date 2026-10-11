@@ -121,7 +121,20 @@ pub fn handle_with_store(
     );
     let mut value = heapless::Vec::new();
     get_do(state, tag, &mut value);
-    if rec.private_key.extend_from_slice(&value).is_err() || store.save_key(&rec).is_err() {
+    // An empty value (cleared name, URL, ...) is the default: delete the
+    // record rather than store a zero-length one, which can't be decrypted.
+    let saved = if value.is_empty() {
+        match store.fetch_key(do_key_id(tag)) {
+            Ok(None) => Ok(()),
+            Ok(Some(_)) => store.erase_key(do_key_id(tag)),
+            Err(e) => Err(e),
+        }
+    } else if rec.private_key.extend_from_slice(&value).is_err() {
+        Err(pico2hsm_core::error::HsmError::InvalidInput)
+    } else {
+        store.save_key(&rec)
+    };
+    if saved.is_err() {
         let _ = set_do(state, tag, &old);
         return ApduResponse::err(pico2hsm_core::apdu::SW_MEMORY_FAILURE);
     }

@@ -489,7 +489,9 @@ impl OpenPgp {
             return ApduResponse::err(pico2hsm_core::apdu::SW_MEMORY_FAILURE);
         }
         *pw.get(&mut self.state) = before;
-        let hashes_before = (self.state.pw1_hash, self.state.pw3_hash);
+        // Wiped on drop: copies of the password hashes.
+        let pw1_before = zeroize::Zeroizing::new(self.state.pw1_hash);
+        let pw3_before = zeroize::Zeroizing::new(self.state.pw3_hash);
 
         let resp = self.route_with_store(cmd, store);
 
@@ -501,7 +503,7 @@ impl OpenPgp {
             // Keep RAM consistent with flash (spent counter, old password)
             // and fail closed; see ScHsm::with_persisted_attempt.
             *pw.get(&mut self.state) = spent;
-            (self.state.pw1_hash, self.state.pw3_hash) = hashes_before;
+            (self.state.pw1_hash, self.state.pw3_hash) = (*pw1_before, *pw3_before);
             self.state.pw1_verified_sign = false;
             self.state.pw1_verified_other = false;
             self.state.pw3_verified = false;
