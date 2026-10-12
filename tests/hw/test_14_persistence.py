@@ -356,7 +356,7 @@ class TestNoExportFlagPersistence:
 
         # 2. Verify PIN
         verify_apdu = _verify_pin_apdu(config["pin"])
-        r = runner.send_apdu(SELECT_SC_HSM, verify_apdu, reader=0)
+        r = runner.send_apdu(SELECT_SC_HSM, verify_apdu)
         assert _last_sw(r.stdout) == 0x9000, (
             f"VERIFY PIN failed: SW={_last_sw(r.stdout):04X}"
         )
@@ -365,8 +365,7 @@ class TestNoExportFlagPersistence:
         keygen_data = _p256_keygen_data(key_flags=0x08)
         keygen_apdu = _build_keygen_apdu(0x20, keygen_data)
         r = runner.send_apdu(
-            SELECT_SC_HSM, verify_apdu, keygen_apdu,
-            reader=0, save_as="14_noexport_keygen",
+            SELECT_SC_HSM, verify_apdu, keygen_apdu, save_as="14_noexport_keygen",
         )
         all_sws = _parse_sw(r.stdout)
         # Must have received exactly 3 responses (SELECT + VERIFY + KEYGEN).
@@ -408,7 +407,7 @@ class TestNoExportFlagPersistence:
         r = runner.send_apdu(
             SELECT_SC_HSM, verify_apdu,
             "8072209200",  # EXPORT KEY: CLA=80 INS=72 P1=20 P2=92 Le=00
-            reader=0, save_as="14_noexport_pre_reset",
+            save_as="14_noexport_pre_reset",
         )
         pre_sw = _last_sw(r.stdout)
         assert pre_sw == 0x6985, (
@@ -427,7 +426,7 @@ class TestNoExportFlagPersistence:
         r = runner.send_apdu(
             SELECT_SC_HSM, verify_apdu,
             "8072209200",  # EXPORT KEY: CLA=80 INS=72 P1=20 P2=92 Le=00
-            reader=0, save_as="14_noexport_post_reset",
+            save_as="14_noexport_post_reset",
         )
         post_sw = _last_sw(r.stdout)
         assert post_sw == 0x6985, (
@@ -466,8 +465,7 @@ class TestPinPersistence:
         # 2. Verify PIN works before reset
         verify_apdu = _verify_pin_apdu(pin)
         r = runner.send_apdu(
-            SELECT_SC_HSM, verify_apdu,
-            reader=0, save_as="14_pin_verify_pre_reset",
+            SELECT_SC_HSM, verify_apdu, save_as="14_pin_verify_pre_reset",
         )
         assert _last_sw(r.stdout) == 0x9000, (
             f"VERIFY PIN failed pre-reset: SW={_last_sw(r.stdout):04X}"
@@ -479,8 +477,7 @@ class TestPinPersistence:
 
         # 4. Verify correct PIN after reset
         r = runner.send_apdu(
-            SELECT_SC_HSM, verify_apdu,
-            reader=0, save_as="14_pin_verify_post_reset",
+            SELECT_SC_HSM, verify_apdu, save_as="14_pin_verify_post_reset",
         )
         post_sw = _last_sw(r.stdout)
         assert post_sw == 0x9000, (
@@ -491,8 +488,7 @@ class TestPinPersistence:
         # 5. Verify wrong PIN is rejected after reset
         wrong_apdu = _verify_pin_apdu("000000")
         r = runner.send_apdu(
-            SELECT_SC_HSM, wrong_apdu,
-            reader=0, save_as="14_pin_wrong_post_reset",
+            SELECT_SC_HSM, wrong_apdu, save_as="14_pin_wrong_post_reset",
         )
         wrong_sw = _last_sw(r.stdout)
         assert wrong_sw != 0x9000, (
@@ -506,7 +502,6 @@ class TestPinPersistence:
         # 6. Re-verify correct PIN to restore retry counter
         r = runner.send_apdu(
             SELECT_SC_HSM, verify_apdu,
-            reader=0,
         )
         assert _last_sw(r.stdout) == 0x9000, (
             "Could not re-verify correct PIN after wrong-PIN test"
@@ -526,8 +521,7 @@ class TestPinPersistence:
         # 2. Verify SO-PIN works before reset
         sopin_apdu = _verify_sopin_apdu(so_pin)
         r = runner.send_apdu(
-            SELECT_SC_HSM, sopin_apdu,
-            reader=0, save_as="14_sopin_verify_pre_reset",
+            SELECT_SC_HSM, sopin_apdu, save_as="14_sopin_verify_pre_reset",
         )
         assert _last_sw(r.stdout) == 0x9000, (
             f"VERIFY SO-PIN failed pre-reset: SW={_last_sw(r.stdout):04X}"
@@ -539,8 +533,7 @@ class TestPinPersistence:
 
         # 4. Verify correct SO-PIN after reset
         r = runner.send_apdu(
-            SELECT_SC_HSM, sopin_apdu,
-            reader=0, save_as="14_sopin_verify_post_reset",
+            SELECT_SC_HSM, sopin_apdu, save_as="14_sopin_verify_post_reset",
         )
         post_sw = _last_sw(r.stdout)
         assert post_sw == 0x9000, (
@@ -553,8 +546,7 @@ class TestPinPersistence:
         # CLA=00 INS=20 P1=00 P2=88 Lc=08 data=8×0x00 (26 hex chars = 13 bytes)
         wrong_sopin_apdu = "00200088080000000000000000"
         r = runner.send_apdu(
-            SELECT_SC_HSM, wrong_sopin_apdu,
-            reader=0, save_as="14_sopin_wrong_post_reset",
+            SELECT_SC_HSM, wrong_sopin_apdu, save_as="14_sopin_wrong_post_reset",
         )
         wrong_sw = _last_sw(r.stdout)
         assert wrong_sw != 0x9000, (
@@ -568,7 +560,6 @@ class TestPinPersistence:
         # 6. Re-verify correct SO-PIN to restore retry counter
         r = runner.send_apdu(
             SELECT_SC_HSM, sopin_apdu,
-            reader=0,
         )
         assert _last_sw(r.stdout) == 0x9000, (
             "Could not re-verify correct SO-PIN after wrong-SO-PIN test"
