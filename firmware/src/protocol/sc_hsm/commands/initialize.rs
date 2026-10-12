@@ -278,6 +278,7 @@ pub fn handle(
 
     // Clear the pinned peer (pin again with ENROLL_PEER_PUBKEY).
     state.pinned_peer = None;
+    state.exchanged_peer = None;
 
     // Generate device identity P-256 keypair for DKEK exchange.
     // Stored at reserved slot 0xFE; public key written to EF 0x2F02.
