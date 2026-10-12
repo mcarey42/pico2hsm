@@ -80,6 +80,13 @@ pub trait KeyStore {
     fn retry_counters(&mut self) -> Option<&mut dyn RetryCounterBackend> {
         None
     }
+
+    /// The RSA key pool region (see `storage::rsa_pool`), or `None` if this
+    /// store has none: GENERATE then always generates live.
+    #[cfg(feature = "rsa")]
+    fn rsa_pool(&mut self) -> Option<&mut dyn crate::storage::rsa_pool::PoolBackend> {
+        None
+    }
 }
 
 // ─── FlashKeyStore<Chip> ──────────────────────────────────────────────────────
@@ -95,6 +102,9 @@ pub struct FlashKeyStore<Chip: FlashChip> {
     smk: Option<Zeroizing<[u8; 32]>>,
     /// Retry-counter log on internal flash (every board, SD ones included).
     counters: Option<crate::storage::BoardCounterLog>,
+    /// RSA key pool region on internal flash (every board).
+    #[cfg(feature = "rsa")]
+    pool: Option<crate::storage::BoardPoolRegion>,
 }
 
 #[cfg(target_arch = "arm")]
@@ -108,12 +118,36 @@ impl<Chip: FlashChip> FlashKeyStore<Chip> {
             storage,
             smk,
             counters: None,
+            #[cfg(feature = "rsa")]
+            pool: None,
         }
     }
 
     /// Attach the retry-counter log (before the first key load).
     pub fn attach_retry_counters(&mut self, log: crate::storage::BoardCounterLog) {
         self.counters = Some(log);
+    }
+
+    /// Attach the RSA key pool region (boot, core0).
+    #[cfg(feature = "rsa")]
+    pub fn attach_rsa_pool(&mut self, region: crate::storage::BoardPoolRegion) {
+        self.pool = Some(region);
+    }
+
+    /// The pool region and the storage key, or why there is none.
+    #[cfg(feature = "rsa")]
+    fn pool_and_key(
+        &mut self,
+    ) -> Result<(&mut crate::storage::BoardPoolRegion, &[u8; 32]), HsmError> {
+        let smk = self
+            .smk
+            .as_deref()
+            .ok_or(HsmError::Storage(StorageError::NoStorageKey))?;
+        let pool = self
+            .pool
+            .as_mut()
+            .ok_or(HsmError::Storage(StorageError::NotFormatted))?;
+        Ok((pool, smk))
     }
 
     /// One bounded step of `wipe_by_owner`: erase at most `max` of the
@@ -228,6 +262,63 @@ impl<Chip: FlashChip> KeyStore for FlashKeyStore<Chip> {
         self.counters
             .as_mut()
             .map(|c| c as &mut dyn RetryCounterBackend)
+    }
+
+    #[cfg(feature = "rsa")]
+    fn rsa_pool(&mut self) -> Option<&mut dyn crate::storage::rsa_pool::PoolBackend> {
+        // Without a storage key the pool could not encrypt: no pool.
+        if self.pool.is_none() || self.smk.is_none() {
+            return None;
+        }
+        Some(self)
+    }
+}
+
+/// The pool on internal flash, encrypted under the storage key.  Writes,
+/// takes and erases program internal flash, so they must run on core0
+/// (core1 reaches them through `FlashOp`s); reads are XIP and work on
+/// either core.
+#[cfg(all(target_arch = "arm", feature = "rsa"))]
+impl<Chip: FlashChip> crate::storage::rsa_pool::PoolBackend for FlashKeyStore<Chip> {
+    fn pool_slots(
+        &mut self,
+    ) -> Result<
+        [crate::storage::rsa_pool::SlotState; crate::storage::rsa_pool::POOL_SLOTS],
+        StorageError,
+    > {
+        match self.pool.as_ref() {
+            Some(p) => p.slots(),
+            None => Err(StorageError::NotFormatted),
+        }
+    }
+
+    fn pool_put(
+        &mut self,
+        slot: u8,
+        class: crate::storage::rsa_pool::SizeClass,
+        birth: u32,
+        seq: u32,
+        obj: &KeyObject,
+    ) -> Result<(), HsmError> {
+        let mut nonce = [0u8; 12];
+        crate::crypto::rng::fill_random(&mut nonce).map_err(HsmError::Crypto)?;
+        let (pool, smk) = self.pool_and_key()?;
+        pool.put_key(smk, &nonce, slot, class, birth, seq, obj)
+    }
+
+    fn pool_get(&mut self, slot: u8) -> Result<KeyObject, HsmError> {
+        let (pool, smk) = self.pool_and_key()?;
+        pool.get_key(smk, slot)
+    }
+
+    fn pool_take(&mut self, slot: u8) -> Result<(), HsmError> {
+        let (pool, _) = self.pool_and_key()?;
+        pool.take(slot).map_err(HsmError::Storage)
+    }
+
+    fn pool_erase(&mut self, slot: u8) -> Result<(), HsmError> {
+        let (pool, _) = self.pool_and_key()?;
+        pool.erase(slot).map_err(HsmError::Storage)
     }
 }
 
@@ -583,6 +674,12 @@ impl<P: KeyStore, S: KeyStore> KeyStore for HybridKeyStore<P, S> {
     fn retry_counters(&mut self) -> Option<&mut dyn RetryCounterBackend> {
         // The counters are never mirrored to a removable card.
         self.primary.retry_counters()
+    }
+
+    #[cfg(feature = "rsa")]
+    fn rsa_pool(&mut self) -> Option<&mut dyn crate::storage::rsa_pool::PoolBackend> {
+        // Internal flash only, like the counters.
+        self.primary.rsa_pool()
     }
 }
 

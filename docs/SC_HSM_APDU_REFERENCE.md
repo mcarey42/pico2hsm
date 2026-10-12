@@ -729,6 +729,7 @@ than stored without its attributes (OpenSC's P-521 request has a 2-byte
 | Tag `0x85` length = 48 bytes | `0x15` | ECDSA P-384 |
 | Tag `0x85` length = 66 bytes | `0x17` | ECDSA P-521 |
 | Tag `0x02` value = `0x0800` (2048 bits) | `0x05` | RSA-2048 |
+| Tag `0x02` value = `0x0C00` (3072 bits) | `0x06` | RSA-3072 |
 | Tag `0x02` value = `0x1000` (4096 bits) | `0x07` | RSA-4096 |
 
 **Response data:** A CVC in BSI TR-03110 "authenticated request" format:
@@ -756,6 +757,15 @@ than stored without its attributes (OpenSC's P-521 request has a 2-byte
 **RSA response:** RSA keys return `7F49 (82 <len> <modulus>  82 03 01 00 01)` — modulus + exponent in the public key block.
 
 **Key is stored** in the in-memory EC or RSA keystore and persisted to flash.
+
+**RSA keys and the key pool (`rsa` firmware).**  For RSA-2048/3072/4096
+the card takes the newest pooled key of the size that is younger than the
+pool's maximum age (EXTRAS `0x50`/`0x51` above), marks its pool slot taken
+on flash first, and stores it under the requested reference exactly like
+a freshly generated key (same object, policy, CVC; the Lamport counter and
+object IDs as for any GENERATE).  With no such key — pool empty, off, or
+RSA-1024 — it generates the key during the command (time extensions keep
+the host waiting).  `6581` also when the slot cannot be marked taken.
 
 **Status words:**
 
@@ -1226,6 +1236,8 @@ RESPONSE (`61xx`); no response exceeds 4084 bytes.
 | `0x3D` | ENROLL_PEER_PUBKEY | SO-PIN | 65-byte point | pins the peer for the next exchange |
 | `0x40` | DOMAIN_STATUS | none | — | 117 bytes, see below |
 | `0x47` | GET_MEMBERS | none | P2 = first slot | page, see below |
+| `0x50` | RSA_POOL_STATUS | none | — | 43 bytes, see "RSA key pool" |
+| `0x51` | RSA_POOL_CONFIG | SO-PIN | 8 bytes, see "RSA key pool" | the new status |
 
 **Lamport counter (`0x34`, `0x3C`, `0x3A`).** Persisted on internal flash
 (retry-counter log, record kind `'L'`) and never decreasing; it replaces
@@ -1293,6 +1305,49 @@ version(1) = 1 | status(1) 0 active / 1 revoked | revoked_lamport(8 BE)
     | sig(64) = ECDSA-P256(d_domain, r‖s) over
                 SHA-256("pico2hsm-member-cert-v1" ‖ the 123 bytes before it)
 ```
+
+#### RSA key pool (`0x50`, `0x51`, pico2hsm vendor, `rsa` firmware)
+
+The device pre-generates RSA-2048/3072/4096 keys between APDUs and SC-HSM
+GENERATE KEY PAIR (§3.19) hands out a pooled key when it has one (design
+and security notes: `docs/SECURITY_SUMMARY.md`, "RSA key pool").  Without
+the `rsa` feature both sub-commands answer `6A81`.
+
+**RSA_POOL_STATUS (`80 54 50 00`)**, no PIN, 43 bytes, big-endian:
+
+| Offset | Size | Field |
+|---|---|---|
+| 0 | 1 | format version, 1 |
+| 1 | 1 | health: `01` boot RNG check passed (pool may run), `02` pool region present, `04` background filling stopped after 3 failed writes in a row (until reboot) |
+| 2 | 8 | configuration, as RSA_POOL_CONFIG's data |
+| 10 | 3 | issuable keys (valid and younger than the maximum age): RSA-2048, -3072, -4096 |
+| 13 | 2 | size being generated, in bits; 0 = none |
+| 15 | 8 | pool clock: minutes of powered-on time, persisted |
+| 23 | 4 | sequence number of the newest pooled key |
+| 27 | 4 | keys pooled since boot |
+| 31 | 4 | keys retired by age since boot |
+| 35 | 4 | pooled keys issued since boot |
+| 39 | 4 | keys generated live (pool empty or off) since boot |
+
+**RSA_POOL_CONFIG (`80 54 51 00`)**, SO-PIN (`6982` otherwise), data
+8 bytes:
+
+| Offset | Size | Field |
+|---|---|---|
+| 0 | 1 | flags: `01` pool enabled, `02` rotation / age-out; other bits `6A80` |
+| 1 | 4 | maximum age in minutes of powered-on time, BE, 60 to 525 600 (`6A80` otherwise) |
+| 5 | 3 | keys kept per size, RSA-2048 / -3072 / -4096, each 0–4 (`6A80` otherwise) |
+
+Factory setting: `03 000000F0 04 02 02` (on, rotation on, 4 hours, 4/2/2).
+Another length is `6700`.  The setting is persisted (retry-counter log,
+value id 3) before it takes effect — `6581` if that write fails — and
+survives INITIALIZE.  Clearing `01` erases every pooled key before the
+answer (`6581` if an erase fails; the background finishes the job).
+Lowering a depth retires the oldest surplus keys in the background.  The
+answer is the new RSA_POOL_STATUS.
+
+INITIALIZE erases every pooled key (a re-initialisation is a trust reset);
+the configuration, clock and sequence number stay.
 
 A device that holds the DKEK and has no member list certifies itself
 (sponsor = itself): when the last DKEK share is imported or an exchange

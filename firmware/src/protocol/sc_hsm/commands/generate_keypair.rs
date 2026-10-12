@@ -589,16 +589,19 @@ pub fn handle(
             .and_then(|pk49| find_tlv(pk49, 0x06))
             .unwrap_or(RSA_V15_SHA256_OID);
 
-        // Suppress the watchdog during RSA keygen — modular exponentiation
-        // runs for minutes without RNG calls, which would trip the heartbeat
-        // stall detector and crash the device.
-        let pair = {
-            let _suppress = crate::WatchdogSuppressGuard::new();
-            match crate::crypto::asymmetric::generate_rsa_keypair(key_type, &mut FwRng) {
-                Ok(p) => p,
-                Err(_) => return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
+        // A pre-generated key from the RSA key pool when there is one
+        // (marked taken on flash before it gets here), else a live one from
+        // the sliced generator, which keeps the watchdog heartbeat moving —
+        // no stall-detector suppression.  Either way the key is stored
+        // below exactly as a freshly generated key.
+        let mut pair = crate::rsa_pool::empty_pair(key_type);
+        match crate::rsa_pool::obtain(store, key_type, &mut FwRng, &mut pair) {
+            Ok(()) => {}
+            Err(crate::rsa_pool::IssueError::Storage) => {
+                return ApduResponse::err(pico2hsm_core::apdu::SW_MEMORY_FAILURE)
             }
-        };
+            Err(_) => return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED),
+        }
 
         // Dummy RSA signature length = modulus length
         let sig_len = pair.modulus.len(); // 256 for RSA-2048

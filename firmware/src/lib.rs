@@ -27,6 +27,9 @@ pub mod apdu;
 pub mod crypto;
 pub mod domain;
 pub mod protocol;
+/// RSA key pool: idle-time pre-generation, rotation and issue (`rsa`).
+#[cfg(feature = "rsa")]
+pub mod rsa_pool;
 pub mod security;
 pub mod serial_debug;
 pub mod watchdog;
@@ -92,7 +95,8 @@ pub static WATCHDOG_SUPPRESS_UNTIL: core::sync::atomic::AtomicU32 =
 /// test suite allows an hour.
 pub const WATCHDOG_SUPPRESS_MAX_SECS: u32 = 3600;
 
-fn uptime_secs() -> u32 {
+/// Seconds since boot (0 on the host).
+pub fn uptime_secs() -> u32 {
     #[cfg(target_arch = "arm")]
     {
         embassy_time::Instant::now().as_secs() as u32
