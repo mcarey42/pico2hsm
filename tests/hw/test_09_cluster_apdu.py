@@ -160,8 +160,7 @@ class TestGetDevicePublicKey:
         """GET_DEVICE_PUBLIC_KEY must return exactly 65 bytes (uncompressed P-256 point)."""
         result = runner.send_apdu(
             SELECT_SC_HSM,
-            APDU_GET_PUBKEY,
-            reader=0, save_as="09_get_pubkey",
+            APDU_GET_PUBKEY, save_as="09_get_pubkey",
         )
         sw = _last_sw(result.stdout)
         assert sw == 0x9000, f"Expected SW=9000, got {sw:04X}\n{result.stdout}"
@@ -170,15 +169,15 @@ class TestGetDevicePublicKey:
 
     def test_starts_with_04(self, initialized_device, runner: CLIRunner) -> None:
         """Uncompressed P-256 point must start with 0x04."""
-        result = runner.send_apdu(SELECT_SC_HSM, APDU_GET_PUBKEY, reader=0)
+        result = runner.send_apdu(SELECT_SC_HSM, APDU_GET_PUBKEY)
         data = _parse_received_bytes(result.stdout)
         assert len(data) == 65
         assert data[0] == 0x04, f"Expected 0x04 prefix, got 0x{data[0]:02X}"
 
     def test_deterministic_across_calls(self, initialized_device, runner: CLIRunner) -> None:
         """Device static public key must be stable across calls."""
-        r1 = runner.send_apdu(SELECT_SC_HSM, APDU_GET_PUBKEY, reader=0)
-        r2 = runner.send_apdu(SELECT_SC_HSM, APDU_GET_PUBKEY, reader=0)
+        r1 = runner.send_apdu(SELECT_SC_HSM, APDU_GET_PUBKEY)
+        r2 = runner.send_apdu(SELECT_SC_HSM, APDU_GET_PUBKEY)
         d1 = _parse_received_bytes(r1.stdout)
         d2 = _parse_received_bytes(r2.stdout)
         assert len(d1) == 65 and len(d2) == 65
@@ -192,7 +191,7 @@ class TestGetDevicePublicKey:
 class TestGetGenerationV2:
     def test_returns_8_bytes(self, initialized_device, runner: CLIRunner) -> None:
         """GET_GENERATION_V2 must return exactly 8 bytes."""
-        result = runner.send_apdu(SELECT_SC_HSM, APDU_GET_GEN_V2, reader=0)
+        result = runner.send_apdu(SELECT_SC_HSM, APDU_GET_GEN_V2)
         sw = _last_sw(result.stdout)
         assert sw == 0x9000, f"SW={sw:04X}"
         data = _parse_received_bytes(result.stdout)
@@ -200,7 +199,7 @@ class TestGetGenerationV2:
 
     def test_initial_generation_is_valid_u64(self, initialized_device, runner: CLIRunner) -> None:
         """Generation counter must be a valid u64 (≥ 0) after initialization."""
-        result = runner.send_apdu(SELECT_SC_HSM, APDU_GET_GEN_V2, reader=0)
+        result = runner.send_apdu(SELECT_SC_HSM, APDU_GET_GEN_V2)
         data = _parse_received_bytes(result.stdout)
         assert len(data) == 8
         gen = struct.unpack(">Q", data)[0]
@@ -211,7 +210,7 @@ class TestGetGenerationV2:
         self, initialized_device, provisioned_keys, runner: CLIRunner
     ) -> None:
         """Generation must be > 0 after at least one key was generated."""
-        result = runner.send_apdu(SELECT_SC_HSM, APDU_GET_GEN_V2, reader=0)
+        result = runner.send_apdu(SELECT_SC_HSM, APDU_GET_GEN_V2)
         data = _parse_received_bytes(result.stdout)
         gen = struct.unpack(">Q", data)[0]
         n_keys = sum(1 for v in provisioned_keys.values() if v.get("generated"))
@@ -228,12 +227,12 @@ class TestGetGenerationV2:
 class TestGetKeyManifest:
     def test_requires_pin(self, initialized_device, runner: CLIRunner) -> None:
         """The manifest lists every key, so it needs the user PIN (SW 6982)."""
-        result = runner.send_apdu(SELECT_SC_HSM, APDU_GET_MANIFEST, reader=0)
+        result = runner.send_apdu(SELECT_SC_HSM, APDU_GET_MANIFEST)
         assert _last_sw(result.stdout) == 0x6982
 
     def test_sw_9000_before_keygen(self, initialized_device, runner: CLIRunner) -> None:
         """GET_KEY_MANIFEST must return SW=9000 even on a freshly initialized device."""
-        result = runner.send_apdu(SELECT_SC_HSM, VERIFY_PIN, APDU_GET_MANIFEST, reader=0)
+        result = runner.send_apdu(SELECT_SC_HSM, VERIFY_PIN, APDU_GET_MANIFEST)
         sw = _last_sw(result.stdout)
         assert sw == 0x9000, f"SW={sw:04X}"
 
@@ -241,7 +240,7 @@ class TestGetKeyManifest:
         """On a freshly initialized device, manifest must be empty (0 bytes)."""
         # This test relies on ordering — init_reader0 was fresh.  If keys already
         # exist from earlier modules, skip.
-        result = runner.send_apdu(SELECT_SC_HSM, VERIFY_PIN, APDU_GET_MANIFEST, reader=0)
+        result = runner.send_apdu(SELECT_SC_HSM, VERIFY_PIN, APDU_GET_MANIFEST)
         data = _parse_received_bytes(result.stdout)
         assert len(data) % 44 == 0, f"Manifest length {len(data)} not a multiple of 44"
 
@@ -249,7 +248,7 @@ class TestGetKeyManifest:
         self, initialized_device, provisioned_keys, runner: CLIRunner
     ) -> None:
         """After keygen, manifest must have 44 bytes × number of keys."""
-        result = runner.send_apdu(SELECT_SC_HSM, VERIFY_PIN, APDU_GET_MANIFEST, reader=0)
+        result = runner.send_apdu(SELECT_SC_HSM, VERIFY_PIN, APDU_GET_MANIFEST)
         data = _parse_received_bytes(result.stdout)
         # Other fixtures (the RSA keys) may have added keys too: every
         # provisioned key must be listed, in whole 44-byte entries.
@@ -263,7 +262,7 @@ class TestGetKeyManifest:
         self, initialized_device, provisioned_keys, runner: CLIRunner
     ) -> None:
         """Each manifest entry must have valid key_ref (1-254), non-zero algo, non-tombstone."""
-        result = runner.send_apdu(SELECT_SC_HSM, VERIFY_PIN, APDU_GET_MANIFEST, reader=0)
+        result = runner.send_apdu(SELECT_SC_HSM, VERIFY_PIN, APDU_GET_MANIFEST)
         data = _parse_received_bytes(result.stdout)
         if len(data) == 0:
             pytest.skip("No keys present")
@@ -285,7 +284,7 @@ class TestGetKeyManifest:
 class TestGetStateHash:
     def test_returns_104_bytes(self, initialized_device, runner: CLIRunner) -> None:
         """GET_STATE_HASH must return exactly 104 bytes (8+32+64)."""
-        result = runner.send_apdu(SELECT_SC_HSM, APDU_GET_STATE_HASH, reader=0)
+        result = runner.send_apdu(SELECT_SC_HSM, APDU_GET_STATE_HASH)
         sw = _last_sw(result.stdout)
         assert sw == 0x9000, f"SW={sw:04X}"
         data = _parse_received_bytes(result.stdout)
@@ -295,8 +294,8 @@ class TestGetStateHash:
         self, initialized_device, runner: CLIRunner
     ) -> None:
         """Generation in GET_STATE_HASH must match GET_GENERATION_V2."""
-        r_hash = runner.send_apdu(SELECT_SC_HSM, APDU_GET_STATE_HASH, reader=0)
-        r_gen  = runner.send_apdu(SELECT_SC_HSM, APDU_GET_GEN_V2, reader=0)
+        r_hash = runner.send_apdu(SELECT_SC_HSM, APDU_GET_STATE_HASH)
+        r_gen  = runner.send_apdu(SELECT_SC_HSM, APDU_GET_GEN_V2)
         hash_data = _parse_received_bytes(r_hash.stdout)
         gen_data  = _parse_received_bytes(r_gen.stdout)
         assert len(hash_data) == 104 and len(gen_data) == 8
@@ -308,7 +307,7 @@ class TestGetStateHash:
 
     def test_state_root_not_all_zeros(self, initialized_device, runner: CLIRunner) -> None:
         """State root (bytes 8–39) must not be all zeros after initialization."""
-        result = runner.send_apdu(SELECT_SC_HSM, APDU_GET_STATE_HASH, reader=0)
+        result = runner.send_apdu(SELECT_SC_HSM, APDU_GET_STATE_HASH)
         data = _parse_received_bytes(result.stdout)
         assert len(data) == 104
         state_root = data[8:40]
@@ -318,20 +317,20 @@ class TestGetStateHash:
         self, initialized_device, runner: CLIRunner, provisioned_keys
     ) -> None:
         """State root must differ from the all-empty-slots root once keys exist."""
-        result = runner.send_apdu(SELECT_SC_HSM, APDU_GET_STATE_HASH, reader=0)
+        result = runner.send_apdu(SELECT_SC_HSM, APDU_GET_STATE_HASH)
         data = _parse_received_bytes(result.stdout)
         state_root = data[8:40]
         n_keys = sum(1 for v in provisioned_keys.values() if v.get("generated"))
         if n_keys == 0:
             pytest.skip("No keys present")
         # Compare two consecutive calls — root must be stable
-        r2 = runner.send_apdu(SELECT_SC_HSM, APDU_GET_STATE_HASH, reader=0)
+        r2 = runner.send_apdu(SELECT_SC_HSM, APDU_GET_STATE_HASH)
         d2 = _parse_received_bytes(r2.stdout)
         assert data[8:40] == d2[8:40], "State root is not stable between identical calls"
 
     def test_sig_field_not_all_zeros(self, initialized_device, runner: CLIRunner) -> None:
         """Sig bytes (40–103) must not be all zeros."""
-        result = runner.send_apdu(SELECT_SC_HSM, APDU_GET_STATE_HASH, reader=0)
+        result = runner.send_apdu(SELECT_SC_HSM, APDU_GET_STATE_HASH)
         data = _parse_received_bytes(result.stdout)
         sig = data[40:]
         assert len(sig) == 64
@@ -352,8 +351,7 @@ class TestSignEnrollment:
         """SIGN_ENROLLMENT without SO-PIN auth must return SW=6982."""
         result = runner.send_apdu(
             SELECT_SC_HSM,
-            APDU_SIGN_ENROLLMENT,
-            reader=0, save_as="09_sign_enroll_no_sopin",
+            APDU_SIGN_ENROLLMENT, save_as="09_sign_enroll_no_sopin",
         )
         sw = _last_sw(result.stdout)
         assert sw == 0x6982, f"Expected SW=6982 (security status), got {sw:04X}"
@@ -365,8 +363,7 @@ class TestSignEnrollment:
         result = runner.send_apdu(
             SELECT_SC_HSM,
             VERIFY_SO_PIN,
-            APDU_SIGN_ENROLLMENT,
-            reader=0, save_as="09_sign_enroll_ok",
+            APDU_SIGN_ENROLLMENT, save_as="09_sign_enroll_ok",
         )
         sws = _parse_sw(result.stdout)
         assert len(sws) >= 2, f"Expected at least 2 SW responses; got {sws}"
@@ -388,7 +385,6 @@ class TestSignEnrollment:
             SELECT_SC_HSM,
             VERIFY_SO_PIN,
             apdu_short,
-            reader=0,
         )
         sws = _parse_sw(result.stdout)
         last_sw = sws[-1] if sws else 0
@@ -404,11 +400,10 @@ class TestSignEnrollment:
 class TestNoiseTargetInit:
     def test_requires_so_pin(self, initialized_device, runner: CLIRunner) -> None:
         """The user PIN alone must not start a DKEK exchange (SW 6982)."""
-        r_pub = runner.send_apdu(SELECT_SC_HSM, APDU_GET_PUBKEY, reader=0)
+        r_pub = runner.send_apdu(SELECT_SC_HSM, APDU_GET_PUBKEY)
         source_pub_hex = _parse_received_bytes(r_pub.stdout).hex()
         result = runner.send_apdu(
-            SELECT_SC_HSM, VERIFY_PIN, f"8054350041{source_pub_hex}",
-            reader=0, save_as="09_noise_target_init_user_pin",
+            SELECT_SC_HSM, VERIFY_PIN, f"8054350041{source_pub_hex}", save_as="09_noise_target_init_user_pin",
         )
         assert _parse_sw(result.stdout)[-1] == 0x6982
 
@@ -418,7 +413,7 @@ class TestNoiseTargetInit:
         """NOISE_TARGET_INIT from an enrolled peer (SO-PIN) returns 161 bytes."""
         # Use the device's own static pub as the "source" (a valid point) and
         # enroll it: the exchange only talks to an enrolled peer.
-        r_pub = runner.send_apdu(SELECT_SC_HSM, APDU_GET_PUBKEY, reader=0)
+        r_pub = runner.send_apdu(SELECT_SC_HSM, APDU_GET_PUBKEY)
         source_pub_bytes = _parse_received_bytes(r_pub.stdout)
         assert len(source_pub_bytes) == 65
 
@@ -430,8 +425,7 @@ class TestNoiseTargetInit:
             SELECT_SC_HSM,
             VERIFY_SO_PIN,
             f"80543D00{lc}{source_pub_hex}",  # ENROLL_PEER_PUBKEY
-            apdu_target_init,
-            reader=0, save_as="09_noise_target_init",
+            apdu_target_init, save_as="09_noise_target_init",
         )
         sws = _parse_sw(result.stdout)
         assert sws[-1] == 0x9000, f"NOISE_TARGET_INIT failed: SW={sws[-1]:04X}"
