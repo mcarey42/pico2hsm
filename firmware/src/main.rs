@@ -1697,6 +1697,7 @@ async fn run_geek_board(
         storage,
         detail: DETAIL,
         reset,
+        board: splash.board,
     };
 
     join3(
@@ -2210,6 +2211,7 @@ async fn run_waveshare_lcd_board(
         storage,
         detail: DETAIL,
         reset,
+        board: splash.board,
     };
 
     join3(

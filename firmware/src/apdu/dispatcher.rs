@@ -90,8 +90,11 @@ pub struct DisplayBook {
     current: Option<(u8, u8, bool)>,
     /// `display_snapshot::oneshot` bits before that command.
     armed_before: u8,
-    /// Low byte of the session epoch core1 is in.
-    epoch_lo: u8,
+    /// The session epoch core1 is in (all 32 bits).
+    epoch: u32,
+    /// The last tracked operation, or the GET RESPONSE that continued it,
+    /// answered 61xx: the next GET RESPONSE completes it.
+    awaiting_get_response: bool,
     /// `display_snapshot::health` bits.
     health: u8,
     /// Domain facts, refreshed from the store when they can change.
@@ -118,7 +121,8 @@ impl DisplayBook {
             last_sw: 0,
             current: None,
             armed_before: 0,
-            epoch_lo: 0,
+            epoch: 0,
+            awaiting_get_response: false,
             health: 0,
             domain: crate::display_snapshot::DomainState::None,
             members: 0,
@@ -227,6 +231,7 @@ impl Dispatcher {
         self.display = DisplayBook {
             tracker: pico2hsm_core::op::OpTracker::new(),
             current: None,
+            awaiting_get_response: false,
             ..display
         };
     }
@@ -549,6 +554,7 @@ impl Dispatcher {
         pgp.pw1_verified_other = false;
         pgp.pw3_verified = false;
         self.display.tracker.reset();
+        self.display.awaiting_get_response = false;
         // A comparison code never outlives its session.
         crate::display_snapshot::sas_clear(crate::display_snapshot::SasState::Cancelled);
     }
@@ -660,7 +666,7 @@ impl Dispatcher {
     /// Record the host session core1 now serves (after
     /// [`Self::clear_session`], and at boot).
     pub fn note_session(&mut self, epoch: u32) {
-        self.display.epoch_lo = epoch as u8;
+        self.display.epoch = epoch;
     }
 
     /// Debug detail for the activity line: (algorithm, key reference).
@@ -773,6 +779,15 @@ impl Dispatcher {
             _ => 0x6F00,
         };
         let result = OpResult::of_sw(sw);
+        // A GET RESPONSE that continues a tracked operation's 61xx answer
+        // carries that operation's final status: record it (same op, same
+        // op_seq, so the display keeps its age).
+        let continues = !tracked && ins == 0xC0 && self.display.awaiting_get_response;
+        self.display.awaiting_get_response = (tracked || continues) && sw >> 8 == 0x61;
+        if continues {
+            self.display.activity.result = result;
+            self.display.last_sw = sw;
+        }
         if tracked {
             // A signature that spent a one-shot authorisation says so.
             let spent = self.display.armed_before & !self.display_oneshot();
@@ -970,7 +985,7 @@ impl Dispatcher {
 
         Snapshot {
             session: Session {
-                epoch_lo: self.display.epoch_lo,
+                epoch: self.display.epoch,
                 applet,
                 auth: a,
                 oneshot: one,
@@ -988,7 +1003,14 @@ impl Dispatcher {
             },
             health: Health {
                 domain_id_hi16: self.display.domain_id_hi16,
-                flags: self.display.health,
+                flags: self.display.health
+                    | if crate::display_snapshot::SD_FAULT
+                        .load(core::sync::atomic::Ordering::Acquire)
+                    {
+                        crate::display_snapshot::health::SD_MISSING
+                    } else {
+                        0
+                    },
             },
             last_sw: self.display.last_sw,
         }
@@ -1321,7 +1343,10 @@ mod tests {
             "every auth bit drops with the session"
         );
         assert_eq!(snap.session.oneshot, 0);
-        assert_eq!(snap.session.epoch_lo, 8);
+        assert_eq!(snap.session.epoch, 8);
+        // All 32 bits: 256 silent power cycles later is another session.
+        d.note_session(8 + 256);
+        assert_eq!(d.display_snapshot().session.epoch, 264);
         assert_eq!(snap.session.applet, Applet::None);
     }
 
@@ -1385,9 +1410,35 @@ mod tests {
             (OpCode::Sign, OpResult::Ok),
             "61xx is success"
         );
+        assert_eq!(d.display_snapshot().last_sw, 0x6110);
+        // A GET RESPONSE that is itself cut short (61xx) keeps waiting.
         assert!(!d.display_begin(&[0x00, 0xC0, 0x00, 0x00, 0x10]));
+        d.display_end(&[0x01, 0x61, 0x08], &mut store);
+        assert_eq!(d.display_snapshot().last_sw, 0x6108);
+        // The last one carries the final status into the same op.
+        assert!(!d.display_begin(&[0x00, 0xC0, 0x00, 0x00, 0x08]));
+        d.display_end(&[0x6F, 0x00], &mut store);
+        let b = d.display_snapshot();
+        assert_eq!(
+            (
+                b.activity.op_seq,
+                b.activity.op,
+                b.activity.result,
+                b.last_sw
+            ),
+            (a.op_seq, OpCode::Sign, OpResult::Error, 0x6F00)
+        );
+        // Another GET RESPONSE has nothing to complete.
+        assert!(!d.display_begin(&[0x00, 0xC0, 0x00, 0x00, 0x08]));
+        d.display_end(&[0x6A, 0x86], &mut store);
+        assert_eq!(d.display_snapshot().last_sw, 0x6F00);
+        // Nor does one after an unrelated command broke the sequence.
+        assert!(d.display_begin(&[0x80, 0x68, 0x01, 0x70, 0x01, 0xAA]));
+        d.display_end(&[0x01, 0x61, 0x10], &mut store);
+        assert!(!d.display_begin(&[0x00, 0xCA, 0x01, 0x00]));
         d.display_end(&[0x90, 0x00], &mut store);
-        let b = d.display_snapshot().activity;
-        assert_eq!((b.op_seq, b.op), (a.op_seq, OpCode::Sign));
+        assert!(!d.display_begin(&[0x00, 0xC0, 0x00, 0x00, 0x10]));
+        d.display_end(&[0x6F, 0x00], &mut store);
+        assert_eq!(d.display_snapshot().activity.result, OpResult::Ok);
     }
 }

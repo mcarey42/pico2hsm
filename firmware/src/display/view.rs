@@ -15,12 +15,10 @@ use crate::display_snapshot::SasRole;
 /// The status word (design spec §2.2), highest priority first.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Status {
-    /// The keystore failed (init or the last write).
+    /// The keystore failed (init, the last write, or the SD card is gone).
     Error,
     /// The active applet's primary credential is blocked.
     Locked,
-    /// A mirrored store runs on one copy.
-    Degraded,
     /// An operation has been running for more than 300 ms.
     Working,
     /// USB is not configured by a host.
@@ -35,7 +33,6 @@ impl Status {
         match self {
             Status::Error => "ERROR",
             Status::Locked => "LOCKED",
-            Status::Degraded => "DEGRADED",
             Status::Working => "WORKING",
             Status::NoHost => "NO HOST",
             Status::Ready => "READY",
@@ -46,7 +43,6 @@ impl Status {
     pub fn color(self) -> C444 {
         match self {
             Status::Error | Status::Locked => color::ERR,
-            Status::Degraded => color::WARN,
             Status::Working => color::BUSY,
             Status::NoHost => color::INFO,
             Status::Ready => color::OK,
@@ -173,6 +169,8 @@ pub enum Note {
     NotSaved,
     /// The keystore failed to initialise.
     StorageUnreadable,
+    /// The SD card stopped answering.
+    SdMissing,
     /// How to unblock the active applet's PIN (E40).
     Unblock(Applet),
 }
@@ -328,6 +326,9 @@ pub enum BootStep {
     Keys(u16),
     /// Starting USB.
     Usb,
+    /// Boot is done but core1 has published nothing yet (the display
+    /// task's fail-closed default).
+    Starting,
 }
 
 /// The boot splash.
@@ -435,7 +436,7 @@ pub enum LedTone {
     Blue,
     /// No host.
     Cyan,
-    /// Degraded / admin notice.
+    /// Notices.
     Yellow,
     /// Error / locked.
     Red,
@@ -462,7 +463,6 @@ impl LedTone {
     pub fn of_status(s: Status) -> Self {
         match s {
             Status::Error | Status::Locked => LedTone::Red,
-            Status::Degraded => LedTone::Yellow,
             Status::Working => LedTone::Blue,
             Status::NoHost => LedTone::Cyan,
             Status::Ready => LedTone::Green,

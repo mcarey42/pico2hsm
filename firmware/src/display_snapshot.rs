@@ -126,10 +126,11 @@ pub mod health {
     pub const SMK_MISSING: u8 = 1 << 1;
     /// The last write to the keystore failed (sticky until one succeeds).
     pub const STORE_WRITE_FAILED: u8 = 1 << 2;
-    /// SD card keystore missing.
+    /// The SD card keystore stopped answering (the last card access
+    /// failed: pulled or dead card).  Set by core1 from [`super::SD_FAULT`].
     pub const SD_MISSING: u8 = 1 << 3;
-    /// A mirrored store runs on one copy.
-    pub const MIRROR_DEGRADED: u8 = 1 << 4;
+    // Bit 4 is reserved (was MIRROR_DEGRADED: no display board has a
+    // mirrored store, so it could never be set).
     /// OTP holds a storage key (the device is provisioned).
     pub const PROVISIONED: u8 = 1 << 5;
 }
@@ -144,11 +145,12 @@ pub mod blocked {
     pub const PGP: u8 = 1 << 2;
 }
 
-/// W0 — the host session.
+/// W0 (and W5) — the host session.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Session {
-    /// Low byte of the `SESSION_EPOCH` this was built for.
-    pub epoch_lo: u8,
+    /// The `SESSION_EPOCH` this was built for (all 32 bits, W5: a low byte
+    /// alone would alias after 256 silent power cycles).
+    pub epoch: u32,
     /// Active applet.
     pub applet: Applet,
     /// [`auth`] bits.
@@ -307,8 +309,8 @@ pub struct Health {
 
 /// Words in a published snapshot.  W0–W3 as in the design spec, plus W4
 /// with the raw status word of the last tracked operation (debug builds
-/// show it).
-pub const SNAPSHOT_WORDS: usize = 5;
+/// show it) and W5 with the full session epoch.
+pub const SNAPSHOT_WORDS: usize = 6;
 
 /// Everything the display may show about core1's state, decoded.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -331,7 +333,7 @@ impl Snapshot {
     pub fn pack(&self) -> [u32; SNAPSHOT_WORDS] {
         let mut w = [0u32; SNAPSHOT_WORDS];
         let s = &self.session;
-        put(&mut w[0], 0, 8, u32::from(s.epoch_lo));
+        // W0 bits 0–7 are reserved (the epoch is in W5).
         put(&mut w[0], 8, 2, s.applet as u32);
         put(&mut w[0], 10, 7, u32::from(s.auth));
         put(&mut w[0], 17, 2, u32::from(s.oneshot));
@@ -355,6 +357,7 @@ impl Snapshot {
         put(&mut w[3], 0, 16, u32::from(self.health.domain_id_hi16));
         put(&mut w[3], 16, 6, u32::from(self.health.flags));
         put(&mut w[4], 0, 16, u32::from(self.last_sw));
+        w[5] = s.epoch;
         w
     }
 
@@ -362,7 +365,7 @@ impl Snapshot {
     pub fn unpack(w: [u32; SNAPSHOT_WORDS]) -> Self {
         Snapshot {
             session: Session {
-                epoch_lo: get(w[0], 0, 8) as u8,
+                epoch: w[5],
                 applet: Applet::from_bits(get(w[0], 8, 2)),
                 auth: get(w[0], 10, 7) as u8,
                 oneshot: get(w[0], 17, 2) as u8,
@@ -421,6 +424,19 @@ pub static USB_CONFIGURED: AtomicBool = AtomicBool::new(false);
 /// Core0 uptime (ms, low 32 bits, never 0) when the APDU in flight was
 /// handed to core1; 0 while idle.
 pub static APDU_STARTED_MS: AtomicU32 = AtomicU32::new(0);
+
+/// The last SD card access failed (SD boards; written by whichever core
+/// does the card I/O — core1 on the SD boards — and folded into
+/// [`health::SD_MISSING`] by core1's next publish).  Cleared by the next
+/// access that succeeds.  The card is not re-initialised at runtime (its
+/// pairing is checked only at boot), so a re-inserted card stays MISSING
+/// until the next boot.
+pub static SD_FAULT: AtomicBool = AtomicBool::new(false);
+
+/// Record the outcome of one SD card access.
+pub fn note_sd_io(ok: bool) {
+    SD_FAULT.store(!ok, Ordering::Release);
+}
 
 /// Record the start (`Some(now_ms)`) or end (`None`) of an APDU.
 pub fn set_apdu_started(now_ms: Option<u32>) {
@@ -487,18 +503,22 @@ pub struct SasMail {
     pub peer_fp: u16,
     /// Mailbox state.
     pub state: SasState,
+    /// The `SESSION_EPOCH` the code was published in.  The display shows a
+    /// pending code only while this is still the current session (spec
+    /// §4.7: the SAS never outlives its session).
+    pub epoch: u32,
 }
 
 impl SasMail {
-    fn pack(&self) -> [u32; 3] {
+    fn pack(&self) -> [u32; SAS_WORDS] {
         let mut meta = 0;
         put(&mut meta, 0, 1, self.role as u32);
         put(&mut meta, 1, 16, u32::from(self.peer_fp));
         put(&mut meta, 17, 3, self.state as u32);
-        [self.gen, self.digits, meta]
+        [self.gen, self.digits, meta, self.epoch]
     }
 
-    fn unpack(w: [u32; 3]) -> Self {
+    fn unpack(w: [u32; SAS_WORDS]) -> Self {
         SasMail {
             gen: w[0],
             digits: w[1] % 100_000_000,
@@ -509,22 +529,27 @@ impl SasMail {
             },
             peer_fp: get(w[2], 1, 16) as u16,
             state: SasState::from_bits(get(w[2], 17, 3)),
+            epoch: w[3],
         }
     }
 }
 
+/// Words in the SAS mailbox: `gen`, `digits`, meta, session epoch.
+pub const SAS_WORDS: usize = 4;
+
 /// The SAS mailbox (written by core1 only).
-pub static SAS_MAILBOX: SeqLock<3> = SeqLock::new();
+pub static SAS_MAILBOX: SeqLock<SAS_WORDS> = SeqLock::new();
 
 /// The current mailbox value (all zero = nothing).
 pub fn sas_read() -> SasMail {
     sas_read_from(&SAS_MAILBOX)
 }
 
-/// Show a new code.  It replaces any earlier one (a new `gen`); `digits`
-/// is reduced modulo 10^8.  Core1 only.
-pub fn sas_publish(digits: u32, role: SasRole, peer_fp: u16) {
-    sas_publish_to(&SAS_MAILBOX, digits, role, peer_fp);
+/// Show a new code for the host session `epoch` (the session core1 is
+/// serving).  It replaces any earlier one (a new `gen`); `digits` is
+/// reduced modulo 10^8.  Core1 only.
+pub fn sas_publish(digits: u32, role: SasRole, peer_fp: u16, epoch: u32) {
+    sas_publish_to(&SAS_MAILBOX, digits, role, peer_fp, epoch);
 }
 
 /// End a pending code with `state` (completion, failure, session end,
@@ -534,11 +559,11 @@ pub fn sas_clear(state: SasState) {
     sas_clear_in(&SAS_MAILBOX, state);
 }
 
-fn sas_read_from(mb: &SeqLock<3>) -> SasMail {
+fn sas_read_from(mb: &SeqLock<SAS_WORDS>) -> SasMail {
     mb.read().map(SasMail::unpack).unwrap_or_default()
 }
 
-fn sas_publish_to(mb: &SeqLock<3>, digits: u32, role: SasRole, peer_fp: u16) {
+fn sas_publish_to(mb: &SeqLock<SAS_WORDS>, digits: u32, role: SasRole, peer_fp: u16, epoch: u32) {
     let cur = sas_read_from(mb);
     mb.write(
         SasMail {
@@ -547,12 +572,13 @@ fn sas_publish_to(mb: &SeqLock<3>, digits: u32, role: SasRole, peer_fp: u16) {
             role,
             peer_fp,
             state: SasState::Pending,
+            epoch,
         }
         .pack(),
     );
 }
 
-fn sas_clear_in(mb: &SeqLock<3>, state: SasState) {
+fn sas_clear_in(mb: &SeqLock<SAS_WORDS>, state: SasState) {
     let cur = sas_read_from(mb);
     if cur.state != SasState::Pending {
         return;
@@ -574,7 +600,7 @@ mod tests {
     fn sample() -> Snapshot {
         Snapshot {
             session: Session {
-                epoch_lo: 0xA5,
+                epoch: 0xDEAD_BEA5,
                 applet: Applet::Pgp,
                 auth: auth::PGP_PW3 | auth::HSM_USER,
                 oneshot: oneshot::PGP_SIG_SINGLE,
@@ -617,6 +643,8 @@ mod tests {
         // Every field at its maximum survives without bleeding.
         let words = s.pack();
         assert_eq!(words[0] >> 30, 0);
+        assert_eq!(words[0] & 0xFF, 0, "W0 bits 0-7 reserved");
+        assert_eq!(words[5], 0xDEAD_BEA5, "the full 32-bit epoch");
         assert_eq!(words[1] >> 31, 0);
         assert_eq!(words[2] >> 22, 0);
         assert_eq!(words[3] >> 22, 0);
@@ -641,18 +669,19 @@ mod tests {
 
     #[test]
     fn sas_mail_round_trip_and_clear() {
-        let mb: SeqLock<3> = SeqLock::new();
+        let mb: SeqLock<SAS_WORDS> = SeqLock::new();
         assert_eq!(sas_read_from(&mb).state, SasState::None);
         sas_clear_in(&mb, SasState::Cancelled); // nothing pending: no effect
         assert_eq!(sas_read_from(&mb).state, SasState::None);
-        sas_publish_to(&mb, 1_234_567_890, SasRole::Joiner, 0x04AA);
+        sas_publish_to(&mb, 1_234_567_890, SasRole::Joiner, 0x04AA, 0x0100_0007);
         let m = sas_read_from(&mb);
         assert_eq!(m.state, SasState::Pending);
         assert_eq!(m.digits, 34_567_890);
         assert_eq!(m.role, SasRole::Joiner);
         assert_eq!(m.peer_fp, 0x04AA);
+        assert_eq!(m.epoch, 0x0100_0007);
         let gen = m.gen;
-        sas_publish_to(&mb, 12_345_678, SasRole::Sponsor, 0x7E21);
+        sas_publish_to(&mb, 12_345_678, SasRole::Sponsor, 0x7E21, 8);
         assert_eq!(sas_read_from(&mb).gen, gen.wrapping_add(1));
         sas_clear_in(&mb, SasState::Expired);
         let m = sas_read_from(&mb);

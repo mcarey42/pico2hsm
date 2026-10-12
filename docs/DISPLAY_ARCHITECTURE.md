@@ -54,7 +54,7 @@ in flight has run, the session epoch, its own clock).
 
 ## 2. The snapshot (`display_snapshot::SNAP`)
 
-A seqlock over five `AtomicU32` words.  Writer: `seq += 1` (odd), Release
+A seqlock over six `AtomicU32` words.  Writer: `seq += 1` (odd), Release
 fence, store the words (Relaxed), `seq += 1` (even, Release).  Reader:
 Acquire load of `seq`, read the words, Acquire fence, re-read `seq`; retry
 if it was odd or changed; give up after 64 tries and keep the previous
@@ -63,7 +63,7 @@ starts), then core1 only.  No lock is ever held across cores.
 
 | Word | Bits | Field |
 |---|---|---|
-| W0 session | 0–7 | `epoch_lo`: low byte of the `SESSION_EPOCH` the snapshot was built for |
+| W0 session | 0–7 | reserved (0; the epoch is in W5) |
 | | 8–9 | active applet: 0 none, 1 HSM, 2 PIV, 3 PGP |
 | | 10–16 | auth: HSM_USER, HSM_SO, PIV_PIN, PIV_MGMT, PGP_PW1_81, PGP_PW1_82, PGP_PW3 |
 | | 17–18 | one-shot: PIV_9C_ARMED (`pin_always_ok`), PGP_SIG_SINGLE (C4 = 00 and PW1-81 armed) |
@@ -79,11 +79,19 @@ starts), then core1 only.  No lock is ever held across cores.
 | | 14–15 | domain: 0 none, 1 DKEK without a member certificate, 2 member, 3 revoked |
 | | 16–21 | member-list entries |
 | W3 health | 0–15 | first two bytes of the domain ID |
-| | 16–21 | `KS_INIT_FAILED`, `SMK_MISSING`, `STORE_WRITE_FAILED` (sticky until a write succeeds), `SD_MISSING`, `MIRROR_DEGRADED`, `PROVISIONED` |
+| | 16–21 | `KS_INIT_FAILED`, `SMK_MISSING`, `STORE_WRITE_FAILED` (sticky until a write succeeds), `SD_MISSING` (the last SD card access failed), reserved, `PROVISIONED` |
 | W4 | 0–15 | status word of the last tracked operation (debug detail) |
+| W5 | 0–31 | `epoch`: the full `SESSION_EPOCH` the snapshot was built for |
 
-W4 is an addition to the 4-word layout of the design spec: the raw SW does
-not fit in W1's spare bits.
+W4 and W5 are additions to the 4-word layout of the design spec: the raw
+SW does not fit in W1's spare bits, and the epoch must be compared in full
+(the spec's low byte aliases after 256 silent card power cycles, which
+would let a stale snapshot's authentication show as live).
+
+Health bit 4 was `MIRROR_DEGRADED` (and a DEGRADED status word).  No
+display board has a mirrored store (only the LED-only RP2350-One runs
+RAID-1), so it could never be set; the bit, the status word and its screen
+were removed.
 
 Pack/unpack is unit-tested (`display_snapshot::tests`).
 
@@ -94,7 +102,7 @@ Pack/unpack is unit-tested (`display_snapshot::tests`).
 2. **After dispatch, before `blocking_send`**: everything, with the
    outcome.  The host cannot see the response before the display can.
 3. **After `clear_session()`** (a new host session): auth bits zero, the
-   new `epoch_lo`.
+   new `epoch`.
 4. **After a reset / reload** (empty APDU), and **at boot** from core0.
 
 ### Where the values come from
@@ -116,7 +124,14 @@ Pack/unpack is unit-tested (`display_snapshot::tests`).
   that change it (INITIALIZE, KEY DOMAIN, the EXTRAS domain sub-commands).
 - Health: boot facts from core0 (`set_boot_health`), `STORE_WRITE_FAILED`
   set on SW 6581 and cleared by the next successful write operation,
-  `PROVISIONED` re-read after a 9000 to INS F0–F2.
+  `PROVISIONED` re-read after a 9000 to INS F0–F2.  `SD_MISSING` mirrors
+  `display_snapshot::SD_FAULT`, which `SdCardFlash` sets on every failed
+  card read / write / erase and clears on the next one that succeeds (on
+  the SD boards that I/O runs on core1, so the publish after the command
+  carries it).  A pulled card is noticed at the next card access — there is
+  no idle polling — and, since the card is not re-initialised at runtime
+  (its pairing is checked only at boot), a re-inserted card stays MISSING
+  until the next boot.
 
 ### Operation classification
 
@@ -143,8 +158,11 @@ byte, so the table above follows the handlers.
 
 `Other` never changes the last operation.  A chained command (CLA bit
 0x10) counts once, as the operation its first block announced
-(`OpTracker`); a GET RESPONSE that completes a chained answer keeps the
-op and its `op_seq`.  61xx is success.  SW classes: ok = 9000 / 61xx;
+(`OpTracker`); a GET RESPONSE that continues a tracked operation's 61xx
+answer keeps the op and its `op_seq` and records its own SW and result
+(the final status of the operation: a GET RESPONSE that fails turns the
+op into FAILED / REFUSED).  Only a GET RESPONSE straight after the 61xx
+counts; any other command in between ends the sequence.  61xx is success.  SW classes: ok = 9000 / 61xx;
 error = 64xx / 65xx / 6Fxx (the device failed); refused = everything else
 (wrong PIN, security status, wrong data — the host's request was refused).
 
@@ -154,8 +172,11 @@ error = 64xx / 65xx / 6Fxx (the device failed); refused = everything else
 |---|---|---|
 | `display_snapshot::USB_CONFIGURED` | `UsbSessionHandler` | a host configured USB |
 | `display_snapshot::APDU_STARTED_MS` | CCID loop | uptime (ms, low 32 bits, never 0) when the APDU in flight went to core1; 0 idle |
-| `SESSION_EPOCH` | USB handler, CCID power cycles | the current host session |
-| `display::task::DISPLAY_KICK` | CCID loop, USB handler | `Signal<CriticalSectionRawMutex, ()>`: look again |
+| `SESSION_EPOCH` | USB handler, CCID power on/off, an abandoned bulk-IN write | the current host session (all 32 bits are compared) |
+| `display::task::DISPLAY_KICK` | CCID loop, USB handler, every `bump_session_epoch` | `Signal<CriticalSectionRawMutex, ()>`: look again |
+
+`bump_session_epoch` kicks the display itself, so a card power-off drops
+the authentication on screen at once, not at the next 1 Hz tick.
 
 The CCID loop hands the APDU to core1 *first*, then sets the start time and
 kicks.  It never renders.  Core1 never signals `DISPLAY_KICK` (that would
@@ -185,13 +206,19 @@ of a notice.
 
 ### Controller rules (`display::model`)
 
-- **Status** (highest first): ERROR (`STORE_WRITE_FAILED` or
-  `KS_INIT_FAILED`), LOCKED (active applet's primary credential blocked),
-  DEGRADED (`MIRROR_DEGRADED`), WORKING (APDU in flight ≥ 300 ms), NO HOST
-  (USB not configured), READY.  Health fails closed: READY needs no
-  failure bit.
-- **Authentication** is shown only if `W0.epoch_lo == SESSION_EPOCH as u8`
-  and USB is configured; otherwise the applet chip shows `--`, the PIN tile
+- **No snapshot yet** (never published): a neutral boot-splash screen,
+  `Starting...`, LED off — never READY, never authentication.  In practice
+  core0 publishes the boot snapshot before the task starts, so this is the
+  fail-closed default only.
+- **Status** (highest first): ERROR (`STORE_WRITE_FAILED`,
+  `KS_INIT_FAILED` or `SD_MISSING`), LOCKED (active applet's primary
+  credential blocked), WORKING (APDU in flight ≥ 300 ms), NO HOST (USB not
+  configured), READY.  Health fails closed: READY needs no failure bit.
+  With `SD_MISSING` the footer says `SD MISSING` and the activity note
+  `SD card missing` (unless a failed write's `Last change NOT saved`
+  takes precedence).
+- **Authentication** is shown only if `W5.epoch == SESSION_EPOCH` (all 32
+  bits) and USB is configured; otherwise the applet chip shows `--`, the PIN tile
   "no applet", and no ADMIN chip.  A logout, a card power-off and a USB
   reset all show "not authenticated" (audit S2-misc).
 - **ADMIN chip** whenever SO-PIN, PIV management key or PW3 is live in any
@@ -206,8 +233,9 @@ of a notice.
 - **Screensaver**: after 300 s without any change (snapshot, SAS, USB,
   APDU activity), only on READY / NO HOST without ADMIN: backlight off,
   DISPOFF, SLPIN.  Any change wakes it: SLPOUT, 120 ms, DISPON, full
-  redraw.  The LED stays on, dimmed.  Never asleep with ERROR, LOCKED,
-  DEGRADED, WORKING, ADMIN, a SAS or a notice up.
+  redraw, and only then the backlight (`Panel::backlight_on`), so the
+  pre-sleep GRAM is never visible.  The LED stays on, dimmed.  Never
+  asleep with ERROR, LOCKED, WORKING, ADMIN, a SAS or a notice up.
 - **SAS**: see §6.
 
 ## 5. Rendering and RAM
@@ -252,31 +280,39 @@ feeder keep running throughout.
 
 | Board | before | after | change |
 |---|---|---|---|
-| Waveshare LCD 16MB | 363 352 B | 285 164 B | −78 188 B |
-| Waveshare LCD SDCard | 355 880 B | 277 684 B | −78 196 B |
-| RP2350-Geek 16MB | 329 376 B | 283 216 B | −46 160 B |
-| RP2350-Geek SDCard | 321 904 B | 275 732 B | −46 172 B |
+| Waveshare LCD 16MB | 363 352 B | 285 240 B | −78 112 B |
+| Waveshare LCD SDCard | 355 880 B | 277 768 B | −78 112 B |
+| RP2350-Geek 16MB | 329 376 B | 283 296 B | −46 080 B |
+| RP2350-Geek SDCard | 321 904 B | 275 816 B | −46 088 B |
 
-The snapshot, SAS mailbox, input atomics and kick signal cost under 100 B of `.bss`.
+The snapshot, SAS mailbox, input atomics and kick signal cost under 200 B
+of `.bss` (the review fixes — the 32-bit epoch word, the SAS epoch,
+`SD_FAULT`, the GET RESPONSE flag — added 76–84 B on the display boards).
 Core1: `dispatcher_loop` grew by 8 B (debug build); the new
 `display_end → refresh_display_facts → member::count → fetch_key` branch is
 far shallower than the dispatch path (~89 KB of 128 KB, unchanged).
 
 ## 6. SAS mailbox (enrollment short authentication string)
 
-`display_snapshot::SAS_MAILBOX` is a three-word seqlock: `gen`, `digits`
+`display_snapshot::SAS_MAILBOX` is a four-word seqlock: `gen`, `digits`
 (0..10^8), `meta` = role (1 bit: sponsor / joiner), `peer_fp` (16 bits, the
 first two bytes of SHA-256 of the peer public key), state (3 bits: none,
-pending, enrolled, cancelled, expired).
+pending, enrolled, cancelled, expired), and `epoch`: the full
+`SESSION_EPOCH` the code was published in.
 
-Core1 API: `sas_publish(digits, role, peer_fp)` (a new `gen`; a new code
-replaces the old one) and `sas_clear(state)` (only acts on a pending code).
+Core1 API: `sas_publish(digits, role, peer_fp, epoch)` (a new `gen`; a new
+code replaces the old one; `epoch` is the session core1 serves) and `sas_clear(state)` (only acts on a pending code).
 `sas_clear` is already called on `clear_session()`, on SELECT of a
 different applet, on a successful INITIALIZE and when ENROLL_PEER_PUBKEY
 (EXTRAS 0x3D) pins a new peer.
 
 The display task shows the framed SAS screen (the SAS colour #D4F is
-reserved for it) whenever the state is pending, starts a 120 s deadline
+reserved for it) whenever the state is pending **and** the code belongs to
+the live session: USB configured and the mailbox `epoch` equal to the
+current `SESSION_EPOCH`.  Core1 clears the mailbox only at the next APDU of
+a new session, so between a card power-off / USB reset and that APDU the
+task treats a pending code as cancelled (a CANCELLED notice, never the old
+digits): the SAS never outlives its session (spec §4.7).  It starts a 120 s deadline
 from the first `gen` it sees, overrides the screensaver and the home
 screen, and once the deadline passes shows "CODE EXPIRED" — never the stale
 code.  Enrolled / cancelled / expired transitions show a 10 s notice.
@@ -304,7 +340,8 @@ nonces — see `CLUSTER_PLAN_V3.md` §5.2.
    algorithm / key ref / SW on the activity line, and the panel border on
    the boot splash.  PIN lengths, slot names, labels, nonces and keys are
    never shown.
-7. The SAS never outlives its session.
+7. The SAS never outlives its session: it is shown only while the
+   mailbox epoch is the current `SESSION_EPOCH` and USB is configured.
 8. The screensaver never hides LOCKED, ERROR, ADMIN or a pending SAS.
 
 ## 8. Host render harness

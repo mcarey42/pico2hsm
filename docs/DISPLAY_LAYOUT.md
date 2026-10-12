@@ -72,12 +72,14 @@ y 107); footer 0–239 × 120–134 (6x10).  Short forms: `3/3`, `H4P1G1`,
 
 | Priority | Word | Colour | When |
 |---|---|---|---|
-| 1 | ERROR | ERR | keystore init failed, or the last write failed (sticky until a write succeeds) |
+| 1 | ERROR | ERR | keystore init failed, the last write failed (sticky until a write succeeds), or the SD card stopped answering |
 | 2 | LOCKED | ERR | the active applet's primary credential is blocked |
-| 3 | DEGRADED | WARN | a mirrored store runs on one copy |
-| 4 | WORKING | BUSY | an operation has run for more than 300 ms |
-| 5 | NO HOST | INFO | USB not configured |
-| 6 | READY | OK | otherwise |
+| 3 | WORKING | BUSY | an operation has run for more than 300 ms |
+| 4 | NO HOST | INFO | USB not configured |
+| 5 | READY | OK | otherwise |
+
+Before core1 has published any snapshot the display shows the boot splash
+with `Starting...` (fail closed: never READY).
 
 ### Chips
 
@@ -106,7 +108,7 @@ y 107); footer 0–239 × 120–134 (6x10).  Short forms: `3/3`, `H4P1G1`,
   hints replace the debug detail: `PIN-always: re-verify next` (PIV 9C),
   `PW1 single-use spent` (OpenPGP).
 - Notes replace the age line in ERR: `Last change NOT saved` (E12, a write
-  failed), `Keystore unreadable`, `Unblock: PUK or SO-PIN` / `Unblock: PIV
+  failed), `SD card missing`, `Keystore unreadable`, `Unblock: PUK or SO-PIN` / `Unblock: PIV
   PUK` / `Unblock: PW3 or reset code` (E40, LOCKED).
 
 ### Footer
@@ -125,7 +127,7 @@ development storage key shows a WARN strip `DEV - UNPROVISIONED  up …`.
 |---|---|---|
 | `pico2hsm` | 10x20, centred, y 40 | 9x18, y 20 |
 | `fw 1.0.1  <board>` | 6x13 DIM, y 66 | 6x10, y 42 |
-| step: `Storage...`, `Keys (6)...`, `USB...` | 9x18 TEXT2, y 100 | 6x13, y 70 |
+| step: `Storage...`, `Keys (6)...`, `USB...`, `Starting...` (no snapshot yet) | 9x18 TEXT2, y 100 | 6x13, y 70 |
 | `Last reset: …` (not after a power-on) | 6x13 WARN, y 130 | y 100 |
 
 Each step redraws only its band.  Debug builds draw a 1 px TEXT2 border at
@@ -151,9 +153,11 @@ ERROR / LOCKED in the band with a note on the activity line.
 
 ## 5. Notices (10 s, enrollment outcome)
 
-Same template as the errors, without a code: `ENROLLED` (OK bar,
-`7E21 into 3F9A`), `CANCELLED` (WARN), `CODE EXPIRED` (WARN, `Not confirmed
-in 120 s.` / `Restart enrollment on host.`).
+Same template as the errors, without a code; the title word takes the
+level colour: `ENROLLED` (OK bar and title, `7E21 into 3F9A`),
+`CANCELLED` (WARN), `CODE EXPIRED` (WARN, `Not confirmed in 120 s.` /
+`Restart enrollment on host.`).  CANCELLED also shows when a pending code's
+session ends (card power-off, USB reset).
 
 ## 6. SAS comparison screen
 
@@ -173,6 +177,6 @@ mismatch the operator aborts on the host and revokes.
 
 ## 7. LED (Waveshare WS2812B)
 
-Green READY, blue WORKING, cyan NO HOST, yellow DEGRADED and notices, red
+Green READY, blue WORKING, cyan NO HOST, yellow notices, red
 ERROR / LOCKED / error screens, magenta while a SAS is pending.  Level 8 per
 channel, 2 while the screen sleeps.  Written only when the colour changes.

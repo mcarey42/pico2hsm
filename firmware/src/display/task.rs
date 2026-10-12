@@ -46,7 +46,7 @@ fn sample(last: &mut Option<Snapshot>) -> Inputs {
         snap: *last,
         sas: display_snapshot::sas_read(),
         usb_configured: display_snapshot::USB_CONFIGURED.load(Ordering::Acquire),
-        session_epoch_lo: crate::SESSION_EPOCH.load(Ordering::SeqCst) as u8,
+        session_epoch: crate::SESSION_EPOCH.load(Ordering::SeqCst),
         busy_ms: (start != 0).then(|| (now as u32).wrapping_sub(start)),
     }
 }

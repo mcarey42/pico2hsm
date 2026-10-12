@@ -20,8 +20,12 @@ pub trait Panel {
     async fn write_rows(&mut self, y0: u16, rows: u16, data: &[u8]);
     /// Backlight off, display off, sleep in.
     async fn sleep(&mut self);
-    /// Sleep out, display on, backlight on.  The caller redraws everything.
+    /// Sleep out, display on — backlight still off: GRAM holds the
+    /// pre-sleep frame.  The caller redraws everything, then calls
+    /// [`Self::backlight_on`].
     async fn wake(&mut self);
+    /// Backlight on (after the first full redraw following [`Self::wake`]).
+    async fn backlight_on(&mut self);
     /// Set the status LED (boards without one ignore it).
     async fn set_led(&mut self, _tone: LedTone, _dim: bool) {}
 }
@@ -121,6 +125,8 @@ pub struct ScreenDriver<'b, P> {
     band: &'b mut [u8],
     shown: Option<Screen>,
     asleep: bool,
+    /// Woken but the backlight is still off until a full frame is drawn.
+    dark: bool,
     led: Option<(LedTone, bool)>,
     /// Strings that overflowed their box so far (host tests assert 0).
     pub overflow: u32,
@@ -139,6 +145,7 @@ impl<'b, P: Panel> ScreenDriver<'b, P> {
             band,
             shown: None,
             asleep: false,
+            dark: false,
             led: None,
             overflow: 0,
             bands_sent: 0,
@@ -181,6 +188,12 @@ impl<'b, P: Panel> ScreenDriver<'b, P> {
             self.bands_sent += 1;
         }
         self.shown = Some(*next);
+        // Light the panel only once it holds a full new frame, never the
+        // stale pre-sleep GRAM.
+        if self.dark {
+            self.panel.backlight_on().await;
+            self.dark = false;
+        }
     }
 
     /// Put the panel to sleep.
@@ -191,11 +204,13 @@ impl<'b, P: Panel> ScreenDriver<'b, P> {
         }
     }
 
-    /// Wake the panel; the next [`Self::show`] redraws everything.
+    /// Wake the panel; the next [`Self::show`] redraws everything and
+    /// then turns the backlight on.
     pub async fn wake(&mut self) {
         if self.asleep {
             self.panel.wake().await;
             self.asleep = false;
+            self.dark = true;
             self.shown = None;
         }
     }

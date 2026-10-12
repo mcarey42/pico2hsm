@@ -340,6 +340,7 @@ fn note_text(n: Note, l: &Layout) -> &'static str {
     match n {
         Note::NotSaved => "Last change NOT saved",
         Note::StorageUnreadable => "Keystore unreadable",
+        Note::SdMissing => "SD card missing",
         Note::Unblock(Applet::Hsm) => "Unblock: PUK or SO-PIN",
         Note::Unblock(Applet::Piv) => "Unblock: PIV PUK",
         Note::Unblock(Applet::Pgp) if l.compact => "Unblock: PW3 / RC",
@@ -521,6 +522,7 @@ fn splash<D: DrawTarget<Color = C444>>(p: &mut Painter<'_, D>, v: &SplashView, l
         BootStep::Storage => write!(step, "Storage..."),
         BootStep::Keys(n) => write!(step, "Keys ({n})..."),
         BootStep::Usb => write!(step, "USB..."),
+        BootStep::Starting => write!(step, "Starting..."),
     };
     p.text_center(&step, l.splash_step_y, l.splash_step_font, c::TEXT2, full);
     if let Some(info) = v.reset {
@@ -558,11 +560,14 @@ fn template<D: DrawTarget<Color = C444>>(
         }
         None => l.err_code_at.x,
     };
+    // An error's code carries its colour and the title is plain; a notice
+    // has no code, so its title word takes the level colour (OK / WARN).
+    let title_color = if code.is_some() { c::TEXT } else { level };
     p.text(
         title,
         Point::new(title_x, l.err_code_at.y),
         l.err_font,
-        c::TEXT,
+        title_color,
         band,
     );
     let act = l.err_action;

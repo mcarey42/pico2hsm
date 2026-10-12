@@ -137,7 +137,8 @@ BL HIGH                      — backlight on
 
 Each band is then sent as CASET 52..291, RASET 40+y..40+y+rows−1, RAMWR,
 one DMA transfer.  Screensaver: BL low, DISPOFF (0x28), SLPIN (0x10);
-wake: SLPOUT, 120 ms, DISPON, BL high, full redraw.
+wake: SLPOUT, 120 ms, DISPON, full redraw, then BL high (the stale
+pre-sleep GRAM is never lit).
 
 ---
 

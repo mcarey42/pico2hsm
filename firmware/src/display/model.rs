@@ -46,6 +46,9 @@ pub struct StaticInfo {
     pub detail: bool,
     /// The previous run's end, if not a power-on.
     pub reset: Option<ResetInfo>,
+    /// Board name (boot splash, and the "starting" screen shown while no
+    /// snapshot has been published yet).
+    pub board: &'static str,
 }
 
 /// Map a boot report to what the display says about it (`None` for a
@@ -79,8 +82,8 @@ pub struct Inputs {
     pub sas: SasMail,
     /// USB configured by a host.
     pub usb_configured: bool,
-    /// Low byte of the current `SESSION_EPOCH`.
-    pub session_epoch_lo: u8,
+    /// The current `SESSION_EPOCH` (all 32 bits).
+    pub session_epoch: u32,
     /// How long the APDU in flight has run, if any.
     pub busy_ms: Option<u32>,
 }
@@ -104,7 +107,7 @@ struct Finished {
     activity: Activity,
     sw: u16,
     at_ms: u64,
-    epoch_lo: u8,
+    epoch: u32,
 }
 
 /// The display task's memory; see the module docs.
@@ -171,8 +174,23 @@ impl Controller {
 
     /// Decide the next frame.
     pub fn step(&mut self, i: &Inputs) -> Frame {
-        let snap = i.snap.unwrap_or_default();
         let now = i.now_ms;
+        // No snapshot yet: fail closed.  A neutral "starting" screen, never
+        // READY, never authentication (an all-zero default would read as a
+        // healthy, provisioned-looking READY).
+        let Some(snap) = i.snap else {
+            return Frame {
+                screen: Screen::Splash(SplashView {
+                    step: BootStep::Starting,
+                    reset: self.info.reset,
+                    border: self.info.detail,
+                    board: self.info.board,
+                }),
+                sleep: false,
+                led: LedTone::Off,
+                deadline_ms: None,
+            };
+        };
         let busy = i.busy_ms.is_some();
 
         // Anything that changed counts as activity for the screensaver.
@@ -185,9 +203,11 @@ impl Controller {
         // Track the last finished operation (first seen now).
         let a = snap.activity;
         if a.state == OpState::Done && a.op != OpCode::None {
-            let new = self
-                .last
-                .map_or(true, |f| f.activity.op_seq != a.op_seq || f.activity != a);
+            // Same op_seq with a new result or SW: a GET RESPONSE completed
+            // it (the age is kept below).
+            let new = self.last.map_or(true, |f| {
+                f.activity.op_seq != a.op_seq || f.activity != a || f.sw != snap.last_sw
+            });
             if new {
                 let same_op = self.last.is_some_and(|f| f.activity.op_seq == a.op_seq);
                 self.last = Some(Finished {
@@ -198,7 +218,7 @@ impl Controller {
                     } else {
                         now
                     },
-                    epoch_lo: i.session_epoch_lo,
+                    epoch: i.session_epoch,
                 });
                 self.seen_op = true;
             }
@@ -211,7 +231,15 @@ impl Controller {
         let flags = snap.health.flags;
 
         // ── SAS mailbox ──────────────────────────────────────────────────
-        let mail = i.sas;
+        // A pending code is shown only in the session it was published for,
+        // with USB up (spec §4.7: it never outlives its session).  Core1
+        // clears the mailbox only at the next APDU; until then a stale code
+        // reads as cancelled, never as the old digits.
+        let mut mail = i.sas;
+        if mail.state == SasState::Pending && (!i.usb_configured || mail.epoch != i.session_epoch) {
+            mail.state = SasState::Cancelled;
+            mail.digits = 0;
+        }
         if mail.state == SasState::Pending && self.sas_gen != Some(mail.gen) {
             self.sas_gen = Some(mail.gen);
             self.sas_deadline_ms = now + u64::from(SAS_TIMEOUT_SECS) * 1000;
@@ -290,7 +318,7 @@ impl Controller {
         // ── Home ─────────────────────────────────────────────────────────
         let s = snap.session;
         // Authentication is shown only for the current session with USB up.
-        let live = i.usb_configured && s.epoch_lo == i.session_epoch_lo;
+        let live = i.usb_configured && s.epoch == i.session_epoch;
         let (applet, auth_bits, oneshot_bits) = if live {
             (s.applet, s.auth, s.oneshot)
         } else {
@@ -305,12 +333,13 @@ impl Controller {
         let is_blocked = s.blocked & blocked_bit != 0;
         let working = i.busy_ms.is_some_and(|ms| ms >= WORKING_AFTER_MS);
 
-        let status = if flags & (health::STORE_WRITE_FAILED | health::KS_INIT_FAILED) != 0 {
+        let status = if flags
+            & (health::STORE_WRITE_FAILED | health::KS_INIT_FAILED | health::SD_MISSING)
+            != 0
+        {
             Status::Error
         } else if is_blocked {
             Status::Locked
-        } else if flags & health::MIRROR_DEGRADED != 0 {
-            Status::Degraded
         } else if working {
             Status::Working
         } else if !i.usb_configured {
@@ -365,6 +394,8 @@ impl Controller {
 
         let note = if flags & health::STORE_WRITE_FAILED != 0 {
             Some(Note::NotSaved)
+        } else if flags & health::SD_MISSING != 0 {
+            Some(Note::SdMissing)
         } else if flags & health::KS_INIT_FAILED != 0 {
             Some(Note::StorageUnreadable)
         } else if is_blocked {
@@ -386,7 +417,7 @@ impl Controller {
             }
         } else {
             match self.last {
-                Some(f) if f.epoch_lo == i.session_epoch_lo || note.is_some() => {
+                Some(f) if f.epoch == i.session_epoch || note.is_some() => {
                     let age = (now.saturating_sub(f.at_ms) / 1000) as u32;
                     ActivityView::Done {
                         op: f.activity.op,
@@ -451,13 +482,14 @@ mod tests {
             storage: StorageKind::Qmi,
             detail: false,
             reset: None,
+            board: "test",
         }
     }
 
     fn snap() -> Snapshot {
         Snapshot {
             session: Session {
-                epoch_lo: 3,
+                epoch: 3,
                 applet: Applet::Piv,
                 pri_left: 3,
                 pri_max: 3,
@@ -477,7 +509,7 @@ mod tests {
             snap: Some(s),
             sas: SasMail::default(),
             usb_configured: true,
-            session_epoch_lo: 3,
+            session_epoch: 3,
             busy_ms: None,
         }
     }
@@ -505,9 +537,6 @@ mod tests {
         );
         i.busy_ms = Some(300);
         assert_eq!(home(&c.step(&i)).status, Status::Working);
-        s.health.flags |= health::MIRROR_DEGRADED;
-        i.snap = Some(s);
-        assert_eq!(home(&c.step(&i)).status, Status::Degraded);
         s.session.blocked = blocked::PIV;
         i.snap = Some(s);
         i.usb_configured = true;
@@ -529,7 +558,13 @@ mod tests {
         assert!(h.admin);
         // Card power-off / USB reset: SESSION_EPOCH moved on.
         let mut i = inputs(2, s);
-        i.session_epoch_lo = 4;
+        i.session_epoch = 4;
+        let h = home(&c.step(&i));
+        assert_eq!(h.pin.value, PinValue::NoApplet);
+        assert!(!h.admin);
+        // 256 sessions later the low byte matches again: still stale.
+        let mut i = inputs(2, s);
+        i.session_epoch = 3 + 256;
         let h = home(&c.step(&i));
         assert_eq!(h.pin.value, PinValue::NoApplet);
         assert!(!h.admin);
@@ -562,7 +597,7 @@ mod tests {
         assert_eq!(at(&mut c, 3_601_000), (Age::Hours(1), Fade::Old));
         // A new session starts idle.
         let mut i = inputs(3_602_000, s);
-        i.session_epoch_lo = 9;
+        i.session_epoch = 9;
         assert_eq!(home(&c.step(&i)).activity, ActivityView::Idle);
     }
 
@@ -621,6 +656,7 @@ mod tests {
             role: SasRole::Sponsor,
             peer_fp: 0x04AA,
             state: SasState::Pending,
+            epoch: 3,
         };
         let f = c.step(&i);
         assert!(matches!(
@@ -656,6 +692,146 @@ mod tests {
         assert!(matches!(c.step(&i).screen, Screen::Notice(_)));
         i.now_ms += NOTICE_MS;
         assert!(matches!(c.step(&i).screen, Screen::Home(_)));
+    }
+
+    #[test]
+    fn no_snapshot_fails_closed() {
+        let mut c = Controller::new(info(), 0);
+        let mut i = inputs(1, snap());
+        i.snap = None;
+        let f = c.step(&i);
+        assert!(
+            matches!(
+                f.screen,
+                Screen::Splash(SplashView {
+                    step: BootStep::Starting,
+                    ..
+                })
+            ),
+            "{f:?}"
+        );
+        assert_ne!(f.led, LedTone::of_status(Status::Ready));
+        assert!(!f.sleep);
+    }
+
+    #[test]
+    fn sd_missing_is_an_error() {
+        let mut c = Controller::new(
+            StaticInfo {
+                storage: StorageKind::Sd,
+                ..info()
+            },
+            0,
+        );
+        let mut s = snap();
+        s.activity = Activity {
+            op_seq: 1,
+            op: OpCode::Sign,
+            state: OpState::Done,
+            result: OpResult::Error,
+            ..Default::default()
+        };
+        s.health.flags |= health::SD_MISSING;
+        let h = home(&c.step(&inputs(1, s)));
+        assert_eq!(h.status, Status::Error);
+        assert!(matches!(
+            h.footer,
+            FooterView::Normal {
+                storage: StorageLine::SdMissing,
+                ..
+            }
+        ));
+        assert!(matches!(
+            h.activity,
+            ActivityView::Done {
+                note: Some(Note::SdMissing),
+                ..
+            }
+        ));
+        // The card answers again: READY.
+        s.health.flags &= !health::SD_MISSING;
+        assert_eq!(home(&c.step(&inputs(2, s))).status, Status::Ready);
+    }
+
+    #[test]
+    fn get_response_result_updates_the_same_op() {
+        let mut c = Controller::new(
+            StaticInfo {
+                detail: true,
+                ..info()
+            },
+            0,
+        );
+        let mut s = snap();
+        s.activity = Activity {
+            op_seq: 1,
+            op: OpCode::Sign,
+            state: OpState::Done,
+            ..Default::default()
+        };
+        s.last_sw = 0x6110;
+        c.step(&inputs(1_000, s));
+        s.activity.result = OpResult::Error;
+        s.last_sw = 0x6F00;
+        match home(&c.step(&inputs(3_000, s))).activity {
+            ActivityView::Done {
+                result,
+                age,
+                detail,
+                ..
+            } => {
+                assert_eq!(result, OpResult::Error);
+                assert_eq!(age, Age::Secs(2), "same op: its age is kept");
+                assert_eq!(detail.map(|d| d.sw), Some(0x6F00));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn sas_never_outlives_its_session() {
+        let pending = SasMail {
+            gen: 1,
+            digits: 12_345_678,
+            role: SasRole::Sponsor,
+            peer_fp: 0x04AA,
+            state: SasState::Pending,
+            epoch: 3,
+        };
+        // Published for this session: shown.
+        let mut c = Controller::new(info(), 0);
+        let mut i = inputs(1_000, snap());
+        i.sas = pending;
+        assert!(matches!(c.step(&i).screen, Screen::Sas(_)));
+        // Card power cycle (epoch moved): the code goes, a notice says so.
+        i.session_epoch = 4;
+        i.now_ms += 1;
+        let f = c.step(&i);
+        assert!(
+            matches!(
+                f.screen,
+                Screen::Notice(NoticeView {
+                    kind: NoticeKind::Cancelled,
+                    ..
+                })
+            ),
+            "{f:?}"
+        );
+        // Never the code again in the new session.
+        i.now_ms += NOTICE_MS;
+        assert!(matches!(c.step(&i).screen, Screen::Home(_)));
+        // USB gone: not shown either, even for the same epoch.
+        let mut c = Controller::new(info(), 0);
+        let mut i = inputs(1_000, snap());
+        i.sas = pending;
+        i.usb_configured = false;
+        assert!(!matches!(c.step(&i).screen, Screen::Sas(_)));
+        // Same low byte 256 sessions later: still another session.
+        let mut c = Controller::new(info(), 0);
+        let mut i = inputs(1_000, snap());
+        i.sas = pending;
+        i.session_epoch = 3 + 256;
+        assert!(!matches!(c.step(&i).screen, Screen::Sas(_)));
     }
 
     #[test]

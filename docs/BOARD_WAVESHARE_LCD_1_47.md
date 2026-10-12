@@ -190,7 +190,7 @@ through unswapped.  Confirm on hardware: READY must be green.)
 | READY | green (0, 8, 0) |
 | WORKING | blue (0, 0, 8) |
 | NO HOST | cyan (0, 8, 8) |
-| DEGRADED, notices | yellow (8, 8, 0) |
+| notices | yellow (8, 8, 0) |
 | ERROR, LOCKED, error screens | red (8, 0, 0) |
 | SAS pending | magenta (8, 0, 8) |
 

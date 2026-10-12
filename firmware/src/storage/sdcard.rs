@@ -161,9 +161,10 @@ where
                 contents: [0u8; 512],
             }];
             let block = unsafe { &mut *core::ptr::addr_of_mut!(SD_BLOCK) };
-            self.card
-                .read(block, BlockIdx(sd_sector_idx))
-                .map_err(|_| StorageError::ReadError)?;
+            if self.card.read(block, BlockIdx(sd_sector_idx)).is_err() {
+                crate::display_snapshot::note_sd_io(false);
+                return Err(StorageError::ReadError);
+            }
 
             let src_start = if written == 0 { byte_offset } else { 0 };
             let available = Block::LEN - src_start;
@@ -174,6 +175,7 @@ where
             written += to_copy;
             sd_sector_idx += 1;
         }
+        crate::display_snapshot::note_sd_io(true);
         Ok(())
     }
 
@@ -192,9 +194,10 @@ where
         crate::watchdog::progress();
         // Step 1: read existing 512-byte sector.
         let mut block = [Block::new()];
-        self.card
-            .read(&mut block, BlockIdx(sd_sector_idx))
-            .map_err(|_| StorageError::ReadError)?;
+        if self.card.read(&mut block, BlockIdx(sd_sector_idx)).is_err() {
+            crate::display_snapshot::note_sd_io(false);
+            return Err(StorageError::ReadError);
+        }
 
         // Step 2: patch the window.
         let len = data.len().min(Block::LEN - byte_offset);
@@ -204,6 +207,7 @@ where
         self.card
             .write(&block, BlockIdx(sd_sector_idx))
             .map_err(|_| {
+                crate::display_snapshot::note_sd_io(false);
                 self.write_errors += 1;
                 if self.write_errors >= BAD_WRITE_THRESHOLD {
                     defmt::error!(
@@ -230,6 +234,7 @@ where
             })?;
 
         self.write_errors = 0;
+        crate::display_snapshot::note_sd_io(true);
         Ok(())
     }
 
@@ -247,10 +252,16 @@ where
         for i in 0..SD_SECTORS_PER_LOGICAL {
             // A slow card can take up to 250 ms per block write.
             crate::watchdog::progress();
-            self.card
+            if self
+                .card
                 .write(&blocks, BlockIdx(first_sd_sector + i))
-                .map_err(|_| StorageError::EraseError)?;
+                .is_err()
+            {
+                crate::display_snapshot::note_sd_io(false);
+                return Err(StorageError::EraseError);
+            }
         }
+        crate::display_snapshot::note_sd_io(true);
         Ok(())
     }
 

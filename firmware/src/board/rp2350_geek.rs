@@ -257,6 +257,9 @@ impl crate::display::Panel for St7789StatusDisplay {
         self.cmd(ST7789_SLPOUT, &[]);
         embassy_time::Timer::after_millis(120).await;
         self.cmd(ST7789_DISPON, &[]);
+    }
+
+    async fn backlight_on(&mut self) {
         self.bl.set_high();
     }
 }

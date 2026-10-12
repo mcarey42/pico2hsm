@@ -63,7 +63,7 @@ pub const DIM: C444 = C444::hex(0x888);
 // ── Status (always paired with a word) ───────────────────────────────────────
 /// Ready / verified.
 pub const OK: C444 = C444::hex(0x3D5);
-/// Degraded, admin, policy hint, refusal.
+/// Admin, notices, policy hint, refusal.
 pub const WARN: C444 = C444::hex(0xFB2);
 /// Error, locked, failure.
 pub const ERR: C444 = C444::hex(0xF44);
