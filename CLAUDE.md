@@ -50,6 +50,10 @@ Start `build-all-debug.sh` in the background first (it blocks on RTT streaming),
 
 If multiple pico2hsm devices are connected, use `OPENSC_DEFAULT_READER=N ./run_tests.sh` to target a specific reader (e.g. `N=1` for the second reader). Run `opensc-tool --list-readers` to see which index is which.
 
+- **OpenSC tools ignore `OPENSC_DEFAULT_READER`.** Only pyscard honours it. When it is set, `tests/hw/conftest.py` puts the shims in `tests/hw/helpers/bin` first on PATH; they add `-r N` (`opensc-tool`, `sc-hsm-tool`) or `--slot-description` (`pkcs11-tool`). A bare `opensc-tool` in a shell still talks to reader 0.
+- **gpg can only reach reader 0** once several readers exist: GnuPG 2.4's scdaemon ignores `reader-port` and the devices share a serial number. The gpg checks skip for other readers.
+- **probe-rs resets** need `PROBE_RS_PROBE=2e8a:000c:<serial>` when several probes are attached (`probe-rs list`). Without it the reset tests skip.
+
 If `probe-rs` reports "interface is busy (errno 16)", a previous probe-rs process is still holding the USB device:
 
 ```sh

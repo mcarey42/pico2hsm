@@ -131,6 +131,11 @@ def _kill_probe_rs_run() -> None:
 
 def _reset_device() -> None:
     """Reset the device via probe-rs and wait for USB re-enumeration."""
+    from conftest import probe_reset_skip_reason
+
+    reason = probe_reset_skip_reason()
+    if reason:
+        pytest.skip(f"probe-rs reset: {reason}")
     # Kill any RTT-streaming probe-rs process first so the debug probe is free.
     _kill_probe_rs_run()
 
