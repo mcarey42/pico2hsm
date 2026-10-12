@@ -39,13 +39,24 @@ Security and robustness release from the October 2026 audit
   `rsa` crate's keygen did 21 Miller-Rabin rounds + Lucas on incremental
   candidates but had no `|p − q|` bound, computed `d` modulo φ(n), and ran
   no pairwise test.  Montgomery arithmetic with `UMAAL` on the RP2350; on
-  a Cortex-M33 (QEMU instruction counts, `tools/m33bench`) about 3.4× /
-  5× / 3.5× fewer instructions than the `rsa` crate's keygen for
-  RSA-2048 / 3072 / 4096 (≈ 1.8 / 5.6 / 15 G instructions per key on
-  average, roughly 20–30 s / 1–1.5 min / 2.5–4 min live on the device).
+  a Cortex-M33 (QEMU instruction counts, `tools/m33bench`) about 3.2× /
+  5× / 3.3× fewer instructions than the `rsa` crate's keygen for
+  RSA-2048 / 3072 / 4096 (≈ 1.95 / 5.9 / 15.5 G instructions per key on
+  average, roughly 20–30 s / 1–1.6 min / 2.6–4.1 min live on the device).
   Keys are still parsed, validated and used through the `rsa` crate.
 - **Live RSA keygen no longer suppresses the core1 stall detector**: the
   sliced generator bumps the heartbeat at every unit of work.
+- **Constant-time key generation:** everything done to the accepted
+  primes and the private key avoids secret-dependent branches and the
+  M33's variable-time divider (reciprocal division, fixed-count GCD and
+  Miller-Rabin squaring loops, Fermat inverses); the remaining
+  variable-time steps (rejected candidates, base redraws, the Lucas `D`
+  search, DER lengths) are documented in `rsa_keygen.rs`.
+- **Pool hardening:** fail closed on an unreadable configuration or pool
+  clock (pool off, emptied, live keygen; status health bit `08`); issued
+  slots erased at once; sequence and birth authenticated with the blob;
+  flash erase failures also stop the background; generator state wiped
+  after every key and restart.
 
 ### Changed — RSA key pool
 - **Flash layout:** the pool takes 48 KB (12 sectors) at

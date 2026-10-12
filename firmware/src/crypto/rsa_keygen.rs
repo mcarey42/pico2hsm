@@ -39,15 +39,42 @@
 //!    Montgomery context on `n` itself.  A key that fails is discarded.
 //!
 //! # Side channels
-//! All modular arithmetic is constant-time (see `bignum`).  Exponents are
-//! processed in fixed 4-bit windows over their full word length with a
-//! constant-time table lookup, and the Lucas chain selects with masks, so
-//! the time spent on a prime does not depend on its bits.  What is
-//! variable-time: rejecting candidates (they are discarded), the count of
-//! trailing zero bits `a` of `w − 1` in Miller-Rabin's squaring loop, the
-//! search for the Lucas `D` and `gcd(p−1, q−1)` (binary GCD).
+//! Everything done to the *final* primes and the private key is
+//! constant-time — no branch, memory index or `UDIV`/`SDIV` (data-dependent
+//! on the Cortex-M33) on secret data: Montgomery arithmetic; exponents in
+//! fixed 4-bit windows over their full word length with a masked table
+//! lookup; the Miller-Rabin squaring loop (a fixed [`MR_SQUARINGS`]
+//! squarings whatever `a = ν2(w−1)` is, the outcome accumulated in a mask);
+//! the Lucas chain (masked select per bit); `ν2(w−1)` and the shift by it;
+//! `gcd(p−1, q−1)` (fixed-count binary GCD steps on the odd parts, the
+//! common power of two by masked trailing-zero counts); `d`, dP, dQ (`m mod
+//! e` and the division by `e` and by `g` multiply by a reciprocal; `e`'s
+//! inverse modulo `m mod e` is Fermat's `r^(e−2)` with a public exponent);
+//! qInv (Fermat, windowed); the `|p − q|` and `d > 2^(nlen/2)` checks
+//! (borrow of a subtraction); the pairwise sign.
 //!
-//! # Units
+//! What still depends on secret data, and why it is acceptable:
+//! - **Rejection.**  Whether a candidate is rejected — and *where* (which
+//!   trial-division prime divides it, which Miller-Rabin round or the
+//!   Lucas test fails, the `gcd(p−1, e)` / `|p − q|` / `d` size checks) —
+//!   is visible in the time a candidate takes.  A rejected candidate is
+//!   discarded and independent of the next draw, so this reveals nothing
+//!   about the key.  The accepted candidate always runs every step to the
+//!   end.
+//! - **Miller-Rabin base redraws.**  B.3.1 step 4.2 redraws a base outside
+//!   `[2, w−2]`; how often depends on how far `w` is below `2^k` (at most
+//!   25 % per draw here, `w ≥ ¾·2^k`) — a statistical hint about the top
+//!   bits of `p`/`q` from 4–5 samples, far below anything usable.
+//! - **The Lucas `D` search** (B.3.3 step 2): which `D` is selected depends
+//!   on the Jacobi symbols `(D/w)` for `D = 5, −7, 9, …` — on average under
+//!   two of them, i.e. a bit or two of quadratic-residue information about
+//!   `p` mod small numbers.  The residues `w mod |D|` are computed in
+//!   constant time; the small Jacobi computation is not.
+//! - **DER lengths.**  PKCS#1 minimal INTEGER encoding makes the byte
+//!   length of d, dP, dQ, qInv visible (it is in the stored key's length);
+//!   this is inherent to the format and the same for every implementation.
+//!
+//! //! # Units
 //! The largest units are one trial-division chunk (128 primes over the
 //! candidate), one chunk of Montgomery setup (64 modular doublings), one
 //! Lucas bit (5 modular multiplications) and the `d` derivation (a handful
@@ -84,6 +111,12 @@ const SETUP_CHUNK: usize = 64;
 const GCD_CHUNK: usize = 32;
 /// Lucas `D` values tried before giving up (see the module docs, step 6).
 pub const MAX_LUCAS_D: u32 = 1000;
+/// Squarings after each Miller-Rabin exponentiation: always this many, so
+/// the time does not reveal `a = ν2(w − 1)`.  A candidate with `a ≥ 64`
+/// (probability 2^-63) can be wrongly rejected — never wrongly accepted.
+pub const MR_SQUARINGS: usize = 64;
+/// `ct_recip(E)`.
+const E_RECIP: u32 = bn::ct_recip(E);
 /// Keys discarded by an internal check before the generator gives up
 /// (a fault, not bad luck: every check passes for a correct implementation).
 const MAX_FAILURES: u32 = 3;
@@ -144,6 +177,21 @@ const fn small_primes() -> [u16; NUM_SMALL_PRIMES] {
 
 /// The odd primes below [`TD_LIMIT`], ascending.
 pub static SMALL_PRIMES: [u16; NUM_SMALL_PRIMES] = small_primes();
+
+const fn small_recips() -> [u32; NUM_SMALL_PRIMES] {
+    let p = small_primes();
+    let mut out = [0u32; NUM_SMALL_PRIMES];
+    let mut i = 0;
+    while i < NUM_SMALL_PRIMES {
+        out[i] = u32::MAX / p[i] as u32;
+        i += 1;
+    }
+    out
+}
+
+/// `floor((2^32−1)/p)` for each of [`SMALL_PRIMES`] (constant-time trial
+/// division by multiplication).
+static SMALL_RECIPS: [u32; NUM_SMALL_PRIMES] = small_recips();
 
 // ─── Budget ──────────────────────────────────────────────────────────────────
 
@@ -255,8 +303,12 @@ pub struct KeyGen {
     sub: usize,
     /// Miller-Rabin round with a DRBG base.
     round: u32,
-    /// Trailing zero bits of `w − 1`.
-    mr_a: usize,
+    /// Trailing zero bits of `w − 1` (secret: only used through masks).
+    mr_a: u32,
+    /// Miller-Rabin outcome so far: all-ones = passes.
+    mr_pass: u32,
+    /// Common power of two of `p − 1` and `q − 1` (secret).
+    gcd_k: u32,
     /// Draws for the current prime (A.1.3 iteration limit).
     draws: u32,
     /// Internal-check failures since `start`.
@@ -326,6 +378,8 @@ impl KeyGen {
             sub: 0,
             round: 0,
             mr_a: 0,
+            mr_pass: 0,
+            gcd_k: 0,
             draws: 0,
             failures: 0,
             after_setup: Phase::Idle,
@@ -400,7 +454,9 @@ impl KeyGen {
         self.wipe();
     }
 
-    fn wipe(&mut self) {
+    /// Zeroize every array that can hold key material (candidates,
+    /// primes, exponents, CRT values, Montgomery contexts, temporaries).
+    fn wipe_secrets(&mut self) {
         self.w.zeroize();
         self.one.zeroize();
         self.rr.zeroize();
@@ -421,7 +477,43 @@ impl KeyGen {
         self.sq.zeroize();
         self.minv = 0;
         self.g = 0;
+        self.gcd_k = 0;
+        self.mr_a = 0;
+        self.mr_pass = 0;
         self.lucas_d = 0;
+    }
+
+    /// Every key-material array is zero (test probe).
+    #[cfg(test)]
+    pub(crate) fn holds_no_secrets(&self) -> bool {
+        [
+            &self.w[..],
+            &self.one,
+            &self.rr,
+            &self.mone,
+            &self.acc,
+            &self.base,
+            &self.exp,
+            &self.scratch,
+            &self.p,
+            &self.q,
+            &self.n,
+            &self.d,
+            &self.dp,
+            &self.dq,
+            &self.qinv,
+            &self.msg,
+            &self.sp,
+            &self.sq,
+        ]
+        .iter()
+        .all(|a| a.iter().all(|&x| x == 0))
+            && self.g == 0
+            && self.minv == 0
+    }
+
+    fn wipe(&mut self) {
+        self.wipe_secrets();
         self.nlen = 0;
         self.pw = 0;
         self.phase = Phase::Idle;
@@ -430,6 +522,8 @@ impl KeyGen {
         self.sub = 0;
         self.round = 0;
         self.mr_a = 0;
+        self.mr_pass = 0;
+        self.gcd_k = 0;
         self.draws = 0;
         self.failures = 0;
         self.exp_bits = 0;
@@ -490,10 +584,10 @@ impl KeyGen {
         self.restart_key();
     }
 
-    /// Discard both primes and begin again (keeps `failures` and stats).
+    /// Discard every secret of the attempt and begin again (keeps
+    /// `failures` and stats).
     fn restart_key(&mut self) {
-        self.p.zeroize();
-        self.q.zeroize();
+        self.wipe_secrets();
         self.target_q = false;
         self.draws = 0;
         self.phase = Phase::Draw;
@@ -544,8 +638,9 @@ impl KeyGen {
                 bytes.zeroize();
                 self.w[pw - 1] |= 0xC000_0000;
                 self.w[0] |= 1;
-                // gcd(w − 1, e) = 1  ⇔  w mod e ≠ 1 (e prime).
-                if bn::rem_small(&self.w[..pw], E) == 1 {
+                // gcd(w − 1, e) = 1  ⇔  w mod e ≠ 1 (e prime).  Constant-time
+                // remainder; the branch only rejects.
+                if bn::ct_rem_small(&self.w[..pw], E, E_RECIP) == 1 {
                     return;
                 }
                 if self.target_q && !self.far_from_p() {
@@ -556,9 +651,18 @@ impl KeyGen {
             }
 
             Phase::Trial => {
+                // Constant-time remainders (reciprocal multiplication, no
+                // UDIV on the candidate).  The early exit happens only for a
+                // candidate that is rejected; the accepted one is divided by
+                // every prime.
                 let end = (self.idx + TD_CHUNK).min(NUM_SMALL_PRIMES);
-                for &sp in &SMALL_PRIMES[self.idx..end] {
-                    if bn::rem_u16(&self.w[..pw], sp) == 0 {
+                for i in self.idx..end {
+                    let r = bn::ct_rem_small(
+                        &self.w[..pw],
+                        u32::from(SMALL_PRIMES[i]),
+                        SMALL_RECIPS[i],
+                    );
+                    if r == 0 {
                         self.reject_candidate();
                         return;
                     }
@@ -606,8 +710,8 @@ impl KeyGen {
                 // exp = (w − 1) / 2^a
                 self.exp[..pw].copy_from_slice(&self.w[..pw]);
                 bn::sub_small(&mut self.exp[..pw], 1);
-                self.mr_a = bn::trailing_zeros(&self.exp[..pw]);
-                bn::shr(&mut self.exp[..pw], self.mr_a);
+                self.mr_a = bn::ct_tz(&self.exp[..pw]);
+                bn::ct_shr(&mut self.exp[..pw], self.mr_a);
                 self.exp_bits = k;
                 self.acc[..pw].copy_from_slice(&self.one[..pw]);
                 self.idx = k;
@@ -621,30 +725,29 @@ impl KeyGen {
                 bn::mod_double_if(&mut self.acc[..pw], &self.w[..pw], b);
                 self.idx -= 1;
                 if self.idx == 0 {
-                    if self.acc_is_pm_one() {
-                        self.begin_random_rounds();
-                    } else {
-                        self.sub = 1;
-                        self.phase = Phase::Base2Sq;
-                    }
+                    self.begin_squarings(Phase::Base2Sq);
                 }
             }
 
             Phase::Base2Sq | Phase::MrSq => {
-                if self.sub >= self.mr_a {
-                    self.reject_candidate();
-                    return;
-                }
+                // z_j = z_{j−1}², j = 1 .. MR_SQUARINGS−1; the round passes
+                // if z_0 = ±1 or z_j = −1 for some j < a.  (Once z = 1 it
+                // stays 1, so the textbook "z = 1: composite" exit adds
+                // nothing.)  Every squaring is done; `j < a` is a mask.
                 self.mul(Op::AccSqr);
+                let active = bn::ct_lt_mask_u32(self.sub as u32, self.mr_a);
+                self.mr_pass |= active & bn::ct_eq_mask(&self.acc[..pw], &self.mone[..pw]);
                 self.sub += 1;
-                if bn::ct_eq(&self.acc[..pw], &self.mone[..pw]) {
-                    if self.phase == Phase::Base2Sq {
+                if self.sub == MR_SQUARINGS {
+                    let pass = self.mr_pass != 0;
+                    self.mr_pass = 0;
+                    if !pass {
+                        self.reject_candidate();
+                    } else if self.phase == Phase::Base2Sq {
                         self.begin_random_rounds();
                     } else {
                         self.next_round();
                     }
-                } else if bn::ct_eq(&self.acc[..pw], &self.one[..pw]) {
-                    self.reject_candidate();
                 }
             }
 
@@ -655,8 +758,14 @@ impl KeyGen {
                 let mut b = [0u32; MAX_PW];
                 bn::from_be_bytes(&mut b[..pw], &bytes[..4 * pw]);
                 bytes.zeroize();
-                // Keep wlen = len(w) bits (all of them for real candidates).
-                let wlen = bn::bit_len(&self.w[..pw]);
+                // Keep wlen = len(w) bits: all of them for every real
+                // candidate (its top bit is set — public); the bit length is
+                // computed only for the small numbers of the host tests.
+                let wlen = if self.w[pw - 1] >> 31 == 1 {
+                    32 * pw
+                } else {
+                    bn::bit_len(&self.w[..pw])
+                };
                 for (i, word) in b[..pw].iter_mut().enumerate() {
                     let lo = 32 * i;
                     if lo >= wlen {
@@ -670,9 +779,10 @@ impl KeyGen {
                 bn::sub_small(&mut wm1[..pw], 1);
                 let mut two = [0u32; MAX_PW];
                 two[0] = 2;
-                let ok =
-                    bn::cmp(&b[..pw], &two[..pw]).is_ge() && bn::cmp(&b[..pw], &wm1[..pw]).is_lt();
-                if ok {
+                // Constant-time range check; the branch only redraws (see the
+                // module docs on base redraws).
+                let ok = !bn::ct_lt(&b[..pw], &two[..pw]) & bn::ct_lt(&b[..pw], &wm1[..pw]);
+                if ok != 0 {
                     self.load_base(&b);
                     // exp still holds (w − 1) / 2^a from Base2Start.
                     self.exp_bits = k;
@@ -740,14 +850,7 @@ impl KeyGen {
                 }
             }
 
-            Phase::MrCheck => {
-                if self.acc_is_pm_one() {
-                    self.next_round();
-                } else {
-                    self.sub = 1;
-                    self.phase = Phase::MrSq;
-                }
-            }
+            Phase::MrCheck => self.begin_squarings(Phase::MrSq),
 
             Phase::LucasSetup => self.lucas_setup(),
             Phase::Lucas => self.lucas_bit(),
@@ -765,48 +868,53 @@ impl KeyGen {
             }
 
             Phase::GcdStart => {
+                // gcd(p−1, q−1) = 2^min(sa, sb) · gcd(odd parts), all
+                // constant-time: masked trailing-zero counts and shifts,
+                // then fixed-count binary-GCD steps.
                 let [a, b] = split::<2>(&mut self.scratch[..2 * MAX_PW], MAX_PW);
                 let (a, b) = (&mut a[..pw], &mut b[..pw]);
                 a.copy_from_slice(&self.p[..pw]);
                 b.copy_from_slice(&self.q[..pw]);
                 bn::sub_small(a, 1);
                 bn::sub_small(b, 1);
-                let za = bn::trailing_zeros(a);
-                let zb = bn::trailing_zeros(b);
-                self.sub = za.min(zb); // common power of two
-                bn::shr(a, za);
+                let sa = bn::ct_tz(a);
+                let sb = bn::ct_tz(b);
+                bn::ct_shr(a, sa);
+                bn::ct_shr(b, sb);
+                self.gcd_k = sb ^ ((sa ^ sb) & bn::ct_lt_mask_u32(sa, sb));
+                self.idx = 0;
                 self.phase = Phase::Gcd;
             }
 
             Phase::Gcd => {
                 let [a, b] = split::<2>(&mut self.scratch[..2 * MAX_PW], MAX_PW);
                 let (a, b) = (&mut a[..pw], &mut b[..pw]);
-                for _ in 0..GCD_CHUNK {
-                    if bn::is_zero(b) {
-                        break;
-                    }
-                    let zb = bn::trailing_zeros(b);
-                    bn::shr(b, zb);
-                    if bn::cmp(a, b).is_gt() {
-                        a.swap_with_slice(b);
-                    }
-                    bn::sub_assign(b, a);
+                let total = 2 * 32 * pw;
+                let end = (self.idx + GCD_CHUNK).min(total);
+                for _ in self.idx..end {
+                    bn::ct_gcd_step(a, b);
                 }
-                if bn::is_zero(b) {
-                    // g = a · 2^shift must be a small number.
-                    let shift = self.sub;
-                    let small = a[1..].iter().all(|&x| x == 0)
-                        && shift < 32
-                        && u64::from(a[0]) << shift <= u64::from(u32::MAX);
-                    if small {
-                        self.g = a[0] << shift;
+                self.idx = end;
+                if end == total {
+                    // b = gcd of the odd parts; g = b · 2^k must be below
+                    // 2^17 (the small-divisor routines).  The test is a
+                    // mask; the branch only rejects q (practically never).
+                    let k = self.gcd_k;
+                    let high = bn::ct_is_zero(&b[1..]);
+                    let g64 = u64::from(b[0]) << (k & 31);
+                    let small = high
+                        & bn::ct_lt_mask_u32(k, 17)
+                        & bn::ct_zero_mask_u32((g64 >> 17) as u32 | (g64 >> 49) as u32);
+                    if small != 0 {
+                        self.g = g64 as u32;
                         self.phase = Phase::Derive;
                     } else {
-                        // Practically never: draw another q.
                         self.q.zeroize();
                         self.draws = 0;
                         self.phase = Phase::Draw;
                     }
+                    a.zeroize();
+                    b.zeroize();
                 }
             }
 
@@ -945,10 +1053,14 @@ impl KeyGen {
         }
     }
 
-    /// `acc` is ±1 (Montgomery form).
-    fn acc_is_pm_one(&self) -> bool {
+    /// After a Miller-Rabin exponentiation: record `z_0 = ±1` in the pass
+    /// mask and start the fixed squaring loop.
+    fn begin_squarings(&mut self, next: Phase) {
         let pw = self.pw;
-        bn::ct_eq(&self.acc[..pw], &self.one[..pw]) || bn::ct_eq(&self.acc[..pw], &self.mone[..pw])
+        self.mr_pass = bn::ct_eq_mask(&self.acc[..pw], &self.one[..pw])
+            | bn::ct_eq_mask(&self.acc[..pw], &self.mone[..pw]);
+        self.sub = 1;
+        self.phase = next;
     }
 
     /// Value of exponent window `i` (bits `4i .. 4i+4`).
@@ -977,23 +1089,25 @@ impl KeyGen {
         }
     }
 
-    /// `|w − p| > 2^(k−100)` (A.1.3 step 5.5).
+    /// `|w − p| > 2^(k−100)` (A.1.3 step 5.5), constant-time.
     fn far_from_p(&self) -> bool {
         let pw = self.pw;
+        let mut d1 = [0u32; MAX_PW];
+        let mut d2 = [0u32; MAX_PW];
+        d1[..pw].copy_from_slice(&self.w[..pw]);
+        let br = bn::sub_assign(&mut d1[..pw], &self.p[..pw]); // w − p
+        d2[..pw].copy_from_slice(&self.p[..pw]);
+        bn::sub_assign(&mut d2[..pw], &self.w[..pw]); // p − w
         let mut diff = [0u32; MAX_PW];
-        if bn::cmp(&self.w[..pw], &self.p[..pw]).is_ge() {
-            diff[..pw].copy_from_slice(&self.w[..pw]);
-            bn::sub_assign(&mut diff[..pw], &self.p[..pw]);
-        } else {
-            diff[..pw].copy_from_slice(&self.p[..pw]);
-            bn::sub_assign(&mut diff[..pw], &self.w[..pw]);
-        }
-        let limit_bit = 32 * pw - 100; // 2^(k−100)
-        let len = bn::bit_len(&diff[..pw]);
-        let far = len > limit_bit + 1
-            || (len == limit_bit + 1 && bn::trailing_zeros(&diff[..pw]) != limit_bit);
+        bn::ct_select(&mut diff[..pw], &d2[..pw], &d1[..pw], 0u32.wrapping_sub(br));
+        let mut limit = [0u32; MAX_PW];
+        let lb = 32 * pw - 100; // 2^(k−100)
+        limit[lb / 32] = 1 << (lb % 32);
+        let far = bn::ct_lt(&limit[..pw], &diff[..pw]);
+        d1.zeroize();
+        d2.zeroize();
         diff.zeroize();
-        far
+        far != 0
     }
 
     /// B.3.3 step 2 (with the bound of the module docs) and the chain set-up.
@@ -1004,7 +1118,9 @@ impl KeyGen {
         let mut d: i32 = 5;
         for _ in 0..MAX_LUCAS_D {
             let a = d.unsigned_abs();
-            let r = bn::rem_small(w, a);
+            // Constant-time residue; the small Jacobi symbol is not (see the
+            // module docs).
+            let r = bn::ct_rem_small(w, a, bn::ct_recip(a));
             // (D/w) = (±1/w)·(a/w);  (−1/w) = (−1)^((w−1)/2).
             let mut j = jacobi_small_over_big(a, r, w[0]);
             if d < 0 && w[0] & 3 == 3 {
@@ -1017,7 +1133,7 @@ impl KeyGen {
             if j == -1 {
                 // gcd(w, (1 − D)/4) = 1
                 let qd = ((1 - i64::from(d)) / 4).unsigned_abs() as u32;
-                if qd <= 1 || gcd_u32(bn::rem_small(w, qd), qd) == 1 {
+                if qd <= 1 || bn::ct_gcd_u32(bn::ct_rem_small(w, qd, bn::ct_recip(qd)), qd) == 1 {
                     found = Some(d);
                     break;
                 }
@@ -1032,7 +1148,14 @@ impl KeyGen {
         // K = w + 1
         self.exp[..pw].copy_from_slice(w);
         bn::add_small(&mut self.exp[..pw], 1);
-        self.exp_bits = bn::bit_len(&self.exp[..pw]);
+        // K < 2^k with bit k−1 set for every real candidate (top bit set —
+        // public; w + 1 cannot carry out of an odd prime); the bit length is
+        // computed only for the small numbers of the host tests.
+        self.exp_bits = if self.w[pw - 1] >> 31 == 1 {
+            32 * pw
+        } else {
+            bn::bit_len(&self.exp[..pw])
+        };
         let [u, v, dm, ..] = split::<7>(&mut self.scratch[..7 * MAX_PW], MAX_PW);
         u[..pw].copy_from_slice(&self.one[..pw]);
         v[..pw].copy_from_slice(&self.one[..pw]);
@@ -1061,7 +1184,7 @@ impl KeyGen {
         let pw = self.pw;
         if self.idx == 0 {
             let [u, ..] = split::<7>(&mut self.scratch[..7 * MAX_PW], MAX_PW);
-            let prime = bn::is_zero(&u[..pw]);
+            let prime = bn::ct_is_zero(&u[..pw]) != 0;
             if prime {
                 self.phase = Phase::Accept;
             } else {
@@ -1115,7 +1238,7 @@ impl KeyGen {
         let nlen = self.nlen as usize;
         let g = self.g;
 
-        // n = p · q, exactly nlen bits.
+        // n = p · q, exactly nlen bits (n is public: variable-time is fine).
         bn::mul_into(&mut self.n[..nw], &self.p[..pw], &self.q[..pw]);
         if bn::bit_len(&self.n[..nw]) != nlen {
             self.fail_restart();
@@ -1129,7 +1252,7 @@ impl KeyGen {
         bn::sub_small(pm1, 1);
         qm1g.copy_from_slice(&self.q[..pw]);
         bn::sub_small(qm1g, 1);
-        let r = bn::div_small(qm1g, g);
+        let r = bn::ct_divrem_small(qm1g, g, bn::ct_recip(g));
         // λ = (p − 1) · ((q − 1) / g)
         bn::mul_into(&mut lam[..nw], pm1, qm1g);
         lam[nw] = 0;
@@ -1154,11 +1277,12 @@ impl KeyGen {
         }
         self.scratch.zeroize();
 
-        // 2^(nlen/2) < d (B.3.1); otherwise new primes.
+        // 2^(nlen/2) < d (B.3.1); otherwise new primes.  Constant-time
+        // compare; the branch only restarts.
         let half = nlen / 2;
-        let dl = bn::bit_len(&self.d[..nw]);
-        let big_enough =
-            dl > half + 1 || (dl == half + 1 && bn::trailing_zeros(&self.d[..nw]) != half);
+        let mut pow = [0u32; MAX_NW];
+        pow[half / 32] = 1 << (half % 32);
+        let big_enough = bn::ct_lt(&pow[..nw], &self.d[..nw]) != 0;
         if !big_enough {
             self.d.zeroize();
             self.dp.zeroize();
@@ -1294,22 +1418,20 @@ fn reduce_once(x: &mut [u32], m: &[u32]) {
 
 /// `out = e⁻¹ mod m` for even `m` coprime to `e`: with `k = −m⁻¹ mod e`,
 /// `out = (k·m + 1) / e`, then checked by multiplying back.  `tmp` has
-/// `m.len() + 1` words; `out` has at least `m.len()`.
+/// `m.len() + 1` words; `out` has at least `m.len()`.  Constant-time in
+/// `m`: `m mod e` and the division by `e` multiply by a reciprocal, and
+/// `(m mod e)⁻¹ mod e` is Fermat's `r^(e−2)` (`e` is a public prime).
 fn inverse_of_e(m: &[u32], tmp: &mut [u32], out: &mut [u32]) -> bool {
     let len = m.len();
-    let r = bn::rem_small(m, E);
-    let Some(inv) = bn::inv_mod_u32(r, E) else {
-        return false;
-    };
-    let k = (E - inv) % E;
+    let r = bn::ct_rem_small(m, E, E_RECIP);
+    let inv = bn::ct_inv_mod_small_prime(r, E, E_RECIP); // 0 if e | m
+    let k = E - inv; // in 1..e−1 when inv ≠ 0 (inv = 0 fails below)
     tmp[..len].copy_from_slice(m);
     tmp[len] = bn::mul_small(&mut tmp[..len], k);
     bn::add_small(&mut tmp[..len + 1], 1);
-    let rem = bn::div_small(&mut tmp[..len + 1], E);
-    if rem != 0 || tmp[len] != 0 {
-        tmp.zeroize();
-        return false;
-    }
+    let rem = bn::ct_divrem_small(&mut tmp[..len + 1], E, E_RECIP);
+    let mut ok =
+        bn::ct_zero_mask_u32(rem) & bn::ct_zero_mask_u32(tmp[len]) & !bn::ct_zero_mask_u32(inv);
     out.fill(0);
     out[..len].copy_from_slice(&tmp[..len]);
     // Multiply back: out · e − 1 ≡ 0 (mod m), i.e. out·e = k·m + 1.
@@ -1319,10 +1441,10 @@ fn inverse_of_e(m: &[u32], tmp: &mut [u32], out: &mut [u32]) -> bool {
     let mut km = [0u32; MAX_NW + 1];
     km[..len].copy_from_slice(m);
     km[len] = bn::mul_small(&mut km[..len], k);
-    let ok = bn::ct_eq(&tmp[..len + 1], &km[..len + 1]) && !bn::is_zero(&out[..len]);
+    ok &= bn::ct_eq_mask(&tmp[..len + 1], &km[..len + 1]) & !bn::ct_is_zero(&out[..len]);
     km.zeroize();
     tmp.zeroize();
-    ok
+    ok != 0
 }
 
 /// `(a / w)` for odd `w` given `r = w mod a` and odd `a` (reciprocity:
@@ -1335,13 +1457,6 @@ fn jacobi_small_over_big(a: u32, r: u32, w0: u32) -> i32 {
     j
 }
 
-fn gcd_u32(mut a: u32, mut b: u32) -> u32 {
-    while b != 0 {
-        (a, b) = (b, a % b);
-    }
-    a
-}
-
 /// Bytes of a DER INTEGER (tag + length + content) for an unsigned value.
 fn der_int_len(x: &[u32]) -> usize {
     let content = der_int_content_len(x);
@@ -1349,7 +1464,9 @@ fn der_int_len(x: &[u32]) -> usize {
 }
 
 fn der_int_content_len(x: &[u32]) -> usize {
-    let bits = bn::bit_len(x);
+    // Constant-time count; the resulting length is part of the encoding
+    // (see the module docs on DER lengths).
+    let bits = bn::ct_bit_len(x) as usize;
     if bits == 0 {
         return 1;
     }
@@ -1657,6 +1774,30 @@ mod tests {
         assert!(kg.p.iter().chain(kg.scratch.iter()).all(|&w| w == 0));
         assert_eq!(kg.step(&mut rng, &mut Unlimited), Poll::Idle);
         assert!(!kg.start(1000));
+    }
+
+    /// Timing regression: the work the primality pipeline does on a prime
+    /// (multiplications and squarings — the constant-time units) does not
+    /// depend on `ν2(p − 1)`: the Miller-Rabin squaring loop always runs
+    /// [`MR_SQUARINGS`] times.
+    #[test]
+    fn miller_rabin_work_does_not_depend_on_nu2() {
+        let mut kg = Box::new(KeyGen::new());
+        let mut rng = TestRng(91);
+        let p1 = 0xFFFF_FFFF_FFFF_FFC5u64; // ν2(p − 1) = 2
+        let mut k = (1u64 << 43) | 1;
+        let p2 = loop {
+            let c = (k << 20) + 1; // ν2(c − 1) = 20, top bit set
+            if num_prime(&BigUint::from(c)) {
+                break c;
+            }
+            k += 2;
+        };
+        assert!(kg.test_candidate(p1, &mut rng));
+        let s1 = kg.stats;
+        assert!(kg.test_candidate(p2, &mut rng));
+        let s2 = kg.stats;
+        assert_eq!((s1.modmul, s1.modsqr), (s2.modmul, s2.modsqr));
     }
 
     #[test]

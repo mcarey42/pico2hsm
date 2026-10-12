@@ -88,8 +88,10 @@ AES-256-GCM ciphertext, like the keystore.)  Mitigations:
 
 - **Storage-key encryption.**  Each pooled key is a `KeyObject` blob
   encrypted under the storage master key exactly like a stored key; the
-  slot, size and sequence number are in the authenticated header, so a
-  blob copied to another slot or relabelled does not decrypt.
+  slot, size, sequence number and birth time are in the authenticated
+  header (GCM AAD) and checked against the slot, so a blob copied to
+  another slot, or a header edited in place to claim another size, a
+  younger age or another sequence number, does not yield a key.
 - **Rotation and age-out (default on).**  A pooled key older than the
   maximum age (default 4 hours of powered-on time) is erased and replaced
   in idle time, and GENERATE never issues one past that age.  A flash image
@@ -106,8 +108,24 @@ AES-256-GCM ciphertext, like the keystore.)  Mitigations:
 - **INITIALIZE erases the pool** (trust reset).
 - **Issue order.**  The slot is marked taken on flash (program-without-
   erase) and read back *before* the key leaves the pool; a power cut can
-  waste a key, never issue it twice.  The issued key is then stored and
-  numbered like any generated key.
+  waste a key, never issue it twice.  The slot is then erased at once, so
+  no ciphertext remains whose TAKEN mark an attacker could undo by
+  rewriting the sector from the same image (restoring an *older* image is
+  the rollback class S-15, out of scope).  The issued key is then stored
+  and numbered like any generated key.
+- **Fail closed.**  An unreadable or invalid pool configuration counts as
+  *off*; a pool clock that cannot be read or persisted holds the pool off
+  for the boot (ages could no longer be trusted after a reboot).  Either
+  way the pool is emptied, GENERATE generates live, and RSA_POOL_STATUS
+  sets health bit 3.  Repeated flash failures stop the background work
+  (health bit 2).  A key that fails its pairwise test or the `rsa` crate's
+  validation is never pooled or issued (a pooled one is erased).
+- **No remnants.**  The generator's state (candidates, primes, exponents,
+  CRT values, temporaries) is zeroized after every key — pooled, issued
+  live, discarded, failed — and on every internal restart; big-number
+  temporaries are wiped by the arithmetic routines; decrypted pool
+  objects and issued pairs wipe on drop.  Retired, rotated, issued and
+  torn slots are erased.
 
 **Key quality.**  FIPS 186-5 A.1.3 random probable primes: a fresh DRBG
 candidate per attempt, top two bits set, `gcd(p−1, e) = gcd(q−1, e) = 1`
@@ -126,13 +144,25 @@ candidates, with no `|p − q|` bound, `d` modulo φ(n) and no pairwise test.
 Generation starts only after the boot TRNG reseed succeeded, and draws
 from the same DRBG as every other key (`crypto::rng`).
 
-**Side channels.**  Montgomery arithmetic, exponent windows and the Lucas
-chain are constant-time; rejected candidates, the count of trailing zero
-bits of `p − 1` in Miller-Rabin and `gcd(p−1, q−1)` are not.  Generation
-runs between APDUs, where a host sees only its effect on response times.
+**Side channels.**  Everything computed on the accepted primes and the
+private key is constant-time: no secret-dependent branch, memory index or
+`UDIV`/`SDIV` (data-dependent on the M33).  That covers Montgomery
+arithmetic (`UMAAL`), the windowed exponentiations (Miller-Rabin, qInv,
+the pairwise CRT signature), the Miller-Rabin squaring loop (a fixed 64
+squarings, the outcome in a mask, so `ν2(p−1)` is not visible), the Lucas
+chain, trial division and `p mod e` (multiplication by a reciprocal),
+`gcd(p−1, q−1)` (fixed-count binary GCD), d / dP / dQ (reciprocal
+division, Fermat inverse modulo `e`), and the `|p − q|` and `d` size
+checks.  Not constant-time, and why that is acceptable: *where* a rejected
+candidate fails (it is discarded); Miller-Rabin base redraws (≤ 25 % each,
+a statistical hint about the top bits); the Lucas `D` search (a bit or two
+of quadratic-residue information about `p` modulo small numbers); the DER
+lengths of d, dP, dQ, qInv (inherent to PKCS#1).  Details:
+`firmware/src/crypto/rsa_keygen.rs`, "Side channels".  Generation runs
+between APDUs, where a host sees only its effect on response times.
 
 **Availability.**  Idle work runs in slices of at most 20 ms that end
-before the next unit of work (≤ ~6 ms of computation on the M33) once an
+before the next unit of work (≤ ~7 ms of computation on the M33) once an
 APDU is waiting; the longest wait an APDU can see is one flash sector
 erase of the pool (typically ~45 ms, at most 400 ms by the flash
 datasheets).  Live keygen inside an APDU keeps the stall detector's

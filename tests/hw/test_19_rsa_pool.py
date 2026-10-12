@@ -220,6 +220,7 @@ class TestRsaPool:
         assert st.health & 0x01, "RNG health check did not pass at boot"
         assert st.health & 0x02, "pool region missing (firmware built without rsa?)"
         assert not st.health & 0x04, "background filling stopped after write failures"
+        assert not st.health & 0x08, "pool configuration / clock unreadable (fail-closed)"
         assert st.enabled and st.rotate
         assert st.max_age_min == 240
         assert st.depth == {2048: 4, 3072: 2, 4096: 2}

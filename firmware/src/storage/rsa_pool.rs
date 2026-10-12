@@ -34,10 +34,18 @@
 //! - **Erase**: retiring a key (rotation, take, pool off, INITIALIZE)
 //!   erases its sector.  A torn erase leaves garbage, never a valid slot.
 //!
-//! The blob's own header binds it to its slot, size class and sequence
-//! number (the KeyObject `key_id` and `generation` are authenticated as
-//! GCM AAD), so a blob copied into another slot, or a header edited to
-//! claim another size or age, does not decrypt to a usable key.
+//! The blob's own header binds it to its slot, size class, sequence number
+//! and birth time: the KeyObject `key_id` (`pool_key_id(slot, class)`),
+//! `generation` (= sequence number) and `use_count` (= birth) are in the
+//! GCM AAD, and [`PoolRegion::get_key`] checks them against the slot and
+//! its plaintext header.  A blob copied into another slot, or a header
+//! edited to claim another size, sequence or age, does not decrypt to a
+//! usable key.  A taken slot is erased right after the take (and by the
+//! background if that erase fails), so there is no ciphertext left whose
+//! TAKEN word could be "un-programmed" by erasing and rewriting the sector
+//! from the same image.  Restoring an *older* image (with the key still
+//! untaken) is the rollback class (S-15, `docs/AUDIT_2026-10.md`), out of
+//! scope here as for every flash-backed state.
 
 use pico2hsm_core::error::{CryptoError, HsmError, StorageError};
 use pico2hsm_core::key::KeyType as CoreKeyType;
@@ -148,7 +156,8 @@ pub trait PoolBackend {
     /// The slot table (kept in RAM; reading it costs no flash access).
     fn pool_slots(&mut self) -> Result<[SlotState; POOL_SLOTS], StorageError>;
     /// Encrypt `obj` and write it to the blank-or-dirty `slot`.  `obj`'s
-    /// `key_id` / `generation` must be `pool_key_id(slot, class)` / `seq`.
+    /// `key_id` / `generation` / `use_count` must be
+    /// `pool_key_id(slot, class)` / `seq` / `birth`.
     fn pool_put(
         &mut self,
         slot: u8,
@@ -374,10 +383,10 @@ impl<F: CounterFlash> PoolRegion<F> {
         &mut self,
         slot: u8,
         out: &mut [u8],
-    ) -> Result<(usize, SizeClass, u32), StorageError> {
+    ) -> Result<(usize, SizeClass, u32, u32), StorageError> {
         self.check(slot)?;
         match self.scan_slot(slot)? {
-            SlotState::Valid { class, seq, .. }
+            SlotState::Valid { class, seq, birth }
                 if self.slots[slot as usize] != SlotState::Taken =>
             {
                 let mut h = [0u8; HEADER];
@@ -388,7 +397,7 @@ impl<F: CounterFlash> PoolRegion<F> {
                 }
                 self.flash
                     .read(Self::base(slot) + HEADER as u32, &mut out[..len])?;
-                Ok((len, class, seq))
+                Ok((len, class, seq, birth))
             }
             _ => Err(StorageError::IntegrityFailure),
         }
@@ -405,7 +414,8 @@ impl<F: CounterFlash> PoolRegion<F> {
         seq: u32,
         obj: &KeyObject,
     ) -> Result<(), HsmError> {
-        if obj.key_id != pool_key_id(slot, class) || obj.generation != seq {
+        if obj.key_id != pool_key_id(slot, class) || obj.generation != seq || obj.use_count != birth
+        {
             return Err(HsmError::InvalidInput);
         }
         let mut blob = obj
@@ -420,13 +430,14 @@ impl<F: CounterFlash> PoolRegion<F> {
     /// Read and decrypt a valid slot's key under `smk`.
     pub fn get_key(&mut self, smk: &[u8; 32], slot: u8) -> Result<KeyObject, HsmError> {
         let mut buf = [0u8; MAX_BLOB_SIZE];
-        let (len, class, seq) = self.read_blob(slot, &mut buf).map_err(HsmError::Storage)?;
+        let (len, class, seq, birth) = self.read_blob(slot, &mut buf).map_err(HsmError::Storage)?;
         let id = pool_key_id(slot, class);
         let obj = KeyObject::decrypt(&buf[..len], id, smk)
             .map_err(|_| HsmError::Crypto(CryptoError::DecryptFailure));
         zeroize::Zeroize::zeroize(&mut buf[..]);
         let obj = obj?;
-        if obj.generation != seq {
+        // The authenticated copies of the header's sequence and birth.
+        if obj.generation != seq || obj.use_count != birth {
             return Err(HsmError::Storage(StorageError::IntegrityFailure));
         }
         Ok(obj)
@@ -587,6 +598,10 @@ mod tests {
     use pico2hsm_core::key::AppletId;
 
     fn obj(slot: u8, class: SizeClass, seq: u32) -> KeyObject {
+        obj_born(slot, class, seq, 0)
+    }
+
+    fn obj_born(slot: u8, class: SizeClass, seq: u32, birth: u32) -> KeyObject {
         let mut o = KeyObject::new(
             KmType::Rsa,
             pool_key_id(slot, class),
@@ -594,6 +609,7 @@ mod tests {
             AlgorithmId::RsaDecrypt,
         );
         o.generation = seq;
+        o.use_count = birth;
         o.private_key.extend_from_slice(&[0xA5; 1200]).unwrap();
         o.public_key.extend_from_slice(&[0x5A; 258]).unwrap();
         o
@@ -603,8 +619,14 @@ mod tests {
     fn write_reopen_take_erase() {
         let mut p = MemPool::new();
         assert_eq!(p.pool_slots().unwrap(), [SlotState::Blank; POOL_SLOTS]);
-        p.pool_put(3, SizeClass::R2048, 100, 7, &obj(3, SizeClass::R2048, 7))
-            .unwrap();
+        p.pool_put(
+            3,
+            SizeClass::R2048,
+            100,
+            7,
+            &obj_born(3, SizeClass::R2048, 7, 100),
+        )
+        .unwrap();
         p.reboot();
         let s = p.pool_slots().unwrap();
         assert_eq!(
@@ -643,8 +665,14 @@ mod tests {
     #[test]
     fn a_blob_moved_to_another_slot_does_not_decrypt() {
         let mut p = MemPool::new();
-        p.pool_put(0, SizeClass::R3072, 5, 9, &obj(0, SizeClass::R3072, 9))
-            .unwrap();
+        p.pool_put(
+            0,
+            SizeClass::R3072,
+            5,
+            9,
+            &obj_born(0, SizeClass::R3072, 9, 5),
+        )
+        .unwrap();
         let sector = SECTOR as usize;
         let copy: std::vec::Vec<u8> = p.region.flash_mut().data[..sector].to_vec();
         p.region.flash_mut().data[sector..2 * sector].copy_from_slice(&copy);
@@ -657,9 +685,67 @@ mod tests {
         assert!(p.pool_get(0).is_ok());
     }
 
+    /// Rewrites a slot's plaintext header field at `off` (with a fixed-up
+    /// CRC) — what an attacker with flash access could do in place.
+    fn tamper_header(p: &mut MemPool, slot: usize, off: usize, value: &[u8]) {
+        let sector = SECTOR as usize;
+        let data = &mut p.region.flash_mut().data;
+        let base = slot * sector;
+        data[base + off..base + off + value.len()].copy_from_slice(value);
+        let len = u16::from_le_bytes([data[base + 6], data[base + 7]]) as usize;
+        let mut h = crc32fast::Hasher::new();
+        h.update(&data[base..base + 16]);
+        h.update(&data[base + 32..base + 32 + len]);
+        let c = h.finalize().to_le_bytes();
+        data[base + 16..base + 20].copy_from_slice(&c);
+    }
+
+    #[test]
+    fn header_tampering_in_place_is_caught() {
+        // Claim another size, another sequence number, a younger birth.
+        for (off, value) in [
+            (5usize, &[SizeClass::R4096 as u8][..]),
+            (12, &8u32.to_le_bytes()[..]),
+            (8, &999u32.to_le_bytes()[..]),
+        ] {
+            let mut p = MemPool::new();
+            p.pool_put(
+                2,
+                SizeClass::R2048,
+                10,
+                7,
+                &obj_born(2, SizeClass::R2048, 7, 10),
+            )
+            .unwrap();
+            tamper_header(&mut p, 2, off, value);
+            p.reboot();
+            // The header parses (CRC fixed up) ...
+            assert!(matches!(
+                p.pool_slots().unwrap()[2],
+                SlotState::Valid { .. }
+            ));
+            // ... but the authenticated copy disagrees: refused.
+            assert!(p.pool_get(2).is_err(), "tamper at {off}");
+        }
+    }
+
+    #[test]
+    fn birth_must_match_on_put() {
+        let mut p = MemPool::new();
+        assert!(p
+            .pool_put(
+                1,
+                SizeClass::R2048,
+                5,
+                1,
+                &obj_born(1, SizeClass::R2048, 1, 6)
+            )
+            .is_err());
+    }
+
     #[test]
     fn torn_write_is_never_valid() {
-        let o = obj(2, SizeClass::R4096, 1);
+        let o = obj_born(2, SizeClass::R4096, 1, 1);
         let mut written = 0;
         // Cut power after every possible number of programmed bytes.
         for budget in (0..1600).step_by(37).chain([1650, 1700, 1800, 4000]) {

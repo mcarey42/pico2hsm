@@ -1318,7 +1318,7 @@ the `rsa` feature both sub-commands answer `6A81`.
 | Offset | Size | Field |
 |---|---|---|
 | 0 | 1 | format version, 1 |
-| 1 | 1 | health: `01` boot RNG check passed (pool may run), `02` pool region present, `04` background filling stopped after 3 failed writes in a row (until reboot) |
+| 1 | 1 | health: `01` boot RNG check passed (pool may run), `02` pool region present, `04` background work stopped after 3 failed flash writes / erases in a row (until reboot), `08` configuration or pool clock unreadable / not persisted: pool held off and emptied (fail closed) |
 | 2 | 8 | configuration, as RSA_POOL_CONFIG's data |
 | 10 | 3 | issuable keys (valid and younger than the maximum age): RSA-2048, -3072, -4096 |
 | 13 | 2 | size being generated, in bits; 0 = none |

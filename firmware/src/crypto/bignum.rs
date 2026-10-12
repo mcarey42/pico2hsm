@@ -17,11 +17,21 @@
 //! accesses depend only on `len`, never on the operands.
 //!
 //! # Constant time
-//! The modular primitives (`mont_*`, `mod_add`, `mod_sub`, `mod_double`,
-//! `mod_half`, [`select_from_table`]) are branch-free in their operands.
-//! Comparisons ([`cmp`], [`bit_len`]) and the small-divisor helpers are
-//! variable-time; the key generator only uses those on public values or
-//! where the module docs of `rsa_keygen` say so.
+//! Constant-time in the operands (no data-dependent branch, memory index
+//! or `UDIV`/`SDIV` — the Cortex-M33's divider takes 2–11 cycles depending
+//! on its operands): the modular primitives (`mont_*`, `mod_*`,
+//! [`select_from_table`]), [`add_small`] / [`sub_small`] (full length, no
+//! early exit), and every `ct_*` function: masks, comparisons, trailing
+//! zeros, shifts by a secret amount, division / remainder by a small
+//! divisor (multiplication by a reciprocal), the inverse modulo a small
+//! prime, and binary-GCD steps.
+//!
+//! Variable-time, and **only for public values** (the modulus, test code,
+//! public divisors computed once): [`cmp`], [`bit_len`],
+//! [`trailing_zeros`], [`is_zero`], [`div_small`], [`rem_small`],
+//! [`inv_mod_u32`], [`jacobi_u32`] (the one secret use, the Lucas `D`
+//! search, is argued in `rsa_keygen`).  `shr` / `shl` take a public shift
+//! amount (constant-time in the value).
 
 // Index loops mirror the textbook algorithms (several arrays per index).
 #![allow(clippy::needless_range_loop)]
@@ -53,7 +63,7 @@ fn sbb(a: u32, b: u32, borrow: u32) -> (u32, u32) {
 
 /// All-ones if `bit` is 1, zero if 0 (`bit` must be 0 or 1).
 #[inline(always)]
-fn mask(bit: u32) -> u32 {
+const fn mask(bit: u32) -> u32 {
     0u32.wrapping_sub(bit)
 }
 
@@ -81,13 +91,11 @@ pub fn sub_assign(a: &mut [u32], b: &[u32]) -> u32 {
     br
 }
 
-/// `a += k` for a small `k`; returns the carry.
+/// `a += k` for a small `k`; returns the carry.  Full length (no early
+/// exit when the carry dies), so constant-time in `a`.
 pub fn add_small(a: &mut [u32], k: u32) -> u32 {
     let mut c = k;
     for x in a.iter_mut() {
-        if c == 0 {
-            break;
-        }
         let (s, c2) = adc(*x, c, 0);
         *x = s;
         c = c2;
@@ -95,13 +103,10 @@ pub fn add_small(a: &mut [u32], k: u32) -> u32 {
     c
 }
 
-/// `a -= k` for a small `k`; returns the borrow.
+/// `a -= k` for a small `k`; returns the borrow.  Full length.
 pub fn sub_small(a: &mut [u32], k: u32) -> u32 {
     let mut br = k;
     for x in a.iter_mut() {
-        if br == 0 {
-            break;
-        }
         let (d, b2) = sbb(*x, br, 0);
         *x = d;
         br = b2;
@@ -121,6 +126,7 @@ pub fn mul_small(a: &mut [u32], k: u32) -> u32 {
 }
 
 /// `a /= k` in place; returns `a mod k`.  `k` must be non-zero.
+/// Variable-time (64-bit software division): public values only.
 pub fn div_small(a: &mut [u32], k: u32) -> u32 {
     let k = u64::from(k);
     let mut r: u64 = 0;
@@ -132,7 +138,7 @@ pub fn div_small(a: &mut [u32], k: u32) -> u32 {
     r as u32
 }
 
-/// `a mod k` (`k` non-zero).
+/// `a mod k` (`k` non-zero).  Variable-time: public values only.
 pub fn rem_small(a: &[u32], k: u32) -> u32 {
     let k = u64::from(k);
     let mut r: u64 = 0;
@@ -140,19 +146,6 @@ pub fn rem_small(a: &[u32], k: u32) -> u32 {
         r = ((r << 32) | u64::from(x)) % k;
     }
     r as u32
-}
-
-/// `a mod p` for a 16-bit divisor, using only 32-bit divisions (the
-/// Cortex-M33 has a hardware `UDIV`, but no 64-bit divide).
-#[inline]
-pub fn rem_u16(a: &[u32], p: u16) -> u32 {
-    let p = u32::from(p);
-    let mut r: u32 = 0;
-    for &x in a.iter().rev() {
-        r = ((r << 16) | (x >> 16)) % p;
-        r = ((r << 16) | (x & 0xFFFF)) % p;
-    }
-    r
 }
 
 /// `out = a · b` (schoolbook); `out.len()` must be `a.len() + b.len()`.
@@ -217,7 +210,8 @@ pub fn bit(a: &[u32], i: usize) -> u32 {
     (a[i / 32] >> (i % 32)) & 1
 }
 
-/// Number of significant bits (0 for zero).  Variable-time.
+/// Number of significant bits (0 for zero).  Variable-time: public values
+/// only (see [`ct_bit_len`]).
 pub fn bit_len(a: &[u32]) -> usize {
     for i in (0..a.len()).rev() {
         if a[i] != 0 {
@@ -227,7 +221,8 @@ pub fn bit_len(a: &[u32]) -> usize {
     0
 }
 
-/// Number of trailing zero bits (0 for zero).  Variable-time.
+/// Number of trailing zero bits (0 for zero).  Variable-time: public
+/// values only (see [`ct_tz`]).
 pub fn trailing_zeros(a: &[u32]) -> usize {
     for (i, &x) in a.iter().enumerate() {
         if x != 0 {
@@ -237,12 +232,13 @@ pub fn trailing_zeros(a: &[u32]) -> usize {
     0
 }
 
-/// `a == 0`.  Variable-time.
+/// `a == 0`.  Variable-time: public values only (see [`ct_is_zero`]).
 pub fn is_zero(a: &[u32]) -> bool {
     a.iter().all(|&x| x == 0)
 }
 
-/// Compare equal-length numbers.  Variable-time.
+/// Compare equal-length numbers.  Variable-time (early exit): public
+/// values only (see [`ct_lt`]).
 pub fn cmp(a: &[u32], b: &[u32]) -> Ordering {
     for i in (0..a.len()).rev() {
         match a[i].cmp(&b[i]) {
@@ -255,11 +251,230 @@ pub fn cmp(a: &[u32], b: &[u32]) -> Ordering {
 
 /// Constant-time equality of equal-length numbers.
 pub fn ct_eq(a: &[u32], b: &[u32]) -> bool {
+    ct_eq_mask(a, b) != 0
+}
+
+// ─── Constant-time helpers ───────────────────────────────────────────────────
+
+/// All-ones if `x == 0`, else 0 (no comparison instruction on `x`).
+#[inline(always)]
+pub fn ct_zero_mask_u32(x: u32) -> u32 {
+    mask(((x | x.wrapping_neg()) >> 31) ^ 1)
+}
+
+/// All-ones if `a < b`, for `a, b < 2^31`.
+#[inline(always)]
+pub fn ct_lt_mask_u32(a: u32, b: u32) -> u32 {
+    mask(a.wrapping_sub(b) >> 31)
+}
+
+/// All-ones if `a == b` (equal-length numbers).
+pub fn ct_eq_mask(a: &[u32], b: &[u32]) -> u32 {
     let mut acc = 0;
     for (&x, &y) in a.iter().zip(b) {
         acc |= x ^ y;
     }
-    acc == 0
+    ct_zero_mask_u32(acc)
+}
+
+/// All-ones if `a == 0`.
+pub fn ct_is_zero(a: &[u32]) -> u32 {
+    let mut acc = 0;
+    for &x in a {
+        acc |= x;
+    }
+    ct_zero_mask_u32(acc)
+}
+
+/// All-ones if `a < b` (equal-length numbers): the borrow of `a − b`.
+pub fn ct_lt(a: &[u32], b: &[u32]) -> u32 {
+    let mut br = 0;
+    for (&x, &y) in a.iter().zip(b) {
+        let (_, b2) = sbb(x, y, br);
+        br = b2;
+    }
+    mask(br)
+}
+
+/// `out = m ? a : b` word by word (`m` all-ones or zero).
+pub fn ct_select(out: &mut [u32], a: &[u32], b: &[u32], m: u32) {
+    for ((o, &x), &y) in out.iter_mut().zip(a).zip(b) {
+        *o = (x & m) | (y & !m);
+    }
+}
+
+/// Number of trailing zero bits (0 for zero), constant-time.
+pub fn ct_tz(a: &[u32]) -> u32 {
+    let mut tz = 0;
+    let mut found = 0;
+    for (i, &w) in a.iter().enumerate() {
+        let nz = !ct_zero_mask_u32(w);
+        // RBIT + CLZ on the M33 (TZCNT on x86): constant-time.
+        let t = (32 * i as u32).wrapping_add(w.trailing_zeros());
+        tz |= t & nz & !found;
+        found |= nz;
+    }
+    tz
+}
+
+/// Number of significant bits, constant-time.
+pub fn ct_bit_len(a: &[u32]) -> u32 {
+    let mut len = 0;
+    for (i, &w) in a.iter().enumerate() {
+        let nz = !ct_zero_mask_u32(w);
+        // CLZ is constant-time; later (higher) non-zero words override.
+        let l = (32 * i as u32 + 32).wrapping_sub(w.leading_zeros());
+        len = (l & nz) | (len & !nz);
+    }
+    len
+}
+
+/// Shift right by a secret amount `sh` (< 32·len): a barrel shifter of
+/// masked public-amount shifts.
+pub fn ct_shr(a: &mut [u32], sh: u32) {
+    let n = a.len();
+    let mut t = [0u32; MAX_WORDS];
+    let mut stage = 0;
+    while (1usize << stage) < 32 * n {
+        let m = mask((sh >> stage) & 1);
+        t[..n].copy_from_slice(a);
+        shr(&mut t[..n], 1 << stage);
+        for (x, &y) in a.iter_mut().zip(&t[..n]) {
+            *x = (y & m) | (*x & !m);
+        }
+        stage += 1;
+    }
+    crate::security::zeroize::wipe_words(&mut t[..n]);
+}
+
+/// `floor((2^32 − 1) / d)` for `0 < d < 2^17`, by a fixed 32-step restoring
+/// division (no `UDIV`: `d` may be secret).
+pub const fn ct_recip(d: u32) -> u32 {
+    let mut rem: u32 = 0;
+    let mut q: u32 = 0;
+    let mut i = 32;
+    while i > 0 {
+        i -= 1;
+        rem = (rem << 1) | 1; // the bits of 2^32 − 1
+        let ge = !mask(rem.wrapping_sub(d) >> 31); // rem ≥ d (both < 2^18)
+        rem = rem.wrapping_sub(d & ge);
+        q |= (ge & 1) << i;
+    }
+    q
+}
+
+/// `(x / d, x mod d)` for `x < 2^32` and `0 < d < 2^17` with `recip =
+/// ct_recip(d)`: multiply by the reciprocal (`UMULL`), one masked
+/// correction.  `x·recip / 2^32` undershoots the quotient by at most one.
+#[inline(always)]
+fn ct_divrem32(x: u32, d: u32, recip: u32) -> (u32, u32) {
+    let mut q = ((u64::from(x) * u64::from(recip)) >> 32) as u32;
+    let mut r = x.wrapping_sub(q.wrapping_mul(d)); // < 2d
+    let ge = !mask(r.wrapping_sub(d) >> 31);
+    r = r.wrapping_sub(d & ge);
+    q = q.wrapping_add(ge & 1);
+    (q, r)
+}
+
+/// `a mod d` for `0 < d < 2^17`, constant-time in `a` and `d` (`recip =
+/// ct_recip(d)`).  Each word goes in 2 + 15 + 15-bit pieces so that
+/// `(r << bits) | piece` stays below 2^32.
+pub fn ct_rem_small(a: &[u32], d: u32, recip: u32) -> u32 {
+    let mut r = 0;
+    for &w in a.iter().rev() {
+        r = ct_divrem32((r << 2) | (w >> 30), d, recip).1;
+        r = ct_divrem32((r << 15) | ((w >> 15) & 0x7FFF), d, recip).1;
+        r = ct_divrem32((r << 15) | (w & 0x7FFF), d, recip).1;
+    }
+    r
+}
+
+/// `a /= d` in place, returning `a mod d`, for `0 < d < 2^17`;
+/// constant-time in `a` and `d` (`recip = ct_recip(d)`).
+pub fn ct_divrem_small(a: &mut [u32], d: u32, recip: u32) -> u32 {
+    let mut r = 0;
+    for w in a.iter_mut().rev() {
+        let (q0, r0) = ct_divrem32((r << 2) | (*w >> 30), d, recip);
+        let (q1, r1) = ct_divrem32((r0 << 15) | ((*w >> 15) & 0x7FFF), d, recip);
+        let (q2, r2) = ct_divrem32((r1 << 15) | (*w & 0x7FFF), d, recip);
+        *w = (q0 << 30) | (q1 << 15) | q2;
+        r = r2;
+    }
+    r
+}
+
+/// `r⁻¹ mod p` for a prime `p < 2^17` (`recip = ct_recip(p)`), by Fermat:
+/// `r^(p−2)`, square-and-multiply over the public exponent.  0 for `r ≡ 0`.
+pub fn ct_inv_mod_small_prime(r: u32, p: u32, recip: u32) -> u32 {
+    let mulmod = |x: u32, y: u32| {
+        let t = u64::from(x) * u64::from(y);
+        ct_rem_small(&[t as u32, (t >> 32) as u32], p, recip)
+    };
+    let e = p - 2;
+    let mut acc = 1u32;
+    let base = ct_rem_small(&[r], p, recip);
+    let mut i = 32 - e.leading_zeros();
+    while i > 0 {
+        i -= 1;
+        acc = mulmod(acc, acc);
+        if (e >> i) & 1 == 1 {
+            // The exponent is public.
+            acc = mulmod(acc, base);
+        }
+    }
+    acc
+}
+
+/// `gcd(a, b)` of small numbers (`b < 2^17` public or secret), by a fixed
+/// number of binary-GCD steps; constant-time.
+pub fn ct_gcd_u32(a: u32, b: u32) -> u32 {
+    // gcd(a, b) = gcd(a mod b, b); both below 2^17, then 2·17 steps of the
+    // odd-v binary GCD after taking out the common power of two.
+    let mut u = a;
+    let mut v = b;
+    let zu = (u | 0x0002_0000).trailing_zeros();
+    let zv = (v | 0x0002_0000).trailing_zeros();
+    let k = zv ^ ((zu ^ zv) & ct_lt_mask_u32(zu, zv)); // min
+    u >>= zu & 31;
+    v >>= zv & 31;
+    // v odd (unless b == 0, which callers never pass).
+    for _ in 0..80 {
+        let odd = mask(u & 1);
+        let lt = ct_lt_mask_u32(u, v);
+        let d = u.wrapping_sub(v);
+        let nd = v.wrapping_sub(u);
+        let swap = odd & lt;
+        let nv = (u & swap) | (v & !swap);
+        let diff = (nd & lt) | (d & !lt);
+        u = ((diff & odd) | (u & !odd)) >> 1;
+        v = nv;
+    }
+    v << k
+}
+
+/// One step of constant-time binary GCD for `v` odd: if `u` is odd,
+/// `(u, v) = (|u − v|, min(u, v))`; then `u >>= 1`.  `2·bits` steps take
+/// any `u` to 0, leaving `gcd` in `v`.
+pub fn ct_gcd_step(u: &mut [u32], v: &mut [u32]) {
+    let n = u.len();
+    let odd = mask(u[0] & 1);
+    let mut d = [0u32; MAX_WORDS];
+    let mut nd = [0u32; MAX_WORDS];
+    d[..n].copy_from_slice(u);
+    let br = sub_assign(&mut d[..n], v); // u − v
+    nd[..n].copy_from_slice(v);
+    sub_assign(&mut nd[..n], u); // v − u
+    let lt = mask(br);
+    let swap = odd & lt;
+    for j in 0..n {
+        let new_v = (u[j] & swap) | (v[j] & !swap);
+        let diff = (nd[j] & lt) | (d[j] & !lt);
+        u[j] = (diff & odd) | (u[j] & !odd);
+        v[j] = new_v;
+    }
+    shr1(u);
+    crate::security::zeroize::wipe_words(&mut d[..n]);
+    crate::security::zeroize::wipe_words(&mut nd[..n]);
 }
 
 /// Load a big-endian byte string into `out` (zero-extended; excess high
@@ -317,6 +532,7 @@ pub fn mod_add(x: &mut [u32], y: &[u32], m: &[u32]) {
     for j in 0..n {
         x[j] = (s[j] & keep_s) | (x[j] & !keep_s);
     }
+    crate::security::zeroize::wipe_words(s);
 }
 
 /// `x = (x - y) mod m` for `x, y < m`.
@@ -348,6 +564,7 @@ pub fn mod_double(x: &mut [u32], m: &[u32]) {
     for j in 0..n {
         x[j] = (d[j] & keep_d) | (x[j] & !keep_d);
     }
+    crate::security::zeroize::wipe_words(d);
 }
 
 /// `x = 2x mod m` if `bit` is 1, else `x` unchanged (`x < m`; constant
@@ -602,7 +819,7 @@ pub fn select_from_table(out: &mut [u32], table: &[u32], entries: usize, idx: u3
     let n = out.len();
     out.fill(0);
     for e in 0..entries {
-        let hit = mask(u32::from(e as u32 == idx));
+        let hit = ct_zero_mask_u32(e as u32 ^ idx);
         let row = &table[e * n..e * n + n];
         for j in 0..n {
             out[j] |= row[j] & hit;
@@ -612,8 +829,8 @@ pub fn select_from_table(out: &mut [u32], table: &[u32], entries: usize, idx: u3
 
 // ─── Small-integer helpers ───────────────────────────────────────────────────
 
-/// `a⁻¹ mod m` for coprime `a`, `m` (`m` > 1).  Variable-time (used on
-/// residues modulo the public exponent).
+/// `a⁻¹ mod m` for coprime `a`, `m` (`m` > 1).  Variable-time (extended
+/// Euclid): public values only — secrets use [`ct_inv_mod_small_prime`].
 pub fn inv_mod_u32(a: u32, m: u32) -> Option<u32> {
     let (mut r0, mut r1) = (i64::from(m), i64::from(a % m));
     let (mut t0, mut t1) = (0i64, 1i64);
@@ -628,7 +845,8 @@ pub fn inv_mod_u32(a: u32, m: u32) -> Option<u32> {
     Some(t0.rem_euclid(i64::from(m)) as u32)
 }
 
-/// Jacobi symbol `(a / n)` for odd `n` > 0.  Variable-time.
+/// Jacobi symbol `(a / n)` for odd `n` > 0.  Variable-time (see the Lucas
+/// `D` search in `rsa_keygen` for its one use on a secret residue).
 pub fn jacobi_u32(mut a: u32, mut n: u32) -> i32 {
     debug_assert!(n & 1 == 1);
     a %= n;
@@ -816,7 +1034,14 @@ mod tests {
             let k = rng.next() | 1;
             let p = (rng.next() as u16) | 1;
             assert_eq!(BigUint::from(rem_small(&a, k)), big(&a) % k);
-            assert_eq!(BigUint::from(rem_u16(&a, p)), big(&a) % u32::from(p));
+            let d = (rng.next() % 131_071) + 1; // < 2^17
+            let rc = ct_recip(d);
+            assert_eq!(rc, u32::MAX / d);
+            assert_eq!(BigUint::from(ct_rem_small(&a, d, rc)), big(&a) % d);
+            let mut qa = a.clone();
+            let rr = ct_divrem_small(&mut qa, d, rc);
+            assert_eq!(big(&qa) * d + rr, big(&a));
+            let _ = p;
             let mut q = a.clone();
             let r = div_small(&mut q, k);
             assert_eq!(big(&q) * k + r, big(&a));
@@ -832,6 +1057,87 @@ mod tests {
             let b = rng.fill(9);
             mul_into(&mut prod, &a, &b);
             assert_eq!(big(&prod), big(&a) * big(&b));
+        }
+    }
+
+    #[test]
+    fn constant_time_helpers_match_reference() {
+        let mut rng = Lcg(19);
+        for _ in 0..200 {
+            let n = (rng.next() % 9 + 1) as usize;
+            let a = rng.fill(n);
+            let mut b = rng.fill(n);
+            assert_eq!(ct_lt(&a, &b) != 0, big(&a) < big(&b));
+            assert_eq!(ct_eq_mask(&a, &a), u32::MAX);
+            b[0] ^= 1 << (rng.next() % 32);
+            assert_eq!(ct_eq_mask(&a, &b) != 0, a == b);
+            let mut z = a.clone();
+            let sh = rng.next() % 32;
+            z[0] &= !((1u32 << sh) - 1);
+            z[0] |= 1 << sh;
+            assert_eq!(ct_tz(&z) as usize, trailing_zeros(&z));
+            assert_eq!(ct_bit_len(&a) as usize, bit_len(&a));
+            assert_eq!(ct_is_zero(&a) != 0, is_zero(&a));
+            let s = rng.next() % (32 * n as u32);
+            let mut x = a.clone();
+            ct_shr(&mut x, s);
+            let mut y = a.clone();
+            shr(&mut y, s as usize);
+            assert_eq!(x, y);
+        }
+        assert_eq!(ct_tz(&[0, 0]), 0);
+        assert_eq!(ct_bit_len(&[0, 0]), 0);
+        for p in [3u32, 5, 65_537, 131_071] {
+            let rc = ct_recip(p);
+            for r in [1u32, 2, p - 1, p / 2 + 1, 12_345 % p] {
+                if r == 0 {
+                    continue;
+                }
+                let inv = ct_inv_mod_small_prime(r, p, rc);
+                assert_eq!(
+                    u64::from(inv) * u64::from(r) % u64::from(p),
+                    1,
+                    "{r} mod {p}"
+                );
+            }
+        }
+        for (a, b) in [
+            (12u32, 18u32),
+            (17, 5),
+            (0, 7),
+            (65_536, 6),
+            (1, 1),
+            (96, 64),
+        ] {
+            let g = {
+                let (mut x, mut y) = (a, b);
+                while y != 0 {
+                    (x, y) = (y, x % y);
+                }
+                x
+            };
+            assert_eq!(ct_gcd_u32(a, b), g, "gcd({a},{b})");
+        }
+        // Multi-word GCD steps against the reference.
+        for _ in 0..50 {
+            let u = rng.fill(4);
+            let mut v = rng.fill(4);
+            v[0] |= 1;
+            let want = {
+                let (mut x, mut y) = (big(&u), big(&v));
+                while y != BigUint::from(0u8) {
+                    let r = &x % &y;
+                    x = y;
+                    y = r;
+                }
+                x
+            };
+            let (mut uu, mut vv) = (u.clone(), v.clone());
+            for _ in 0..2 * 128 {
+                ct_gcd_step(&mut uu, &mut vv);
+            }
+            assert!(is_zero(&uu));
+            assert_eq!(big(&vv), want);
         }
     }
 

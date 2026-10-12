@@ -27,6 +27,18 @@
 //! - **Off**: turning the pool off erases every pooled key.  INITIALIZE
 //!   (a trust reset) erases them as well; the configuration itself, the
 //!   clock and the sequence number survive.
+//! - **Fail closed.**  A configuration that cannot be read (counter log
+//!   unreadable, record invalid) counts as *off*: pooled keys are erased
+//!   and GENERATE generates live.  A pool clock that cannot be read or
+//!   persisted means ages can no longer be trusted across a reboot, so the
+//!   pool is likewise held off (and emptied) for the rest of the boot.
+//!   Repeated flash failures (writes or erases) stop the background work
+//!   until reboot.  A pooled key is only ever handed out after its slot
+//!   reads back as taken, and it is then erased at once.
+//! - **No remnants.**  The generator's state is wiped after every key
+//!   (pooled, issued live, discarded or failed) and on every restart;
+//!   decrypted pool objects and the issued pair are zeroized by the
+//!   caller-side owners (`KeyObject` / `RsaKeyPair` wipe on drop).
 
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -49,8 +61,8 @@ pub const MIN_MAX_AGE_MIN: u32 = 60;
 pub const MAX_MAX_AGE_MIN: u32 = 365 * 24 * 60;
 /// How often the pool clock is persisted (minutes).
 pub const CLOCK_PERSIST_MIN: u64 = 10;
-/// Failed pool writes in a row before background filling stops until
-/// the next boot (a worn or failing region must not be hammered).
+/// Failed pool writes or erases in a row before background work stops
+/// until the next boot (a worn or failing region must not be hammered).
 const MAX_WRITE_FAILURES: u8 = 3;
 
 /// Pool settings (persisted in the counter log, `ValueId::PoolConfig`).
@@ -73,6 +85,12 @@ impl PoolConfig {
         rotate: true,
         max_age_min: 4 * 60,
         depth: [4, 2, 2],
+    };
+
+    /// What an unreadable configuration counts as: off (fail closed).
+    pub const FAIL_CLOSED: PoolConfig = PoolConfig {
+        enabled: false,
+        ..PoolConfig::DEFAULT
     };
 
     const F_ENABLED: u8 = 0x01;
@@ -190,7 +208,8 @@ pub struct PoolStatus {
     /// Keys generated live (pool empty / off) since boot.
     pub live: u32,
     /// Bit 0: RNG ready; bit 1: pool region present; bit 2: background
-    /// filling stopped after write failures.
+    /// work stopped after flash failures; bit 3: configuration or clock
+    /// unreadable / not persisted — pool held off (fail closed).
     pub health: u8,
 }
 
@@ -209,6 +228,12 @@ pub struct Engine {
     seq: u32,
     persisted_seq: u32,
     rng_ok: bool,
+    /// The pool clock was read at load and every persist since succeeded:
+    /// ages can be trusted.  Pooled keys are used only while this holds.
+    clock_ok: bool,
+    /// The configuration was read from the counter log (or was never
+    /// written, i.e. the factory setting).
+    config_ok: bool,
     write_failures: u8,
     generated: u32,
     rotated: u32,
@@ -230,6 +255,8 @@ impl Engine {
             seq: 0,
             persisted_seq: 0,
             rng_ok: false,
+            clock_ok: false,
+            config_ok: false,
             write_failures: 0,
             generated: 0,
             rotated: 0,
@@ -257,19 +284,24 @@ impl Engine {
     }
 
     /// Load config, clock and sequence number (first use after boot).
+    /// Anything unreadable fails closed (see the module docs).
     fn load(&mut self, store: &mut dyn KeyStore, uptime_min: u64) {
         let mut cfg = None;
-        let mut clock = 0;
+        let mut clock = None;
         let mut seq = 0;
         if let Some(log) = store.retry_counters() {
-            cfg = log
-                .value(ValueId::PoolConfig)
-                .ok()
-                .flatten()
-                .and_then(PoolConfig::decode);
-            clock = log.value(ValueId::PoolClock).ok().flatten().unwrap_or(0);
+            cfg = match log.value(ValueId::PoolConfig) {
+                Ok(None) => Some(PoolConfig::DEFAULT),
+                Ok(Some(v)) => PoolConfig::decode(v),
+                Err(_) => None,
+            };
+            clock = log.value(ValueId::PoolClock).ok().map(|c| c.unwrap_or(0));
             seq = log.value(ValueId::PoolSeq).ok().flatten().unwrap_or(0) as u32;
         }
+        self.config_ok = cfg.is_some();
+        self.config = cfg.unwrap_or(PoolConfig::FAIL_CLOSED);
+        self.clock_ok = clock.is_some();
+        let mut clock = clock.unwrap_or(0);
         self.persisted_clock = clock;
         self.persisted_seq = seq;
         if let Some(pool) = store.rsa_pool() {
@@ -282,11 +314,30 @@ impl Engine {
                 }
             }
         }
-        self.config = cfg.unwrap_or(PoolConfig::DEFAULT);
         self.clock_base = clock;
         self.uptime_at_load = uptime_min;
         self.seq = seq;
         self.loaded = true;
+    }
+
+    /// Erase a slot, counting failures (fail closed: stop hammering a
+    /// failing region).
+    fn erase_counted(&mut self, store: &mut dyn KeyStore, i: usize) -> bool {
+        let ok = store
+            .rsa_pool()
+            .is_some_and(|p| p.pool_erase(i as u8).is_ok());
+        if ok {
+            self.write_failures = 0;
+        } else {
+            self.write_failures = self.write_failures.saturating_add(1);
+        }
+        ok
+    }
+
+    /// The pool may hold and hand out keys: enabled, configuration and
+    /// clock trusted.
+    fn pool_usable(&self) -> bool {
+        self.config.enabled && self.config_ok && self.clock_ok
     }
 
     fn ensure_loaded(&mut self, store: &mut dyn KeyStore, uptime_min: u64) {
@@ -330,31 +381,26 @@ impl Engine {
             Some(Ok(s)) => s,
             _ => return Activity::Idle,
         };
-        let erase = |store: &mut dyn KeyStore, i: usize| {
-            store
-                .rsa_pool()
-                .is_some_and(|p| p.pool_erase(i as u8).is_ok())
-        };
-
-        // Off: erase whatever is left (the config APDU already did; this
-        // is the backstop after a failed erase or a reboot mid-wipe).
-        if !self.config.enabled {
+        if self.write_failures >= MAX_WRITE_FAILURES {
+            return Activity::Idle;
+        }
+        // Off (or configuration / clock not trustworthy): erase whatever is
+        // left — the config APDU already did; this is the backstop after a
+        // failed erase, a reboot mid-wipe, or an unreadable log.
+        if !(self.config.enabled && self.config_ok && self.clock_ok) {
             if self.gen_class.take().is_some() {
                 self.kg.reset();
             }
             if let Some(i) = slots.iter().position(|s| *s != SlotState::Blank) {
-                erase(store, i);
+                self.erase_counted(store, i);
                 return Activity::Worked;
             }
-            return Activity::Idle;
-        }
-        if self.write_failures >= MAX_WRITE_FAILURES {
             return Activity::Idle;
         }
 
         // Taken or torn slots: erase (wipes the issued key's pool copy).
         if let Some(i) = slots.iter().position(|s| s.needs_erase()) {
-            erase(store, i);
+            self.erase_counted(store, i);
             return Activity::Worked;
         }
 
@@ -383,31 +429,33 @@ impl Engine {
             let too_many = count > self.config.depth[class as usize];
             let too_old = self.config.rotate && !self.in_age(now, birth);
             if too_many || too_old {
-                if erase(store, i) && too_old && !too_many {
+                if self.erase_counted(store, i) && too_old && !too_many {
                     self.rotated += 1;
                 }
                 return Activity::Worked;
             }
         }
 
-        // Persist the clock (and sequence number) now and then.
+        // Persist the clock (and sequence number) now and then.  A clock
+        // that cannot be persisted would come back too young after a
+        // reboot, so a failure holds the pool off (and empties it) for the
+        // rest of this boot.  The sequence number is only a tie-breaker.
         if now >= self.persisted_clock + CLOCK_PERSIST_MIN || self.seq > self.persisted_seq {
-            if let Some(log) = store.retry_counters() {
-                let ok_c = log.put_value(ValueId::PoolClock, now).is_ok();
-                let ok_s = log.put_value(ValueId::PoolSeq, u64::from(self.seq)).is_ok();
-                if ok_c {
-                    self.persisted_clock = now;
-                }
-                if ok_s {
-                    self.persisted_seq = self.seq;
-                }
-                if ok_c || ok_s {
-                    return Activity::Worked;
-                }
-            }
-            // No log (or it failed): keep going; births still carry time.
+            let (ok_c, ok_s) = match store.retry_counters() {
+                Some(log) => (
+                    log.put_value(ValueId::PoolClock, now).is_ok(),
+                    log.put_value(ValueId::PoolSeq, u64::from(self.seq)).is_ok(),
+                ),
+                None => (false, false),
+            };
             self.persisted_clock = now;
             self.persisted_seq = self.seq;
+            if !ok_c {
+                self.clock_ok = false;
+                self.write_failures = self.write_failures.saturating_add(1);
+            }
+            let _ = ok_s;
+            return Activity::Worked;
         }
 
         // What to make next: the size furthest below its depth.
@@ -449,12 +497,15 @@ impl Engine {
             }
             Poll::Ready => {
                 let Some(slot) = slots.iter().position(|s| *s == SlotState::Blank) else {
-                    // No blank slot (all erases failing): try later.
+                    // No blank slot (erases failing): discard the key
+                    // rather than keep it in RAM.
+                    self.kg.reset();
+                    self.gen_class = None;
                     return Activity::Worked;
                 };
                 let seq = self.seq.wrapping_add(1);
                 let birth = now.min(u64::from(u32::MAX)) as u32;
-                let result = match self.pooled_object(slot as u8, class, seq) {
+                let result = match self.pooled_object(slot as u8, class, seq, birth) {
                     Some(obj) => match store.rsa_pool() {
                         Some(p) => p.pool_put(slot as u8, class, birth, seq, &obj),
                         None => Err(HsmError::Storage(StorageError::NotFormatted)),
@@ -479,14 +530,16 @@ impl Engine {
     /// The generator's key as a pooled `KeyObject` (same layout as a
     /// generated SC-HSM key: PKCS#1 DER private key; public key
     /// `len(2, BE) || modulus || exponent`).
-    fn pooled_object(&self, slot: u8, class: SizeClass, seq: u32) -> Option<KeyObject> {
+    fn pooled_object(&self, slot: u8, class: SizeClass, seq: u32, birth: u32) -> Option<KeyObject> {
         let mut obj = KeyObject::new(
             KmType::Rsa,
             pool_key_id(slot, class),
             pico2hsm_core::key::AppletId::ScHsm,
             AlgorithmId::RsaDecrypt,
         );
+        // Sequence and birth ride in the authenticated header (GCM AAD).
         obj.generation = seq;
+        obj.use_count = birth;
         self.kg.write_der(&mut obj.private_key).ok()?;
         let mut modulus: heapless::Vec<u8, 512> = heapless::Vec::new();
         self.kg.write_modulus(&mut modulus).ok()?;
@@ -516,7 +569,7 @@ impl Engine {
         let class = SizeClass::of_key_type(key_type).ok_or(IssueError::Unsupported)?;
         self.ensure_loaded(store, uptime_min);
         let now = self.now(uptime_min);
-        if self.config.enabled {
+        if self.pool_usable() {
             if let Some(pool) = store.rsa_pool() {
                 if self.take_pooled(pool, class, now, out)? {
                     self.issued += 1;
@@ -620,6 +673,10 @@ impl Engine {
                     out.zeroize();
                     return Err(IssueError::Storage);
                 }
+                // Destroy the pooled ciphertext now (there is then nothing
+                // whose TAKEN mark could be rewritten).  If the erase
+                // fails the slot stays taken and the background retries.
+                let _ = pool.pool_erase(slot);
                 return Ok(true);
             }
             // Unusable (corrupt, wrong key): retire it, try the next.
@@ -646,6 +703,7 @@ impl Engine {
         log.put_value(ValueId::PoolConfig, cfg.encode())
             .map_err(HsmError::Storage)?;
         self.config = cfg;
+        self.config_ok = true;
         self.write_failures = 0;
         if !cfg.enabled {
             self.wipe(store)?;
@@ -684,7 +742,7 @@ impl Engine {
                 present = true;
                 for s in slots {
                     if let SlotState::Valid { class, birth, .. } = s {
-                        if self.config.enabled && self.in_age(now, birth) {
+                        if self.pool_usable() && self.in_age(now, birth) {
                             ready[class as usize] += 1;
                         }
                     }
@@ -708,7 +766,8 @@ impl Engine {
             live: self.live,
             health: u8::from(self.rng_ok)
                 | (u8::from(present) << 1)
-                | (u8::from(self.write_failures >= MAX_WRITE_FAILURES) << 2),
+                | (u8::from(self.write_failures >= MAX_WRITE_FAILURES) << 2)
+                | (u8::from(!(self.config_ok && self.clock_ok)) << 3),
         }
     }
 }
@@ -1049,7 +1108,8 @@ mod tests {
         assert!(r.windows(256).any(|w| w == modulus));
         // Taken on flash; stored under the requested reference exactly as
         // a fresh key (same private / public encoding, counters at zero).
-        assert_eq!(s.slots()[newest], SlotState::Taken);
+        // Taken, then erased at once.
+        assert_eq!(s.slots()[newest], SlotState::Blank);
         let (kid, generation, uses, der, public) = s.saved.last().unwrap().clone();
         assert_eq!(kid, pico2hsm_core::key::KeyId::sc_hsm(0, 5).0);
         assert_eq!((generation, uses), (0, 0));
@@ -1058,6 +1118,138 @@ mod tests {
         // Numbered like any keygen.
         assert_eq!(s.counters.lamport, 1);
         with_engine(|e| assert_eq!(e.status(&mut s, 0).issued, 1));
+    }
+
+    // ── Review findings: fail-open, integrity, remnants ──
+
+    #[test]
+    fn unreadable_config_fails_closed() {
+        let mut e = engine();
+        let mut s = Store::new();
+        let mut rng = TestRng(30);
+        e.set_config(&mut s, small_cfg(), 0).unwrap();
+        settle(&mut e, &mut s, &mut rng, 0, 5000);
+        assert_eq!(s.count(SizeClass::R2048), 2);
+        // The log becomes unreadable: after a reboot the pool is off,
+        // emptied, and GENERATE generates live.
+        s.counters.unformatted = true;
+        e.reboot();
+        let st = e.status(&mut s, 0);
+        assert!(!st.config.enabled);
+        assert_eq!(st.health & 0x08, 0x08);
+        assert_eq!(st.ready, [0, 0, 0]);
+        let before = s.count(SizeClass::R2048);
+        let p = issue(&mut e, &mut s, CoreKeyType::RsaPrivate2048, &mut rng, 0).unwrap();
+        assert_eq!(p.modulus.len(), 256);
+        assert_eq!(e.status(&mut s, 0).live, 1);
+        assert_eq!(s.count(SizeClass::R2048), before, "no pooled key used");
+        settle(&mut e, &mut s, &mut rng, 0, 5000);
+        assert_eq!(s.slots(), [SlotState::Blank; POOL_SLOTS]);
+        // An invalid stored record fails closed too.
+        s.counters.unformatted = false;
+        s.counters.values[ValueId::PoolConfig.index()] = Some(0xFF);
+        e.reboot();
+        assert!(!e.config(&mut s, 0).enabled);
+    }
+
+    #[test]
+    fn clock_persist_failure_holds_the_pool_off() {
+        let mut e = engine();
+        let mut s = Store::new();
+        let mut rng = TestRng(31);
+        e.set_config(&mut s, small_cfg(), 0).unwrap();
+        settle(&mut e, &mut s, &mut rng, 0, 5000);
+        assert_eq!(s.count(SizeClass::R2048), 2);
+        s.counters.fail_values = true;
+        // Ten minutes later the clock cannot be persisted.
+        e.background_step(&mut s, &mut rng, 10, &mut Units(10));
+        let st = e.status(&mut s, 10);
+        assert_eq!(st.health & 0x08, 0x08);
+        assert_eq!(st.ready, [0, 0, 0]);
+        let p = issue(&mut e, &mut s, CoreKeyType::RsaPrivate2048, &mut rng, 10).unwrap();
+        assert_eq!(p.modulus.len(), 256);
+        assert_eq!(e.status(&mut s, 10).issued, 0);
+        settle(&mut e, &mut s, &mut rng, 10, 5000);
+        assert_eq!(s.slots(), [SlotState::Blank; POOL_SLOTS]);
+    }
+
+    #[test]
+    fn erase_failures_stop_the_background() {
+        let mut e = engine();
+        let mut s = Store::new();
+        let mut rng = TestRng(32);
+        e.set_config(&mut s, small_cfg(), 0).unwrap();
+        settle(&mut e, &mut s, &mut rng, 0, 5000);
+        issue(&mut e, &mut s, CoreKeyType::RsaPrivate2048, &mut rng, 0).unwrap();
+        // Make every erase fail; a stray dirty slot needs one.
+        let blank = s
+            .slots()
+            .iter()
+            .position(|x| *x == SlotState::Blank)
+            .unwrap();
+        let sector = crate::storage::flash_layout::SECTOR as usize;
+        s.pool.region.flash_mut().data[blank * sector] = 0;
+        s.pool.reboot();
+        s.pool.region.flash_mut().fail_erase = true;
+        let n = settle(&mut e, &mut s, &mut rng, 0, 5000);
+        assert!(n <= 4, "kept hammering a failing erase ({n} steps)");
+        assert_eq!(e.status(&mut s, 0).health & 0x04, 0x04);
+    }
+
+    #[test]
+    fn issued_slot_is_erased_at_once() {
+        let mut e = engine();
+        let mut s = Store::new();
+        let mut rng = TestRng(33);
+        e.set_config(&mut s, small_cfg(), 0).unwrap();
+        settle(&mut e, &mut s, &mut rng, 0, 5000);
+        let before = s.slots();
+        issue(&mut e, &mut s, CoreKeyType::RsaPrivate2048, &mut rng, 0).unwrap();
+        let after = s.slots();
+        let i = (0..POOL_SLOTS).find(|&i| before[i] != after[i]).unwrap();
+        // Blank: the ciphertext is gone, nothing for a rewrite to restore.
+        assert_eq!(after[i], SlotState::Blank);
+        let sector = crate::storage::flash_layout::SECTOR as usize;
+        assert!(s.pool.region.flash_mut().data[i * sector..(i + 1) * sector]
+            .iter()
+            .all(|&b| b == 0xFF));
+    }
+
+    #[test]
+    fn generator_holds_no_secrets_after_use() {
+        let mut e = engine();
+        let mut s = Store::new();
+        let mut rng = TestRng(34);
+        e.set_config(
+            &mut s,
+            PoolConfig {
+                depth: [1, 0, 0],
+                ..PoolConfig::DEFAULT
+            },
+            0,
+        )
+        .unwrap();
+        // After a key is pooled.
+        settle(&mut e, &mut s, &mut rng, 0, 5000);
+        assert!(e.kg.holds_no_secrets());
+        // After a live key (pool emptied by a take first).
+        issue(&mut e, &mut s, CoreKeyType::RsaPrivate2048, &mut rng, 0).unwrap();
+        issue(&mut e, &mut s, CoreKeyType::RsaPrivate3072, &mut rng, 0).unwrap();
+        assert!(e.kg.holds_no_secrets());
+        // After an abort mid-generation (pool turned off).
+        for _ in 0..30 {
+            e.background_step(&mut s, &mut rng, 0, &mut Units(300));
+        }
+        assert!(e.kg.is_busy());
+        e.set_config(&mut s, PoolConfig::FAIL_CLOSED, 0).unwrap();
+        assert!(e.kg.holds_no_secrets());
+        // After a restart inside the generator (fresh primes), nothing of
+        // the old attempt is kept: covered by `restart_key` → wipe_secrets.
+        let mut kg = Box::new(KeyGen::new());
+        kg.start(512);
+        kg.step(&mut rng, &mut Units(2000));
+        kg.reset();
+        assert!(kg.holds_no_secrets());
     }
 
     #[test]
@@ -1110,7 +1302,8 @@ mod tests {
             .1;
         let pair = issue(&mut e, &mut s, CoreKeyType::RsaPrivate2048, &mut rng, 0).unwrap();
         assert_eq!(pair.modulus.len(), 256);
-        assert_eq!(s.slots()[newest], SlotState::Taken);
+        // Taken, then erased at once.
+        assert_eq!(s.slots()[newest], SlotState::Blank);
         assert_eq!(e.status(&mut s, 0).issued, 1);
         // The background erases the taken slot and refills.
         settle(&mut e, &mut s, &mut rng, 0, 5000);
