@@ -1,5 +1,21 @@
 # Display Rendering Research — embedded-graphics + ST7789
 
+> **Status (2026-10, display redesign).**  This is the background research.
+> What the firmware does now is in `DISPLAY_ARCHITECTURE.md` and
+> `DISPLAY_LAYOUT.md`.  Where it differs from the notes below:
+> - Both panels run **RGB444** (COLMOD 0x03 / 0x33), not RGB565, with a
+>   palette defined in RGB444 (`display/color.rs`) and a custom `C444`
+>   colour type; nothing converts from RGB565 any more.
+> - There is **no framebuffer**.  The screen is rendered in 16-row
+>   full-width bands into a 7 680 B (Waveshare) / 5 760 B (Geek) buffer and
+>   each band is one window + one DMA transfer; only bands whose content
+>   changed are redrawn.  The shared `Rgb444Band` target uses span fills.
+> - Waveshare MADCTL is **0xA0** (MY + MV), landscape 320 × 172 with RASET
+>   34–205; the Geek uses 0x70 = MX + MV + ML (RGB order, not BGR).
+> - SPI runs at 37.5 MHz on both LCDs (40 MHz requested; 150 MHz / 4).
+>   75 MHz would be out of spec.
+> - Controller init on both boards uses async `embassy_time` delays.
+
 **Target boards:** Waveshare RP2350-Geek (240×135, SPI1, 30 MHz) and Waveshare RP2350-LCD-1.47-B (172×320 portrait / 320×172 landscape, SPI0, 40 MHz)
 **Runtime:** no_std + no_alloc, Embassy async, Cortex-M33 (RP2350)
 

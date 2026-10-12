@@ -1,805 +1,321 @@
-# Display Update Architecture
+# Display Architecture
 
-## Overview
+How the status display on the LCD boards gets its data and draws it.
+Boards: RP2350-Geek (ST7789, 240×135, SPI1) and Waveshare RP2350-LCD-1.47
+(ST7789V3, 320×172, SPI0, plus a WS2812B LED).  The pixel layout is in
+`DISPLAY_LAYOUT.md`.
 
-The display pipeline decouples the APDU loop from display rendering so that
-SPI writes to the ST7789 never add latency to a CCID command response.
+Code:
 
-The APDU loop (a plain `async` block inside `run_geek_board`) posts a
-`DisplayUpdate` message into a static `Channel` and immediately continues.
-A separate Embassy task on core0 (`display_task`) drains that channel,
-maintains the full `DisplayState`, drives the SPI bus, and manages the
-screensaver timer.  Nothing crosses to core1; the display task is pure core0.
-
-```
-USB host
-   │  CCID bulk-OUT
-   ▼
-ccid.recv_apdu()          ← core0, CCID loop
-   │
-   ├─ DISPLAY_CHANNEL.try_send(DisplayUpdate::ApduActivity)   // non-blocking
-   ├─ APDU_CHANNEL.send(apdu_bytes).await                     // to core1
-   │
-   │        core1 dispatcher_task (crypto) ─────────────────────────────┐
-   │                                                                     │
-   ◄─ RESP_CHANNEL.receive().await ◄────────────────────────────────────┘
-   │
-   ├─ DISPLAY_CHANNEL.try_send(DisplayUpdate::SetLastOp(op))  // non-blocking
-   ├─ DISPLAY_CHANNEL.try_send(DisplayUpdate::SetStatus(s))   // non-blocking
-   │
-   └─ ccid.send_response(...)
-```
-
-The display task runs as a third future joined alongside `usb.run()` and
-`ccid_fut`, or spawned as a separate Embassy task. Either composition works;
-the spawned-task approach is preferred because it avoids widening the join
-tuple and keeps `run_geek_board` readable. See Section 6 for the task
-skeleton.
-
----
-
-## 1. `DisplayState` Struct
-
-`DisplayState` is the complete model for one rendered frame. The display task
-owns the single authoritative instance and mutates it in response to
-`DisplayUpdate` messages.
-
-```rust
-/// Timestamp in seconds since boot, derived from `embassy_time::Instant`.
-type BootSecs = u32;
-
-/// Classification of the last completed HSM operation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LastOperation {
-    Sign,
-    KeyGen,
-    Ecdh,
-    Decrypt,
-    Verify,
-    ChangePin,
-    Initialize,
-    Other,
-}
-
-/// Everything needed to render one display frame.
-#[derive(Debug, Clone, Copy)]
-pub struct DisplayState {
-    /// Overall HSM status — maps to a status-bar colour.
-    pub status: LedStatus,
-
-    /// Number of key objects currently stored.
-    pub key_count: u8,
-
-    /// `true` when both flash mirrors are healthy (RAID intact).
-    pub storage_ok: bool,
-
-    /// `true` when a PIN session is active (VERIFY succeeded, not yet timed out).
-    pub authenticated: bool,
-
-    /// Last completed operation and the boot-second at which it completed.
-    /// Cleared to `None` after `LAST_OP_DISPLAY_SECS` seconds have elapsed.
-    pub last_op: Option<(LastOperation, BootSecs)>,
-
-    /// Persistent error message.  Set on any unrecoverable error; cleared
-    /// when the next successful operation arrives.
-    pub error_msg: Option<&'static str>,
-
-    /// Seconds elapsed since firmware boot (wraps at ~136 years).
-    pub uptime_secs: BootSecs,
-}
-
-impl DisplayState {
-    pub const fn new() -> Self {
-        Self {
-            status: LedStatus::Off,
-            key_count: 0,
-            storage_ok: true,
-            authenticated: false,
-            last_op: None,
-            error_msg: None,
-            uptime_secs: 0,
-        }
-    }
-}
-```
-
-Key design choices:
-
-- All fields are `Copy` — no heap, no `heapless::Vec`. The struct is 24 bytes
-  on a 32-bit target and passes cheaply through the channel.
-- `last_op` carries a timestamp rather than a countdown so the display task can
-  recompute the remaining TTL relative to the current `uptime_secs` on every
-  render pass, without needing a separate timer future.
-- `error_msg` is `&'static str` — error strings are compile-time literals;
-  there is no need for a heap-allocated string.
-
----
-
-## 2. `DisplayUpdate` Enum
-
-Messages posted by the APDU loop. The channel capacity (Section 4) is 8;
-if the channel is full `try_send` silently drops the update. This is
-acceptable because the display is informational — a dropped status update
-causes a one-frame stale display, never a protocol error.
-
-```rust
-/// Message posted by the APDU loop to the display task.
-#[derive(Debug, Clone, Copy)]
-pub enum DisplayUpdate {
-    /// Overall HSM status changed (Busy/Ready/Error/WaitingForPin/…).
-    SetStatus(LedStatus),
-
-    /// Number of stored keys changed (after GenerateKey or DeleteKey).
-    SetKeyCount(u8),
-
-    /// Last completed operation (posted after RESP_CHANNEL.receive() returns).
-    SetLastOp(LastOperation),
-
-    /// A persistent error message to show until the next successful op.
-    SetError(&'static str),
-
-    /// Clear the persistent error (posted on any successful operation).
-    ClearError,
-
-    /// Any APDU arrived — resets screensaver timer, wakes display.
-    /// Posted by the CCID loop immediately on recv_apdu() Ok(_).
-    ApduActivity,
-
-    /// Storage health changed.
-    SetStorageHealth(bool),
-
-    /// PIN session state changed.
-    SetAuthenticated(bool),
-
-    /// Periodic uptime tick posted by a 1-second timer task or inline in the
-    /// CCID loop.  Drives uptime_secs and triggers screensaver countdown.
-    Tick(u32),
-}
-```
-
-`SetError` and `ClearError` are separate variants rather than
-`SetError(Option<…>)` to make call-sites read clearly:
-
-```rust
-// On success:
-let _ = DISPLAY_CHANNEL.try_send(DisplayUpdate::ClearError);
-// On error:
-let _ = DISPLAY_CHANNEL.try_send(DisplayUpdate::SetError("flash write failed"));
-```
-
----
-
-## 3. `DisplayChannel` Static
-
-```rust
-use embassy_sync::channel::Channel;
-// Spinlock 28 is unreserved in this firmware (29=APDU, 30=RESP, 31=defmt RTT).
-use embassy_rp::spinlock_mutex::SpinlockRawMutex;
-
-/// Core0 APDU loop → Core0 display task.
-/// Capacity 8: absorbs a burst of updates for one APDU round-trip
-/// (ApduActivity + SetStatus(Busy) + SetLastOp + SetStatus(Ready) + ClearError
-/// = 5 messages max per APDU) without dropping.
-pub static DISPLAY_CHANNEL: Channel<SpinlockRawMutex<28>, DisplayUpdate, 8> = Channel::new();
-```
-
-Why a `SpinlockRawMutex` rather than `CriticalSectionRawMutex`? Both
-producers (the CCID async block) and the consumer (display task) run on core0,
-so a `CriticalSectionRawMutex` would also work and is marginally cheaper.
-However, using a numbered spinlock keeps the concurrency model explicit and
-consistent with the existing `APDU_CHANNEL` / `RESP_CHANNEL` pattern, making
-it easier to audit which spinlocks each core can hold simultaneously.
-
-Spinlock assignment:
-
-| Spinlock | Owner |
+| Path | What |
 |---|---|
-| 29 | `APDU_CHANNEL` (core0 → core1) |
-| 30 | `RESP_CHANNEL` (core1 → core0) |
-| 31 | defmt RTT (embassy-rp critical_section) — **do not use on core1** |
-| 28 | `DISPLAY_CHANNEL` (core0 → core0) — new |
+| `pico2hsm-core/src/op.rs` | `classify_op`: the one table mapping an APDU of any applet to an operation category; `OpResult::of_sw` |
+| `firmware/src/display_snapshot.rs` | Core1 → core0 snapshot (seqlock), SAS mailbox, core0 input atomics |
+| `firmware/src/apdu/dispatcher.rs` | `display_begin` / `display_end` / `display_snapshot` (core1 side) |
+| `firmware/src/display/model.rs` | `Controller::step`: inputs → `Screen` (status priority, auth staleness, screensaver, SAS expiry) |
+| `firmware/src/display/view.rs` | The view model (`Screen` and its parts, all `Copy + PartialEq`) |
+| `firmware/src/display/layout.rs` | Pixel layouts for both panels |
+| `firmware/src/display/render.rs` | `render(&Screen, &Layout, target)` |
+| `firmware/src/display/band.rs` | `Rgb444Band` draw target (16-row band, span fills), `Scale2` |
+| `firmware/src/display/driver.rs` | `Panel` trait, `ScreenDriver` (dirty bands, partial updates) |
+| `firmware/src/display/task.rs` | The display task loop (ARM only) |
+| `firmware/src/display/tests.rs` | Host render harness (golden hashes, text fit, previews) |
+| `firmware/src/board/rp2350_geek.rs`, `waveshare_rp2350_lcd.rs` | The two `Panel`s (controller init, band writes, sleep/wake, LED) |
+
+Everything except `task.rs` and the board panels compiles and is tested on
+the host.
 
 ---
 
-## 4. Integration Points in `main.rs`
+## 1. Data flow
 
-The APDU loop is duplicated across four board runners
-(`run_geek_board`, `run_one_board`, `run_pico2_board`,
-`run_waveshare_lcd_board`). The integration pattern is identical in each.
-This section uses `run_geek_board` as the reference; the diff for the other
-three runners is structurally identical.
-
-Only the Geek board currently has an LCD. The display task should be compiled
-only when the `rp2350_geek_*` features are active (or in future when any
-other board feature enables a display). Guard the spawn with
-`#[cfg(any(feature = "rp2350_geek_16m", ...))]`.
-
-### 4a. Before the CCID loop — spawn the display task
-
-Insert after the line `board.led().set_status(LedStatus::Ready);` (line 567
-in the current file) and before `let usb_fut = usb.run();` (line 599):
-
-```rust
-// ── CHECKPOINT 6b — spawn display task (Geek board only) ──────────────
-#[cfg(any(
-    feature = "rp2350_geek_16m",
-    feature = "rp2350_geek_sdcard",
-))]
-spawner.spawn(display_task()).expect("display task");
+```text
+ core1 (sync dispatcher_loop)                 core0 (Embassy executor)
+ ────────────────────────────                 ─────────────────────────
+                                              CCID loop: recv APDU
+                                                 send_to_core1(apdu)
+                                                 APDU_STARTED_MS = now
+                                                 DISPLAY_KICK.signal()
+ display_begin(apdu) ─ tracked op? ─┐
+   SNAP.write(W0..W4) [in progress] │
+ dispatch_with_store(...)           │         display task wakes:
+ display_end(response, store)       │           step(inputs) → Screen
+ SNAP.write(W0..W4) [outcome]       │           dirty bands → render → DMA
+ blocking_send(RESP_CHANNEL)        │
+                                              await_core1_response
+                                              APDU_STARTED_MS = 0
+                                              DISPLAY_KICK.signal()
+                                              send response to host
 ```
 
-`spawner` is the `Spawner` argument of `#[embassy_executor::main]`.
-`run_geek_board` must gain a `spawner: Spawner` parameter:
-
-```rust
-// Before:
-async fn run_geek_board(p: embassy_rp::Peripherals) {
-
-// After:
-async fn run_geek_board(p: embassy_rp::Peripherals, spawner: embassy_executor::Spawner) {
-```
-
-And the call-site in `main()` changes from:
-
-```rust
-run_geek_board(p).await;
-```
-
-to:
-
-```rust
-run_geek_board(p, _spawner).await;
-```
-
-(`_spawner` is already the parameter name of `main`.)
-
-Apply the same `spawner` parameter addition to the other board runners that
-will use a display task in the future. For runners without a display it is a
-no-op — the parameter is simply unused.
-
-### 4b. Inside the CCID loop — posting updates
-
-The five insertion points within the `ccid_fut` async block are:
-
-```rust
-// (1) Immediately after recv_apdu() returns Ok — wake screensaver, mark busy.
-Ok(apdu_bytes) => {
-    let _ = DISPLAY_CHANNEL.try_send(DisplayUpdate::ApduActivity);  // NEW
-    let _ = DISPLAY_CHANNEL.try_send(DisplayUpdate::SetStatus(LedStatus::Busy)); // NEW
-    board.led().set_status(LedStatus::Busy);   // existing — keep for non-LCD boards
-    let _ = APDU_CHANNEL.send(apdu_bytes).await;
-
-    // ... existing time-extension loop ...
-
-    // (2) After RESP_CHANNEL.receive() returns and before send_response — post result.
-    // The APDU loop does not currently know the operation type; a future
-    // enhancement can decode INS from the saved apdu_bytes.  For now, post
-    // a generic SetLastOp. Full INS decoding is described in Section 9.
-    let _ = DISPLAY_CHANNEL.try_send(DisplayUpdate::SetLastOp(LastOperation::Other)); // NEW
-
-    match ccid.send_response(&response).await {
-        Ok(()) => {
-            // (3) Successful response delivered.
-            let _ = DISPLAY_CHANNEL.try_send(DisplayUpdate::ClearError);              // NEW
-            let _ = DISPLAY_CHANNEL.try_send(DisplayUpdate::SetStatus(LedStatus::Ready)); // NEW
-            board.led().set_status(LedStatus::Ready); // existing
-        }
-        Err(CcidError::UsbDisconnected) => { ... }
-        Err(_) => {}
-    }
-}
-// (4) On recv_apdu error / USB disconnect — return to Ready.
-Err(CcidError::UsbDisconnected) => {
-    ...
-    let _ = DISPLAY_CHANNEL.try_send(DisplayUpdate::SetStatus(LedStatus::Ready)); // NEW
-    board.led().set_status(LedStatus::Ready);  // existing
-    break;
-}
-```
-
-Note: `try_send` is used (never `.await`) so the CCID loop never yields to
-the display task while holding a position in the APDU pipeline. If the channel
-is full (capacity 8), the update is silently dropped; the display shows the
-previous state for one more frame.
-
-### 4c. Uptime ticks
-
-A one-second tick can be produced in two ways:
-
-**Option A — inline tick in the CCID loop (simpler).**
-Not viable: the CCID loop blocks on `recv_apdu()` indefinitely; it cannot
-independently fire a 1-second timer.
-
-**Option B — separate tick task (recommended).**
-A tiny core0 task posts `DisplayUpdate::Tick(secs)` every second:
-
-```rust
-#[embassy_executor::task]
-async fn uptime_tick_task() {
-    let mut secs: u32 = 0;
-    loop {
-        embassy_time::Timer::after_secs(1).await;
-        secs = secs.wrapping_add(1);
-        let _ = DISPLAY_CHANNEL.try_send(DisplayUpdate::Tick(secs));
-    }
-}
-```
-
-Spawn alongside the display task:
-
-```rust
-spawner.spawn(uptime_tick_task()).expect("uptime tick task");
-```
-
----
-
-## 5. Display Task Skeleton
-
-```rust
-/// How long to show a last-op label before reverting to the main status view.
-const LAST_OP_DISPLAY_SECS: u32 = 3;
-
-/// Screensaver activates after this many seconds of APDU inactivity.
-const SCREENSAVER_TIMEOUT_SECS: u32 = 300; // 5 minutes
-
-#[cfg(any(
-    feature = "rp2350_geek_16m",
-    feature = "rp2350_geek_sdcard",
-))]
-#[embassy_executor::task]
-async fn display_task() {
-    use embassy_time::{Duration, Instant, Timer};
-    use pico2hsm_firmware::board::rp2350_geek::{
-        LCD_HEIGHT, LCD_WIDTH, ScreenLayout, St7789StatusDisplay,
-    };
-    use pico2hsm_firmware::display::render;
-
-    // --- Hardware init ---
-    // St7789StatusDisplay::new() steals the SPI1 + LCD GPIO pins.
-    // This is safe because display_task() is spawned after run_geek_board()
-    // has already consumed the SPI1 peripheral into Rp2350GeekBoard, which
-    // means the St7789StatusDisplay::new() call here should be the *second*
-    // owner.  To avoid the double-steal, the preferred refactor is to move
-    // St7789StatusDisplay construction entirely into display_task() and
-    // remove it from Rp2350GeekBoard — see Section 8 (Refactor Notes).
-    // Until that refactor, display_task() receives the constructed
-    // St7789StatusDisplay via a StaticCell:
-    //
-    //   static DISPLAY_CELL: StaticCell<St7789StatusDisplay> = StaticCell::new();
-    //
-    // run_geek_board() calls DISPLAY_CELL.init(St7789StatusDisplay::new(spi1))
-    // before spawning this task, which transfers ownership cleanly.
-    let display: &'static mut St7789StatusDisplay = DISPLAY_CELL.wait().await;
-
-    let layout = ScreenLayout::for_st7789_geek(); // 240×135, pre-computed font zones
-
-    let mut state = DisplayState::new();
-    let mut screensaver = ScreensaverState::Active;
-    let mut last_activity_secs: u32 = 0;
-
-    loop {
-        // Drain all pending messages before rendering (batching).
-        // Use a short timeout so the screensaver timer still fires even when
-        // there is no APDU activity.
-        let deadline = Instant::now() + Duration::from_millis(100);
-        loop {
-            match embassy_futures::select::select(
-                DISPLAY_CHANNEL.receive(),
-                Timer::at(deadline),
-            ).await {
-                embassy_futures::select::Either::First(msg) => {
-                    apply_update(&mut state, msg, &mut last_activity_secs, &mut screensaver);
-                }
-                embassy_futures::select::Either::Second(_) => break,
-            }
-        }
-
-        // Advance screensaver state machine.
-        let idle_secs = state.uptime_secs.saturating_sub(last_activity_secs);
-        match screensaver {
-            ScreensaverState::Active => {
-                if idle_secs >= SCREENSAVER_TIMEOUT_SECS {
-                    screensaver = ScreensaverState::Sleeping;
-                    display.backlight_off();
-                }
-            }
-            ScreensaverState::Sleeping => {
-                // Display stays blank; we still drain the channel but skip render.
-            }
-        }
-
-        // Expire last_op label if TTL elapsed.
-        if let Some((_, op_secs)) = state.last_op {
-            if state.uptime_secs.saturating_sub(op_secs) >= LAST_OP_DISPLAY_SECS {
-                state.last_op = None;
-            }
-        }
-
-        // Render only when awake.
-        if screensaver == ScreensaverState::Active {
-            render(display, &state, &layout);
-        }
-    }
-}
-
-/// Apply one `DisplayUpdate` message to `DisplayState`.
-fn apply_update(
-    state: &mut DisplayState,
-    msg: DisplayUpdate,
-    last_activity_secs: &mut u32,
-    screensaver: &mut ScreensaverState,
-) {
-    match msg {
-        DisplayUpdate::SetStatus(s) => state.status = s,
-        DisplayUpdate::SetKeyCount(n) => state.key_count = n,
-        DisplayUpdate::SetLastOp(op) => state.last_op = Some((op, state.uptime_secs)),
-        DisplayUpdate::SetError(e) => state.error_msg = Some(e),
-        DisplayUpdate::ClearError => state.error_msg = None,
-        DisplayUpdate::SetStorageHealth(ok) => state.storage_ok = ok,
-        DisplayUpdate::SetAuthenticated(a) => state.authenticated = a,
-        DisplayUpdate::ApduActivity => {
-            *last_activity_secs = state.uptime_secs;
-            if *screensaver == ScreensaverState::Sleeping {
-                *screensaver = ScreensaverState::Active;
-                // Caller (display_task loop) will turn backlight on before
-                // the next render call.
-            }
-        }
-        DisplayUpdate::Tick(secs) => state.uptime_secs = secs,
-    }
-}
-```
-
-Key decisions:
-
-- The task polls the channel with a 100 ms deadline rather than blocking
-  indefinitely. This ensures the screensaver timer fires within 100 ms of its
-  deadline even if no APDU arrives.
-- Multiple messages are batched per 100 ms window so a burst of five updates
-  from one APDU round-trip results in one SPI frame write, not five.
-- `apply_update` is a pure function separated from the task body so it can be
-  unit-tested on x86_64 without any `embassy_executor` context.
-
----
-
-## 6. Screensaver State Machine
-
-```
-                 boot
-                  │
-                  ▼
-          ┌───────────────┐
-          │    Active     │◄──────────────────────────┐
-          │               │  ApduActivity message      │
-          │  backlight ON │  (any APDU arrival)        │
-          └───────┬───────┘                            │
-                  │                                    │
-    idle >= 300 s │                                    │
-                  ▼                                    │
-          ┌───────────────┐                            │
-          │   Sleeping    │────────────────────────────┘
-          │               │
-          │ backlight OFF │
-          │  blank screen │
-          └───────────────┘
-```
-
-State representation:
-
-```rust
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ScreensaverState {
-    Active,
-    Sleeping,
-}
-```
-
-Transition rules:
-
-| From | Event | To | Side-effect |
-|---|---|---|---|
-| `Active` | `idle_secs >= SCREENSAVER_TIMEOUT_SECS` | `Sleeping` | `display.backlight_off()` |
-| `Sleeping` | `DisplayUpdate::ApduActivity` received | `Active` | `display.backlight_on()` then full render |
-| `Active` | any `DisplayUpdate` other than `ApduActivity` | `Active` | accumulate, render on next 100 ms tick |
-| `Sleeping` | any `DisplayUpdate` other than `ApduActivity` | `Sleeping` | accumulate state, skip render |
-
-`backlight_off()` and `backlight_on()` are new methods on `St7789StatusDisplay`
-that toggle the `BL` pin without issuing any SPI commands:
-
-```rust
-// To add to St7789StatusDisplay:
-pub fn backlight_off(&mut self) { self.bl.set_low(); }
-pub fn backlight_on(&mut self)  { self.bl.set_high(); }
-```
-
----
-
-## 7. `ScreenLayout` Struct
-
-`ScreenLayout` pre-computes all pixel coordinates and font sizes for a given
-display resolution so that `render()` contains no arithmetic and is easy to
-review.
-
-```rust
-/// Pre-computed layout parameters for one display size.
-///
-/// Produced once at startup by `ScreenLayout::for_st7789_geek()` (or a
-/// future `for_waveshare_lcd()`) and passed by reference to every `render()`.
-#[derive(Debug, Clone, Copy)]
-pub struct ScreenLayout {
-    /// Pixel width of the display (e.g., 240).
-    pub width: u16,
-    /// Pixel height of the display (e.g., 135).
-    pub height: u16,
-
-    // ── Status bar (top strip) ────────────────────────────────────────────────
-    /// Y coordinate of the bottom edge of the status bar.
-    pub status_bar_height: u16,
-    /// Background colour of the status bar (RGB565), overridden per `LedStatus`.
-    pub status_bar_bg: u16,
-
-    // ── Main content zone ─────────────────────────────────────────────────────
-    /// Y start of the main content area (below status bar).
-    pub content_y: u16,
-    /// Height of the main content area in pixels.
-    pub content_height: u16,
-
-    // ── Font sizes (pixel height of one text glyph row) ──────────────────────
-    /// Large font — used for key-count and last-op label.
-    pub font_large_h: u16,
-    /// Small font — used for status text, uptime, storage line.
-    pub font_small_h: u16,
-
-    // ── Text zone origins (x, y top-left of each rendered text block) ─────────
-    /// Top-left of the key-count text.
-    pub key_count_origin: (u16, u16),
-    /// Top-left of the authenticated indicator.
-    pub auth_origin: (u16, u16),
-    /// Top-left of the storage health indicator.
-    pub storage_origin: (u16, u16),
-    /// Top-left of the last-op label (shown for LAST_OP_DISPLAY_SECS seconds).
-    pub last_op_origin: (u16, u16),
-    /// Top-left of the error message text.
-    pub error_origin: (u16, u16),
-    /// Top-left of the uptime counter.
-    pub uptime_origin: (u16, u16),
-}
-
-impl ScreenLayout {
-    /// Layout for the 240×135 ST7789 on the RP2350-Geek.
-    pub const fn for_st7789_geek() -> Self {
-        Self {
-            width: 240,
-            height: 135,
-            status_bar_height: 24,
-            status_bar_bg: 0x0000,
-            content_y: 24,
-            content_height: 111,
-            font_large_h: 28,
-            font_small_h: 14,
-            key_count_origin:  (8,   28),
-            auth_origin:       (160, 28),
-            storage_origin:    (160, 50),
-            last_op_origin:    (8,   70),
-            error_origin:      (8,   96),
-            uptime_origin:     (8,  118),
-        }
-    }
-
-    /// Layout for the 172×320 ST7789V3 on the Waveshare RP2350-LCD-1.47-B
-    /// (landscape: 320×172 logical after MADCTL rotation).
-    pub const fn for_waveshare_lcd_1_47() -> Self {
-        Self {
-            width: 320,
-            height: 172,
-            status_bar_height: 30,
-            status_bar_bg: 0x0000,
-            content_y: 30,
-            content_height: 142,
-            font_large_h: 32,
-            font_small_h: 16,
-            key_count_origin:  (8,   36),
-            auth_origin:       (220, 36),
-            storage_origin:    (220, 60),
-            last_op_origin:    (8,   90),
-            error_origin:      (8,  124),
-            uptime_origin:     (8,  155),
-        }
-    }
-}
-```
-
----
-
-## 8. `render()` Function Signature
-
-```rust
-/// Render the complete display frame.
-///
-/// Called by the display task after batching updates.  Writes to the
-/// display via the `DrawTarget` impl on `St7789StatusDisplay`.
-///
-/// `display` — mutable reference to the display driver (owns the SPI bus).
-/// `state`   — current `DisplayState` (read-only; all fields are `Copy`).
-/// `layout`  — pre-computed pixel geometry for this display size.
-pub fn render<D>(
-    display: &mut D,
-    state: &DisplayState,
-    layout: &ScreenLayout,
-) where
-    D: embedded_graphics::draw_target::DrawTarget<Color = embedded_graphics::pixelcolor::Rgb565>,
-{
-    use embedded_graphics::{
-        mono_font::{ascii::FONT_9X18, ascii::FONT_6X10, MonoTextStyle},
-        prelude::*,
-        primitives::{PrimitiveStyleBuilder, Rectangle},
-        text::Text,
-    };
-
-    // 1. Status bar — full-width rectangle coloured by LedStatus.
-    let bar_color = led_status_to_rgb565(state.status);
-    let bar_style = PrimitiveStyleBuilder::new()
-        .fill_color(Rgb565::new(/* ... unpack bar_color ... */))
-        .build();
-    Rectangle::new(Point::zero(), Size::new(layout.width.into(), layout.status_bar_height.into()))
-        .into_styled(bar_style)
-        .draw(display)
-        .ok();
-
-    // 2. Key count label.
-    // 3. Auth indicator ("PIN" badge or blank).
-    // 4. Storage health indicator.
-    // 5. Last-op label (only when state.last_op.is_some()).
-    // 6. Error message (only when state.error_msg.is_some()).
-    // 7. Uptime counter.
-}
-```
-
-The `DrawTarget` bound means `render()` compiles and runs on x86_64 against
-a `MockDisplay` from the `embedded-graphics-simulator` crate, enabling
-full-frame snapshot tests without physical hardware.
-
----
-
-## 9. Sequence Diagram
-
-```
-Host        USB CCID     core0 CCID loop    DISPLAY_CHANNEL    display_task      ST7789 SPI
- |               |               |                  |                |               |
- |──APDU──►      |               |                  |                |               |
- |          ──recv_apdu──►       |                  |                |               |
- |               |      try_send(ApduActivity)──►   |                |               |
- |               |      try_send(SetStatus(Busy))──►|                |               |
- |               |      APDU_CHANNEL.send().await   |                |               |
- |               |               |  [core1 crypto]  |                |               |
- |               |          (100 ms poll deadline fires)             |               |
- |               |               |                  |──drain msgs──► |               |
- |               |               |                  |                |──render()──── |
- |               |               |                  |                |  fill status  |
- |               |               |                  |                |  bar + zones  |
- |               |               |                  |                | ─────────────►|
- |               |    RESP_CHANNEL.receive().await   |                |               |
- |               |               |                  |                |               |
- |               |      try_send(SetLastOp(op))──►  |                |               |
- |               |      try_send(ClearError)────►   |                |               |
- |               |      try_send(SetStatus(Ready))─►|                |               |
- |               |      send_response()             |                |               |
- |◄──response──  |               |                  |                |               |
- |               |          (100 ms poll fires)      |                |               |
- |               |               |                  |──drain msgs──► |               |
- |               |               |                  |                |──render()─────|
- |               |               |                  |                |  Ready state  |
- |               |               |                  |                | ─────────────►|
-```
-
-Notes on the timeline:
-
-- The 100 ms render window means the display update lags the APDU response by
-  at most 100 ms. This is imperceptible to a human operator.
-- The `try_send` calls are non-blocking and do not appear in the timing path
-  between `recv_apdu` and `send_response`. The entire APDU latency budget is
-  unchanged.
-- `render()` occurs in a different Embassy task and therefore interleaves with
-  `usb.run()` at `await` points inside `render()` (i.e., at each SPI DMA
-  transfer if the SPI is switched to async mode). For the initial
-  implementation using blocking SPI, `render()` is a single long synchronous
-  burst; switching to async SPI is a follow-on optimisation.
-
----
-
-## 10. `StaticCell` Ownership Transfer
-
-The `St7789StatusDisplay` must be constructed exactly once and transferred from
-`run_geek_board` to `display_task` without cloning. The pattern:
-
-```rust
-// In main.rs (module level):
-#[cfg(any(feature = "rp2350_geek_16m", ...))]
-static DISPLAY_CELL: StaticCell<St7789StatusDisplay> = StaticCell::new();
-
-// In run_geek_board(), after Rp2350GeekBoard::new() — before spawning:
-// Extract display from board struct (requires pub field or into_parts() method):
-let (display, spi0_bus) = board.into_parts(); // refactor needed; see below
-DISPLAY_CELL.init(display);
-
-// In display_task():
-let display: &'static mut St7789StatusDisplay = DISPLAY_CELL.wait().await;
-```
-
-The `into_parts()` refactor on `Rp2350GeekBoard` is required because:
-
-1. `display_task` needs sole ownership of `St7789StatusDisplay` (and therefore
-   the SPI1 bus and the four LCD GPIOs).
-2. The CCID loop only needs to call `board.led().set_status()` for non-LCD
-   boards — on the Geek board all status updates go through `DISPLAY_CHANNEL`
-   instead, so the CCID loop can drop its reference to the display entirely.
-
-Until the refactor is done, a simpler interim approach is to keep the
-`St7789StatusDisplay` inside `Rp2350GeekBoard` and have the display task
-access it via a `&'static Mutex<SpinlockRawMutex<28>, St7789StatusDisplay>`.
-This avoids the ownership change at the cost of one spinlock acquisition per
-render.
-
----
-
-## 11. File Layout
-
-New and modified files for the implementation:
-
-```
-firmware/src/
-├── main.rs                          — add DISPLAY_CELL, spawn display_task + uptime_tick_task
-├── board/
-│   ├── mod.rs                       — no changes needed
-│   └── rp2350_geek.rs               — add backlight_off/on, ScreenLayout, into_parts()
-└── display/
-    ├── mod.rs                       — pub use render, DisplayState, DisplayUpdate, DISPLAY_CHANNEL
-    ├── state.rs                     — DisplayState, LastOperation, DisplayUpdate
-    ├── channel.rs                   — DISPLAY_CHANNEL static, uptime_tick_task
-    ├── render.rs                    — render<D: DrawTarget>(), led_status_to_rgb565()
-    └── screensaver.rs               — ScreensaverState, apply_update()
-```
-
-`display/` is a new sub-module of the `pico2hsm_firmware` library crate
-(`firmware/src/lib.rs` will need `pub mod display;`).  The display task itself
-lives in `main.rs` (binary crate) because it references the `DISPLAY_CELL`
-and `DISPLAY_CHANNEL` statics that must have `'static` lifetime rooted at the
-binary crate.
-
----
-
-## 12. RAM Budget
-
-| Item | Size | Notes |
+Core0 never derives state from APDU bytes.  The only truth is core1's
+snapshot; core0 adds what only it knows (USB configured, how long the APDU
+in flight has run, the session epoch, its own clock).
+
+## 2. The snapshot (`display_snapshot::SNAP`)
+
+A seqlock over five `AtomicU32` words.  Writer: `seq += 1` (odd), Release
+fence, store the words (Relaxed), `seq += 1` (even, Release).  Reader:
+Acquire load of `seq`, read the words, Acquire fence, re-read `seq`; retry
+if it was odd or changed; give up after 64 tries and keep the previous
+copy.  One writer: core0 at boot (`publish_boot_snapshot`, before core1
+starts), then core1 only.  No lock is ever held across cores.
+
+| Word | Bits | Field |
 |---|---|---|
-| `DisplayState` | 24 B | On stack inside `display_task` |
-| `ScreensaverState` | 1 B | On stack |
-| `DISPLAY_CHANNEL` (8 × `DisplayUpdate`) | ~96 B | BSS, static |
-| `DISPLAY_CELL` (`St7789StatusDisplay`) | ~64 B | BSS, static (SPI + 4 GPIO pins) |
-| `display_task` future | ~200 B | Embassy task pool |
-| `uptime_tick_task` future | ~16 B | Embassy task pool |
+| W0 session | 0–7 | `epoch_lo`: low byte of the `SESSION_EPOCH` the snapshot was built for |
+| | 8–9 | active applet: 0 none, 1 HSM, 2 PIV, 3 PGP |
+| | 10–16 | auth: HSM_USER, HSM_SO, PIV_PIN, PIV_MGMT, PGP_PW1_81, PGP_PW1_82, PGP_PW3 |
+| | 17–18 | one-shot: PIV_9C_ARMED (`pin_always_ok`), PGP_SIG_SINGLE (C4 = 00 and PW1-81 armed) |
+| | 19–22 / 23–26 | `pri_left` / `pri_max`: active applet's primary PIN (saturated at 15) |
+| | 27–29 | blocked: one bit per applet's primary credential |
+| W1 activity | 0–7 | `op_seq` (wraps) |
+| | 8–12 | `op` (`OpCode`) |
+| | 13–14 | state: 0 idle, 1 in progress, 2 done |
+| | 15–16 | result: 0 ok (9000, 61xx), 1 refused, 2 error |
+| | 17–20 / 21–28 | `algo` / `key_ref` (shown in debug builds only) |
+| | 29–30 | policy hint: 1 PIV 9C PIN-always spent, 2 PGP single-signature PW1 spent |
+| W2 inventory | 0–7 / 8–11 / 12–13 | user keys: SC-HSM / PIV / OpenPGP |
+| | 14–15 | domain: 0 none, 1 DKEK without a member certificate, 2 member, 3 revoked |
+| | 16–21 | member-list entries |
+| W3 health | 0–15 | first two bytes of the domain ID |
+| | 16–21 | `KS_INIT_FAILED`, `SMK_MISSING`, `STORE_WRITE_FAILED` (sticky until a write succeeds), `SD_MISSING`, `MIRROR_DEGRADED`, `PROVISIONED` |
+| W4 | 0–15 | status word of the last tracked operation (debug detail) |
 
-Total addition: approximately 400 bytes BSS, negligible stack. Well within the
-RAM headroom reported in `CLAUDE.md` (current BSS ~210 KB, limit ~520 KB SRAM).
+W4 is an addition to the 4-word layout of the design spec: the raw SW does
+not fit in W1's spare bits.
 
----
+Pack/unpack is unit-tested (`display_snapshot::tests`).
 
-## 13. Dependency Requirements
+### Publish points (all in `dispatcher_loop`, core1)
 
-Add to `firmware/Cargo.toml` under `[dependencies]` (feature-gated):
+1. **Before dispatch**, only for a tracked operation: W1 `state=1`, `op`,
+   `op_seq += 1`.
+2. **After dispatch, before `blocking_send`**: everything, with the
+   outcome.  The host cannot see the response before the display can.
+3. **After `clear_session()`** (a new host session): auth bits zero, the
+   new `epoch_lo`.
+4. **After a reset / reload** (empty APDU), and **at boot** from core0.
 
-```toml
-[dependencies]
-embedded-graphics = { version = "0.8", optional = true }
+### Where the values come from
 
-[features]
-# Enable when any display-equipped board is active.
-display = ["embedded-graphics"]
-rp2350_geek_16m       = ["display", ...]
-rp2350_geek_sdcard    = ["display", ...]
-waveshare_rp2350_lcd_16m = ["display", ...]
+`Dispatcher::display_snapshot()` reads live RAM state only:
+
+- Auth: SC-HSM `pin_verified` / `so_pin_verified`, PIV `pin_verified` /
+  `mgmt_key_authenticated`, OpenPGP `pw1_verified_sign` /
+  `pw1_verified_other` / `pw3_verified`.
+- Retries: the applets' RAM counters (`pin_retry_count`,
+  `pin_state.pin_retries_remaining`, `pw1_retries`).  Every
+  `with_persisted_attempt` keeps them equal to the retry-counter log, so
+  no flash is read per publish.  The SC-HSM user-PIN maximum is the log's
+  `allowance`, cached at boot and after INITIALIZE / RESET RETRY COUNTER.
+- Keys: SC-HSM `key_index` without files (type 16) and refs 0xFC–0xFF;
+  PIV `key_index`; OpenPGP slots with a key type.
+- Domain: `state.domain`, and the member list (count, this device's entry
+  and its status) re-read from the store at boot and after the commands
+  that change it (INITIALIZE, KEY DOMAIN, the EXTRAS domain sub-commands).
+- Health: boot facts from core0 (`set_boot_health`), `STORE_WRITE_FAILED`
+  set on SW 6581 and cleared by the next successful write operation,
+  `PROVISIONED` re-read after a 9000 to INS F0–F2.
+
+### Operation classification
+
+`pico2hsm_core::op::classify_op(applet, ins, p1, p2, data)`:
+
+| Op | Mapping |
+|---|---|
+| Sign | HSM 0x68; PIV 0x87 on 9A/9C/9E with a challenge (tag 81) in the 7C template; PGP 0x2A 9E9A |
+| Decrypt | HSM 0x62 with an RSA algorithm (P2 0x21/0x22); PIV 0x87 on 9D with tag 81 |
+| Derive | HSM 0x62 with an ECDH algorithm or DERIVE_ASYM (P1=01, P2=00); PIV 0x87 on 9D with tag 85 |
+| Auth | PGP 0x88 |
+| Decipher | PGP 0x2A 8086 |
+| KeyGen | HSM 0x46 / 0x48; PIV 0x47; PGP 0x47 with P1=0x80 (P1=0x81 only reads the key) |
+| Import | HSM 0x74 |
+| Delete | HSM 0xE4 |
+| Verify | 0x20 with a PIN (an empty body is a status query, P1=FF a logout: both Other) |
+| ChangePin / Unblock / Initialize | 0x24 / 0x2C / 0x50 |
+| Enroll | HSM EXTRAS 0x54 with P1 0x37 / 0x3D / 0x45 |
+| Other | everything else (SELECT, GET DATA, READ BINARY, GET RESPONSE, ...) |
+
+Note: the design spec mapped "HSM 0x62 with P2=0x00" to Decrypt; in this
+firmware P2=0x00 is DERIVE_ASYM and DECIPHER always carries an algorithm
+byte, so the table above follows the handlers.
+
+`Other` never changes the last operation.  A chained command (CLA bit
+0x10) counts once, as the operation its first block announced
+(`OpTracker`); a GET RESPONSE that completes a chained answer keeps the
+op and its `op_seq`.  61xx is success.  SW classes: ok = 9000 / 61xx;
+error = 64xx / 65xx / 6Fxx (the device failed); refused = everything else
+(wrong PIN, security status, wrong data — the host's request was refused).
+
+## 3. Core0 inputs
+
+| Input | Written by | Meaning |
+|---|---|---|
+| `display_snapshot::USB_CONFIGURED` | `UsbSessionHandler` | a host configured USB |
+| `display_snapshot::APDU_STARTED_MS` | CCID loop | uptime (ms, low 32 bits, never 0) when the APDU in flight went to core1; 0 idle |
+| `SESSION_EPOCH` | USB handler, CCID power cycles | the current host session |
+| `display::task::DISPLAY_KICK` | CCID loop, USB handler | `Signal<CriticalSectionRawMutex, ()>`: look again |
+
+The CCID loop hands the APDU to core1 *first*, then sets the start time and
+kicks.  It never renders.  Core1 never signals `DISPLAY_KICK` (that would
+take the critical-section spinlock core0's USB stack uses); the 300 ms
+WORKING deadline and the kick after the response cover it.
+
+## 4. The display task (`display::task::run`)
+
+`run_geek_board` / `run_waveshare_lcd_board` initialise the panel, draw the
+boot splash through the storage, key-load and USB steps, then join three
+futures on core0: `usb.run()`, the CCID loop, and `display::task::run`
+(which owns the panel: SPI bus, DC/CS/RST/BL, and the WS2812 on Waveshare).
+
+```text
+loop {
+    inputs = sample()                       // snapshot, SAS mailbox, atomics, clock
+    frame  = controller.step(&inputs)       // Screen, sleep?, LED, deadline
+    if frame.sleep { panel sleep } else { wake if asleep; driver.show(screen) }
+    driver.led(frame.led, dim = frame.sleep)  // written only on change
+    select3(DISPLAY_KICK.wait(), Ticker 1 Hz, Timer::at(deadline))
+}
 ```
 
-`embedded-graphics` is a pure-Rust, `no_std` crate with zero unsafe code and
-no heap dependency. It adds approximately 8 KB to flash in a typical
-embedded-graphics application using `MonoFont` text rendering.
+Deadlines: `APDU start + 300 ms` (WORKING appears only then), every 250 ms
+while WORKING (progress bar), every second while a SAS is pending, the end
+of a notice.
+
+### Controller rules (`display::model`)
+
+- **Status** (highest first): ERROR (`STORE_WRITE_FAILED` or
+  `KS_INIT_FAILED`), LOCKED (active applet's primary credential blocked),
+  DEGRADED (`MIRROR_DEGRADED`), WORKING (APDU in flight ≥ 300 ms), NO HOST
+  (USB not configured), READY.  Health fails closed: READY needs no
+  failure bit.
+- **Authentication** is shown only if `W0.epoch_lo == SESSION_EPOCH as u8`
+  and USB is configured; otherwise the applet chip shows `--`, the PIN tile
+  "no applet", and no ADMIN chip.  A logout, a card power-off and a USB
+  reset all show "not authenticated" (audit S2-misc).
+- **ADMIN chip** whenever SO-PIN, PIV management key or PW3 is live in any
+  applet.
+- **Last operation** stays on screen with its age (seen-at time on core0)
+  and fades: TEXT under 10 s, TEXT2 under 60 s, DIM after.  A new session
+  starts at "Idle".
+- **Full-screen errors**: E20 while `SMK_MISSING`; E11 while
+  `KS_INIT_FAILED` and the host has not yet run an operation (afterwards an
+  ERROR band).  E10 is drawn by the boot code (no SD card) before it waits
+  for the watchdog.
+- **Screensaver**: after 300 s without any change (snapshot, SAS, USB,
+  APDU activity), only on READY / NO HOST without ADMIN: backlight off,
+  DISPOFF, SLPIN.  Any change wakes it: SLPOUT, 120 ms, DISPON, full
+  redraw.  The LED stays on, dimmed.  Never asleep with ERROR, LOCKED,
+  DEGRADED, WORKING, ADMIN, a SAS or a notice up.
+- **SAS**: see §6.
+
+## 5. Rendering and RAM
+
+There is no framebuffer.  The screen is drawn 16 full-width rows at a time
+into a band buffer (`DISPLAY_BAND`, a `ConstStaticCell`):
+
+| Board | Band buffer | Old framebuffer |
+|---|---|---|
+| Waveshare 320×172 | 320 × 16 × 1.5 = 7 680 B | 82 560 B |
+| Geek 240×135 | 240 × 16 × 1.5 = 5 760 B | 48 600 B |
+
+For each band, `render()` runs the whole screen against `Rgb444Band`, which
+drops rows outside the band; `Painter` skips every element whose box misses
+the band, so a band costs about its share of the screen (well under 1 ms).
+Each band goes out as one CASET/RASET window and one DMA transfer.
+Full-width bands mean every row starts on a pixel pair: no
+read-modify-write across band edges.
+
+`Rgb444Band::fill_solid` is a span fill: at most one leading and one
+trailing odd pixel are written individually, the middle is a repeated
+12-byte pattern copied with `copy_from_slice` (a couple of cycles per pixel
+instead of ~25).
+
+**Partial updates.** `ScreenDriver` keeps the last `Screen` it sent.
+`dirty_bands(prev, next)` compares region by region (status band, each
+tile, activity, footer; splash step line; SAS countdown; error/notice
+footer) and only the bands touching changed rows are re-rendered.  The
+1 Hz uptime tick touches the footer only (two bands on Waveshare, about
+15 KB of SPI).  The host tests check that every partial update produces
+exactly the frame a full redraw would.
+
+Commands shorter than 300 ms cause no READY/WORKING repaint at all — only
+the activity line (and possibly a tile) after they complete.
+
+**Watchdog.** The task awaits a DMA transfer between bands and does no
+synchronous work longer than one band render; controller init uses
+`embassy_time` delays on both boards, so the executor and the watchdog
+feeder keep running throughout.
+
+### Measured `.bss` (release, all applets + RSA + curve25519)
+
+| Board | before | after | change |
+|---|---|---|---|
+| Waveshare LCD 16MB | 363 352 B | 285 164 B | −78 188 B |
+| Waveshare LCD SDCard | 355 880 B | 277 684 B | −78 196 B |
+| RP2350-Geek 16MB | 329 376 B | 283 216 B | −46 160 B |
+| RP2350-Geek SDCard | 321 904 B | 275 732 B | −46 172 B |
+
+The snapshot, SAS mailbox, input atomics and kick signal cost under 100 B of `.bss`.
+Core1: `dispatcher_loop` grew by 8 B (debug build); the new
+`display_end → refresh_display_facts → member::count → fetch_key` branch is
+far shallower than the dispatch path (~89 KB of 128 KB, unchanged).
+
+## 6. SAS mailbox (enrollment short authentication string)
+
+`display_snapshot::SAS_MAILBOX` is a three-word seqlock: `gen`, `digits`
+(0..10^8), `meta` = role (1 bit: sponsor / joiner), `peer_fp` (16 bits, the
+first two bytes of SHA-256 of the peer public key), state (3 bits: none,
+pending, enrolled, cancelled, expired).
+
+Core1 API: `sas_publish(digits, role, peer_fp)` (a new `gen`; a new code
+replaces the old one) and `sas_clear(state)` (only acts on a pending code).
+`sas_clear` is already called on `clear_session()`, on SELECT of a
+different applet, on a successful INITIALIZE and when ENROLL_PEER_PUBKEY
+(EXTRAS 0x3D) pins a new peer.
+
+The display task shows the framed SAS screen (the SAS colour #D4F is
+reserved for it) whenever the state is pending, starts a 120 s deadline
+from the first `gen` it sees, overrides the screensaver and the home
+screen, and once the deadline passes shows "CODE EXPIRED" — never the stale
+code.  Enrolled / cancelled / expired transitions show a 10 s notice.
+
+**On `main`, nothing calls `sas_publish`.**  The trigger is the follow-up
+(design spec §2.6 P2b, on `feat/p2-enrollment`): the device computes the
+SAS itself from `device_member_pub()`, the pinned peer and nonces drawn by
+each device's TRNG behind a commit/reveal (`SAS_BEGIN` 0x4B, `SAS_PEER`
+0x4C, `SAS_REVEAL` 0x4D).  A device must never show a SAS without device
+nonces — see `CLUSTER_PLAN_V3.md` §5.2.
+
+## 7. Security rules
+
+1. On-screen text is firmware-static.  No host-supplied bytes are rendered
+   (no labels, DOs, names, APDU data); numbers come from firmware state
+   (counts, fingerprints, SAS digits computed on the device).
+2. The SAS colour and framed SAS layout are reserved for a pending SAS set
+   by core1 (a host test asserts no other screen contains the colour).
+3. Authentication is shown only from core1's snapshot, for the current
+   session with USB configured.  Stale means not authenticated.
+4. Admin authorisation is the most visible element (ADMIN chip).
+5. Health fails closed; defaults are "not provisioned" and "no auth".
+6. Production and debug builds differ (`cfg(any(debug_assertions, feature =
+   "debug"))` = `display::DETAIL`): debug adds the per-applet key split, the
+   algorithm / key ref / SW on the activity line, and the panel border on
+   the boot splash.  PIN lengths, slot names, labels, nonces and keys are
+   never shown.
+7. The SAS never outlives its session.
+8. The screensaver never hides LOCKED, ERROR, ADMIN or a pending SAS.
+
+## 8. Host render harness
+
+`cargo test -p pico2hsm-firmware --lib --no-default-features --features
+pico2_4m --target x86_64-unknown-linux-gnu display::` runs:
+
+- golden FNV-1a hashes of every screen and state at both resolutions (the
+  failure message prints the new table after an intended change);
+- a text-fit check (no string outside its box);
+- partial-update ≡ full-redraw for every pair of screens;
+- the 1 Hz footer tick sends at most two bands;
+- PPM images in `target/display-snapshots/<res>/`, and PNGs (1:1 and 3×
+  in `3x/`) in `$DISPLAY_PREVIEW_DIR/<res>/` when that variable is set.

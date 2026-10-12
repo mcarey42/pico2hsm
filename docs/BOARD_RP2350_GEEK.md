@@ -89,28 +89,34 @@ MISO is not connected to the ST7789 (write-only display).
 | Resolution      | 240 × 135 pixels (landscape)       |
 | Colour format   | RGB444 (12-bit, COLMOD = 0x33)     |
 | Colour inversion| Required (INVON must be sent)      |
-| Column offset   | 52 (CASET start = 52, end = 291)   |
-| Row offset      | 40 (RASET start = 40, end = 174)   |
-| Orientation     | Landscape (MADCTL = 0x70: MX+MV+BGR)|
+| Column offset   | 52 (CASET start = 52, end = 291) — unverified, see below |
+| Row offset      | 40 (RASET start = 40, end = 174) — unverified, see below |
+| Orientation     | Landscape (MADCTL = 0x70: MX+MV+ML, RGB order)|
 | SPI bus         | SPI1                               |
-| SPI frequency   | 30 MHz (rated up to 62.5 MHz)      |
+| SPI frequency   | 40 MHz requested = 37.5 MHz actual (150 MHz / 4); never request more (next step 75 MHz is out of spec) |
 | SPI mode        | Mode 0 (CPOL=0, CPHA=0)            |
 
-### Colour mapping (pico2hsm `LedStatus`)
+### What the display shows
 
-| `LedStatus`    | RGB565     | Colour description |
-|----------------|------------|--------------------|
-| Off            | `0x0000`   | Black              |
-| Ready          | `0x07E0`   | Green              |
-| Busy           | `0x001F`   | Blue               |
-| Error          | `0xF800`   | Red                |
-| Degraded       | `0xFFE0`   | Yellow             |
-| Resyncing      | `0x07FF`   | Cyan               |
-| WaitingForPin  | `0x031F`   | Bright blue        |
+The status UI (status band, PIN / KEYS / DOMAIN tiles, activity line,
+footer, boot splash, error and SAS screens) is drawn by the display task;
+see `DISPLAY_ARCHITECTURE.md` and `DISPLAY_LAYOUT.md`.  The screen is sent
+as 16-row bands from a 5 760-byte band buffer — there is no framebuffer.
+
+### Window offsets (unverified, design spec B13)
+
+52 / 40 are the *portrait* offsets of the 135 × 240 panel
+(52 = (240 − 135) / 2, 40 = (320 − 240) / 2).  With MADCTL 0x70 (MV = 1)
+the landscape window would be expected at CASET 40..279 × RASET 53..187,
+so the image may sit about 12 px off.  The offsets stay unchanged until
+checked on a Geek: debug builds draw a 1 px border at the panel edge on the
+boot splash — all four edges must be visible.
 
 ### ST7789 init sequence
 
-The init sequence sent by `St7789StatusDisplay::st7789_init()`:
+The init sequence sent by `St7789StatusDisplay::init()` (async: the
+delays are `embassy_time` awaits, so the executor and the watchdog feeder
+keep running):
 
 ```
 RST LOW  10 ms  → RST HIGH
@@ -120,19 +126,18 @@ delay 150 ms
 SLPOUT  (0x11)
 delay 255 ms
 COLMOD  (0x3A) data=[0x33]   — 12-bit RGB444
-delay  10 ms
-MADCTL  (0x36) data=[0x70]   — MX | MV | BGR = landscape, correct colour order
-CASET   (0x2A) data=[0x00,0x34,0x01,0x23]   — columns 52..291
-RASET   (0x2B) data=[0x00,0x28,0x00,0xB6]   — rows 40..174
+MADCTL  (0x36) data=[0x70]   — MX | MV | ML = landscape; bit 3 clear = RGB order
+CASET/RASET 0..319 × 0..239, RAMWR zeros — clear all of GRAM (from the band buffer, by DMA)
 INVON   (0x21)               — inversion on (required for ST7789 correct colours)
-delay  10 ms
 NORON   (0x13)               — normal display mode
-delay  10 ms
 DISPON  (0x29)               — display on
 delay  10 ms
 BL HIGH                      — backlight on
-fill_screen(0x0000)          — clear to black
 ```
+
+Each band is then sent as CASET 52..291, RASET 40+y..40+y+rows−1, RAMWR,
+one DMA transfer.  Screensaver: BL low, DISPOFF (0x28), SLPIN (0x10);
+wake: SLPOUT, 120 ms, DISPON, BL high, full redraw.
 
 ---
 
@@ -177,7 +182,7 @@ between renders is safe).
 | CS[2]  |  14  | Mirror flash chip 2                 |
 | CS[3]  |  15  | Mirror flash chip 3                 |
 
-Frequency: **30 MHz** for LCD writes.  If mirror flash chips require a
+Frequency: **37.5 MHz** (40 MHz requested) for LCD writes.  If mirror flash chips require a
 different frequency, the SPI1 bus must be reconfigured before each flash
 transaction.  Both ST7789 and typical SPI NOR flash operate in Mode 0.
 
@@ -262,13 +267,12 @@ signature (which main.rs calls without GPIO arguments).
 The steal is safe because those four GPIOs are exclusively wired to the
 ST7789 LCD on this board and are not claimed anywhere else in the firmware.
 
-### Screen fill performance
+### Screen update performance
 
-`fill_screen()` writes 240 × 135 = 32,400 pixels (48,600 bytes in RGB444) over SPI.
-At 30 MHz with 8-bit transfers, theoretical minimum is ~17 ms per fill.
-In practice, including CS toggling and CASET/RASET commands, a full fill
-takes approximately 20–25 ms on hardware.  This is acceptable for status
-updates (which change at most once per APDU).
+A full screen is 240 × 135 × 1.5 = 48,600 bytes: about 10.5 ms of SPI at
+37.5 MHz, sent as nine band transfers.  Typical updates are partial (the
+1 Hz uptime tick redraws only the footer band), and commands shorter than
+300 ms cause no status repaint at all.
 
 ### SPI1 sharing with mirror flash
 

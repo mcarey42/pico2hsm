@@ -1,547 +1,178 @@
-# pico2hsm — Display Layout Specification
+# pico2hsm — Display Layout
 
-This document is the authoritative UI/UX specification for the pico2hsm status
-display.  It covers both supported display targets, the shared zone system, color
-palette, font selection, and pixel-precise bounds that an implementation agent can
-use directly.
+Pixel layout of every screen on the two LCD boards.  The coordinates are
+the ones in `firmware/src/display/layout.rs` (`WAVESHARE_320X172`,
+`GEEK_240X135`); data flow and rules are in `DISPLAY_ARCHITECTURE.md`.
+Previews of every screen at both resolutions come out of the host render
+harness (`DISPLAY_PREVIEW_DIR=... cargo test ... display::`).
 
----
+All coordinates are logical: (0,0) is the top-left visible pixel.
+Controller offsets live in the board drivers:
 
-## 1. Color Palette
+| Board | Panel | MADCTL | Visible window |
+|---|---|---|---|
+| Waveshare RP2350-LCD-1.47 | ST7789V3, 320 × 172 landscape | 0xA0 (MY + MV) | CASET 0–319, RASET 34–205 |
+| RP2350-Geek | ST7789, 240 × 135 landscape | 0x70 (MX + MV + ML, RGB order) | CASET 52–291, RASET 40–174 (unverified, see `BOARD_RP2350_GEEK.md`) |
 
-All colors expressed as RGB565 hex values (16-bit, big-endian as transmitted over SPI).
+Both run COLMOD RGB444 (two pixels in three bytes) with INVON.
 
-### 1.1 Background and Structure
+## 1. Palette (RGB444) and type
 
-| Role                    | RGB565   | Approximate sRGB  | Notes                              |
-|-------------------------|----------|-------------------|------------------------------------|
-| Screen background       | `0x0841` | #080808 (near-black) | Avoids pure black; allows subtle border visibility |
-| Header bar background   | `0x18C3` | #181818           | Slightly lighter than screen background |
-| Divider / border line   | `0x2945` | #292929           | Used for zone separators           |
-| Info cell background    | `0x10A2` | #101010           | Subtle card background within grid |
-| Banner background (overlay) | `0x0020` | #000040       | Dark navy — clearly differs from status colors |
+| Group | Tokens |
+|---|---|
+| Backgrounds | BG #000, PANEL #111, PANEL2 #222, RULE #333 |
+| Text | TEXT #EEE, TEXT2 #AAA, DIM #888 |
+| Status | OK #3D5, WARN #FB2, ERR #F44, BUSY #4AF, INFO #6CF |
+| Reserved | SAS #D4F — only the pending-SAS screen |
 
-### 1.2 Text Colors
+The palette is defined in RGB444 directly (`display/color.rs`), so no two
+tokens collapse after truncation (the old RGB565 palette mapped the header
+and the cells to the same #111 and "teal" to green).  Black text on OK,
+WARN and INFO fills; white on ERR and BUSY.  Every status colour is paired
+with a word: colour is never the only signal.
 
-| Role             | RGB565   | Approximate sRGB | Notes                                   |
-|------------------|----------|------------------|-----------------------------------------|
-| Primary text     | `0xEF7D` | #EFEFEF          | Labels and values (high contrast on dark) |
-| Secondary text   | `0x9CF3` | #9C9C9C          | Sub-labels, units, "Keys:", "Auth:" prefixes |
-| Dim text         | `0x6B4D` | #686868          | Uptime, low-priority metadata           |
-| Disabled/Off     | `0x4228` | #404040          | Fields that are inactive (e.g., no error) |
+| Use | Waveshare | Geek |
+|---|---|---|
+| Status word | 10x20 | 9x18 bold |
+| Tile value | 9x18 bold | 9x18 bold |
+| Labels, body | 6x13 | 6x13 (tile labels and sub-lines 6x10) |
+| Footer | 6x13 | 6x10 |
+| SAS digits | 20x40 (10x20 drawn ×2) | 18x36 (9x18 drawn ×2) |
 
-### 1.3 Status Colors (matching existing `LedStatus` mapping)
+All embedded-graphics mono fonts (ASCII), in flash.
 
-These are the canonical status pill/indicator fill colors used in the existing
-`status_color()` function in both board drivers.  Do not alter these values.
+## 2. Home screen (the only steady-state screen)
 
-| `LedStatus`    | RGB565   | Color name   |
-|----------------|----------|--------------|
-| Off            | `0x0000` | Black        |
-| Ready          | `0x07E0` | Green        |
-| Busy           | `0x001F` | Blue         |
-| Error          | `0xF800` | Red          |
-| Degraded       | `0xFFE0` | Yellow       |
-| Resyncing      | `0x07FF` | Cyan         |
-| WaitingForPin  | `0x031F` | Bright blue  |
+### Waveshare 320 × 172
 
-### 1.4 Semantic Colors
-
-| Role                   | RGB565   | Color name         | Notes                              |
-|------------------------|----------|--------------------|------------------------------------|
-| Success accent         | `0x07E0` | Green              | Same as Ready; for "OK" indicators |
-| Warning accent         | `0xFFE0` | Yellow             | Same as Degraded                   |
-| Error/alert accent     | `0xF800` | Red                | Same as Error; for error border/banner |
-| Authentication active  | `0x3666` | Teal-ish green     | Auth=YES indicator text tint       |
-| Authentication inactive| `0x6B4D` | Dim gray           | Auth=NO                            |
-| Storage OK             | `0x07E0` | Green              | storage_ok = true                  |
-| Storage degraded       | `0xF800` | Red                | storage_ok = false                 |
-| Context banner (success)| `0x0320`| Very dark green    | Banner background when op succeeded |
-| Context banner (error) | `0x4000` | Very dark red      | Banner background when op failed    |
-
----
-
-## 2. Main Screen Layout — RP2350-Geek (240×135)
-
-### 2.1 Physical Properties
-
-- Controller: ST7789, MADCTL=0x70 (landscape, MX+MV+BGR)
-- Logical resolution: 240 wide × 135 tall (already in landscape orientation)
-- Column offset in CASET: 52; row offset in RASET: 40 (handled by driver, not layout)
-- All layout coordinates are in logical pixels (0,0 = top-left of the 240×135 frame)
-
-### 2.2 Zone Definitions
-
-```
-x=0                                                       x=239
-y=0  ┌─────────────────────────────────────────────────────┐
-     │ HEADER BAR                          (240 × 18 px)   │
-     │ "pico2hsm"  [STATUS PILL 48×12]  00:00:00           │
-y=18 ├─────────────────────────────────────────────────────┤  ← 1px divider line
-y=19 │                                                     │
-     │  INFO GRID  (240 × 114 px, y=19..132)               │
-     │                                                     │
-     │  ┌──────────────┬──────────────┬──────────────────┐ │
-     │  │  KEYS CELL   │  AUTH CELL   │   STORAGE CELL   │ │
-     │  │  (78×50)     │  (78×50)     │   (82×50)        │ │
-     │  │  y=21..70    │  y=21..70    │   y=21..70       │ │
-     │  │              │              │                  │ │
-     │  │  Keys        │  Auth        │   Storage        │ │
-     │  │  12          │  YES         │   OK             │ │
-     │  ├──────────────┴──────────────┴──────────────────┤ │
-     │  │  LAST OP / UPTIME ROW  (236 × 42 px, y=72..113)│ │
-     │  │  Last op: Sign        Up: 00:23:41              │ │
-     │  └─────────────────────────────────────────────────┘ │
-y=133├─────────────────────────────────────────────────────┤  ← 1px bottom divider
-y=134│ STATUS BAR  (240 × 1 px)  — filled with status color│
-y=135└─────────────────────────────────────────────────────┘
+```text
+y   0 ┌─▌READY─────────────────────────[ADMIN][ PIV ]┐  band 0–33: PANEL, 6 px status bar,
+      │                                               │  status word 10x20 @ (14,7),
+ 34   ├───────────────────────────────────────────────┤  admin chip 186–252, applet chip 260–316 (y 5–28)
+ 36   │ PIN          │ KEYS          │ DOMAIN         │  tiles 104×62 @ x 2 / 108 / 214, y 36–97
+      │ OK           │ 6             │ 3F9A           │  label 6x13 (+6,+4), value 9x18B (+6,+20),
+      │ 3/3 left     │ H4 P1 G1      │ 3 members      │  sub-line 6x13 (+6,+44)
+100   │ Sign                                          │  activity 2–317 × 100–143, PANEL2
+      │ 4s ago  P-256 #9A 9000                        │  line 1 9x18 (+8,+3), line 2 6x13 (+8,+23)
+138   │ ▂▂▂▂▂▂▂██████▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂ │  progress bar 10–309 × 138–141 (WORKING only)
+150   │ up 2d 04:11  fw 1.0.1  QMI ok  rst: core1     │  footer 0–319 × 150–171, 6x13 DIM
+172   └───────────────────────────────────────────────┘
 ```
 
-### 2.3 Zone Pixel Bounds
-
-#### Header Bar
-| Property     | Value                           |
-|--------------|---------------------------------|
-| Bounds       | x=0, y=0, w=240, h=18          |
-| Background   | `0x18C3` (header bg)           |
-| Left text    | "pico2hsm" — FONT_6X10, primary text, x=4, y=4 |
-| Center       | Status pill — x=86, y=3, w=68, h=12 |
-| Right text   | Uptime HH:MM:SS — FONT_6X10, dim text, right-aligned at x=236, y=4 |
-
-**Status pill** (within header):
-- Bounds: x=86, y=3, w=68, h=12
-- Fill: status color from `LedStatus` mapping
-- Text (inside pill): status name string, FONT_6X10, contrasting color
-  - For dark status fills (Busy, Error): white `0xFFFF`
-  - For light status fills (Ready/green, Degraded/yellow, Resyncing/cyan): black `0x0000`
-  - "READY" / "BUSY" / "ERROR" / "DEGRADED" / "RESYNCING" / "PIN WAIT" / "OFF"
-
-**Uptime** (within header, right side):
-- Format: `HH:MM:SS` when uptime < 24 h; `Dd HH:MM` when uptime >= 24 h
-- Text: FONT_6X10, dim text `0x6B4D`
-- Bounds: right-aligned, x=168, y=4, w=68, h=10
-
-#### Divider Line (header/body separator)
-| Property | Value                        |
-|----------|------------------------------|
-| Bounds   | x=0, y=18, w=240, h=1       |
-| Fill     | `0x2945` (divider color)     |
-
-#### Info Grid — Upper Row (3 cells)
-The 236 px interior (240 minus 2px for left/right margins) is divided into 3 cells
-with 2px inter-cell gaps.
-
-| Cell     | x   | y  | w  | h  | Content                                  |
-|----------|-----|----|----|----|------------------------------------------|
-| Keys     | 2   | 21 | 76 | 49 | Label "Keys" + value (key_count as decimal) |
-| Auth     | 80  | 21 | 76 | 49 | Label "Auth" + value "YES"/"NO"          |
-| Storage  | 158 | 21 | 80 | 49 | Label "Storage" + value "OK"/"FAIL"      |
-
-Each cell:
-- Background: `0x10A2` (info cell bg), filled rectangle
-- Label: FONT_6X10, secondary text `0x9CF3`, y-offset +4 from cell top, x-offset +4
-- Value: FONT_8X13, primary text (or status-colored), y-offset +18 from cell top, x-offset +4
-- Auth "YES": teal `0x3666`; Auth "NO": dim `0x6B4D`
-- Storage "OK": green `0x07E0`; Storage "FAIL": red `0xF800`
-- key_count value: primary text `0xEF7D`
-
-#### Info Grid — Lower Row (last op + uptime)
-| Property | Value                                          |
-|----------|------------------------------------------------|
-| Bounds   | x=2, y=72, w=236, h=42                        |
-| Background | `0x10A2`                                    |
-| Left column | "Last op:" label FONT_6X10 secondary, x=6, y=76 |
-| Left value  | Operation name FONT_8X13 primary, x=6, y=88  |
-| Right column | "Up:" label FONT_6X10 secondary, x=150, y=76 |
-| Right value  | Uptime FONT_8X13 dim, x=150, y=88           |
-
-When `last_op` is None, left value shows "--" in dim text.
-When `last_op` is Some, left value shows the operation name (see Section 4 for naming).
-
-#### Status Stripe (bottom)
-| Property | Value                                          |
-|----------|------------------------------------------------|
-| Bounds   | x=0, y=134, w=240, h=1                        |
-| Fill     | Current `LedStatus` status color               |
-
-This 1px stripe gives a persistent at-a-glance color indicator at the very bottom
-edge, similar to a status LED. It is always the status color regardless of other
-display content.
-
-### 2.4 Per-Status Appearance Changes
-
-| Status         | Header pill        | Bottom stripe  | Background | Notes               |
-|----------------|--------------------|----------------|------------|---------------------|
-| Off            | Black pill, "OFF"  | Black          | Normal     | Screensaver if >5min |
-| Ready          | Green, "READY"     | Green          | Normal     |                      |
-| Busy           | Blue, "BUSY"       | Blue           | Normal     | Animate with spinner if feasible |
-| Error          | Red, "ERROR"       | Red            | Red border | See Section 5        |
-| Degraded       | Yellow, "DEGRADED" | Yellow         | Normal     |                      |
-| Resyncing      | Cyan, "RESYNCING"  | Cyan           | Normal     |                      |
-| WaitingForPin  | Bright blue, "PIN WAIT" | Bright blue | Normal  |                      |
-
----
-
-## 3. Main Screen Layout — Waveshare LCD-1.47 (logical 320×172 landscape)
-
-### 3.1 Physical Properties
-
-- Controller: ST7789V3, MADCTL=0x00 (portrait native: 172 wide × 320 tall)
-- **After MADCTL rotation** the firmware uses MADCTL=0x70 (or equivalent) to present
-  a **logical 320 wide × 172 tall** landscape surface to the renderer.
-- All layout coordinates below are in logical landscape pixels (0,0 = top-left of
-  the 320×172 rotated frame).
-- Effective rendering area: 320×172 px.
-
-**Note for implementation**: The Waveshare LCD-1.47 board doc specifies `MADCTL=0x00`
-(normal portrait) in the current init sequence.  To use landscape orientation, change
-MADCTL to `0x70` (same as the Geek board: MX|MV|BGR).  With MADCTL=0x70, CASET
-covers 0–171 (172 columns), RASET covers 0–319 (320 rows), producing a 320×172
-logical landscape frame.  Alternatively, MADCTL=0x60 (MY|MV|BGR) gives 320×172
-with the opposite horizontal flip — test on hardware to confirm preferred orientation.
-
-### 3.2 Zone Definitions
-
-```
-x=0                                                                  x=319
-y=0  ┌──────────────────────────────────────────────────────────────────┐
-     │  HEADER BAR                                  (320 × 22 px)       │
-     │  "pico2hsm"   [STATUS PILL 80×14]  00:00:00                      │
-y=22 ├──────────────────────────────────────────────────────────────────┤  1px divider
-y=23 │                                                                  │
-     │  INFO GRID  (320 × 147 px, y=23..169)                            │
-     │                                                                  │
-     │  ┌───────────┬───────────┬───────────┬──────────────────────┐    │
-     │  │KEYS CELL  │AUTH CELL  │STORAGE    │  UPTIME CELL         │    │
-     │  │(74×62)    │(74×62)    │(74×62)    │  (90×62)             │    │
-     │  │x=2,y=25   │x=78,y=25  │x=154,y=25 │  x=230,y=25         │    │
-     │  │           │           │           │                      │    │
-     │  │Keys       │Auth       │Storage    │  Uptime              │    │
-     │  │12         │YES        │OK         │  00:23:41            │    │
-     │  ├───────────┴───────────┴───────────┴──────────────────────┤    │
-     │  │  LAST OPERATION ROW  (316 × 52 px, y=90..141)            │    │
-     │  │  Last operation:  ECDSA-P256 Sign                        │    │
-     │  └──────────────────────────────────────────────────────────┘    │
-y=170├──────────────────────────────────────────────────────────────────┤  1px divider
-y=171│  STATUS STRIPE  (320 × 1 px) — filled with status color          │
-y=172└──────────────────────────────────────────────────────────────────┘
-```
-
-### 3.3 Zone Pixel Bounds
-
-#### Header Bar
-| Property    | Value                              |
-|-------------|------------------------------------|
-| Bounds      | x=0, y=0, w=320, h=22             |
-| Background  | `0x18C3`                          |
-| Left text   | "pico2hsm" — FONT_8X13, primary text, x=5, y=5 |
-| Center      | Status pill — x=110, y=4, w=100, h=14 |
-| Right text  | Uptime — FONT_8X13, dim text, right-aligned at x=315, y=5 |
-
-**Status pill** (within header):
-- Bounds: x=110, y=4, w=100, h=14
-- Fill: `LedStatus` color
-- Text: status name, FONT_6X10 centered, contrasting color
-- Status name strings: same as Geek (READY / BUSY / ERROR / DEGRADED / RESYNCING / PIN WAIT / OFF)
-
-**Uptime** (within header, right side):
-- Format: `HH:MM:SS` when < 24 h; `Nd HH:MM` when >= 24 h (N = days)
-- Text: FONT_8X13, dim text `0x6B4D`
-- Bounds: x=220, y=5, w=95, h=13
-
-#### Divider Line
-| Property | Value                        |
-|----------|------------------------------|
-| Bounds   | x=0, y=22, w=320, h=1       |
-| Fill     | `0x2945`                     |
-
-#### Info Grid — Upper Row (4 cells)
-The 316 px interior is divided into 4 cells with 2px gaps.
-
-| Cell     | x   | y  | w  | h  | Content                                    |
-|----------|-----|----|----|----|---------------------------------------------|
-| Keys     | 2   | 25 | 74 | 62 | "Keys" label + key_count decimal            |
-| Auth     | 78  | 25 | 74 | 62 | "Auth" label + "YES"/"NO"                   |
-| Storage  | 154 | 25 | 74 | 62 | "Storage" label + "OK"/"FAIL"              |
-| Uptime   | 230 | 25 | 88 | 62 | "Uptime" label + HH:MM:SS value            |
-
-Each cell:
-- Background: `0x10A2`
-- Label: FONT_6X10, secondary text `0x9CF3`, y-offset +5, x-offset +5
-- Value: FONT_8X13, appropriate color, y-offset +22, x-offset +5
-- Auth/Storage colors: same as Geek definition above
-- Uptime value color: dim text `0x6B4D`
-
-#### Last Operation Row
-| Property    | Value                                              |
-|-------------|----------------------------------------------------|
-| Bounds      | x=2, y=90, w=316, h=52                            |
-| Background  | `0x10A2`                                          |
-| Label text  | "Last operation:" FONT_6X10, secondary, x=6, y=94 |
-| Value text  | Operation name FONT_8X13, primary, x=6, y=108     |
-| Sub-label   | "slot 0x??" if applicable, FONT_6X10, secondary, x=6, y=124 |
-
-When `last_op` is None: value text shows "—" in dim text.
-Operation names for the larger display use the verbose form (see Section 4).
-
-#### Status Stripe (bottom)
-| Property | Value                          |
-|----------|--------------------------------|
-| Bounds   | x=0, y=171, w=320, h=1        |
-| Fill     | Current `LedStatus` color      |
-
----
-
-## 4. Context Banner (both displays)
-
-The context banner is a full-width overlay strip that appears at the bottom of the
-screen for 3 seconds after a `last_op` becomes Some, then dismisses itself and
-returns to the main info grid view.
-
-### 4.1 Geek (240×135) — Context Banner
-
-| Property     | Value                                         |
-|--------------|-----------------------------------------------|
-| Bounds       | x=0, y=98, w=240, h=36                       |
-| Background   | Dark green `0x0320` (success) or dark red `0x4000` (error) |
-| Border top   | 1px line in `0x07E0` (success) or `0xF800` (error) |
-| Icon text    | "+" (success) or "!" (error), FONT_8X13, at x=8, y=103 |
-| Operation text | Short op name, FONT_8X13, primary `0xEF7D`, x=24, y=103 |
-| Sub-text     | Slot/detail if available, FONT_6X10, secondary `0x9CF3`, x=24, y=117 |
-
-The banner **overlays** the lower info row (y=72..113); the upper grid cells remain
-fully visible while the banner is active.
-
-#### Operation Short Names (Geek, space-constrained)
-
-| `LastOperation` | Short display string |
-|-----------------|----------------------|
-| Sign            | `Sign`               |
-| Verify          | `Verify`             |
-| KeyGen          | `Key Generated`      |
-| ECDH            | `ECDH`               |
-| Decrypt         | `Decrypt`            |
-| Encrypt         | `Encrypt`            |
-| DeriveKey       | `Key Derived`        |
-| Initialize      | `Initialize`         |
-| DeleteKey       | `Key Deleted`        |
-
-When a key slot is known: append ` [0x??]` to the operation string, FONT_6X10, dim,
-on the sub-text line.
-
-### 4.2 Waveshare LCD-1.47 (320×172) — Context Banner
-
-| Property     | Value                                         |
-|--------------|-----------------------------------------------|
-| Bounds       | x=0, y=120, w=320, h=50                      |
-| Background   | Dark green `0x0320` (success) or dark red `0x4000` (error) |
-| Border top   | 1px in `0x07E0` / `0xF800`                   |
-| Icon text    | "+" or "!", FONT_8X13, x=10, y=127           |
-| Operation text | Verbose op name, FONT_8X13, primary, x=30, y=127 |
-| Sub-text     | "slot 0x??" or detail, FONT_6X10, secondary, x=30, y=143 |
-
-#### Operation Verbose Names (LCD-1.47, wider display)
-
-| `LastOperation` | Verbose display string |
-|-----------------|------------------------|
-| Sign            | `ECDSA Sign`           |
-| Verify          | `Signature Verify`     |
-| KeyGen          | `Key Generated`        |
-| ECDH            | `ECDH Exchange`        |
-| Decrypt         | `Decrypt`              |
-| Encrypt         | `Encrypt`              |
-| DeriveKey       | `Key Derived`          |
-| Initialize      | `HSM Initialize`       |
-| DeleteKey       | `Key Deleted`          |
-
-### 4.3 Banner Lifecycle
-
-1. `last_op` transitions from None to Some(op) — immediately render banner.
-2. Timer starts (3 000 ms).
-3. On timer expiry: re-render info grid over the banner area; set `last_op` display
-   back to showing the persistent "last op" label in the lower info cell.
-4. If a new `last_op` arrives during the 3 s window: restart timer, update banner text.
-
----
-
-## 5. Error State
-
-When `error_msg` is Some, the layout is modified as follows on both displays.
-
-### 5.1 Visual Treatment
-
-1. **Red border** — a 2px red (`0xF800`) border is drawn around the outermost screen
-   rectangle on all four edges.  This is rendered after all content and persists for
-   as long as `error_msg` is Some.
-2. **Info grid — lower row replaced** — the lower info row (Last op / Uptime) is
-   replaced by the `error_msg` string.
-   - FONT_6X10, red text `0xF800`, word-wrapped within the cell bounds.
-   - If the error string is longer than the cell width allows, truncate with "…"
-     (Unicode U+2026 is not available in MonoFont; use `...` three dots instead).
-3. **Status pill** — always shows "ERROR" with red fill while `error_msg` is Some,
-   regardless of the `LedStatus` value reported.
-4. **Bottom stripe** — always red `0xF800` while error is active.
-
-### 5.2 Error Dismissal
-
-`error_msg` is persistent — it stays until the firmware clears it (e.g., after a
-successful INITIALIZE or a power cycle).  No auto-dismiss timer.
-
-### 5.3 Geek Error Layout Specifics
-
-| Modified zone        | Change                                               |
-|----------------------|------------------------------------------------------|
-| Outer border         | 2px `0xF800` on x=0..1, x=238..239, y=0..1, y=133..134 |
-| Lower info row (y=72..113) | Replaced by error_msg text, `0xF800`, FONT_6X10 |
-| Header pill          | "ERROR", red fill                                    |
-
-### 5.4 LCD-1.47 Error Layout Specifics
-
-| Modified zone        | Change                                               |
-|----------------------|------------------------------------------------------|
-| Outer border         | 2px `0xF800` on x=0..1, x=318..319, y=0..1, y=170..171 |
-| Last op row (y=90..141) | Replaced by error_msg text, `0xF800`, FONT_6X10 |
-| Header pill          | "ERROR", red fill                                    |
-
----
-
-## 6. Screensaver
-
-After 300 seconds (5 minutes) of idle (no APDU received, `status` == Ready):
-
-- **Fill the entire screen with `0x0000` (black).**
-- **Disable the backlight** (BL pin LOW).
-- No animation; no burn-in pattern.  Pure off.
-
-On any APDU arrival or status change:
-- **Re-enable backlight** (BL pin HIGH).
-- **Re-render the full main screen.**
-
-Idle tracking: maintained by core0; reset on every APDU dispatch.  The screensaver
-trigger is a timer task that checks idle seconds after each 30 s tick.
-
----
-
-## 7. Scaling Rules
-
-The layout is parameterized by `(W, H)` where `W` and `H` are the logical landscape
-dimensions of the target display.
-
-### 7.1 Zone Height Formulas
-
-| Zone                | Formula                        | Geek (135) | LCD-1.47 (172) |
-|---------------------|--------------------------------|------------|----------------|
-| Header bar height   | `max(18, H / 7)`               | 19 → 18px  | 24 → 22px      |
-| Header divider      | 1px fixed                      | 1          | 1              |
-| Upper info cells h  | `(H - header_h - 1 - lower_row_h - 2) / 2 * 1.1` | 49px | 62px |
-| Lower row height    | `H - header_h - 1 - upper_cell_h - 3` | 42px | 52px |
-| Bottom stripe       | 1px fixed                      | 1          | 1              |
-
-In practice, for any display with `H < 150`: use the Geek layout constants.
-For `H >= 150`: use the LCD-1.47 layout constants.
-
-### 7.2 Info Grid Column Count
-
-| Condition    | Column count | Rationale                                      |
-|--------------|--------------|------------------------------------------------|
-| W < 280      | 3 columns    | Geek 240px — Keys, Auth, Storage               |
-| W >= 280     | 4 columns    | LCD-1.47 320px — Keys, Auth, Storage, Uptime   |
-
-When 4 columns are available, move the uptime value from the header right-side to
-the 4th info cell, and use the header right slot only for a more compact `HH:MM`
-format.
-
-### 7.3 Font Selection Rule
-
-| Condition         | Primary value font | Label/secondary font |
-|-------------------|--------------------|----------------------|
-| H < 150           | FONT_8X13          | FONT_6X10            |
-| 150 <= H < 200    | FONT_8X13          | FONT_6X10            |
-| H >= 200          | FONT_10X20         | FONT_8X13            |
-
-The Geek (H=135) and LCD-1.47 (H=172) both fall below H=200, so both use
-FONT_8X13 for values and FONT_6X10 for labels.
-
-### 7.4 Status Pill Width Rule
-
-`pill_width = min(W / 4, 100)` pixels.  On Geek: min(60, 100) = 60 → round to 68
-(text padding).  On LCD-1.47: min(80, 100) = 80 → round to 100.
-
-### 7.5 Minimum Useful Display Size
-
-- Minimum W: 200 px — below this, the 3-column grid is too narrow for readable labels.
-- Minimum H: 100 px — below this, the header + two rows cannot fit at any font size.
-
----
-
-## 8. Font Recommendations
-
-All fonts are from the `embedded-graphics` crate, `mono_font` module.  The crate
-must be added to `Cargo.toml` as a target-agnostic dependency (it has no hardware
-requirements):
-
-```toml
-[dependencies]
-embedded-graphics = { version = "0.8", default-features = false }
-```
-
-The `embedded-graphics` 0.8.x font names and pixel sizes are:
-
-### 8.1 Font Table
-
-| Role                          | Font constant (embedded-graphics 0.8.x)         | Glyph size | Use                             |
-|-------------------------------|--------------------------------------------------|------------|---------------------------------|
-| Header title ("pico2hsm")     | `mono_font::ascii::FONT_8X13`                   | 8×13 px    | Title text in header bar        |
-| Status pill text              | `mono_font::ascii::FONT_6X10`                   | 6×10 px    | Status name inside 12–14 px pill |
-| Info cell value (large)       | `mono_font::ascii::FONT_8X13`                   | 8×13 px    | key_count, YES/NO, OK/FAIL      |
-| Info cell label (small)       | `mono_font::ascii::FONT_6X10`                   | 6×10 px    | "Keys", "Auth", "Storage" captions |
-| Uptime value                  | `mono_font::ascii::FONT_8X13`                   | 8×13 px    | HH:MM:SS display                |
-| Context banner operation name | `mono_font::ascii::FONT_8X13`                   | 8×13 px    | "ECDSA Sign", "Key Generated"   |
-| Context banner detail         | `mono_font::ascii::FONT_6X10`                   | 6×10 px    | Slot number, sub-detail         |
-| Error message text            | `mono_font::ascii::FONT_6X10`                   | 6×10 px    | Wrapped error string            |
-| Dim metadata (secondary)      | `mono_font::ascii::FONT_6X10`                   | 6×10 px    | Low-priority info               |
-
-### 8.2 Text Rendering Notes
-
-- `embedded-graphics` `Text` + `MonoTextStyle` is the correct abstraction.
-  Use `MonoTextStyleBuilder` to set font, text color, and background color.
-- Background color for text: use `None` (transparent) over colored cells, or set to
-  the cell background color to avoid rendering artifacts on partial updates.
-- For right-aligned text (uptime in header), calculate the string pixel width as
-  `string.len() * font.character_size.width` and subtract from the right edge x.
-- Clipping: wrap text rendering in an embedded-graphics `Clipped` viewport bounded
-  to the target cell rectangle to prevent overflow into adjacent zones.
-
-### 8.3 Character Width Reference
-
-| Font        | Char width | Max chars in 76px cell | Max chars in 240px row |
-|-------------|------------|------------------------|------------------------|
-| FONT_6X10   | 6 px       | 12                     | 40                     |
-| FONT_8X13   | 8 px       | 9                      | 30                     |
-| FONT_10X20  | 10 px      | 7                      | 24                     |
-
-Within a 76px-wide cell using FONT_8X13: 9 characters maximum.  Key count values
-are at most 3 digits; "YES"/"NO" are 2–3 chars; "OK"/"FAIL" are 2–4 chars —
-all fit comfortably.
-
----
-
-## 9. Implementation Checklist
-
-The following items must be addressed when implementing this spec:
-
-- [ ] Add `embedded-graphics = { version = "0.8", default-features = false }` to
-  `firmware/Cargo.toml` under platform-agnostic dependencies.
-- [ ] Add `embedded-graphics-core = { version = "0.4" }` if needed for `DrawTarget`.
-- [ ] Implement a `DrawTarget` wrapper over the existing `fill_screen()` / row-write
-  SPI path, or adopt `mipidsi` crate which provides a ready `DrawTarget` for ST7789.
-- [ ] For the Waveshare LCD-1.47, change MADCTL from `0x00` to `0x70` in
-  `waveshare_rp2350_lcd.rs` `st7789v3_init()` to enable logical landscape orientation,
-  and update CASET (0–171) / RASET (0–319) accordingly.
-- [ ] Add `DisplayState` struct fields for `uptime_secs: u64`, `last_op: Option<LastOperation>`,
-  and `error_msg: Option<&'static str>` to the existing `DisplayState` struct in
-  `rp2350_geek.rs` (and create an equivalent in `waveshare_rp2350_lcd.rs`).
-- [ ] Implement screensaver idle timer on core0 — increment `idle_secs` counter,
-  reset on APDU, trigger screensaver at 300 s.
-- [ ] Context banner timer: 3 s countdown, re-render on expiry.  Use Embassy
-  `embassy_time::Timer::after(Duration::from_secs(3))` in the display task.
+### Geek 240 × 135
+
+Band 0–25 (4 px bar, status 9x18 bold @ (8,4), admin chip 146–190, applet
+chip 196–236, y 4–21, 6x13); tiles 77 × 46 at x 2 / 81 / 160, y 28–73
+(label 6x10 +4,+3; value 9x18 bold +4,+14; sub-line 6x10 +4,+33);
+activity 2–236 × 76–111 (two 6x13 lines at +3 / +17, 3 px progress bar at
+y 107); footer 0–239 × 120–134 (6x10).  Short forms: `3/3`, `H4P1G1`,
+`SIG1`, `fw1.0.1`.  The footer drops its `rst:` note if it would not fit.
+
+### Status word (also the band bar and the LED)
+
+| Priority | Word | Colour | When |
+|---|---|---|---|
+| 1 | ERROR | ERR | keystore init failed, or the last write failed (sticky until a write succeeds) |
+| 2 | LOCKED | ERR | the active applet's primary credential is blocked |
+| 3 | DEGRADED | WARN | a mirrored store runs on one copy |
+| 4 | WORKING | BUSY | an operation has run for more than 300 ms |
+| 5 | NO HOST | INFO | USB not configured |
+| 6 | READY | OK | otherwise |
+
+### Chips
+
+- **Applet chip**: 1 px RULE border, `HSM` / `PIV` / `PGP` in TEXT, or `--`
+  in DIM (none selected, or the session is stale).
+- **ADMIN chip**: WARN fill, black `ADMIN`, while SO-PIN, the PIV
+  management key or PW3 is live in *any* applet.
+
+### Tiles
+
+| Tile | Value | Sub-line |
+|---|---|---|
+| PIN (active applet's primary: SC-HSM user PIN, PIV PIN, OpenPGP PW1) | `OK` INFO when verified, `--` DIM when not, `BLOCK` white on an ERR tile when blocked | `n/max left` — TEXT2 at ≥ 2, WARN at 1, ERR at 0; with a one-shot armed (PIV 9C PIN-always, OpenPGP single-signature mode) `n/max SIG x1`; `no applet` DIM when none |
+| KEYS | user keys, all applets | debug: `H4 P1 G1` (SC-HSM / PIV / OpenPGP); production: `keys` |
+| DOMAIN | first two bytes of the domain ID, hex | `N members`; `self` WARN (DKEK without a member certificate); `REVOKED` ERR; `--` / `no domain` DIM |
+
+### Activity
+
+- `Idle` (DIM): no operation yet in this host session.
+- `Working: Sign` + elapsed `m:ss` right-aligned + an indeterminate bar
+  (40 px BUSY segment, 8 px per 250 ms step): an operation running for more
+  than 300 ms.
+- `Sign` / `Sign REFUSED` (WARN) / `Sign FAILED` (ERR), then the age
+  (`4s ago`).  The text fades TEXT → TEXT2 after 10 s → DIM after 60 s; it
+  is never removed.  Debug builds add `algorithm #keyref SW`.  Policy
+  hints replace the debug detail: `PIN-always: re-verify next` (PIV 9C),
+  `PW1 single-use spent` (OpenPGP).
+- Notes replace the age line in ERR: `Last change NOT saved` (E12, a write
+  failed), `Keystore unreadable`, `Unblock: PUK or SO-PIN` / `Unblock: PIV
+  PUK` / `Unblock: PW3 or reset code` (E40, LOCKED).
+
+### Footer
+
+`up 2d 04:11  fw 1.0.1  QMI ok  rst: core1` in DIM.  Uptime is
+`HH:MM:SS` under a day, `Nd HH:MM` under 1000 days, then `Nd`.  Storage:
+`QMI ok`, `SD ok`, or in ERR `QMI FAIL` / `SD FAIL` / `SD MISSING`.
+`rst:` names a non-power-on reset for 24 h after boot.  During the first
+60 s after such a reset the whole footer is a WARN strip:
+`Last reset: core1 stall x2`.  An unprovisioned device running on the
+development storage key shows a WARN strip `DEV - UNPROVISIONED  up …`.
+
+## 3. Boot splash
+
+| Element | Waveshare | Geek |
+|---|---|---|
+| `pico2hsm` | 10x20, centred, y 40 | 9x18, y 20 |
+| `fw 1.0.1  <board>` | 6x13 DIM, y 66 | 6x10, y 42 |
+| step: `Storage...`, `Keys (6)...`, `USB...` | 9x18 TEXT2, y 100 | 6x13, y 70 |
+| `Last reset: …` (not after a power-on) | 6x13 WARN, y 130 | y 100 |
+
+Each step redraws only its band.  Debug builds draw a 1 px TEXT2 border at
+the panel edge: all four edges must be visible (window offset check).
+
+## 4. Full-screen errors
+
+Waveshare: band 0–35 (PANEL, 6 px ERR bar, code 10x20 ERR at (14,8), title
+10x20 TEXT at x 64); two action lines 9x18 TEXT2 from y 48 (pitch 24);
+detail 6x13 DIM at y 128; footer 150–171.  Geek: band 0–27 (9x18 bold,
+title at x 44); action lines 6x13 from y 38 (pitch 16); detail at y 100;
+footer 122–134.
+
+| Code | Title | Action | When |
+|---|---|---|---|
+| E10 | NO SD CARD | Insert microSD card. / Retrying (try N). | SD card init fails at boot; drawn before the device waits for the watchdog (N = watchdog resets in a row + 1) |
+| E11 | STORAGE UNREADABLE | Keys not loaded. / Run pico2hsm-tool diag. | keystore init failed; until the host runs an operation, then an ERROR band |
+| E20 | NOT PROVISIONED | Keys cannot be stored. / See PROVISIONING.md. | no storage master key (release build, unprovisioned OTP) |
+| E31 | RNG FAILURE | Hardware RNG failed self-test. / Device halted. | rendered by the harness; not yet wired (the TRNG failure path resets without the display) |
+
+E12 (a write failed) and E40 (PIN blocked) are not full-screen: they are
+ERROR / LOCKED in the band with a note on the activity line.
+
+## 5. Notices (10 s, enrollment outcome)
+
+Same template as the errors, without a code: `ENROLLED` (OK bar,
+`7E21 into 3F9A`), `CANCELLED` (WARN), `CODE EXPIRED` (WARN, `Not confirmed
+in 120 s.` / `Restart enrollment on host.`).
+
+## 6. SAS comparison screen
+
+Waveshare: 3 px SAS frame; `ENROLL - COMPARE CODE` 9x18 bold centred at
+y 7; digits `1234 5678` in 20x40 glyphs at y 40–80, centred, 20 px between
+the groups; `This device: SPONSOR  peer 04AA` 6x13 TEXT2 at y 92;
+`Same code on both devices? Continue on host.` / `Different? Abort and
+revoke.` 6x13 TEXT at y 114 / 131; countdown bar (SAS colour, 4 px) at
+y 156, x 10–309, shrinking over 120 s.
+
+Geek: 2 px frame; `COMPARE CODE` at y 4; digits 18x36 at y 28 (18 px gap);
+role and peer at y 72; `Same code? Continue on host.` / `Different? Abort
+and revoke.` at y 90 / 104; countdown bar at y 126.
+
+There is no button: the screen only *detects* a man-in-the-middle; on a
+mismatch the operator aborts on the host and revokes.
+
+## 7. LED (Waveshare WS2812B)
+
+Green READY, blue WORKING, cyan NO HOST, yellow DEGRADED and notices, red
+ERROR / LOCKED / error screens, magenta while a SAS is pending.  Level 8 per
+channel, 2 while the screen sleeps.  Written only when the colour changes.
