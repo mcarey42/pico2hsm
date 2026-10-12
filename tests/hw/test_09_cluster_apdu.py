@@ -21,6 +21,7 @@ import struct
 import pytest
 
 from helpers.cli import CLIRunner
+from helpers.pcsc import dut_index
 
 log = logging.getLogger(__name__)
 
@@ -137,7 +138,7 @@ def cluster_ready(init_reader0, runner: CLIRunner, config: dict) -> None:
     """Load 1 DKEK share so cluster APDUs requiring DKEK are available."""
     import subprocess, os
     env = os.environ.copy()
-    env["OPENSC_DEFAULT_READER"] = "0"
+    env["OPENSC_DEFAULT_READER"] = str(dut_index())
     result = subprocess.run(
         [
             "sc-hsm-tool",

@@ -9,8 +9,6 @@ deleted again (``53 00``) at the end.
 
 from __future__ import annotations
 
-import os
-
 import pytest
 
 from helpers import sw_from_output
@@ -36,8 +34,9 @@ def _put_data_ext(content: bytes) -> str:
 def _get_data() -> bytes:
     from smartcard.System import readers
 
-    idx = int(os.environ.get("OPENSC_DEFAULT_READER", "0"))
-    conn = readers()[idx].createConnection()
+    from helpers.pcsc import dut_index
+
+    conn = readers()[dut_index()].createConnection()
     conn.connect()
     try:
         sel = [0x00, 0xA4, 0x04, 0x00, len(PIV_AID), *PIV_AID, 0x00]

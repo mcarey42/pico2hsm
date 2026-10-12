@@ -619,7 +619,7 @@ class TestCardContactInterop:
             f"00200081{len(pin):02X}{pin.hex()}",
         ]
         apdus.append(f"8068{slot2:02X}7020{digest.hex()}00")
-        args = ["opensc-tool", "-r0"]
+        args = ["opensc-tool", f"-r{dut_index()}"]
         for a in apdus:
             args += ["-s", a]
         res = runner.run(args, save_as="11cc_host_sign")
