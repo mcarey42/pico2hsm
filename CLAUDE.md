@@ -63,8 +63,16 @@ pkill -9 -f "probe-rs"
 ## Architecture overview
 
 **Concurrency model** (RP2350 dual-core):
-- **Core0** — Embassy async executor: USB device driver + CCID transport loop, plus the hardware-watchdog feeder task. Sends APDUs to core1 via `APDU_CHANNEL` and waits for responses on `RESP_CHANNEL`.
-- **Core1** — Synchronous `dispatcher_loop()`: no Embassy executor.  Sleeps via ARM `wfe` (Wait For Event) while idle; woken by core0 via `sev` (Send Event) after each channel send.  Calls `blocking_receive()`/`blocking_send()` on the shared channels using `try_receive()`/`try_send()`.
+- **Core0** — Embassy async executor: USB device driver + CCID transport loop, plus the hardware-watchdog feeder task. Sends APDUs to core1 via `APDU_CHANNEL` and waits for responses on `RESP_CHANNEL`.  A `flash_service` future (joined with USB and CCID in every board runner) runs core1's `FlashOp`s whenever they come — during an APDU and between APDUs.
+- **Core1** — Synchronous `dispatcher_loop()`: no Embassy executor.  Between APDUs `next_apdu()` runs the RSA key pool's idle work in slices (`rsa_pool::background`, ≤ 20 ms, ending as soon as `APDU_CHANNEL` is non-empty); with nothing to do it sleeps via ARM `wfe` (Wait For Event) and is woken by core0 via `sev` (Send Event) after each channel send.  Calls `blocking_receive()`/`blocking_send()` on the shared channels using `try_receive()`/`try_send()`.
+
+**RSA key pool** (`rsa` feature; `firmware/src/rsa_pool.rs`, `storage/rsa_pool.rs`,
+`crypto/rsa_keygen.rs`): pre-generated RSA-2048/3072/4096 keys in 12 sectors of
+internal flash at `0x1F0000` (every board), encrypted under the storage key;
+SC-HSM GENERATE KEY PAIR takes one (slot marked taken on flash first) or
+generates live with the sliced generator.  Config / clock / sequence are
+value records in the retry-counter log.  The generator state (~9 KB) is a
+static (`rsa_pool::ENGINE`), never on the stack.
 
 Both channels use RP2350 hardware spinlocks (29 and 30) for SMP-safe cross-core signalling.
 Core0 issues `cortex_m::asm::sev()` after every `APDU_CHANNEL.send()` and `FLASH_RESP.send()` to wake core1 from WFE.
@@ -238,7 +246,7 @@ when changing the code.
 
 **Cause**: core1 runs the whole dispatch chain on its own 128 KB stack (`CORE1_STACK` in `firmware/src/main.rs`). Large stack temporaries — `Vec<u8, 4096>` response buffers, `KeyObject`s (~3 KB), 4 KB flash sector buffers, PKCS#1 DER buffers — add up across `dispatcher_loop → Dispatcher::dispatch_with_store → <protocol>::process_apdu_with_store → route_with_store → handler → store`. MSPLIM is set at the stack base, so an overflow faults (UsageFault) instead of silently corrupting memory, but core1 still stops. (The protocol *state*, e.g. `ScHsmState`, lives in BSS via `DISPATCHER_CELL`, not on this stack.)
 
-**Measured** (2026-10, debug, pico2_4m and SD boards, worst path): dispatcher_loop 20.6 KB → dispatch_with_store 8.2 KB → Piv::process_apdu_with_store 11.2 KB → route 7.1 KB → PIV put_data::handle_with_store 20.6 KB → save_key / fetch_key chain ~20 KB ≈ **89 KB of 128 KB**. Before the synchronous `Core1KeyStore` (which removed a queue of by-value `KeyObject`s) it was ~123 KB.
+**Measured** (2026-10, debug, pico2_4m and SD boards, worst path): dispatcher_loop 20.6 KB → dispatch_with_store 8.2 KB → Piv::process_apdu_with_store 11.2 KB → route 7.1 KB → PIV put_data::handle_with_store 20.6 KB → save_key / fetch_key chain ~20 KB ≈ **89 KB of 128 KB**. Before the synchronous `Core1KeyStore` (which removed a queue of by-value `KeyObject`s) it was ~123 KB.  RSA GENERATE from the key pool: … → route_handler 4.1 KB → generate_keypair::handle 9.1 KB → Engine::take_pooled 6.3 KB → PoolRegion::get_key 12.1 KB → KeyObject::decrypt chain ~9.8 KB ≈ **86 KB**; the idle-time pool slice ≈ 31 KB.
 
 **Re-measure** after adding large locals or a deeper call path:
 ```sh
@@ -265,7 +273,8 @@ write/erase and key load, for blocking storage work on core0.
 - Code on core0 that blocks the executor for more than a few seconds must
   call `watchdog::progress()` as it goes (or the chip resets ~8 s in).
 - Core1 work longer than 30 s must bump `WATCHDOG_HEARTBEAT` (RNG calls and
-  storage ops do) or hold a `WatchdogSuppressGuard`.
+  storage ops do) or hold a `WatchdogSuppressGuard`.  RSA keygen no longer
+  needs the guard: the sliced generator bumps the heartbeat every unit.
 - Send work to core1 only via `send_to_core1()`, and count each reply
   (`note_core1_response`), or the feeder's busy/idle accounting drifts.
 - Reset with `watchdog::reset_now(cause)`, not `SCB::sys_reset()` (on

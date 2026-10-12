@@ -71,6 +71,103 @@ items.
 - `fill_random()` reseeds every 1,000 calls via atomic counter
 - Hardware TRNG (RP2350 ROSC/ring oscillator) feeds seed material
 
+### RSA key pool (pre-generated RSA keys, 2026-10)
+
+RSA keygen on the Cortex-M33 takes tens of seconds to minutes, so the
+firmware (with `rsa`) pre-generates RSA-2048/3072/4096 keys while idle and
+SC-HSM GENERATE KEY PAIR hands out a pooled key.  Code:
+`firmware/src/rsa_pool.rs` (policy), `storage/rsa_pool.rs` (flash slots),
+`crypto/rsa_keygen.rs` (generator); APDUs: `SC_HSM_APDU_REFERENCE.md`,
+"RSA key pool".
+
+**The time-shift property.**  A pooled key exists before anyone asks for
+it.  Whoever obtains the pool region *and* the device storage key at time
+T learns keys that may be issued later — keys their owner believes were
+created after T.  (Without the storage key the region holds only
+AES-256-GCM ciphertext, like the keystore.)  Mitigations:
+
+- **Storage-key encryption.**  Each pooled key is a `KeyObject` blob
+  encrypted under the storage master key exactly like a stored key; the
+  slot, size, sequence number and birth time are in the authenticated
+  header (GCM AAD) and checked against the slot, so a blob copied to
+  another slot, or a header edited in place to claim another size, a
+  younger age or another sequence number, does not yield a key.
+- **Rotation and age-out (default on).**  A pooled key older than the
+  maximum age (default 4 hours of powered-on time) is erased and replaced
+  in idle time, and GENERATE never issues one past that age.  A flash image
+  therefore holds keys that are likely retired before anyone uses them.
+  GENERATE takes the *newest* key.  Age is measured in powered-on minutes
+  (persisted pool clock, no RTC): time unplugged does not count, so a key
+  can sit in an unplugged device's flash for longer than the maximum age.
+- **Configuration (SO-PIN).**  RSA_POOL_CONFIG turns rotation off, changes
+  the maximum age (1 hour to 1 year — the floor bounds flash wear: each
+  slot is erased about once per maximum age, ≥ 11 years of continuous
+  power to 100 000 cycles at 1 hour) or the depth per size, or turns the
+  pool off; off erases every pooled key, and GENERATE then always
+  generates live.  Readable without a PIN (RSA_POOL_STATUS).
+- **INITIALIZE erases the pool** (trust reset).
+- **Issue order.**  The slot is marked taken on flash (program-without-
+  erase) and read back *before* the key leaves the pool; a power cut can
+  waste a key, never issue it twice.  The slot is then erased at once, so
+  no ciphertext remains whose TAKEN mark an attacker could undo by
+  rewriting the sector from the same image (restoring an *older* image is
+  the rollback class S-15, out of scope).  The issued key is then stored
+  and numbered like any generated key.
+- **Fail closed.**  An unreadable or invalid pool configuration counts as
+  *off*; a pool clock that cannot be read or persisted holds the pool off
+  for the boot (ages could no longer be trusted after a reboot).  Either
+  way the pool is emptied, GENERATE generates live, and RSA_POOL_STATUS
+  sets health bit 3.  Repeated flash failures stop the background work
+  (health bit 2).  A key that fails its pairwise test or the `rsa` crate's
+  validation is never pooled or issued (a pooled one is erased).
+- **No remnants.**  The generator's state (candidates, primes, exponents,
+  CRT values, temporaries) is zeroized after every key — pooled, issued
+  live, discarded, failed — and on every internal restart; big-number
+  temporaries are wiped by the arithmetic routines; decrypted pool
+  objects and issued pairs wipe on drop.  Retired, rotated, issued and
+  torn slots are erased.
+
+**Key quality.**  FIPS 186-5 A.1.3 random probable primes: a fresh DRBG
+candidate per attempt, top two bits set, `gcd(p−1, e) = gcd(q−1, e) = 1`
+(`e = 65537`), `|p − q| > 2^(nlen/2−100)`, trial division by the odd primes
+below 2^14, Miller-Rabin to base 2, then FIPS 186-5 Table B.1's rounds
+with DRBG bases for the stricter error column (5 / 4 / 4 rounds for
+1024 / 1536 / 2048-bit primes: error ≤ 2^-112 / 2^-128 / 2^-144), then the
+B.3.3 Lucas test (base 2 + Lucas = Baillie-PSW; no composite is known to
+pass it).  `d = e⁻¹ mod lcm(p−1, q−1)` with `d > 2^(nlen/2)`; dP, dQ, qInv
+checked by multiplying back; a pairwise-consistency test (CRT signature of
+a random message, verified with `(n, e)`) before a key is pooled or
+issued; and at issue the key is parsed and validated again by the `rsa`
+crate (an independent big-integer implementation).  The previous keygen
+(`rsa` crate) did more Miller-Rabin rounds (21) but on incremental
+candidates, with no `|p − q|` bound, `d` modulo φ(n) and no pairwise test.
+Generation starts only after the boot TRNG reseed succeeded, and draws
+from the same DRBG as every other key (`crypto::rng`).
+
+**Side channels.**  Everything computed on the accepted primes and the
+private key is constant-time: no secret-dependent branch, memory index or
+`UDIV`/`SDIV` (data-dependent on the M33).  That covers Montgomery
+arithmetic (`UMAAL`), the windowed exponentiations (Miller-Rabin, qInv,
+the pairwise CRT signature), the Miller-Rabin squaring loop (a fixed 64
+squarings, the outcome in a mask, so `ν2(p−1)` is not visible), the Lucas
+chain, trial division and `p mod e` (multiplication by a reciprocal),
+`gcd(p−1, q−1)` (fixed-count binary GCD), d / dP / dQ (reciprocal
+division, Fermat inverse modulo `e`), and the `|p − q|` and `d` size
+checks.  Not constant-time, and why that is acceptable: *where* a rejected
+candidate fails (it is discarded); Miller-Rabin base redraws (≤ 25 % each,
+a statistical hint about the top bits); the Lucas `D` search (a bit or two
+of quadratic-residue information about `p` modulo small numbers); the DER
+lengths of d, dP, dQ, qInv (inherent to PKCS#1).  Details:
+`firmware/src/crypto/rsa_keygen.rs`, "Side channels".  Generation runs
+between APDUs, where a host sees only its effect on response times.
+
+**Availability.**  Idle work runs in slices of at most 20 ms that end
+before the next unit of work (≤ ~7 ms of computation on the M33) once an
+APDU is waiting; the longest wait an APDU can see is one flash sector
+erase of the pool (typically ~45 ms, at most 400 ms by the flash
+datasheets).  Live keygen inside an APDU keeps the stall detector's
+heartbeat moving instead of suppressing it.
+
 ### TLS transport (Python daemon)
 - P-256 ECDSA self-signed X.509 identity auto-generated via `ensure_daemon_identity()`
 - `create_server_context()` / `create_client_context()` from `tls.py`

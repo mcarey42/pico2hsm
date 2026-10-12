@@ -22,6 +22,12 @@ pub fn zeroize_slice(buf: &mut [u8]) {
     buf.zeroize();
 }
 
+/// Securely zero a word slice in place (big-number temporaries).
+#[inline]
+pub fn wipe_words(buf: &mut [u32]) {
+    buf.zeroize();
+}
+
 /// Securely zero a fixed-size array in place.
 #[inline]
 pub fn zeroize_array<const N: usize>(buf: &mut [u8; N]) {

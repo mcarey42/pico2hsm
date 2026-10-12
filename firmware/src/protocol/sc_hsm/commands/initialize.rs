@@ -198,6 +198,13 @@ pub fn handle(
         return ApduResponse::err(pico2hsm_core::apdu::SW_MEMORY_FAILURE);
     }
     state.domain = None;
+    // Re-initialisation is a trust reset: pre-generated RSA keys go too
+    // (they belong to no applet, but were made before it).  The pool's
+    // configuration and clock stay.
+    #[cfg(feature = "rsa")]
+    if crate::rsa_pool::with_engine(|e| e.wipe(store)).is_err() {
+        return ApduResponse::err(pico2hsm_core::apdu::SW_MEMORY_FAILURE);
+    }
 
     // Generate fresh random salts for all credentials.
     let so_salt = gen_salt();

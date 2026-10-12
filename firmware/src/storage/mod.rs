@@ -40,6 +40,8 @@
 pub mod flash_layout;
 pub mod keystore;
 pub mod retry_counter;
+#[cfg(feature = "rsa")]
+pub mod rsa_pool;
 pub use keystore::HybridKeyStore;
 pub use keystore::KeyStore;
 
@@ -78,6 +80,10 @@ pub use keystore::FlashKeyStore;
 /// The retry-counter log on internal flash, as every board uses it.
 #[cfg(target_arch = "arm")]
 pub type BoardCounterLog = retry_counter::CounterLog<flash_chip::QmiCounterFlash>;
+
+/// The RSA key pool region on internal flash, as every board uses it.
+#[cfg(all(target_arch = "arm", feature = "rsa"))]
+pub type BoardPoolRegion = rsa_pool::PoolRegion<flash_chip::QmiPoolFlash>;
 
 #[cfg(target_arch = "arm")]
 use filesystem::{Directory, KeyFilesystem, ScrubReport};

@@ -18,8 +18,14 @@
 //!   all equality comparisons involving secrets
 
 pub mod asymmetric;
+/// Runtime-width big integers for the sliced RSA key generator.
+#[cfg(feature = "rsa")]
+pub mod bignum;
 pub mod ec_params;
 pub mod kdf;
+/// Sliceable FIPS 186-5 RSA key generation (A.1.3 / B.3).
+#[cfg(feature = "rsa")]
+pub mod rsa_keygen;
 pub mod symmetric;
 
 // RNG module uses embassy_rp TRNG and ADC peripherals — ARM only.
