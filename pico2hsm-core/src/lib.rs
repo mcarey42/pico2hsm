@@ -23,6 +23,7 @@ pub mod apdu;
 pub mod error;
 pub mod flash;
 pub mod key;
+pub mod op;
 pub mod protocol;
 pub mod storage;
 

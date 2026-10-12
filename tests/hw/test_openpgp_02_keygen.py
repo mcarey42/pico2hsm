@@ -282,9 +282,9 @@ def test_openpgp_gpg_card_status_shows_sig_fingerprint(
     writes it with PUT DATA C7 (this is what `gpg --card-edit` does).  The
     test writes a known fingerprint and checks gpg reports exactly that.
     """
-    from conftest import gpg_skip_reason
+    from conftest import gpg_card_status_cmd
 
-    if reason := gpg_skip_reason():
+    if reason := gpg_card_status_cmd()[1]:
         pytest.skip(reason)
     fingerprint = bytes(range(0xA0, 0xB4))  # 20 recognisable bytes
     put_fp_sig = f"00DA00C714{fingerprint.hex()}"
@@ -298,8 +298,9 @@ def test_openpgp_gpg_card_status_shows_sig_fingerprint(
 
     # scdaemon caches card data while it holds the card; the APDUs above went
     # through PC/SC behind its back, so restart it to read fresh data.
-    subprocess.run(["gpgconf", "--kill", "scdaemon"], capture_output=True, timeout=30)
-    cmd = ["gpg", "--no-tty", "--card-status"]
+    cmd, reason = gpg_card_status_cmd(learn=True)
+    if reason:
+        pytest.skip(reason)
     log.info("Running: %s", " ".join(cmd))
     try:
         proc = subprocess.run(cmd, capture_output=True, timeout=30, text=True)
@@ -326,16 +327,17 @@ def test_openpgp_gpg_card_status_shows_sig_fingerprint(
         f"gpg --card-status failed (rc={proc.returncode}):\n{stdout}\n{stderr}"
     )
 
-    # Find the 'Signature key' line and confirm it is not '[none]'
+    # Find the signature key fingerprint: scdaemon's `S KEY-FPR 1` status
+    # line, or gpg --card-status's 'Signature key' line.
     sig_key_line = ""
     for line in stdout.splitlines():
-        if "signature key" in line.lower():
-            sig_key_line = line
+        if line.startswith("S KEY-FPR 1 ") or "signature key" in line.lower():
+            sig_key_line = line.replace("S KEY-FPR 1 ", "Signature key:")
             break
 
     log.info("Signature key line: %r", sig_key_line)
     assert sig_key_line, (
-        f"'Signature key' line not found in gpg --card-status output:\n{stdout}"
+        f"'Signature key' line not found in the card status output:\n{stdout}"
     )
     shown = sig_key_line.split(":", 1)[-1].replace(" ", "").lower()
     assert shown == fingerprint.hex(), (

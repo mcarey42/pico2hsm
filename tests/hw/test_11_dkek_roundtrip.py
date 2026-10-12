@@ -43,6 +43,7 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec, utils
 
 from helpers.cli import CLIRunner
+from helpers.pcsc import dut_index
 
 log = logging.getLogger(__name__)
 
@@ -256,7 +257,7 @@ class TestDkekWrapUnwrapRoundtrip:
         # OpenSC's sc_hsm_determine_free_id picks the first free slot; after
         # fresh initialization the first key always lands in slot 1, but we
         # query to be safe.
-        device_slot = _get_first_key_slot(reader=0)
+        device_slot = _get_first_key_slot(reader=dut_index())
         assert device_slot is not None, "Could not detect device key slot after keygen"
         log.info("Device key slot (for wrap/unwrap): %d (0x%02X)", device_slot, device_slot)
 
@@ -401,7 +402,7 @@ class TestDkekDifferentSharesIncompatible:
         )
 
         # Detect the actual device slot assigned to this key
-        mismatch_slot = _get_first_key_slot(reader=0)
+        mismatch_slot = _get_first_key_slot(reader=dut_index())
         assert mismatch_slot is not None, "Could not detect device key slot after mismatch keygen"
         log.info("Mismatch test key in device slot %d (0x%02X)", mismatch_slot, mismatch_slot)
 
@@ -555,7 +556,7 @@ class TestCardContactInterop:
             save_as="11cc_keygen",
         )
         assert keygen.returncode == 0, keygen.stderr[-2000:]
-        slot = _get_first_key_slot(reader=0)
+        slot = _get_first_key_slot(reader=dut_index())
         assert slot is not None
         pub_der_path = tmp_path / "pub.der"
         export = runner.pkcs11_tool(
@@ -618,7 +619,7 @@ class TestCardContactInterop:
             f"00200081{len(pin):02X}{pin.hex()}",
         ]
         apdus.append(f"8068{slot2:02X}7020{digest.hex()}00")
-        args = ["opensc-tool", "-r0"]
+        args = ["opensc-tool", f"-r{dut_index()}"]
         for a in apdus:
             args += ["-s", a]
         res = runner.run(args, save_as="11cc_host_sign")

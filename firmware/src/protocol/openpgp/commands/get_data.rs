@@ -16,7 +16,7 @@
 
 use pico2hsm_core::apdu::{ApduCommand, ApduResponse};
 
-use crate::protocol::openpgp::{OpenPgpState, OPENPGP_AID};
+use crate::protocol::openpgp::{openpgp_aid, OpenPgpState};
 
 /// INS byte for GET DATA.
 pub const INS_GET_DATA: u8 = 0xCA;
@@ -30,7 +30,7 @@ pub fn handle(state: &mut OpenPgpState, cmd: &ApduCommand<'_>) -> ApduResponse {
 
     match tag {
         // 004F — Application Identifier (full AID)
-        0x004F => ApduResponse::ok(&OPENPGP_AID),
+        0x004F => ApduResponse::ok(&openpgp_aid()),
 
         // 005B — Cardholder Name
         0x005B => ApduResponse::ok(&state.cardholder_name),
@@ -290,8 +290,9 @@ fn build_application_related(state: &OpenPgpState) -> ApduResponse {
 
     // 4F — AID
     let _ = content.push(0x4F);
-    let _ = content.push(OPENPGP_AID.len() as u8);
-    let _ = content.extend_from_slice(&OPENPGP_AID);
+    let aid = openpgp_aid();
+    let _ = content.push(aid.len() as u8);
+    let _ = content.extend_from_slice(&aid);
 
     // 5F52 — Historical Bytes (minimal compact-TLV for card capabilities)
     // This is a minimal set: category indicator (0x00), then compact-TLV

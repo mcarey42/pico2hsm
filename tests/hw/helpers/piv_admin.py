@@ -51,7 +51,9 @@ def admin_send(*apdus_hex: str, reader: int | None = None, key: bytes = DEFAULT_
     """
     from smartcard.System import readers
 
-    idx = int(os.environ.get("OPENSC_DEFAULT_READER", "0")) if reader is None else reader
+    from helpers.pcsc import dut_index
+
+    idx = dut_index() if reader is None else reader
     conn = readers()[idx].createConnection()
     conn.connect()
     stdout = ""

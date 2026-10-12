@@ -46,11 +46,47 @@ def apdu(cla: int, ins: int, p1: int, p2: int, data: bytes = b"", le: int | None
     return out
 
 
+def dut_index() -> int:
+    """PC/SC index of the device under test, resolved now.
+
+    PICO2HSM_READER (a substring of one reader name, e.g. the board's USB
+    serial) wins over OPENSC_DEFAULT_READER (an index).  Indexes shift
+    whenever a board re-enumerates (flash, probe-rs reset), so resolve on
+    every connection rather than once per run.
+    """
+    sel = os.environ.get("PICO2HSM_READER")
+    if sel:
+        from smartcard.System import readers
+
+        hits = [i for i, r in enumerate(readers()) if sel in str(r)]
+        if len(hits) != 1:
+            raise RuntimeError(f"PICO2HSM_READER={sel!r} matches {len(hits)} readers")
+        return hits[0]
+    return int(os.environ.get("OPENSC_DEFAULT_READER", "0"))
+
+
+def peer_index() -> int:
+    """PC/SC index of the second device for two-device tests, resolved now:
+    PICO2HSM_PEER_READER (a reader-name substring), else the first reader
+    that is not the device under test."""
+    from smartcard.System import readers
+
+    names = [str(r) for r in readers()]
+    sel = os.environ.get("PICO2HSM_PEER_READER")
+    if sel:
+        hits = [i for i, n in enumerate(names) if sel in n]
+        if len(hits) != 1:
+            raise RuntimeError(f"PICO2HSM_PEER_READER={sel!r} matches {len(hits)} readers")
+        return hits[0]
+    dut = dut_index()
+    return next(i for i in range(len(names)) if i != dut)
+
+
 @contextmanager
 def session(reader: int | None = None):
     from smartcard.System import readers
 
-    idx = int(os.environ.get("OPENSC_DEFAULT_READER", "0")) if reader is None else reader
+    idx = dut_index() if reader is None else reader
     conn = readers()[idx].createConnection()
     conn.connect()
     try:

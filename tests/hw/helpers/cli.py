@@ -146,12 +146,14 @@ class CLIRunner:
         Args:
             apdus: Hex APDU strings to send in sequence.
             reader: PCSC reader index (default: the device under test,
-                OPENSC_DEFAULT_READER, else 0).  Pass it only for tests
+                PICO2HSM_READER / OPENSC_DEFAULT_READER, else 0).  Pass it only for tests
                 that address a specific device of several.
             save_as: If set, save the trace to this filename in run_dir.
         """
         if reader is None:
-            reader = int(os.environ.get("OPENSC_DEFAULT_READER", "0"))
+            from helpers.pcsc import dut_index
+
+            reader = dut_index()
         cmd = ["opensc-tool", "-c", "default", f"-r{reader}"]
         for apdu in apdus:
             cmd += ["-s", apdu]

@@ -38,7 +38,7 @@ import time
 
 import pytest
 
-from helpers.pcsc import session
+from helpers.pcsc import dut_index as R0, peer_index as R1, session
 
 log = logging.getLogger(__name__)
 
@@ -173,9 +173,9 @@ def enroll(s0, s1, p0: bytes, p1: bytes) -> "dom.MemberCert":
 
 def setup_pair(config: dict) -> None:
     """Reader 0 forms a domain from SHARE1+SHARE2; reader 1 is fresh."""
-    initialize(0, config, 2)
-    initialize(1, config, 1)
-    with session(0) as s:
+    initialize(R0(), config, 2)
+    initialize(R1(), config, 1)
+    with session(R0()) as s:
         s.ok(SELECT_SC_HSM)
         for share in (SHARE1, SHARE2):
             ok_share(s, share)
@@ -192,7 +192,7 @@ def ok_share(s, share: bytes) -> None:
 
 def test_enroll_reader1_through_reader0(config):
     setup_pair(config)
-    with session(0) as s0, session(1) as s1:
+    with session(R0()) as s0, session(R1()) as s1:
         p0, p1 = open_dev(s0, config), open_dev(s1, config)
         lamport = status(s0).lamport
         cert = enroll(s0, s1, p0, p1)
@@ -213,7 +213,7 @@ def test_enroll_reader1_through_reader0(config):
 
 def test_revoke_and_carry_the_revocation(config):
     setup_pair(config)
-    with session(0) as s0, session(1) as s1:
+    with session(R0()) as s0, session(R1()) as s1:
         p0, p1 = open_dev(s0, config), open_dev(s1, config)
         enroll(s0, s1, p0, p1)
         q = status(s0).q_domain
@@ -236,7 +236,7 @@ def test_revoke_and_carry_the_revocation(config):
 
 def test_reenrolling_a_revoked_device_is_refused(config):
     setup_pair(config)
-    with session(0) as s0, session(1) as s1:
+    with session(R0()) as s0, session(R1()) as s1:
         p0, p1 = open_dev(s0, config), open_dev(s1, config)
         enroll(s0, s1, p0, p1)
         id1 = dom.member_id(p1)
@@ -258,8 +258,8 @@ def test_reenrolling_a_revoked_device_is_refused(config):
     # Re-INITIALIZE: INITIALIZE generates a new device key, so the device
     # comes back as a NEW member, and only through the full enrollment
     # (sponsor SO-PIN + SAS).  The old member ID stays revoked.
-    initialize(1, config, 1)
-    with session(0) as s0, session(1) as s1:
+    initialize(R1(), config, 1)
+    with session(R0()) as s0, session(R1()) as s1:
         p0, p1b = open_dev(s0, config), open_dev(s1, config)
         assert dom.member_id(p1b) != id1, "INITIALIZE gave a new member key"
         enroll(s0, s1, p0, p1b)
@@ -271,9 +271,9 @@ def test_reenrolling_a_revoked_device_is_refused(config):
 
 
 def test_device_formed_from_the_same_shares_imports_the_members(config):
-    initialize(0, config, 2)
-    initialize(1, config, 2)
-    with session(0) as s0, session(1) as s1:
+    initialize(R0(), config, 2)
+    initialize(R1(), config, 2)
+    with session(R0()) as s0, session(R1()) as s1:
         for s in (s0, s1):
             s.ok(SELECT_SC_HSM)
             for share in (SHARE1, SHARE2):
@@ -314,12 +314,12 @@ def test_cli_local_enroll(config, tmp_path):
     pin = tmp_path / "so-pin"
     pin.write_text(config["so_pin"] + "\n")
     r = subprocess.run(
-        [TOOL, "domain", "enroll", "--sponsor", "0", "--joiner", "1",
+        [TOOL, "domain", "enroll", "--sponsor", str(R0()), "--joiner", str(R1()),
          "--so-pin-file", str(pin)],
         input="y\n", capture_output=True, text=True, timeout=180)
     log.info("%s\n%s", r.stdout, r.stderr)
     assert r.returncode == 0, r.stdout + r.stderr
-    for reader in ("0", "1"):
+    for reader in (str(R0()), str(R1())):
         m = subprocess.run([TOOL, "-r", reader, "domain", "members"],
                            capture_output=True, text=True, timeout=60)
         assert m.returncode == 0, m.stdout + m.stderr
@@ -335,10 +335,10 @@ def test_cli_remote_enroll_by_message_files(config, tmp_path):
     msgs.mkdir()
     common = ["domain", "enroll", "--remote", "--msg-dir", str(msgs),
               "--so-pin-file", str(pin), "--timeout", "120"]
-    sponsor = subprocess.Popen([TOOL, "-r", "0", *common, "--role", "sponsor"],
+    sponsor = subprocess.Popen([TOOL, "-r", str(R0()), *common, "--role", "sponsor"],
                                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                stderr=subprocess.STDOUT, text=True)
-    joiner = subprocess.Popen([TOOL, "-r", "1", *common, "--role", "joiner"],
+    joiner = subprocess.Popen([TOOL, "-r", str(R1()), *common, "--role", "joiner"],
                               stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                               stderr=subprocess.STDOUT, text=True)
     # Both sides wait on each other's messages: answer both prompts concurrently
@@ -353,6 +353,6 @@ def test_cli_remote_enroll_by_message_files(config, tmp_path):
     assert sponsor.returncode == 0 and joiner.returncode == 0
     sas_lines = [ln for ln in (s_out + j_out).splitlines() if "authentication string" in ln]
     assert len(sas_lines) == 2 and sas_lines[0].split()[-2:] == sas_lines[1].split()[-2:]
-    m = subprocess.run([TOOL, "-r", "1", "domain", "members"],
+    m = subprocess.run([TOOL, "-r", str(R1()), "domain", "members"],
                        capture_output=True, text=True, timeout=60)
     assert m.returncode == 0 and m.stdout.count("verified") == 2, m.stdout

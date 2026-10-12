@@ -72,6 +72,80 @@ Security and robustness release from the October 2026 audit
   (id 4).  Firmware before this skips them.
 - **RAM:** +9.0 KB (the generator state, static) on every board.
 
+### Changed — status display redesign (Geek 240×135, Waveshare LCD 320×172)
+See `docs/DISPLAY_ARCHITECTURE.md` and `docs/DISPLAY_LAYOUT.md`.
+- **Core1 is the single source of truth.**  The dispatcher publishes a
+  seqlocked snapshot (`display_snapshot::SNAP`: session auth, retries,
+  the last operation and its result, key inventory, domain, health) before
+  every response; core0 no longer guesses state from INS bytes.  One
+  host-tested table, `pico2hsm_core::op::classify_op`, names operations for
+  all three applets (SC-HSM SIGN 0x68, PIV GENERAL AUTHENTICATE, OpenPGP
+  INTERNAL AUTHENTICATE, chained commands and 61xx results included).
+- **A display task on core0** owns the panel.  The CCID loop hands each
+  APDU to core1 first and only signals the task; WORKING appears only
+  after 300 ms, so short commands no longer cause two full repaints
+  (~60–70 ms per APDU on Waveshare, ~45 ms on Geek).
+- **No framebuffer.**  The screen is drawn in 16-row bands (span fills,
+  one DMA per band) and only changed bands are redrawn; the 1 Hz uptime
+  tick redraws the footer only.  Release `.bss` (all applets + RSA +
+  curve25519): Waveshare 16MB 363 352 → 285 164 B (−76.4 KB), Waveshare
+  SD 355 880 → 277 684 B (−76.4 KB), Geek 16MB 329 376 → 283 216 B
+  (−45.1 KB), Geek SD 321 904 → 275 732 B (−45.1 KB).
+- **New screens**: home (status word + band bar, applet and ADMIN chips,
+  PIN / KEYS / DOMAIN tiles, activity line with age, footer with uptime,
+  firmware, storage and last reset cause), boot splash with progress,
+  full-screen errors E10 / E11 / E20 (E31 rendered, not yet wired),
+  enrollment notices, and the SAS comparison screen.  RGB444 palette
+  defined natively (the RGB565 colours collapsed after truncation).
+- **SAS mailbox** (`display_snapshot::SAS_MAILBOX`, `sas_publish` /
+  `sas_clear`) and its 120 s screen are in place; nothing on `main`
+  publishes a code yet (the device-side commit/reveal is the follow-up,
+  `CLUSTER_PLAN_V3.md` §5.2).
+- Geek LCD init is async (no 0.7 s busy-wait under the armed watchdog) and
+  no longer paints solid blue/green before storage is up; SPI1 now runs at
+  37.5 MHz (40 MHz requested; the old 30 MHz request gave 25 MHz).
+- Design decisions (2026-10-12): the last operation outlives its host
+  session, dimmed once that session has ended, and "Idle" means nothing
+  since boot (authentication and ADMIN still clear with the session);
+  the Waveshare status word is bold (double-struck, no RAM); NO HOST is
+  cyan on the LCD (it was INFO light blue, next to WORKING's blue) as on
+  the LED; every footer strip, including the reset warning and the
+  dev-board strip, keeps the storage token at its right; the Geek footer
+  is drawn in TEXT2 instead of DIM.  No `.bss` change.
+- Host render harness: golden-hash snapshots of every screen at both
+  resolutions, text-fit and partial-update checks, PPM / PNG previews
+  (`DISPLAY_PREVIEW_DIR`).  `png` is a dev-dependency only.
+
+### Fixed — status display
+- "Last op" stayed `--` while signing (0x68, 0x46, 0x87, 0x88 unmapped,
+  61xx dropped, 0x62 always "ECDH", OpenPGP 0x47/81 shown as key
+  generation).
+- Uptime and the last-op age froze while idle; the last op now stays with
+  its age and fades instead of expiring after 3 s.
+- Screensaver inverted on both boards (Geek turned the backlight *off* on
+  the first APDU after idle; Waveshare blanked, redrew BUSY and stuck).
+  Now: 300 s idle → backlight off, DISPOFF, SLPIN; any activity wakes it;
+  never while ERROR, LOCKED, ADMIN, WORKING or a SAS is up.
+- The Auth indicator was a heuristic: a VERIFY P1=FF logout showed YES, a
+  failed VERIFY left YES, YES survived USB disconnect and card power-off
+  (audit S2-misc), SO-PIN and PIV management-key auth were never shown.
+  Authentication now comes only from core1's snapshot for the current
+  session epoch with USB configured; admin credentials show an ADMIN chip.
+- Storage health was hard-coded OK and READY showed after a failed keystore
+  init; health now comes from core1 (init failure, missing storage key,
+  sticky write failure) and fails closed.
+- No SD card: Waveshare showed BUSY until the watchdog fired, the Geek
+  showed READY and then panicked.  Both now show E10 with the attempt count
+  before waiting for the watchdog.
+- The key count lagged one APDU, counted files, certificates and the device
+  key, and ignored PIV and OpenPGP keys.
+- Uptime and keys were drawn twice; uptime overflowed at 1000 h.
+- Waveshare WS2812: R and G were swapped twice, so READY was red; the LED
+  is now written only on a colour change.  (By code inspection — confirm on
+  hardware.)
+- Removed the 1 px status stripe at the bottom edge and the RGB565-era
+  colours that produced the faint "gradient" / dash artefacts.
+
 ### Added — domains, phase P2: enrollment (`docs/CLUSTER_PLAN_V3.md` §11b)
 - **ISSUE_MEMBER_CERT (0x54/45, SO-PIN).**  Certifies an enrolling device
   with the domain key.  It only certifies the peer this device sent its
