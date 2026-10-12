@@ -571,6 +571,13 @@ pub struct ScHsmState {
     /// Persisted at `domain::records::PINNED_PEER`.
     pub pinned_peer: Option<[u8; 65]>,
 
+    /// The peer this device, as SOURCE, sent its DKEK to in a V2 exchange
+    /// completed in this card session (step 3 spent the pin for it).
+    /// ISSUE_MEMBER_CERT certifies only this key or a still-pinned peer —
+    /// both operator-verified (§5.2).  Session state: cleared at session
+    /// end, by INITIALIZE, and by the certificate it allows (single use).
+    pub exchanged_peer: Option<[u8; 65]>,
+
     /// In-memory EF file data cache.
     ///
     /// Core1's `FlashQueueKeyStore::fetch_key()` always returns `Ok(None)` —
@@ -628,6 +635,7 @@ impl ScHsmState {
             lamport_seen: 0,
             domain: None,
             pinned_peer: None,
+            exchanged_peer: None,
             ef_cache: Vec::new(),
         }
     }
@@ -679,6 +687,7 @@ impl ScHsmState {
             addr_of_mut!((*dest).lamport_seen).write(0);
             addr_of_mut!((*dest).domain).write(None);
             addr_of_mut!((*dest).pinned_peer).write(None);
+            addr_of_mut!((*dest).exchanged_peer).write(None);
             addr_of_mut!((*dest).ef_cache).write(Vec::new());
         }
     }
