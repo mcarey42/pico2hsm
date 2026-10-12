@@ -38,11 +38,30 @@ pub const OPENPGP_AID_PREFIX: &[u8] = &[0xD2, 0x76, 0x00, 0x01, 0x24, 0x01];
 /// D2 76 00 01 24 01 = RID + application
 /// 03 04 = version 3.4
 /// FF FF = manufacturer (test/unassigned)
-/// 00 00 00 01 = serial number (placeholder)
+/// xx xx xx xx = serial number, per device (see `openpgp_aid`)
 /// 00 00 = RFU
-pub const OPENPGP_AID: [u8; 16] = [
-    0xD2, 0x76, 0x00, 0x01, 0x24, 0x01, 0x03, 0x04, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00,
+const OPENPGP_AID_TEMPLATE: [u8; 16] = [
+    0xD2, 0x76, 0x00, 0x01, 0x24, 0x01, 0x03, 0x04, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 ];
+
+/// This device's OpenPGP AID.  The serial (bytes 10-13) is the first four
+/// bytes of SHA-256("pico2hsm-openpgp-serial" || chip id): GnuPG's scdaemon
+/// tells cards apart by this serial, so a fixed one made every device look
+/// like the same card.
+pub fn openpgp_aid() -> [u8; 16] {
+    use sha2::{Digest, Sha256};
+    #[cfg(target_arch = "arm")]
+    let chip_id = embassy_rp::otp::get_chipid().unwrap_or(0);
+    #[cfg(not(target_arch = "arm"))]
+    let chip_id = 0u64;
+    let mut h = Sha256::new();
+    h.update(b"pico2hsm-openpgp-serial");
+    h.update(chip_id.to_be_bytes());
+    let digest = h.finalize();
+    let mut aid = OPENPGP_AID_TEMPLATE;
+    aid[10..14].copy_from_slice(&digest[..4]);
+    aid
+}
 
 /// P-256 OID bytes (1.2.840.10045.3.1.7) — used in algorithm attributes.
 pub const P256_OID: &[u8] = &[0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07];

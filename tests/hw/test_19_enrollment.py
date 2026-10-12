@@ -173,8 +173,8 @@ def enroll(s0, s1, p0: bytes, p1: bytes) -> "dom.MemberCert":
 
 def setup_pair(config: dict) -> None:
     """Reader 0 forms a domain from SHARE1+SHARE2; reader 1 is fresh."""
-    initialize(0, config, 2)
-    initialize(1, config, 1)
+    initialize(R0(), config, 2)
+    initialize(R1(), config, 1)
     with session(R0()) as s:
         s.ok(SELECT_SC_HSM)
         for share in (SHARE1, SHARE2):
@@ -258,7 +258,7 @@ def test_reenrolling_a_revoked_device_is_refused(config):
     # Re-INITIALIZE: INITIALIZE generates a new device key, so the device
     # comes back as a NEW member, and only through the full enrollment
     # (sponsor SO-PIN + SAS).  The old member ID stays revoked.
-    initialize(1, config, 1)
+    initialize(R1(), config, 1)
     with session(R0()) as s0, session(R1()) as s1:
         p0, p1b = open_dev(s0, config), open_dev(s1, config)
         assert dom.member_id(p1b) != id1, "INITIALIZE gave a new member key"
@@ -271,8 +271,8 @@ def test_reenrolling_a_revoked_device_is_refused(config):
 
 
 def test_device_formed_from_the_same_shares_imports_the_members(config):
-    initialize(0, config, 2)
-    initialize(1, config, 2)
+    initialize(R0(), config, 2)
+    initialize(R1(), config, 2)
     with session(R0()) as s0, session(R1()) as s1:
         for s in (s0, s1):
             s.ok(SELECT_SC_HSM)

@@ -1634,8 +1634,7 @@ async fn display_board_ccid_loop<'d, D: embassy_usb::driver::Driver<'d>>(
                     send_to_core1(apdu_bytes).await;
                     set_apdu_started(Some(embassy_time::Instant::now().as_millis() as u32));
                     kick();
-                    let mut response = match await_core1_response(ccid).await
-                    {
+                    let mut response = match await_core1_response(ccid).await {
                         Some(r) => r,
                         None => watchdog_reset(ccid).await,
                     };

@@ -6,7 +6,7 @@
 use heapless::Vec;
 use pico2hsm_core::apdu::{ApduCommand, ApduResponse, SW_FILE_NOT_FOUND};
 
-use crate::protocol::openpgp::{OpenPgpState, OPENPGP_AID, OPENPGP_AID_PREFIX};
+use crate::protocol::openpgp::{openpgp_aid, OpenPgpState, OPENPGP_AID_PREFIX};
 
 /// INS byte for SELECT.
 pub const INS_SELECT: u8 = 0xA4;
@@ -24,7 +24,7 @@ pub fn handle(state: &mut OpenPgpState, cmd: &ApduCommand<'_>) -> ApduResponse {
     state.reset_security_state();
 
     // Build FCI: 6F [ 84 [AID] A5 [ 9F6E [version] ] ]
-    let aid = &OPENPGP_AID;
+    let aid = &openpgp_aid();
     // Version data: OpenPGP card version 3.4
     let version: &[u8] = &[0x03, 0x04, 0x00, 0x00];
 

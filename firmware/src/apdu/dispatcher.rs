@@ -1183,11 +1183,11 @@ fn build_piv_fci() -> ApduResponse {
 ///     9F6E 04 03 04 00 00   — version 3.4
 /// ```
 fn build_openpgp_fci(openpgp: &mut OpenPgp) -> ApduResponse {
-    use crate::protocol::openpgp::OPENPGP_AID;
+    use crate::protocol::openpgp::openpgp_aid;
 
     openpgp.state.reset_security_state();
 
-    let aid = &OPENPGP_AID;
+    let aid = &openpgp_aid();
     let version: &[u8] = &[0x03, 0x04, 0x00, 0x00];
 
     let a5_inner_len: u8 = 2 + 1 + version.len() as u8;

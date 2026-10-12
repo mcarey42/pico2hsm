@@ -31,8 +31,9 @@ log = logging.getLogger(__name__)
 # so with several devices attached a bare `opensc-tool` would silently test
 # another device.  When either is set, the shims in helpers/bin add the reader to
 # opensc-tool / sc-hsm-tool / pkcs11-tool.  GnuPG 2.4's scdaemon opens every
-# reader and ignores reader-port, and firmware before the per-chip USB serial
-# shared one serial number, so gpg can only test reader 0: `gpg_skip_reason()` skips those checks otherwise.
+# reader and ignores reader-port; `gpg_card_status_cmd()` reads the device
+# under test by its OpenPGP serial (`gpg-card list <serial>`; per device since
+# 2.0; older firmware shares one, so gpg can then only test reader 0).
 
 _HW_DIR = Path(__file__).resolve().parent
 
@@ -70,10 +71,50 @@ def probe_reset_skip_reason() -> str | None:
     return None
 
 
-def gpg_skip_reason() -> str | None:
+def _dut_openpgp_serial() -> str | None:
+    """The device under test's OpenPGP AID (scdaemon's card serial), hex."""
+    from helpers.pcsc import session
+
+    try:
+        with session(target_reader()) as s:
+            data, sw = s.send(bytes.fromhex("00A4040006D27600012401"))
+    except Exception:
+        return None
+    i = data.find(b"\x84\x10")
+    return data[i + 2:i + 18].hex().upper() if sw == 0x9000 and i >= 0 else None
+
+
+def gpg_card_status_cmd(learn: bool = False) -> tuple[list[str] | None, str | None]:
+    """Restart scdaemon; return (command printing the card status of the
+    device under test, None) or (None, skip reason).
+
+    scdaemon's current card is per connection, so `scd switchcard` can't
+    steer a later `gpg --card-status`; `gpg-card list <serial>` selects the
+    card in its own session.  It shows keygrips, not fingerprints, for keys
+    not in the keyring, so `learn=True` returns an agent session that selects
+    the card and prints scdaemon's status lines (`S KEY-FPR 1 <hex>`).
+    """
+    try:
+        subprocess.run(["gpgconf", "--kill", "scdaemon"], capture_output=True, timeout=30)
+        serial = _dut_openpgp_serial()
+        cards = subprocess.run(
+            ["gpg-connect-agent", "scd serialno --all", "scd getinfo card_list", "/bye"],
+            capture_output=True, text=True, timeout=30).stdout
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return None, "gpg / scdaemon not available"
+    # One reply per command: `serialno --all` (the current card), then the
+    # card list.
+    replies = cards.split("\nOK")
+    listed = [l.split()[2] for l in replies[1].splitlines()
+              if l.startswith("S SERIALNO ")] if len(replies) > 1 else []
+    if serial is not None and listed.count(serial) == 1:
+        if learn:
+            return ["gpg-connect-agent", "scd serialno --all", f"scd switchcard {serial}",
+                    "scd learn --force", "/bye"], None
+        return ["gpg-card", "--no-history", "list", serial], None
     if target_reader() != 0:
-        return "gpg/scdaemon can only reach reader 0 (it ignores reader-port with several readers)"
-    return None
+        return None, "gpg/scdaemon can only reach reader 0 (devices share one OpenPGP serial)"
+    return ["gpg", "--no-tty", "--card-status"], None
 
 
 def pytest_configure(config):
