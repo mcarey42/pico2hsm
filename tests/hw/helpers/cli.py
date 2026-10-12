@@ -134,7 +134,7 @@ class CLIRunner:
     def send_apdu(
         self,
         *apdus: str,
-        reader: int = 0,
+        reader: Optional[int] = None,
         save_as: Optional[str] = None,
     ) -> CLIResult:
         """Send one or more raw APDUs via opensc-tool and return the result.
@@ -145,9 +145,13 @@ class CLIRunner:
 
         Args:
             apdus: Hex APDU strings to send in sequence.
-            reader: PCSC reader index (default 0).
+            reader: PCSC reader index (default: the device under test,
+                OPENSC_DEFAULT_READER, else 0).  Pass it only for tests
+                that address a specific device of several.
             save_as: If set, save the trace to this filename in run_dir.
         """
+        if reader is None:
+            reader = int(os.environ.get("OPENSC_DEFAULT_READER", "0"))
         cmd = ["opensc-tool", "-c", "default", f"-r{reader}"]
         for apdu in apdus:
             cmd += ["-s", apdu]

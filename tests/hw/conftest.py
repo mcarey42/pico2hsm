@@ -19,6 +19,65 @@ from helpers import trace
 
 log = logging.getLogger(__name__)
 
+
+# ---------------------------------------------------------------------------
+# Target reader selection
+# ---------------------------------------------------------------------------
+# OPENSC_DEFAULT_READER=N selects the device under test.  The pyscard helpers
+# honour it, but OpenSC's tools and GnuPG do not (they always use reader 0),
+# so with several devices attached a bare `opensc-tool` would silently test
+# another device.  When it is set, the shims in helpers/bin add the reader to
+# opensc-tool / sc-hsm-tool / pkcs11-tool.  GnuPG 2.4's scdaemon opens every
+# reader and ignores reader-port, and our devices share one serial number, so
+# gpg can only test reader 0: `gpg_skip_reason()` skips those checks otherwise.
+
+_HW_DIR = Path(__file__).resolve().parent
+
+
+def target_reader() -> int:
+    return int(os.environ.get("OPENSC_DEFAULT_READER", "0"))
+
+
+def _reader_name(index: int) -> str | None:
+    try:
+        from smartcard.System import readers
+
+        return str(readers()[index])
+    except Exception:
+        return None
+
+
+def probe_reset_skip_reason() -> str | None:
+    """Why a probe-rs reset can't target the device under test, if it can't."""
+    if os.environ.get("PROBE_RS_PROBE"):
+        return None
+    try:
+        out = subprocess.run(["probe-rs", "list"], capture_output=True, timeout=15).stdout.decode()
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return "probe-rs not available"
+    probes = [l for l in out.splitlines() if l.strip().startswith("[")]
+    if not probes:
+        return "no debug probe attached"
+    if len(probes) > 1:
+        return "several debug probes attached: set PROBE_RS_PROBE=VID:PID:SERIAL for the device under test"
+    if target_reader() != 0:
+        return "OPENSC_DEFAULT_READER selects another device: set PROBE_RS_PROBE for its probe"
+    return None
+
+
+def gpg_skip_reason() -> str | None:
+    if target_reader() != 0:
+        return "gpg/scdaemon can only reach reader 0 (it ignores reader-port with several readers)"
+    return None
+
+
+def pytest_configure(config):
+    if "OPENSC_DEFAULT_READER" not in os.environ:
+        return
+    os.environ["PATH"] = f"{_HW_DIR / 'helpers' / 'bin'}{os.pathsep}{os.environ['PATH']}"
+    name = _reader_name(target_reader())
+    log.info("device under test: reader %d (%s)", target_reader(), name)
+
 # ---------------------------------------------------------------------------
 # Key slot definitions (used in multiple test modules)
 # ---------------------------------------------------------------------------
