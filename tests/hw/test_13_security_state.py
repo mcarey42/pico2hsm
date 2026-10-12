@@ -82,8 +82,7 @@ class TestSelectClearsAuth:
         # Step 1: SELECT + VERIFY — PIN must be accepted.
         # After this the device has pin_verified=True in RAM.
         r = runner.send_apdu(
-            SELECT_SC_HSM, verify_apdu,
-            reader=0, save_as="13_select_verify",
+            SELECT_SC_HSM, verify_apdu, save_as="13_select_verify",
         )
         sws = _parse_sw(r.stdout)
         log.info("Step 1 SWs: %s", [f"{sw:04X}" for sw in sws])
@@ -94,8 +93,7 @@ class TestSelectClearsAuth:
         # Step 2: fresh opensc-tool invocation → SELECT (clears auth) + AUTH_REQUIRED.
         # SELECT AID must clear pin_verified; AUTH_REQUIRED must then return 6982/6985.
         r2 = runner.send_apdu(
-            SELECT_SC_HSM, AUTH_REQUIRED,
-            reader=0, save_as="13_reselect_auth_required",
+            SELECT_SC_HSM, AUTH_REQUIRED, save_as="13_reselect_auth_required",
         )
         sw = _last_sw(r2.stdout)
         log.info("Step 2 AUTH_REQUIRED after re-SELECT (no VERIFY): SW=%04X", sw)
@@ -111,8 +109,7 @@ class TestSelectClearsAuth:
         # This also covers the common OpenSC pattern where SELECT AID is sent
         # twice (card detection + explicit select).
         r = runner.send_apdu(
-            SELECT_SC_HSM, SELECT_SC_HSM, AUTH_REQUIRED,
-            reader=0, save_as="13_double_select",
+            SELECT_SC_HSM, SELECT_SC_HSM, AUTH_REQUIRED, save_as="13_double_select",
         )
         sw = _last_sw(r.stdout)
         assert sw == 0x6982 or sw == 0x6985, (
@@ -131,16 +128,14 @@ class TestAppletSwitchClearsAuth:
 
         # Step 1: Verify on SC-HSM
         r = runner.send_apdu(
-            SELECT_SC_HSM, verify_apdu,
-            reader=0, save_as="13_verify_before_piv",
+            SELECT_SC_HSM, verify_apdu, save_as="13_verify_before_piv",
         )
         if _last_sw(r.stdout) != 0x9000:
             pytest.skip("Could not verify PIN")
 
         # Step 2: Switch to PIV applet
         piv_result = runner.send_apdu(
-            SELECT_PIV,
-            reader=0, save_as="13_select_piv",
+            SELECT_PIV, save_as="13_select_piv",
         )
         if _last_sw(piv_result.stdout) != 0x9000:
             pytest.skip("PIV applet not present in this build")
@@ -148,8 +143,7 @@ class TestAppletSwitchClearsAuth:
         # Step 3: Switch back to SC-HSM — should clear pin_verified
         # Step 4: LIST KEYS without re-verifying — must fail
         r2 = runner.send_apdu(
-            SELECT_SC_HSM, AUTH_REQUIRED,
-            reader=0, save_as="13_schsm_after_piv",
+            SELECT_SC_HSM, AUTH_REQUIRED, save_as="13_schsm_after_piv",
         )
         sw = _last_sw(r2.stdout)
         log.info("LIST KEYS after PIV→SC-HSM switch: SW=%04X", sw)
@@ -167,24 +161,21 @@ class TestAppletSwitchClearsAuth:
 
         # Step 1: Verify on SC-HSM
         r = runner.send_apdu(
-            SELECT_SC_HSM, verify_apdu,
-            reader=0, save_as="13_verify_before_openpgp",
+            SELECT_SC_HSM, verify_apdu, save_as="13_verify_before_openpgp",
         )
         if _last_sw(r.stdout) != 0x9000:
             pytest.skip("Could not verify PIN")
 
         # Step 2: Switch to OpenPGP applet
         openpgp_result = runner.send_apdu(
-            SELECT_OPENPGP,
-            reader=0, save_as="13_select_openpgp",
+            SELECT_OPENPGP, save_as="13_select_openpgp",
         )
         if _last_sw(openpgp_result.stdout) != 0x9000:
             pytest.skip("OpenPGP applet not present in this build")
 
         # Step 3: Switch back to SC-HSM + LIST KEYS — must fail
         r2 = runner.send_apdu(
-            SELECT_SC_HSM, AUTH_REQUIRED,
-            reader=0, save_as="13_schsm_after_openpgp",
+            SELECT_SC_HSM, AUTH_REQUIRED, save_as="13_schsm_after_openpgp",
         )
         sw = _last_sw(r2.stdout)
         log.info("LIST KEYS after OpenPGP→SC-HSM switch: SW=%04X", sw)

@@ -133,8 +133,7 @@ class TestChangePIN:
         # Change PIN: P1=0x01 (TLV), P2=0x81 (User PIN)
         change_apdu = _change_pin_tlv_apdu(old_pin, new_pin)
         result = runner.send_apdu(
-            SELECT_SC_HSM, change_apdu,
-            reader=0, save_as="12_change_pin",
+            SELECT_SC_HSM, change_apdu, save_as="12_change_pin",
         )
         assert _last_sw(result.stdout) == 0x9000, (
             f"CHANGE REFERENCE DATA failed: SW={_last_sw(result.stdout):04X}"
@@ -142,12 +141,12 @@ class TestChangePIN:
 
         # Verify new PIN works
         verify_new = _verify_pin_apdu(new_pin)
-        r = runner.send_apdu(SELECT_SC_HSM, verify_new, reader=0)
+        r = runner.send_apdu(SELECT_SC_HSM, verify_new)
         assert _last_sw(r.stdout) == 0x9000, "New PIN not accepted after change"
 
         # Restore original PIN so other tests are unaffected
         restore_apdu = _change_pin_tlv_apdu(new_pin, old_pin)
-        r2 = runner.send_apdu(SELECT_SC_HSM, restore_apdu, reader=0)
+        r2 = runner.send_apdu(SELECT_SC_HSM, restore_apdu)
         assert _last_sw(r2.stdout) == 0x9000, (
             f"Failed to restore original PIN: SW={_last_sw(r2.stdout):04X}"
         )
@@ -161,8 +160,7 @@ class TestChangePIN:
 
         change_apdu = _change_pin_tlv_apdu(wrong_old, new_pin)
         result = runner.send_apdu(
-            SELECT_SC_HSM, change_apdu,
-            reader=0, save_as="12_change_pin_wrong_old",
+            SELECT_SC_HSM, change_apdu, save_as="12_change_pin_wrong_old",
         )
         sw = _last_sw(result.stdout)
         assert sw != 0x9000, "Wrong old PIN was accepted"
@@ -172,7 +170,7 @@ class TestChangePIN:
 
         # Re-verify correct PIN to reset retry counter
         verify = _verify_pin_apdu(config["pin"])
-        runner.send_apdu(SELECT_SC_HSM, verify, reader=0)
+        runner.send_apdu(SELECT_SC_HSM, verify)
 
     def test_change_pin_new_pin_too_short_rejected(
         self, runner: CLIRunner, config: dict, initialized_device
@@ -183,8 +181,7 @@ class TestChangePIN:
 
         change_apdu = _change_pin_tlv_apdu(old_pin, short_pin)
         result = runner.send_apdu(
-            SELECT_SC_HSM, change_apdu,
-            reader=0, save_as="12_change_pin_too_short",
+            SELECT_SC_HSM, change_apdu, save_as="12_change_pin_too_short",
         )
         sw = _last_sw(result.stdout)
         assert sw != 0x9000, f"Short new PIN was accepted: SW={sw:04X}"
@@ -208,7 +205,7 @@ class TestPINLockout:
         wrong_pin = "000000"
         apdu = _verify_pin_apdu(wrong_pin)
 
-        result = runner.send_apdu(SELECT_SC_HSM, apdu, reader=0)
+        result = runner.send_apdu(SELECT_SC_HSM, apdu)
         sw = _last_sw(result.stdout)
         assert (sw & 0xFFF0) == 0x63C0, f"Expected 63Cx, got {sw:04X}"
         counter = sw & 0x0F
@@ -217,7 +214,7 @@ class TestPINLockout:
 
         # Reset by verifying correct PIN
         verify = _verify_pin_apdu(config["pin"])
-        r = runner.send_apdu(SELECT_SC_HSM, verify, reader=0)
+        r = runner.send_apdu(SELECT_SC_HSM, verify)
         assert _last_sw(r.stdout) == 0x9000, "Could not restore PIN after decrement test"
 
     def test_pin_blocked_after_exhaustion(
@@ -229,7 +226,7 @@ class TestPINLockout:
 
         blocked = False
         for i in range(10):  # default retries = 3, so 10 is more than enough
-            result = runner.send_apdu(SELECT_SC_HSM, apdu, reader=0)
+            result = runner.send_apdu(SELECT_SC_HSM, apdu)
             sw = _last_sw(result.stdout)
             log.info("Attempt %d: SW=%04X", i + 1, sw)
             if sw == 0x6983:
@@ -240,7 +237,7 @@ class TestPINLockout:
 
         # Confirm PIN is blocked — even correct PIN must be rejected
         verify_correct = _verify_pin_apdu(config["pin"])
-        r = runner.send_apdu(SELECT_SC_HSM, verify_correct, reader=0)
+        r = runner.send_apdu(SELECT_SC_HSM, verify_correct)
         assert _last_sw(r.stdout) == 0x6983, (
             f"Correct PIN accepted on blocked device: SW={_last_sw(r.stdout):04X}"
         )
@@ -255,15 +252,14 @@ class TestPINLockout:
         reset_apdu = f"002C0281{len(new_pin_bytes):02X}{new_pin_bytes.hex()}"
 
         r = runner.send_apdu(
-            SELECT_SC_HSM, verify_sopin, reset_apdu,
-            reader=0, save_as="12_unblock_after_exhaust",
+            SELECT_SC_HSM, verify_sopin, reset_apdu, save_as="12_unblock_after_exhaust",
         )
         assert _last_sw(r.stdout) == 0x9000, (
             f"RESET RETRY COUNTER failed: SW={_last_sw(r.stdout):04X}"
         )
 
         # Verify PIN works again
-        r = runner.send_apdu(SELECT_SC_HSM, verify_correct, reader=0)
+        r = runner.send_apdu(SELECT_SC_HSM, verify_correct)
         assert _last_sw(r.stdout) == 0x9000, "PIN still blocked after reset"
 
     def test_pin_reset_via_sopin(
@@ -275,12 +271,12 @@ class TestPINLockout:
 
         # Lock the PIN
         for _ in range(10):
-            r = runner.send_apdu(SELECT_SC_HSM, wrong_apdu, reader=0)
+            r = runner.send_apdu(SELECT_SC_HSM, wrong_apdu)
             if _last_sw(r.stdout) == 0x6983:
                 break
 
         # Confirm locked
-        r = runner.send_apdu(SELECT_SC_HSM, wrong_apdu, reader=0)
+        r = runner.send_apdu(SELECT_SC_HSM, wrong_apdu)
         assert _last_sw(r.stdout) == 0x6983, "PIN not locked"
 
         # Reset: VERIFY SO-PIN then RESET RETRY COUNTER P1=0x02 P2=0x81
@@ -289,8 +285,7 @@ class TestPINLockout:
         reset_apdu = f"002C0281{len(new_pin_bytes):02X}{new_pin_bytes.hex()}"
 
         r = runner.send_apdu(
-            SELECT_SC_HSM, verify_sopin, reset_apdu,
-            reader=0, save_as="12_reset_via_sopin",
+            SELECT_SC_HSM, verify_sopin, reset_apdu, save_as="12_reset_via_sopin",
         )
         assert _last_sw(r.stdout) == 0x9000, (
             f"RESET RETRY COUNTER failed: SW={_last_sw(r.stdout):04X}"
@@ -298,7 +293,7 @@ class TestPINLockout:
 
         # Verify PIN works again
         verify = _verify_pin_apdu(config["pin"])
-        r = runner.send_apdu(SELECT_SC_HSM, verify, reader=0)
+        r = runner.send_apdu(SELECT_SC_HSM, verify)
         assert _last_sw(r.stdout) == 0x9000, "PIN still not accepted after reset"
 
 
@@ -320,8 +315,7 @@ class TestGetChallenge:
         """
         apdu = "0084000020"
         result = runner.send_apdu(
-            SELECT_SC_HSM, apdu,
-            reader=0, save_as="12_get_challenge_32",
+            SELECT_SC_HSM, apdu, save_as="12_get_challenge_32",
         )
         assert _last_sw(result.stdout) == 0x9000
         data = _parse_received_bytes(result.stdout)
@@ -332,7 +326,7 @@ class TestGetChallenge:
     ) -> None:
         """GET CHALLENGE with Le=8 must return exactly 8 bytes."""
         apdu = "0084000008"
-        result = runner.send_apdu(SELECT_SC_HSM, apdu, reader=0)
+        result = runner.send_apdu(SELECT_SC_HSM, apdu)
         assert _last_sw(result.stdout) == 0x9000
         data = _parse_received_bytes(result.stdout)
         assert len(data) == 8, f"Expected 8 bytes, got {len(data)}"
@@ -342,7 +336,7 @@ class TestGetChallenge:
     ) -> None:
         """GET CHALLENGE must not return all zeros (basic entropy sanity check)."""
         apdu = "0084000020"
-        result = runner.send_apdu(SELECT_SC_HSM, apdu, reader=0)
+        result = runner.send_apdu(SELECT_SC_HSM, apdu)
         assert _last_sw(result.stdout) == 0x9000
         data = _parse_received_bytes(result.stdout)
         assert data != bytes(32), "GET CHALLENGE returned all zeros — TRNG failure"
@@ -353,8 +347,8 @@ class TestGetChallenge:
     ) -> None:
         """Consecutive GET CHALLENGE calls must return different bytes."""
         apdu = "0084000020"
-        r1 = runner.send_apdu(SELECT_SC_HSM, apdu, reader=0)
-        r2 = runner.send_apdu(SELECT_SC_HSM, apdu, reader=0)
+        r1 = runner.send_apdu(SELECT_SC_HSM, apdu)
+        r2 = runner.send_apdu(SELECT_SC_HSM, apdu)
         d1 = _parse_received_bytes(r1.stdout)
         d2 = _parse_received_bytes(r2.stdout)
         assert _last_sw(r1.stdout) == 0x9000

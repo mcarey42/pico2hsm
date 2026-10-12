@@ -239,6 +239,10 @@ def test_openpgp_gpg_card_status(runner: CLIRunner, run_dir: Path) -> None:
     Note: Requires gpg and pcscd to be running.  The test is a subprocess
     invocation; it does NOT use the CLIRunner APDU trace infrastructure.
     """
+    from conftest import gpg_skip_reason
+
+    if reason := gpg_skip_reason():
+        pytest.skip(reason)
     cmd = ["gpg", "--no-tty", "--card-status"]
     log.info("Running: %s", " ".join(cmd))
 

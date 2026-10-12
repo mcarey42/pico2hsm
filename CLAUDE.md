@@ -50,6 +50,10 @@ Start `build-all-debug.sh` in the background first (it blocks on RTT streaming),
 
 If multiple pico2hsm devices are connected, use `OPENSC_DEFAULT_READER=N ./run_tests.sh` to target a specific reader (e.g. `N=1` for the second reader). Run `opensc-tool --list-readers` to see which index is which.
 
+- **OpenSC tools ignore `OPENSC_DEFAULT_READER`.** Only pyscard honours it. When it is set, `tests/hw/conftest.py` puts the shims in `tests/hw/helpers/bin` first on PATH; they add `-r N` (`opensc-tool`, `sc-hsm-tool`) or `--slot-description` (`pkcs11-tool`). A bare `opensc-tool` in a shell still talks to reader 0.
+- **gpg can only reach reader 0** once several readers exist: GnuPG 2.4's scdaemon ignores `reader-port` and the devices share a serial number. The gpg checks skip for other readers.
+- **probe-rs resets** need `PROBE_RS_PROBE=2e8a:000c:<serial>` when several probes are attached (`probe-rs list`). Without it the reset tests skip.
+
 If `probe-rs` reports "interface is busy (errno 16)", a previous probe-rs process is still holding the USB device:
 
 ```sh
@@ -226,6 +230,21 @@ when changing the code.
   the retry-counter log and is advanced before the change it numbers.
 - **The DKEK** is persisted at 0xFD, only replaced by an authenticated,
   SO-PIN, enrolled-peer exchange, never overwritten while set.
+- **A member certificate is only issued for an operator-verified key**
+  (ISSUE_MEMBER_CERT, 0x54/45, SO-PIN). That key is the peer this device
+  sent its DKEK to in this card session (`exchanged_peer`, session state),
+  or the currently pinned peer. Either is spent by the certificate. Never
+  an arbitrary key. `exchanged_peer` also ends at SELECT, at a new pin and
+  at a new SOURCE run.
+- **Imported Lamport values are capped** (`member::LAMPORT_CEILING`, 2^62).
+  Anything that raises `lamport_seen` from outside the device must be
+  bounded, or one signed object could exhaust the persisted counter for
+  good.
+- **Revocation is permanent per member key** (owner decision 8, plan §12).
+  Issue and import refuse a revoked member ID (6984), whatever the
+  certificate's Lamport value. Member-list entries are never removed
+  before P5. Imports need no PIN: the device checks the domain signature.
+  Note that INITIALIZE generates the device (member) key from the TRNG.
 - **Secrets are wiped in place.** Zeroize before moving or dropping; use
   `security::zeroize::key_buf` for fixed key buffers; `mem::replace` /
   assigning `None` does not wipe the old bytes.

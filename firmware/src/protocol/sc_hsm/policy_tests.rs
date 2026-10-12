@@ -16,7 +16,7 @@ pub(crate) struct BlobStore {
             u32,
             heapless::Vec<u8, { crate::security::key_management::MAX_BLOB_SIZE }>,
         ),
-        24,
+        48,
     >,
     /// Retry counters (PIN / PUK / PW1 / PW3).
     pub counters: crate::storage::retry_counter::MemCounters,

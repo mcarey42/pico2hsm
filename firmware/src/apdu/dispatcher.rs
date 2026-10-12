@@ -539,6 +539,7 @@ impl Dispatcher {
         sc.exchange_ephem_pub = None;
         sc.exchange_challenge = None;
         sc.exchange_peer_ephem_pub = None;
+        sc.exchanged_peer = None;
         sc.op_buf.invalidate();
         #[cfg(feature = "applet-piv")]
         {
@@ -578,6 +579,9 @@ impl Dispatcher {
             // a prior session — HIGH-1 security audit finding.
             self.sc_hsm.state.so_pin_verified = false;
             self.sc_hsm.state.pin_verified = false;
+            // Nor the right to certify a peer served earlier (another
+            // client of a shared reader may be the one selecting).
+            self.sc_hsm.state.exchanged_peer = None;
             return build_sc_hsm_fci();
         }
 
@@ -886,7 +890,7 @@ impl Dispatcher {
             for slot in 0..members {
                 if let Ok(Some(e)) = member::load(store, slot) {
                     if e.cert.member_id == own {
-                        state = if e.status == member::STATUS_REVOKED {
+                        state = if e.status() == member::STATUS_REVOKED {
                             DomainState::Revoked
                         } else {
                             DomainState::Member
@@ -1265,8 +1269,10 @@ mod tests {
         }
         d.openpgp.state.pw1_verified_sign = true;
         d.openpgp.state.pw3_verified = true;
+        d.sc_hsm.state.exchanged_peer = Some([4; 65]);
 
         d.clear_session();
+        assert!(d.sc_hsm.state.exchanged_peer.is_none());
 
         assert_eq!(d.active, ActiveProtocol::None);
         assert!(!d.sc_hsm.state.pin_verified && !d.sc_hsm.state.so_pin_verified);
@@ -1440,5 +1446,17 @@ mod tests {
         assert!(!d.display_begin(&[0x00, 0xC0, 0x00, 0x00, 0x10]));
         d.display_end(&[0x6F, 0x00], &mut store);
         assert_eq!(d.display_snapshot().activity.result, OpResult::Ok);
+    }
+
+    #[test]
+    fn select_drops_the_right_to_certify_an_exchanged_peer() {
+        let mut slot = core::mem::MaybeUninit::<Dispatcher>::uninit();
+        let d = Dispatcher::init_in_place(&mut slot);
+        d.sc_hsm.state.exchanged_peer = Some([4; 65]);
+        d.sc_hsm.state.so_pin_verified = true;
+        let resp = d.select_aid(SC_HSM_AID);
+        assert_eq!(resp.sw, SW_OK);
+        assert!(d.sc_hsm.state.exchanged_peer.is_none());
+        assert!(!d.sc_hsm.state.so_pin_verified);
     }
 }

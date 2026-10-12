@@ -75,6 +75,39 @@ See `docs/DISPLAY_ARCHITECTURE.md` and `docs/DISPLAY_LAYOUT.md`.
 - Removed the 1 px status stripe at the bottom edge and the RGB565-era
   colours that produced the faint "gradient" / dash artefacts.
 
+### Added — domains, phase P2: enrollment (`docs/CLUSTER_PLAN_V3.md` §11b)
+- **ISSUE_MEMBER_CERT (0x54/45, SO-PIN).**  Certifies an enrolling device
+  with the domain key.  It only certifies the peer this device sent its
+  DKEK to in this card session, or the currently pinned peer; either is
+  spent.  The issuing device's own certificate must be active with
+  may-sponsor (the default).  The Lamport counter is advanced first.
+- **REVOKE_MEMBER (0x54/46, SO-PIN)** returns a 121-byte revocation record
+  signed with the domain key.  The entry stays, marked revoked.  A device
+  never revokes itself.  **Revocation is permanent** for that member key
+  (owner decision 8).
+- **IMPORT_MEMBER_CERT (0x54/49) and IMPORT_REVOCATION (0x54/4A), no PIN.**
+  The device checks the domain signature and the domain, and refuses
+  duplicates and revoked members.  Certificates and revocations are
+  ranked, so every member keeps the same ones.  A full list (32 entries,
+  revoked included) gets `6A84`.
+- **Hardening from the P2 security review.**
+  - The right to certify the peer of an exchange now also ends at SELECT, at a new pin, and when another exchange starts.
+  - Imports refuse an issuer that is listed here without may-sponsor, and a revoker that was revoked earlier (`6982`).
+  - Imports refuse Lamport values above 2^62 (`6A80`). Before this, a single signed object could exhaust the persisted counter.
+- **GET_MEMBERS v2** (data `02`): 277-byte entries carrying each revoked
+  member's revocation, so hosts can carry revocations between devices.
+  DOMAIN_STATUS flags `10` (a served peer awaits its certificate) and `20`
+  (this device is revoked).
+- Python reference and vectors: revocations and the enrollment short
+  authentication string (`firmware/tests/vectors/enrollment_v1.txt`).
+  Hardware test `tests/hw/test_19_enrollment.py` (two devices).
+
+### Changed — domains, phase P2
+- Member-list entries are stored in version 2 (277 bytes); P1's
+  version-1 entries still load.
+- The plan's §4.2 is corrected: INITIALIZE generates the device (member)
+  key from the TRNG, so a re-initialised device is a new member.
+
 ### Added — domains, phase P1 (`docs/CLUSTER_PLAN_V3.md` §11a)
 - **Persisted Lamport counter.**  The SC-HSM generation counter is now a
   `u64` on internal flash (a new record kind in the retry-counter log),

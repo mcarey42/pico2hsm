@@ -282,6 +282,10 @@ def test_openpgp_gpg_card_status_shows_sig_fingerprint(
     writes it with PUT DATA C7 (this is what `gpg --card-edit` does).  The
     test writes a known fingerprint and checks gpg reports exactly that.
     """
+    from conftest import gpg_skip_reason
+
+    if reason := gpg_skip_reason():
+        pytest.skip(reason)
     fingerprint = bytes(range(0xA0, 0xB4))  # 20 recognisable bytes
     put_fp_sig = f"00DA00C714{fingerprint.hex()}"
     result_gen = _send_apdus(
