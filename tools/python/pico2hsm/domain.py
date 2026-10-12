@@ -20,6 +20,26 @@ Member certificate (187 bytes)::
     | member_pub(65) | sponsor_id(16) | issued_lamport(8, BE) | flags(1)
     | sig(64) = ECDSA-P256(d_domain, SHA-256("pico2hsm-member-cert-v1" | body)), r | s
 
+Revocation (121 bytes, phase P2)::
+
+    version(1) = 1 | domain_id(16) | member_id(16) | revoker_id(16)
+    | revoked_lamport(8, BE)
+    | sig(64) = ECDSA-P256(d_domain, SHA-256("pico2hsm-member-revoke-v1" | body)), r | s
+
+Member-list entry: version 1 (197 bytes, P1, GET_MEMBERS v1) =
+``1 | status | revoked_lamport(8) | cert(187)``; version 2 (277 bytes,
+stored, GET_MEMBERS v2) = the same with version 2, then
+``revoker_id(16) | revocation sig(64)`` (zeros while active).
+
+Short authentication string (enrollment, phase P2), ordered sponsor first::
+
+    h   = SHA-256("pico2hsm-sas-v1" | sponsor_pub | joiner_pub
+                  [| sponsor_nonce(32) | joiner_nonce(32)])   # nonces: remote mode
+    sas = int(h[0:8]) mod 10^8, eight digits shown as "1234 5678"
+
+In remote mode the sponsor first commits to its nonce,
+``SHA-256("pico2hsm-sas-commit-v1" | sponsor_pub | sponsor_nonce)``.
+
 Only the `cryptography` package is needed.
 """
 
@@ -47,6 +67,16 @@ FLAG_MAY_SPONSOR = 0x01
 
 ENTRY_VERSION = 1
 ENTRY_LEN = 10 + CERT_LEN
+ENTRY_V2_VERSION = 2
+ENTRY_V2_LEN = ENTRY_LEN + 16 + 64
+
+REVOCATION_VERSION = 1
+REVOCATION_BODY_LEN = 57
+REVOCATION_LEN = REVOCATION_BODY_LEN + 64
+REVOCATION_CONTEXT = b"pico2hsm-member-revoke-v1"
+
+SAS_CONTEXT = b"pico2hsm-sas-v1"
+SAS_COMMIT_CONTEXT = b"pico2hsm-sas-commit-v1"
 STATUS_ACTIVE = 0
 STATUS_REVOKED = 1
 
@@ -213,24 +243,104 @@ def parse_domain_status(b: bytes) -> DomainStatus:
     )
 
 
+# ---------------------------------------------------------------------------
+# Revocations (phase P2)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Revocation:
+    domain_id: bytes
+    member_id: bytes
+    revoker_id: bytes
+    revoked_lamport: int
+    sig: bytes
+
+    def body(self) -> bytes:
+        return (bytes([REVOCATION_VERSION]) + self.domain_id + self.member_id
+                + self.revoker_id + struct.pack(">Q", self.revoked_lamport))
+
+    def encode(self) -> bytes:
+        return self.body() + self.sig
+
+    def verify(self, q_domain: bytes) -> bool:
+        if self.domain_id != domain_id(q_domain) or self.member_id == self.revoker_id:
+            return False
+        pub = ec.EllipticCurvePublicKey.from_encoded_point(ec.SECP256R1(), q_domain)
+        r = int.from_bytes(self.sig[:32], "big")
+        s = int.from_bytes(self.sig[32:], "big")
+        try:
+            pub.verify(utils.encode_dss_signature(r, s), REVOCATION_CONTEXT + self.body(),
+                       ec.ECDSA(hashes.SHA256()))
+        except Exception:
+            return False
+        return True
+
+
+def parse_revocation(b: bytes) -> Revocation:
+    if len(b) != REVOCATION_LEN or b[0] != REVOCATION_VERSION:
+        raise ValueError("not a version-1 revocation")
+    return Revocation(b[1:17], b[17:33], b[33:49], struct.unpack(">Q", b[49:57])[0], b[57:121])
+
+
+def issue_revocation(dkek: bytes, member: bytes, revoker: bytes, lamport: int) -> Revocation:
+    """Sign a revocation with the domain key (RFC 6979)."""
+    if member == revoker:
+        raise ValueError("a member cannot revoke itself")
+    rev = Revocation(domain_id(domain_q(dkek)), member, revoker, lamport, b"")
+    der = domain_private_key(dkek).sign(
+        REVOCATION_CONTEXT + rev.body(), ec.ECDSA(hashes.SHA256(), deterministic_signing=True))
+    r, s = utils.decode_dss_signature(der)
+    rev.sig = r.to_bytes(32, "big") + s.to_bytes(32, "big")
+    return rev
+
+
+# ---------------------------------------------------------------------------
+# Short authentication string (phase P2 enrollment)
+# ---------------------------------------------------------------------------
+
+def sas(sponsor_pub: bytes, joiner_pub: bytes, sponsor_nonce: bytes = b"",
+        joiner_nonce: bytes = b"") -> str:
+    """Eight decimal digits; nonces only in remote mode (32 bytes each)."""
+    if bool(sponsor_nonce) != bool(joiner_nonce):
+        raise ValueError("both nonces or neither")
+    h = hashlib.sha256(SAS_CONTEXT + sponsor_pub + joiner_pub + sponsor_nonce
+                       + joiner_nonce).digest()
+    return f"{int.from_bytes(h[:8], 'big') % 100_000_000:08d}"
+
+
+def sas_commit(sponsor_pub: bytes, sponsor_nonce: bytes) -> bytes:
+    return hashlib.sha256(SAS_COMMIT_CONTEXT + sponsor_pub + sponsor_nonce).digest()
+
+
 @dataclass
 class MemberEntry:
     status: int
     revoked_lamport: int
     cert: MemberCert
+    revocation: Revocation | None = None
 
 
 def parse_member_entry(b: bytes) -> MemberEntry:
-    if len(b) != ENTRY_LEN or b[0] != ENTRY_VERSION:
-        raise ValueError("not a version-1 member-list entry")
-    return MemberEntry(b[1], struct.unpack(">Q", b[2:10])[0], parse_cert(b[10:]))
+    """A GET_MEMBERS entry, version 1 (197 bytes) or 2 (277 bytes)."""
+    if len(b) == ENTRY_LEN and b[0] == ENTRY_VERSION:
+        return MemberEntry(b[1], struct.unpack(">Q", b[2:10])[0], parse_cert(b[10:]))
+    if len(b) != ENTRY_V2_LEN or b[0] != ENTRY_V2_VERSION:
+        raise ValueError("not a member-list entry")
+    cert = parse_cert(b[10:ENTRY_LEN])
+    lamport = struct.unpack(">Q", b[2:10])[0]
+    rev = None
+    if b[1] == STATUS_REVOKED:
+        rev = Revocation(cert.domain_id, cert.member_id, b[ENTRY_LEN:ENTRY_LEN + 16], lamport,
+                         b[ENTRY_LEN + 16:])
+    return MemberEntry(b[1], lamport, cert, rev)
 
 
-def parse_members_page(b: bytes) -> tuple[int, int, list[MemberEntry]]:
-    """Response of GET_MEMBERS (80 54 47 <first>): (total, first, entries)."""
+def parse_members_page(b: bytes, v2: bool = False) -> tuple[int, int, list[MemberEntry]]:
+    """Response of GET_MEMBERS (80 54 47 <first> [02]): (total, first, entries)."""
     total, first, n = b[0], b[1], b[2]
     body = b[3:]
-    if len(body) != n * ENTRY_LEN:
+    size = ENTRY_V2_LEN if v2 else ENTRY_LEN
+    if len(body) != n * size:
         raise ValueError("GET_MEMBERS length mismatch")
-    return total, first, [parse_member_entry(body[i * ENTRY_LEN:(i + 1) * ENTRY_LEN])
+    return total, first, [parse_member_entry(body[i * size:(i + 1) * size])
                           for i in range(n)]

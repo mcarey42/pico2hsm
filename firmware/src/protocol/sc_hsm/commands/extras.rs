@@ -20,7 +20,11 @@
 //! - P1=0x3C: GET_GENERATION_V2 (the persisted Lamport counter, u64)
 //! - P1=0x3D: ENROLL_PEER_PUBKEY (SO-PIN; pins the peer for one exchange)
 //! - P1=0x40: DOMAIN_STATUS (no auth)
-//! - P1=0x47: GET_MEMBERS (no auth; paged, P2 = first slot)
+//! - P1=0x45: ISSUE_MEMBER_CERT (SO-PIN; only for an operator-verified peer)
+//! - P1=0x46: REVOKE_MEMBER (SO-PIN)
+//! - P1=0x47: GET_MEMBERS (no auth; paged, P2 = first slot; data 02 = v2)
+//! - P1=0x49: IMPORT_MEMBER_CERT (no auth; the domain signature is checked)
+//! - P1=0x4A: IMPORT_REVOCATION (no auth; the domain signature is checked)
 
 use pico2hsm_core::apdu::{
     ApduCommand, ApduResponse, SW_CONDITIONS_NOT_SATISFIED, SW_SECURITY_STATUS, SW_WRONG_DATA,
@@ -50,6 +54,9 @@ pub fn handle(
         0x3C => handle_get_generation_v2(store),
         0x40 => handle_domain_status(state, store),
         0x47 => handle_get_members(store, cmd),
+        // Authority is the domain signature, checked on the device (§12.1).
+        0x49 => handle_import_member_cert(state, store, cmd),
+        0x4A => handle_import_revocation(state, store, cmd),
 
         // SO-PIN required.
         0x3B => {
@@ -63,6 +70,18 @@ pub fn handle(
                 return ApduResponse::err(SW_SECURITY_STATUS);
             }
             handle_enroll_peer_pubkey(state, store, cmd)
+        }
+        0x45 => {
+            if !state.so_pin_verified {
+                return ApduResponse::err(SW_SECURITY_STATUS);
+            }
+            handle_issue_member_cert(state, store, cmd)
+        }
+        0x46 => {
+            if !state.so_pin_verified {
+                return ApduResponse::err(SW_SECURITY_STATUS);
+            }
+            handle_revoke_member(state, store, cmd)
         }
         // V2 DKEK exchange: moves the master wrapping key, so SO-PIN only.
         0x35..=0x38 => {
@@ -397,6 +416,9 @@ fn handle_noise_finalize_send_v2(
     if crate::protocol::sc_hsm::ScHsm::consume_pinned_peer(state, _store).is_err() {
         return ApduResponse::err(pico2hsm_core::apdu::SW_MEMORY_FAILURE);
     }
+    // The verified peer may now be certified, in this session only
+    // (ISSUE_MEMBER_CERT, §5.2 step 6).
+    state.exchanged_peer = Some(peer);
 
     // nonce(12) || ciphertext(32) || tag(16) = 60 bytes
     let mut out = [0u8; 60];
@@ -784,6 +806,11 @@ pub const DS_PRODUCTION: u8 = 0x02;
 pub const DS_SELF_MEMBER: u8 = 0x04;
 /// DOMAIN_STATUS flags: a peer is pinned for the next DKEK exchange.
 pub const DS_PINNED_PEER: u8 = 0x08;
+/// DOMAIN_STATUS flags: an exchange this session sent the DKEK to a peer
+/// that ISSUE_MEMBER_CERT may now certify.
+pub const DS_EXCHANGED_PEER: u8 = 0x10;
+/// DOMAIN_STATUS flags: this device's own certificate is revoked.
+pub const DS_SELF_REVOKED: u8 = 0x20;
 
 /// Public domain state; no authentication (cluster plan V3 §7.4, §8).
 ///
@@ -831,6 +858,9 @@ fn handle_domain_status(state: &mut ScHsmState, store: &mut dyn KeyStore) -> Apd
             match member::load(store, slot) {
                 Ok(Some(e)) if e.cert.member_id == id => {
                     flags |= DS_SELF_MEMBER;
+                    if e.revocation.is_some() {
+                        flags |= DS_SELF_REVOKED;
+                    }
                     break;
                 }
                 Ok(_) => {}
@@ -840,6 +870,9 @@ fn handle_domain_status(state: &mut ScHsmState, store: &mut dyn KeyStore) -> Apd
     }
     if state.pinned_peer.is_some() {
         flags |= DS_PINNED_PEER;
+    }
+    if state.exchanged_peer.is_some() {
+        flags |= DS_EXCHANGED_PEER;
     }
     out[1] = flags;
     out[107..115].copy_from_slice(&lamport.to_be_bytes());
@@ -852,22 +885,30 @@ fn handle_domain_status(state: &mut ScHsmState, store: &mut dyn KeyStore) -> Apd
 // P1=0x47  GET_MEMBERS
 // ---------------------------------------------------------------------------
 
-/// Member-list entries per GET_MEMBERS page.
+/// Member-list entries per GET_MEMBERS v1 page (197-byte entries).
 pub const MEMBERS_PER_PAGE: u8 = 16;
+/// Member-list entries per GET_MEMBERS v2 page (277-byte entries).
+pub const MEMBERS_PER_PAGE_V2: u8 = 14;
 
-/// The member list, a page at a time; no authentication (certificates are
-/// public and signed).  P2 = first slot.
+/// The member list, a page at a time; no authentication (certificates and
+/// revocations are public and signed).  P2 = first slot; data absent or
+/// `01` = version-1 entries (197 bytes, P1), `02` = version-2 entries
+/// (277 bytes, with each revoked member's revocation record).
 ///
 /// ```text
 /// [0]  total entries      [1]  first slot (= P2)     [2]  n entries here
-/// n × 197-byte entries (`domain::member`: version, status,
-///      revoked_lamport, certificate)
+/// n × entry (`domain::member`)
 /// ```
 /// The host asks again with P2 = first + n while first + n < total.
 #[inline(never)]
 fn handle_get_members(store: &mut dyn KeyStore, cmd: &ApduCommand<'_>) -> ApduResponse {
     use crate::domain::member;
 
+    let v2 = match cmd.data {
+        [] | [0x01] => false,
+        [0x02] => true,
+        _ => return ApduResponse::err(SW_WRONG_DATA),
+    };
     let Ok(total) = member::count(store) else {
         return ApduResponse::err(pico2hsm_core::apdu::SW_MEMORY_FAILURE);
     };
@@ -875,18 +916,325 @@ fn handle_get_members(store: &mut dyn KeyStore, cmd: &ApduCommand<'_>) -> ApduRe
     if first > total {
         return ApduResponse::err(pico2hsm_core::apdu::SW_INCORRECT_P1P2);
     }
-    let n = (total - first).min(MEMBERS_PER_PAGE);
+    let per_page = if v2 {
+        MEMBERS_PER_PAGE_V2
+    } else {
+        MEMBERS_PER_PAGE
+    };
+    let n = (total - first).min(per_page);
     let mut resp = ApduResponse::ok(&[total, first, n]);
     for slot in first..first + n {
         let entry = match member::load(store, slot) {
             Ok(Some(e)) => e,
             _ => return ApduResponse::err(pico2hsm_core::apdu::SW_MEMORY_FAILURE),
         };
-        if resp.data.extend_from_slice(&entry.encode()).is_err() {
+        let pushed = if v2 {
+            resp.data.extend_from_slice(&entry.encode())
+        } else {
+            resp.data.extend_from_slice(&entry.encode_v1())
+        };
+        if pushed.is_err() {
             return ApduResponse::err(pico2hsm_core::apdu::SW_MEMORY_FAILURE);
         }
     }
     resp
+}
+
+// ---------------------------------------------------------------------------
+// P1=0x45  ISSUE_MEMBER_CERT (SO-PIN)
+// ---------------------------------------------------------------------------
+
+/// Which operator-verified pin a certificate is issued against.
+enum IssueBinding {
+    /// The peer of the exchange this device completed as SOURCE this session.
+    Exchanged,
+    /// The peer pinned with ENROLL_PEER_PUBKEY (§5.3: a joiner that got the
+    /// DKEK from the shares); the issue spends the pin.
+    Pinned,
+}
+
+/// Certify an enrolling member (cluster plan V3 §5.2 step 6).
+///
+/// Data: `member_pub(65) [|| flags(1)]`; flags default to
+/// `FLAG_MAY_SPONSOR` (§12.3) and only that bit may be set.  Response: the
+/// 187-byte certificate, also stored in this device's member list.
+///
+/// A sponsor never certifies an arbitrary key: `member_pub` must be the
+/// peer this device sent its DKEK to in this card session (P1=37 records
+/// it) or the peer currently pinned with P1=3D — both checked by the
+/// operator with the short authentication string.  Either is spent by the
+/// certificate.  This device must hold an active certificate with the
+/// may-sponsor flag; a revoked member is never re-certified; a device does
+/// not certify itself (it self-certifies when its DKEK appears).  The
+/// Lamport counter is advanced (on flash) before anything changes.
+///
+/// | SW | Meaning |
+/// |---|---|
+/// | 6985 | no domain (DKEK), no identity key, or no exchanged / pinned peer |
+/// | 6700 | data not 65 or 66 bytes |
+/// | 6A80 | not a P-256 point, unknown flag bits, or this device's own key |
+/// | 6982 | SO-PIN not verified; the key is not the exchanged / pinned peer; or this device may not sponsor |
+/// | 6984 | the member is revoked |
+/// | 6A84 | the member list is full |
+/// | 6581 | the Lamport counter, pin or list could not be written |
+#[inline(never)]
+fn handle_issue_member_cert(
+    state: &mut ScHsmState,
+    store: &mut dyn KeyStore,
+    cmd: &ApduCommand<'_>,
+) -> ApduResponse {
+    use crate::domain::member::{self, Lookup, MemberCert, MemberEntry, FLAG_MAY_SPONSOR};
+    use pico2hsm_core::apdu::SW_MEMORY_FAILURE;
+
+    if state.domain.is_none() {
+        return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED);
+    }
+    let (subject, flags) = match cmd.data.len() {
+        65 => (&cmd.data[..65], FLAG_MAY_SPONSOR),
+        66 => (&cmd.data[..65], cmd.data[65]),
+        _ => return ApduResponse::err(SW_WRONG_LENGTH),
+    };
+    let Ok(subject) = <[u8; 65]>::try_from(subject) else {
+        return ApduResponse::err(SW_WRONG_LENGTH);
+    };
+    if subject[0] != 0x04
+        || p256::ecdsa::VerifyingKey::from_sec1_bytes(&subject).is_err()
+        || flags & !FLAG_MAY_SPONSOR != 0
+    {
+        return ApduResponse::err(SW_WRONG_DATA);
+    }
+    let Some(own) = crate::protocol::sc_hsm::ScHsm::device_member_pub(store) else {
+        return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED);
+    };
+    if subject == own {
+        return ApduResponse::err(SW_WRONG_DATA);
+    }
+    let binding = if state.exchanged_peer == Some(subject) {
+        IssueBinding::Exchanged
+    } else if state.pinned_peer == Some(subject) {
+        IssueBinding::Pinned
+    } else if state.exchanged_peer.is_none() && state.pinned_peer.is_none() {
+        return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED);
+    } else {
+        return ApduResponse::err(SW_SECURITY_STATUS);
+    };
+
+    let own_id = member::member_id(&own);
+    match member::lookup(store, &own_id) {
+        Ok(Lookup::Found(_, me)) if me.may_administer() => {}
+        Ok(_) => return ApduResponse::err(SW_SECURITY_STATUS),
+        Err(_) => return ApduResponse::err(SW_MEMORY_FAILURE),
+    }
+    let subject_id = member::member_id(&subject);
+    let (slot, seen) = match member::lookup(store, &subject_id) {
+        Ok(Lookup::Found(_, held)) if held.revocation.is_some() => {
+            return ApduResponse::err(pico2hsm_core::apdu::SW_DATA_INVALID)
+        }
+        // The new certificate must outrank the held one: number it above.
+        Ok(Lookup::Found(slot, held)) => (slot, held.cert.issued_lamport),
+        Ok(Lookup::Free(slot)) => (slot, 0),
+        Ok(Lookup::Full) => return ApduResponse::err(member::SW_LIST_FULL),
+        Err(_) => return ApduResponse::err(SW_MEMORY_FAILURE),
+    };
+
+    // Numbered before the change (§6.1); a failure changes nothing.
+    let Ok(lamport) =
+        crate::storage::retry_counter::advance_lamport(store, state.lamport_seen.max(seen))
+    else {
+        return ApduResponse::err(SW_MEMORY_FAILURE);
+    };
+    // Single use, spent before the certificate exists.
+    match binding {
+        IssueBinding::Exchanged => state.exchanged_peer = None,
+        IssueBinding::Pinned => {
+            if crate::protocol::sc_hsm::ScHsm::consume_pinned_peer(state, store).is_err() {
+                return ApduResponse::err(SW_MEMORY_FAILURE);
+            }
+        }
+    }
+    let Some(domain) = state.domain.as_ref() else {
+        return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED);
+    };
+    let Ok(cert) = MemberCert::issue(domain, &subject, &own_id, lamport, flags) else {
+        return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED);
+    };
+    let out = cert.encode();
+    if member::save(store, slot, &MemberEntry::active(cert)).is_err() {
+        return ApduResponse::err(SW_MEMORY_FAILURE);
+    }
+    ApduResponse::ok(&out)
+}
+
+// ---------------------------------------------------------------------------
+// P1=0x46  REVOKE_MEMBER (SO-PIN)
+// ---------------------------------------------------------------------------
+
+/// Revoke a member (cluster plan V3 §6.4).
+///
+/// Data: `member_id(16)`.  Response: the 121-byte revocation record
+/// (`domain::member::Revocation`), also stored in this device's list
+/// (the entry stays, marked revoked).  Other members learn it through
+/// IMPORT_REVOCATION (P1=4A).  This device must hold an active certificate
+/// with the may-sponsor flag (the right to enroll is the right to
+/// revoke); it cannot revoke itself.  The Lamport counter is advanced (on
+/// flash) first and the revocation carries the new value.
+///
+/// | SW | Meaning |
+/// |---|---|
+/// | 6985 | no domain (DKEK) or no identity key |
+/// | 6700 | data not 16 bytes |
+/// | 6A80 | this device's own member ID |
+/// | 6982 | SO-PIN not verified, or this device may not sponsor |
+/// | 6A88 | the member is not in the list |
+/// | 6A89 | the member is already revoked |
+/// | 6581 | the Lamport counter or list could not be written |
+#[inline(never)]
+fn handle_revoke_member(
+    state: &mut ScHsmState,
+    store: &mut dyn KeyStore,
+    cmd: &ApduCommand<'_>,
+) -> ApduResponse {
+    use crate::domain::member::{self, Lookup, Revocation};
+    use pico2hsm_core::apdu::SW_MEMORY_FAILURE;
+
+    if state.domain.is_none() {
+        return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED);
+    }
+    let Ok(target) = <[u8; member::MEMBER_ID_LEN]>::try_from(cmd.data) else {
+        return ApduResponse::err(SW_WRONG_LENGTH);
+    };
+    let Some(own) = crate::protocol::sc_hsm::ScHsm::device_member_pub(store) else {
+        return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED);
+    };
+    let own_id = member::member_id(&own);
+    if target == own_id {
+        return ApduResponse::err(SW_WRONG_DATA);
+    }
+    match member::lookup(store, &own_id) {
+        Ok(Lookup::Found(_, me)) if me.may_administer() => {}
+        Ok(_) => return ApduResponse::err(SW_SECURITY_STATUS),
+        Err(_) => return ApduResponse::err(SW_MEMORY_FAILURE),
+    }
+    let (slot, mut entry) = match member::lookup(store, &target) {
+        Ok(Lookup::Found(_, e)) if e.revocation.is_some() => {
+            return ApduResponse::err(member::SW_ALREADY_HELD)
+        }
+        Ok(Lookup::Found(slot, e)) => (slot, e),
+        Ok(_) => return ApduResponse::err(member::SW_UNKNOWN_MEMBER),
+        Err(_) => return ApduResponse::err(SW_MEMORY_FAILURE),
+    };
+    let seen = state.lamport_seen.max(entry.cert.issued_lamport);
+    let Ok(lamport) = crate::storage::retry_counter::advance_lamport(store, seen) else {
+        return ApduResponse::err(SW_MEMORY_FAILURE);
+    };
+    let Some(domain) = state.domain.as_ref() else {
+        return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED);
+    };
+    let Ok(rev) = Revocation::issue(domain, &target, &own_id, lamport) else {
+        return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED);
+    };
+    let out = rev.encode();
+    entry.revocation = Some(rev);
+    if member::save(store, slot, &entry).is_err() {
+        return ApduResponse::err(SW_MEMORY_FAILURE);
+    }
+    ApduResponse::ok(&out)
+}
+
+// ---------------------------------------------------------------------------
+// P1=0x49  IMPORT_MEMBER_CERT, P1=0x4A  IMPORT_REVOCATION (no PIN)
+// ---------------------------------------------------------------------------
+
+/// Response of a successful import: `01` the member is new to the list,
+/// `00` an entry was updated.
+fn imported(
+    r: Result<crate::domain::member::Imported, crate::domain::member::ImportError>,
+) -> ApduResponse {
+    match r {
+        Ok(i) => ApduResponse::ok(&[u8::from(i.added)]),
+        Err(e) => ApduResponse::err(e.sw()),
+    }
+}
+
+/// Raise the highest Lamport value seen from other members (§6.1).
+fn saw_lamport(state: &mut ScHsmState, value: u64) {
+    state.lamport_seen = state.lamport_seen.max(value);
+}
+
+/// Import a member certificate signed with the domain key (§5.2 step 7,
+/// §5.3).  Data: the 187-byte certificate.  No PIN (owner decision §12.1):
+/// the device checks the domain signature.  See
+/// `domain::member::import_cert` for what is refused.
+///
+/// | SW | Meaning |
+/// |---|---|
+/// | 9000 | data `01` added, `00` replaced a lower-ranked certificate |
+/// | 6985 | no domain (DKEK) |
+/// | 6A80 | malformed, another domain, or a bad signature |
+/// | 6A89 | already held, or the held certificate outranks it |
+/// | 6984 | the member (or the sponsor, before issuing it) is revoked |
+/// | 6A84 | the member list is full |
+/// | 6581 | the list could not be written |
+#[inline(never)]
+fn handle_import_member_cert(
+    state: &mut ScHsmState,
+    store: &mut dyn KeyStore,
+    cmd: &ApduCommand<'_>,
+) -> ApduResponse {
+    let Some(q) = state.domain.as_ref().map(|d| d.q) else {
+        return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED);
+    };
+    let r = crate::domain::member::import_cert(store, &q, cmd.data);
+    if r.is_ok() {
+        // A certificate that imported is CERT_LEN bytes.
+        let lamport = u64::from_be_bytes(cmd.data[114..122].try_into().unwrap_or([0; 8]));
+        saw_lamport(state, lamport);
+    }
+    imported(r)
+}
+
+/// Import a revocation signed with the domain key.  Data: the 121-byte
+/// revocation, optionally followed by the revoked member's 187-byte
+/// certificate (required when the member is not listed yet; the 308 bytes
+/// need an extended APDU).  No PIN, as for certificates.
+///
+/// | SW | Meaning |
+/// |---|---|
+/// | 9000 | data `01` added (with its certificate), `00` marked revoked |
+/// | 6985 | no domain (DKEK) |
+/// | 6700 | data neither 121 nor 308 bytes |
+/// | 6A80 | malformed, self-revocation, another domain, a bad signature, or a certificate for another member |
+/// | 6A89 | already revoked by this or an earlier revocation |
+/// | 6A88 | the member is not listed and no certificate came with it |
+/// | 6A84 | the member list is full |
+/// | 6581 | the list could not be written |
+#[inline(never)]
+fn handle_import_revocation(
+    state: &mut ScHsmState,
+    store: &mut dyn KeyStore,
+    cmd: &ApduCommand<'_>,
+) -> ApduResponse {
+    use crate::domain::member::{CERT_LEN, REVOCATION_LEN};
+
+    let Some(q) = state.domain.as_ref().map(|d| d.q) else {
+        return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED);
+    };
+    let (rev, cert) = match cmd.data.len() {
+        REVOCATION_LEN => (cmd.data, None),
+        n if n == REVOCATION_LEN + CERT_LEN => (
+            &cmd.data[..REVOCATION_LEN],
+            Some(&cmd.data[REVOCATION_LEN..]),
+        ),
+        _ => return ApduResponse::err(SW_WRONG_LENGTH),
+    };
+    let r = crate::domain::member::import_revocation(store, &q, rev, cert);
+    if r.is_ok() {
+        saw_lamport(
+            state,
+            u64::from_be_bytes(rev[49..57].try_into().unwrap_or([0; 8])),
+        );
+    }
+    imported(r)
 }
 
 // ---------------------------------------------------------------------------
@@ -2184,7 +2532,7 @@ mod tests {
         assert_eq!(m.sw, 0x9000);
         assert_eq!(&m.data[..3], &[1, 0, 1]);
         let e = crate::domain::member::MemberEntry::decode(&m.data[3..]).unwrap();
-        assert_eq!(e.status, crate::domain::member::STATUS_ACTIVE);
+        assert_eq!(e.status(), crate::domain::member::STATUS_ACTIVE);
         assert_eq!(e.cert.member_id, own);
         assert_eq!(e.cert.sponsor_id, own);
         assert_eq!(e.cert.issued_lamport, 1);

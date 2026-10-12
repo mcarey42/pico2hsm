@@ -470,6 +470,7 @@ impl Dispatcher {
         sc.exchange_ephem_pub = None;
         sc.exchange_challenge = None;
         sc.exchange_peer_ephem_pub = None;
+        sc.exchanged_peer = None;
         sc.op_buf.invalidate();
         #[cfg(feature = "applet-piv")]
         {
