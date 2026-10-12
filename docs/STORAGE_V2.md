@@ -526,8 +526,8 @@ display and recorded in the counter log.
 
 Recovery from a refused store is then: `OPEN DEGRADED` → DKEK export (or
 domain resync from a peer, cluster plan V3) → FORMAT STORE → restore.
-Whether the SO-PIN may also **accept the current head and re-anchor**
-(`ACCEPT STORE`) is an owner decision (§16, OD-1).
+The SO-PIN may also **accept the current head and re-anchor**
+(`ACCEPT STORE`, §16 OD-1: decided, implement with its guards).
 
 ## 10. Wear
 
@@ -576,8 +576,8 @@ party **with the card sent separately**:
 - **Unprovisioned development boards** share a blank-OTP SMK computable
   from public data, so anyone holding their card can decrypt it, and a
   DKEK or domain key imported into one is exposed.  Shown on the display
-  (DEV footer); whether DKEK import and domain enrolment are refused is an
-  owner decision (§16, OD-2).
+  (DEV footer).  DKEK import and domain enrolment stay allowed, with a
+  prominent warning (§16, OD-2: decided, warn only).
 
 ## 12. Removed in 2.0
 
@@ -629,7 +629,7 @@ party **with the card sent separately**:
    snapshot, lookup, free bitmap; SD block-granular writes; remove the RAM
    directory, key index and EF cache.
 4. Anchor checks, formatting rules, fail-closed boot, `OPEN DEGRADED`
-   (and `ACCEPT STORE` if OD-1 says so).
+   and `ACCEPT STORE` (OD-1).
 5. Remove RAID / WAL / multi-chip / legacy formats / SD pairing block.
 6. 2.0 flash layout with the partition table (separate plan).
 7. Docs; full hardware runs; SD power-pull campaign; `v2.0.0-rc1`.
@@ -648,6 +648,7 @@ tests.
 ## 16. Owner decisions
 
 **OD-1 — SO-PIN re-anchor (`ACCEPT STORE`), from H5.**
+*Decided 2026-10-12: implement, with the guards below (the recommendation).*
 A refused store (journal behind the anchor, or damaged) can today only be
 recovered through `OPEN DEGRADED` → DKEK export → FORMAT STORE → restore,
 or a domain resync.  `ACCEPT STORE` would let the SO-PIN accept the
@@ -668,6 +669,8 @@ store) as the new anchor and resume read-write.
   Strictest; costs availability on SD boards.
 
 **OD-2 — unprovisioned development boards, from the low findings.**
+*Decided 2026-10-12: warn only, in every build, but prominently* (see
+"Decision" below).
 A blank-OTP board's SMK is computable from public data, so a DKEK or a
 domain key imported into one is exposed to anyone with its flash or card.
 - **Recommendation:** production builds refuse DKEK import (key shares)
@@ -675,6 +678,19 @@ domain key imported into one is exposed to anyone with its flash or card.
   display); development builds allow both with a persistent warning on the
   display and a log line on every boot.
 - **Alternative:** warn only, in every build.
+- **Decision (owner): warn only, with a significant warning** about key
+  integrity, and about losing every key when the board is provisioned:
+  - The display keeps the DEV · UNPROVISIONED footer, and DKEK share import
+    or domain enrolment on such a board first shows a full-screen warning
+    ("keys on this board are NOT protected; provisioning OTP will make
+    them unreadable").  The APDU still succeeds.
+  - Every boot logs the same text; device status reports `unprovisioned`.
+  - Writing the storage-key IKM changes the SMK, so the store written
+    before it can't be opened afterwards (the anchor binding fails); the
+    old keys are lost unless they were exported (DKEK) or are held by
+    domain peers.  `docs/PROVISIONING.md` says so before the IKM step.
+  - Release builds without `insecure-dev-keystore` keep refusing to run
+    the keystore at all on a blank IKM (unchanged).
 
 ## 17. Review findings and resolutions (2026-10-12)
 
