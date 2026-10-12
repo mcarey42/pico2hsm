@@ -496,6 +496,23 @@ fn init_rsa_pool(store: &mut pico2hsm_firmware::storage::BoardKeyStore) {
     store.attach_rsa_pool(PoolRegion::open(QmiPoolFlash::new(flash)));
 }
 
+/// USB serial number: the RP2350's 64-bit chip ID in hex, so every board
+/// gets its own stable PC/SC reader name (with one shared serial, hosts
+/// can tell identical boards apart only by enumeration order, which
+/// changes whenever one re-enumerates).  `0001` if OTP cannot be read.
+#[cfg(target_arch = "arm")]
+fn usb_serial() -> &'static str {
+    static SERIAL: StaticCell<[u8; 16]> = StaticCell::new();
+    let Ok(id) = embassy_rp::otp::get_chipid() else {
+        return "0001";
+    };
+    let buf = SERIAL.init([0; 16]);
+    for (i, b) in buf.iter_mut().enumerate() {
+        *b = b"0123456789ABCDEF"[((id >> (60 - 4 * i)) & 0xF) as usize];
+    }
+    core::str::from_utf8(buf).unwrap_or("0001")
+}
+
 /// One-time initialised key store — lives for the duration of the firmware.
 /// Owned by core0 for flash writes; core1 accesses via FLASH_REQ/FLASH_RESP.
 #[cfg(target_arch = "arm")]
@@ -1384,7 +1401,7 @@ async fn run_one_board(p: embassy_rp::Peripherals) {
     let mut usb_config = UsbConfig::new(USB_VID, USB_PID);
     usb_config.manufacturer = Some("pico2hsm");
     usb_config.product = Some("pico2hsm SC-HSM");
-    usb_config.serial_number = Some("0001");
+    usb_config.serial_number = Some(usb_serial());
     usb_config.max_power = 100;
 
     // USB descriptor buffers — must live for the duration of run_one_board.
@@ -1879,7 +1896,7 @@ async fn run_geek_board(
     let mut usb_config = UsbConfig::new(USB_VID, USB_PID);
     usb_config.manufacturer = Some("pico2hsm");
     usb_config.product = Some("pico2hsm SC-HSM");
-    usb_config.serial_number = Some("0001");
+    usb_config.serial_number = Some(usb_serial());
     usb_config.max_power = 100;
 
     // cdc_state must be declared before the builder and descriptor buffers so
@@ -1993,7 +2010,7 @@ async fn run_pico2_board(p: embassy_rp::Peripherals) {
     let mut usb_config = UsbConfig::new(USB_VID, USB_PID);
     usb_config.manufacturer = Some("pico2hsm");
     usb_config.product = Some("pico2hsm SC-HSM");
-    usb_config.serial_number = Some("0001");
+    usb_config.serial_number = Some(usb_serial());
     usb_config.max_power = 100;
 
     let mut config_descriptor_buf = [0u8; 512]; // bump to 512 for CDC+CCID
@@ -2401,7 +2418,7 @@ async fn run_waveshare_lcd_board(
     let mut usb_config = UsbConfig::new(USB_VID, USB_PID);
     usb_config.manufacturer = Some("pico2hsm");
     usb_config.product = Some("pico2hsm SC-HSM");
-    usb_config.serial_number = Some("0001");
+    usb_config.serial_number = Some(usb_serial());
     usb_config.max_power = 100;
     let mut config_descriptor_buf = [0u8; 512];
     let mut bos_descriptor_buf = [0u8; 256];
