@@ -24,6 +24,10 @@ Security and robustness release from the October 2026 audit
   duplicates and revoked members.  Certificates and revocations are
   ranked, so every member keeps the same ones.  A full list (32 entries,
   revoked included) gets `6A84`.
+- **Hardening from the P2 security review.**
+  - The right to certify the peer of an exchange now also ends at SELECT, at a new pin, and when another exchange starts.
+  - Imports refuse an issuer that is listed here without may-sponsor, and a revoker that was revoked earlier (`6982`).
+  - Imports refuse Lamport values above 2^62 (`6A80`). Before this, a single signed object could exhaust the persisted counter.
 - **GET_MEMBERS v2** (data `02`): 277-byte entries carrying each revoked
   member's revocation, so hosts can carry revocations between devices.
   DOMAIN_STATUS flags `10` (a served peer awaits its certificate) and `20`

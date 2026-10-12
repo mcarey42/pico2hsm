@@ -309,6 +309,8 @@ fn handle_noise_source_respond(
     store: &mut dyn KeyStore,
     cmd: &ApduCommand<'_>,
 ) -> ApduResponse {
+    // A new SOURCE run ends the right to certify the previous peer.
+    state.exchanged_peer = None;
     // Input: ephem_T_pub(65) || challenge(32) || Sig_T(64) = 161 bytes
     if cmd.data.len() != 161 {
         return abort_exchange(state, SW_WRONG_DATA);
@@ -769,6 +771,9 @@ fn handle_enroll_peer_pubkey(
     let mut pubkey = [0u8; 65];
     pubkey.copy_from_slice(cmd.data);
     let before = state.pinned_peer.replace(pubkey);
+    // A new pin starts a new enrollment: the peer of an earlier exchange
+    // may no longer be certified on the strength of that exchange.
+    state.exchanged_peer = None;
 
     // Persist so the pin survives a reset between pinning and the exchange.
     if crate::protocol::sc_hsm::ScHsm::save_pinned_peer(state, store).is_err() {
@@ -1170,9 +1175,10 @@ fn saw_lamport(state: &mut ScHsmState, value: u64) {
 /// |---|---|
 /// | 9000 | data `01` added, `00` replaced a lower-ranked certificate |
 /// | 6985 | no domain (DKEK) |
-/// | 6A80 | malformed, another domain, or a bad signature |
+/// | 6A80 | malformed, another domain, a bad signature, or a Lamport value above 2^62 |
 /// | 6A89 | already held, or the held certificate outranks it |
 /// | 6984 | the member (or the sponsor, before issuing it) is revoked |
+/// | 6982 | the sponsor is listed here without may-sponsor |
 /// | 6A84 | the member list is full |
 /// | 6581 | the list could not be written |
 #[inline(never)]
@@ -1203,9 +1209,10 @@ fn handle_import_member_cert(
 /// | 9000 | data `01` added (with its certificate), `00` marked revoked |
 /// | 6985 | no domain (DKEK) |
 /// | 6700 | data neither 121 nor 308 bytes |
-/// | 6A80 | malformed, self-revocation, another domain, a bad signature, or a certificate for another member |
+/// | 6A80 | malformed, self-revocation, another domain, a bad signature, a certificate for another member, or a Lamport value above 2^62 |
 /// | 6A89 | already revoked by this or an earlier revocation |
 /// | 6A88 | the member is not listed and no certificate came with it |
+/// | 6982 | the revoker is listed here as revoked before it, or without may-sponsor |
 /// | 6A84 | the member list is full |
 /// | 6581 | the list could not be written |
 #[inline(never)]

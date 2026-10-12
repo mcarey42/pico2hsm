@@ -794,3 +794,124 @@ fn a_member_enrolled_through_b_is_accepted_by_a() {
     want.sort();
     assert_eq!(ids, want);
 }
+
+// ---------------------------------------------------------------------------
+// Security review of P2 (regressions)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_exchanged_peer_binding_ends_with_a_new_pin_or_a_new_exchange() {
+    // A new pin (a new enrollment) ends it.
+    let (mut a, mut b) = (Dev::from_shares(), Dev::new());
+    exchange(&mut a, &mut b);
+    assert_eq!(a.x(0x3D, &some_pub(31)).0, SW_OK);
+    assert_eq!(a.hsm.state.exchanged_peer, None);
+    assert_eq!(issue(&mut a, &b.pubk).0, SW_SECURITY_STATUS);
+
+    // So does the start of another SOURCE run, even one that fails.
+    let (mut a, mut b) = (Dev::from_shares(), Dev::new());
+    exchange(&mut a, &mut b);
+    assert_eq!(a.x(0x36, &[0u8; 161]).0, SW_CONDITIONS_NOT_SATISFIED);
+    assert_eq!(a.hsm.state.exchanged_peer, None);
+    assert_eq!(issue(&mut a, &b.pubk).0, SW_CONDITIONS_NOT_SATISFIED);
+}
+
+#[test]
+fn imports_enforce_the_issuers_authority_where_it_is_known() {
+    let (mut a, mut b) = (Dev::from_shares(), Dev::new());
+    exchange(&mut a, &mut b);
+    // A lists B without may-sponsor.
+    let mut d: heapless::Vec<u8, 66> = heapless::Vec::new();
+    d.extend_from_slice(&b.pubk).unwrap();
+    d.push(0x00).unwrap();
+    let (sw, b_cert) = a.x(0x45, &d);
+    assert_eq!(sw, SW_OK);
+    let b_cert = MemberCert::decode(&b_cert).unwrap();
+    let (bid, aid) = (b.id(), a.id());
+
+    // A certificate "issued by B" after that: refused.
+    let p = some_pub(41);
+    let by_b = MemberCert::issue(
+        a.domain(),
+        &p,
+        &bid,
+        b_cert.issued_lamport + 1,
+        member::FLAG_MAY_SPONSOR,
+    )
+    .unwrap();
+    assert_eq!(a.x(0x49, &by_b.encode()).0, SW_SECURITY_STATUS);
+    assert!(a.entry(&by_b.member_id).is_none(), "nothing written");
+    // A revocation "by B": refused too.
+    let rev_by_b = Revocation::issue(a.domain(), &aid, &bid, b_cert.issued_lamport + 1).unwrap();
+    assert_eq!(a.x(0x4A, &rev_by_b.encode()).0, SW_SECURITY_STATUS);
+    assert_eq!(a.entry(&aid).unwrap().status(), member::STATUS_ACTIVE);
+    // Acts older than B's demoting certificate are accepted (B may have
+    // had the right then).
+    let older = MemberCert::issue(a.domain(), &p, &bid, 1, 1).unwrap();
+    assert!(b_cert.issued_lamport > 1);
+    assert_eq!(a.x(0x49, &older.encode()).0, SW_OK);
+
+    // A revoker revoked before its revocation: refused.
+    let c = some_pub(42);
+    let cid = member::member_id(&c);
+    let c_cert = MemberCert::issue(a.domain(), &c, &cid, 1, 1).unwrap();
+    assert_eq!(a.x(0x49, &c_cert.encode()).0, SW_OK);
+    let (_, rev_c) = a.x(0x46, &cid);
+    let rev_c = Revocation::decode(&rev_c).unwrap();
+    let late = Revocation::issue(a.domain(), &bid, &cid, rev_c.revoked_lamport + 1).unwrap();
+    assert_eq!(a.x(0x4A, &late.encode()).0, SW_SECURITY_STATUS);
+    assert_eq!(a.entry(&bid).unwrap().status(), member::STATUS_ACTIVE);
+}
+
+#[test]
+fn imports_cannot_push_the_lamport_counter_to_its_end() {
+    let mut a = Dev::from_shares();
+    let aid = a.id();
+    let p = some_pub(51);
+    let pid = member::member_id(&p);
+    let seen = a.hsm.state.lamport_seen;
+    for lamport in [u64::MAX, u64::MAX - 1, member::LAMPORT_CEILING + 1] {
+        let c = MemberCert::issue(a.domain(), &p, &pid, lamport, 1).unwrap();
+        assert_eq!(a.x(0x49, &c.encode()).0, SW_WRONG_DATA);
+        let r = Revocation::issue(a.domain(), &pid, &aid, lamport).unwrap();
+        let both = rev_with_cert(
+            &r.encode(),
+            &MemberCert::issue(a.domain(), &p, &pid, 1, 1).unwrap(),
+        );
+        assert_eq!(a.x(0x4A, &both).0, SW_WRONG_DATA);
+    }
+    assert_eq!(a.hsm.state.lamport_seen, seen, "the clock did not move");
+    assert!(a.entry(&pid).is_none());
+    // The ceiling itself is accepted, and numbered changes keep working.
+    let c = MemberCert::issue(a.domain(), &p, &pid, member::LAMPORT_CEILING, 1).unwrap();
+    assert_eq!(a.x(0x49, &c.encode()).0, SW_OK);
+    assert_eq!(gen_p256(&mut a.hsm, &mut a.store, 1), SW_OK);
+    assert_eq!(a.lamport(), member::LAMPORT_CEILING + 1);
+    assert_eq!(a.x(0x46, &pid).0, SW_OK, "revoke numbers above it");
+}
+
+#[test]
+fn duplicate_and_outranked_imports_cost_no_flash_write() {
+    let (mut a, c) = (Dev::from_shares(), Dev::from_shares());
+    let mut c = c;
+    let cid = c.id();
+    let c_self = c.entry(&cid).unwrap().cert.encode();
+    assert_eq!(a.x(0x49, &c_self).0, SW_OK);
+    let saves = a.store.saves;
+    for _ in 0..5 {
+        assert_eq!(a.x(0x49, &c_self).0, member::SW_ALREADY_HELD);
+    }
+    let r = Revocation::issue(a.domain(), &cid, &a.id(), 7).unwrap();
+    assert_eq!(a.x(0x4A, &r.encode()).0, SW_OK);
+    let saves_after_rev = a.store.saves;
+    assert_eq!(saves_after_rev, saves + 1);
+    for _ in 0..5 {
+        assert_eq!(a.x(0x4A, &r.encode()).0, member::SW_ALREADY_HELD);
+        assert_eq!(a.x(0x49, &c_self).0, pico2hsm_core::apdu::SW_DATA_INVALID);
+    }
+    assert_eq!(a.store.saves, saves_after_rev, "replays wrote nothing");
+    let mut forged = c_self.clone();
+    forged[150] ^= 1;
+    assert_eq!(a.x(0x49, &forged).0, SW_WRONG_DATA);
+    assert_eq!(a.store.saves, saves_after_rev);
+}

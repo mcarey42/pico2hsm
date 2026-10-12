@@ -578,6 +578,10 @@ pub enum ImportError {
     UnknownMember,
     /// The member list is full.
     Full,
+    /// The issuer is listed here without the authority it claims: a
+    /// sponsor without may-sponsor, or a revoker that was revoked or may
+    /// not sponsor.
+    Unauthorized,
     /// The keystore failed.
     Storage,
 }
@@ -591,6 +595,7 @@ impl ImportError {
             ImportError::Revoked => 0x6984,
             ImportError::UnknownMember => SW_UNKNOWN_MEMBER,
             ImportError::Full => SW_LIST_FULL,
+            ImportError::Unauthorized => 0x6982,
             ImportError::Storage => 0x6581,
         }
     }
@@ -618,11 +623,32 @@ pub const SW_UNKNOWN_MEMBER: u16 = 0x6A88;
 /// SW: the member list is full (`6A84`, "not enough memory space").
 pub const SW_LIST_FULL: u16 = 0x6A84;
 
+/// Highest Lamport value an imported certificate or revocation may carry.
+///
+/// Imports raise this device's Lamport clock (`lamport_seen`), and ISSUE /
+/// REVOKE number above the certificate they replace.  Without a ceiling, one
+/// domain-signed object carrying `u64::MAX - 1` would push the persisted
+/// counter to its end, after which every numbered change (key generation,
+/// deletion, issue, revoke) fails with 6581 forever: the counter never goes
+/// down.  2^62 leaves 2^62 local changes, far beyond any device's life.
+pub const LAMPORT_CEILING: u64 = 1 << 62;
+
 /// What an import did: the slot, and whether the member is new to the list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Imported {
     pub slot: u8,
     pub added: bool,
+}
+
+/// Whether `issuer`, as listed here, had the may-sponsor authority for an
+/// act numbered `at`.  The same rule ISSUE / REVOKE apply locally, applied
+/// to what arrives from elsewhere: an issuer whose held certificate lacks
+/// may-sponsor and is not newer than the act did not have it.  (A held
+/// certificate newer than the act may have been a later demotion, so the
+/// act is accepted.)  Best effort: an issuer this device has not listed
+/// is accepted on the domain signature alone.
+fn held_authority(issuer: &MemberEntry, at: u64) -> bool {
+    issuer.cert.may_sponsor() || issuer.cert.issued_lamport > at
 }
 
 /// Import a member certificate (no PIN: authority is the domain
@@ -638,6 +664,9 @@ pub fn import_cert(
 ) -> Result<Imported, ImportError> {
     let cert = MemberCert::decode(bytes)?;
     cert.verify(q_domain)?;
+    if cert.issued_lamport > LAMPORT_CEILING {
+        return Err(ImportError::Format);
+    }
     if !cert.is_self_issued() {
         if let Lookup::Found(_, sponsor) = lookup(store, &cert.sponsor_id)? {
             if sponsor
@@ -646,6 +675,9 @@ pub fn import_cert(
                 .is_some_and(|r| cert.issued_lamport > r.revoked_lamport)
             {
                 return Err(ImportError::Revoked);
+            }
+            if !held_authority(&sponsor, cert.issued_lamport) {
+                return Err(ImportError::Unauthorized);
             }
         }
     }
@@ -677,6 +709,19 @@ pub fn import_revocation(
 ) -> Result<Imported, ImportError> {
     let rev = Revocation::decode(bytes)?;
     rev.verify(q_domain)?;
+    if rev.revoked_lamport > LAMPORT_CEILING {
+        return Err(ImportError::Format);
+    }
+    if let Lookup::Found(_, revoker) = lookup(store, &rev.revoker_id)? {
+        if revoker
+            .revocation
+            .as_ref()
+            .is_some_and(|r| rev.revoked_lamport > r.revoked_lamport)
+            || !held_authority(&revoker, rev.revoked_lamport)
+        {
+            return Err(ImportError::Unauthorized);
+        }
+    }
     match lookup(store, &rev.member_id)? {
         Lookup::Found(slot, mut held) => {
             if held

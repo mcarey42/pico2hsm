@@ -1323,8 +1323,9 @@ stores the certificate in this device's list.  `flags` defaults to `01`
 (may sponsor); only bit 0 may be set.  `member_pub` must be the peer this
 device sent its DKEK to (`0x37`) **in this card session**, or the peer
 currently pinned with `0x3D`.  Either is single use and spent by the
-certificate.  This device's own certificate must be active with
-may-sponsor.  The Lamport counter is advanced first; the certificate
+certificate.  The exchange binding also ends at SELECT, at a new pin
+(`0x3D`), and when another SOURCE run starts (`0x36`).  This device's own
+certificate must be active with may-sponsor.  The Lamport counter is advanced first; the certificate
 carries the new value and outranks any certificate held for the member.
 
 | SW | Meaning |
@@ -1355,9 +1356,10 @@ not listed that member yet (308 bytes: extended APDU).
 | `9000` | data `01`: member added; `00`: entry replaced / marked revoked |
 | `6985` | no DKEK (no domain) |
 | `6700` | IMPORT_REVOCATION data neither 121 nor 308 bytes |
-| `6A80` | malformed, another domain, bad signature, self-revocation, or a certificate for another member |
+| `6A80` | malformed, another domain, bad signature, self-revocation, a certificate for another member, or a Lamport value above 2^62 |
 | `6A89` | already held, or outranked by what is held |
 | `6984` | the member is revoked (any certificate, however new), or its sponsor was revoked before issuing it |
+| `6982` | the sponsor (or revoker) is listed on this device without may-sponsor, or the revoker was revoked before it |
 | `6A88` | revocation of an unlisted member without its certificate |
 | `6A84` | the member list is full |
 | `6581` | the list could not be written |

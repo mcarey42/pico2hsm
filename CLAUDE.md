@@ -211,7 +211,12 @@ when changing the code.
   (ISSUE_MEMBER_CERT, 0x54/45, SO-PIN). That key is the peer this device
   sent its DKEK to in this card session (`exchanged_peer`, session state),
   or the currently pinned peer. Either is spent by the certificate. Never
-  an arbitrary key.
+  an arbitrary key. `exchanged_peer` also ends at SELECT, at a new pin and
+  at a new SOURCE run.
+- **Imported Lamport values are capped** (`member::LAMPORT_CEILING`, 2^62).
+  Anything that raises `lamport_seen` from outside the device must be
+  bounded, or one signed object could exhaust the persisted counter for
+  good.
 - **Revocation is permanent per member key** (owner decision 8, plan §12).
   Issue and import refuse a revoked member ID (6984), whatever the
   certificate's Lamport value. Member-list entries are never removed
