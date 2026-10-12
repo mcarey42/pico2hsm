@@ -341,8 +341,14 @@ def test_cli_remote_enroll_by_message_files(config, tmp_path):
     joiner = subprocess.Popen([TOOL, "-r", "1", *common, "--role", "joiner"],
                               stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                               stderr=subprocess.STDOUT, text=True)
-    s_out, _ = sponsor.communicate("y\n", timeout=300)
-    j_out, _ = joiner.communicate("y\n", timeout=300)
+    # Both sides wait on each other's messages: answer both prompts concurrently
+    # (communicating with one first would leave the other blocked at its prompt).
+    from concurrent.futures import ThreadPoolExecutor
+
+    with ThreadPoolExecutor(2) as pool:
+        fs, fj = (pool.submit(p.communicate, "y\n", 300) for p in (sponsor, joiner))
+        s_out, _ = fs.result()
+        j_out, _ = fj.result()
     log.info("sponsor:\n%s\njoiner:\n%s", s_out, j_out)
     assert sponsor.returncode == 0 and joiner.returncode == 0
     sas_lines = [ln for ln in (s_out + j_out).splitlines() if "authentication string" in ln]
