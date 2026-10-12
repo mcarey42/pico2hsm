@@ -14,3 +14,4 @@ tools/python/build/
 !.claude/agents/**
 ec_firmware_signing_key.pem
 ec_firmware_signing_key.pub
+tools/m33bench/target/

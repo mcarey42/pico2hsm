@@ -9,6 +9,69 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Security and robustness release from the October 2026 audit
 (`docs/AUDIT_2026-10.md` lists every finding with its commit).
 
+### Added — RSA key pool and sliced RSA key generation (`rsa` feature)
+- **Pre-generated RSA keys.**  Core1 fills a pool of RSA-2048/3072/4096
+  keys between APDUs (default 4 / 2 / 2, at most 4 per size), in slices of
+  at most 20 ms that end as soon as an APDU arrives; the HSM no longer
+  freezes for keygen.  SC-HSM GENERATE KEY PAIR takes the newest pooled
+  key of the size, marks its slot taken on flash *before* handing it out
+  (a power cut can waste a key, never issue one twice), and stores it
+  exactly like a freshly generated key.  With the pool empty or off it
+  generates live.  RSA-1024 is not pooled.  PIV and OpenPGP have no RSA
+  keygen (their GENERATE is EC/Curve25519 only), so only SC-HSM uses it.
+- **Rotation and age-out (default on):** a pooled key older than the
+  maximum age (default 4 h of powered-on time; 1 h to 1 year) is erased
+  and replaced, and never issued.  There is no RTC: age is a pool clock of
+  powered-on minutes, persisted in the counter log.
+- **RSA_POOL_STATUS (`80 54 50`, no PIN) and RSA_POOL_CONFIG (`80 54 51`,
+  SO-PIN):** pool on/off, rotation on/off, maximum age, depth per size.
+  Turning the pool off erases every pooled key.  Wire formats:
+  `docs/SC_HSM_APDU_REFERENCE.md` ("RSA key pool"); pico2hsm-tool support
+  is to follow in that repository.
+- **INITIALIZE erases the pool** (a re-initialisation is a trust reset);
+  the pool configuration, clock and sequence number stay.
+- **New RSA key generator** (`firmware/src/crypto/rsa_keygen.rs`): FIPS
+  186-5 A.1.3 with fresh DRBG candidates, trial division below 2^14,
+  Miller-Rabin to base 2, Table B.1 rounds with DRBG bases (5/4/4 for
+  1024/1536/2048-bit primes, the 2^-112/2^-128/2^-144 column), the B.3.3
+  Lucas test, `|p − q| > 2^(nlen/2−100)`, `d = e⁻¹ mod λ(n)` with
+  `d > 2^(nlen/2)`, and a pairwise sign/verify test on every key.  The
+  `rsa` crate's keygen did 21 Miller-Rabin rounds + Lucas on incremental
+  candidates but had no `|p − q|` bound, computed `d` modulo φ(n), and ran
+  no pairwise test.  Montgomery arithmetic with `UMAAL` on the RP2350; on
+  a Cortex-M33 (QEMU instruction counts, `tools/m33bench`) about 3.2× /
+  5× / 3.3× fewer instructions than the `rsa` crate's keygen for
+  RSA-2048 / 3072 / 4096 (≈ 1.95 / 5.9 / 15.5 G instructions per key on
+  average, roughly 20–30 s / 1–1.6 min / 2.6–4.1 min live on the device).
+  Keys are still parsed, validated and used through the `rsa` crate.
+- **Live RSA keygen no longer suppresses the core1 stall detector**: the
+  sliced generator bumps the heartbeat at every unit of work.
+- **Constant-time key generation:** everything done to the accepted
+  primes and the private key avoids secret-dependent branches and the
+  M33's variable-time divider (reciprocal division, fixed-count GCD and
+  Miller-Rabin squaring loops, Fermat inverses); the remaining
+  variable-time steps (rejected candidates, base redraws, the Lucas `D`
+  search, DER lengths) are documented in `rsa_keygen.rs`.
+- **Pool hardening:** fail closed on an unreadable configuration or pool
+  clock (pool off, emptied, live keygen; status health bit `08`); issued
+  slots erased at once; sequence and birth authenticated with the blob;
+  flash erase failures also stop the background; generator state wiped
+  after every key and restart.
+
+### Changed — RSA key pool
+- **Flash layout:** the pool takes 48 KB (12 sectors) at
+  `0x1F0000`–`0x1FC000`, just below the retry-counter log, on every board;
+  the firmware image limit shrinks from 0x1FC000 to 0x1F0000 (`boards/*.x`;
+  the largest debug image is about 1.2 MB).  The region was never written
+  by earlier firmware, so no migration.
+- **Core0 services core1's flash requests at all times** (a `flash_service`
+  future joined with USB and CCID), not only while it waits for an APDU
+  reply — the pool writes between APDUs.
+- **Counter log:** the Lamport record layout (`'L'`, counter id) also
+  holds the pool's clock (id 2), configuration (id 3) and sequence number
+  (id 4).  Firmware before this skips them.
+- **RAM:** +9.0 KB (the generator state, static) on every board.
+
 ### Changed — status display redesign (Geek 240×135, Waveshare LCD 320×172)
 See `docs/DISPLAY_ARCHITECTURE.md` and `docs/DISPLAY_LAYOUT.md`.
 - **Core1 is the single source of truth.**  The dispatcher publishes a

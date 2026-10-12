@@ -4,7 +4,8 @@
 //! Offsets are from the start of flash (XIP address 0x1000_0000).
 //!
 //! ```text
-//! 0x000000 – 0x1FC000  firmware image      (linker FLASH region, boards/*.x)
+//! 0x000000 – 0x1F0000  firmware image      (linker FLASH region, boards/*.x)
+//! 0x1F0000 – 0x1FC000  RSA key pool        (12 sectors, every board, `rsa`)
 //! 0x1FC000 – 0x200000  retry-counter log   (4 sectors, every board)
 //! 0x200000 – 0x400000  keystore partition  (QMI boards; unused on SD boards)
 //! ```
@@ -19,12 +20,28 @@
 //! counter log fails to link instead of being overwritten (or overwriting
 //! the counters) — `boards_reserve_the_counter_region` checks that every
 //! board script agrees with the constants here.
+//!
+//! The RSA key pool (`storage::rsa_pool`) sits directly below the counter
+//! log, for the same reasons: internal flash on every board (never the
+//! removable card), and never on top of keystore sectors that existing
+//! devices may already use.  It took the top 48 KB of the firmware
+//! partition (2026-10); the largest image (debug, all applets) is far
+//! below the new end.
 
 /// Erase-sector size of the QMI flash.
 pub const SECTOR: u32 = 4096;
 
 /// Exclusive end of the firmware image (end of the linker FLASH region).
-pub const FIRMWARE_END: u32 = 0x001F_C000;
+pub const FIRMWARE_END: u32 = 0x001F_0000;
+
+/// First byte of the RSA key pool region.
+pub const RSA_POOL_OFFSET: u32 = 0x001F_0000;
+
+/// Sectors in the RSA key pool (one pooled key per sector).
+pub const RSA_POOL_SECTORS: u32 = 12;
+
+/// Bytes in the RSA key pool region.
+pub const RSA_POOL_SIZE: u32 = RSA_POOL_SECTORS * SECTOR;
 
 /// First byte of the retry-counter log.
 pub const RETRY_COUNTER_OFFSET: u32 = 0x001F_C000;
@@ -47,10 +64,13 @@ const _: () = {
     // Sector aligned.
     assert!(RETRY_COUNTER_OFFSET % SECTOR == 0);
     assert!(QMI_KEYSTORE_OFFSET % SECTOR == 0);
+    assert!(RSA_POOL_OFFSET % SECTOR == 0);
     // Rotation needs a spare sector.
     assert!(RETRY_COUNTER_SECTORS >= 2);
-    // Firmware, counter log and keystore are disjoint and in this order.
-    assert!(FIRMWARE_END <= RETRY_COUNTER_OFFSET);
+    // Firmware, RSA pool, counter log and keystore are disjoint and in
+    // this order.
+    assert!(FIRMWARE_END <= RSA_POOL_OFFSET);
+    assert!(RSA_POOL_OFFSET + RSA_POOL_SIZE <= RETRY_COUNTER_OFFSET);
     assert!(RETRY_COUNTER_OFFSET + RETRY_COUNTER_SIZE <= QMI_KEYSTORE_OFFSET);
     assert!(QMI_KEYSTORE_OFFSET < QMI_FLASH_SIZE);
 };
@@ -116,6 +136,11 @@ mod tests {
             assert_eq!(cl, RETRY_COUNTER_SIZE, "{name}: counter length");
             let (ko, _) = region(script, "KEYSTORE").expect(name);
             assert!(co + cl <= ko, "{name}: counters overlap the keystore");
+            let (po, pl) = region(script, "RSA_POOL").expect(name);
+            assert_eq!(po, XIP_BASE + RSA_POOL_OFFSET, "{name}: pool origin");
+            assert_eq!(pl, RSA_POOL_SIZE, "{name}: pool length");
+            assert!(fo + fl <= po, "{name}: firmware overlaps the pool");
+            assert!(po + pl <= co, "{name}: pool overlaps the counters");
         }
     }
 }

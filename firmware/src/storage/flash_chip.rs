@@ -553,16 +553,17 @@ impl FlashChip for QmiFlash {
     }
 }
 
-// ─── QmiCounterFlash — the retry-counter log region ──────────────────────────
+// ─── QmiRegionFlash — the counter log and RSA pool regions ──────────────────
 
-/// The retry-counter log region on internal flash
-/// (`flash_layout::RETRY_COUNTER_OFFSET`, every board).
+/// A fixed region of internal flash outside the firmware image and the
+/// keystore: the retry-counter log ([`QmiCounterFlash`]) or the RSA key
+/// pool ([`QmiPoolFlash`]), at `flash_layout` offsets on every board.
 ///
 /// Offsets are relative to the region; anything outside it is refused, so
-/// the log can never reach the firmware image or the keystore.  Writes
+/// the region can never reach the firmware image or the keystore.  Writes
 /// and erases go through the bootrom (`embassy_rp::flash`), which only
 /// works on core0 — on core1 they fail with an error, never a panic.
-pub struct QmiCounterFlash {
+pub struct QmiRegionFlash<const OFFSET: u32, const SIZE: u32> {
     flash: embassy_rp::flash::Flash<
         'static,
         embassy_rp::peripherals::FLASH,
@@ -571,11 +572,23 @@ pub struct QmiCounterFlash {
     >,
 }
 
-impl QmiCounterFlash {
+/// The retry-counter log region (`flash_layout::RETRY_COUNTER_OFFSET`).
+pub type QmiCounterFlash = QmiRegionFlash<
+    { super::flash_layout::RETRY_COUNTER_OFFSET },
+    { super::flash_layout::RETRY_COUNTER_SIZE },
+>;
+
+/// The RSA key pool region (`flash_layout::RSA_POOL_OFFSET`).
+pub type QmiPoolFlash = QmiRegionFlash<
+    { super::flash_layout::RSA_POOL_OFFSET },
+    { super::flash_layout::RSA_POOL_SIZE },
+>;
+
+impl<const OFFSET: u32, const SIZE: u32> QmiRegionFlash<OFFSET, SIZE> {
     /// Wrap a blocking flash driver.  On QMI boards the keystore's
     /// `QmiFlash` owns `p.FLASH`, so this one is built from a stolen
-    /// handle: the driver is stateless and both are used only from core0,
-    /// one operation at a time (`handle_flash_op` / boot).
+    /// handle: the driver is stateless and all of them are used only from
+    /// core0, one operation at a time (`handle_flash_op` / boot).
     pub fn new(
         flash: embassy_rp::flash::Flash<
             'static,
@@ -584,22 +597,23 @@ impl QmiCounterFlash {
             QMI_FLASH_SIZE,
         >,
     ) -> Self {
-        QmiCounterFlash { flash }
+        QmiRegionFlash { flash }
     }
 
     fn absolute(offset: u32, len: usize) -> Result<u32, StorageError> {
-        use super::flash_layout::{RETRY_COUNTER_OFFSET, RETRY_COUNTER_SIZE};
         let end = offset
             .checked_add(len as u32)
             .ok_or(StorageError::WriteError)?;
-        if end > RETRY_COUNTER_SIZE {
+        if end > SIZE {
             return Err(StorageError::WriteError);
         }
-        Ok(RETRY_COUNTER_OFFSET + offset)
+        Ok(OFFSET + offset)
     }
 }
 
-impl super::retry_counter::CounterFlash for QmiCounterFlash {
+impl<const OFFSET: u32, const SIZE: u32> super::retry_counter::CounterFlash
+    for QmiRegionFlash<OFFSET, SIZE>
+{
     fn read(&mut self, offset: u32, buf: &mut [u8]) -> Result<(), StorageError> {
         let at = Self::absolute(offset, buf.len()).map_err(|_| StorageError::ReadError)?;
         self.flash
