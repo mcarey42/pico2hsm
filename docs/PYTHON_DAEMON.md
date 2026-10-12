@@ -1,5 +1,13 @@
 # pico2hsm Python Cluster Daemon -- Operations and Reference Guide
 
+> **Superseded by [CLUSTER_PLAN_V3.md](CLUSTER_PLAN_V3.md) for production
+> use.** The Python daemon is frozen as the reference implementation and test
+> harness (CLUSTER_PLAN_V3 §10). The production daemon will be
+> `pico2hsm-syncd`, in the companion pico2hsm-tool repository. Its primary /
+> secondary model is replaced by domains with multi-way sync.
+> "Mirrored" here means two devices that hold the same keys. It has nothing
+> to do with mirrored (RAID) flash, which pico2hsm does not use.
+
 ## 1. Overview
 
 The pico2hsm cluster daemon (`hsm_daemon.py`) is a long-running Python process that keeps multiple pico2hsm HSM devices synchronized. It automates three operations:

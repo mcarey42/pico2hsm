@@ -5,7 +5,7 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Rust Edition](https://img.shields.io/badge/rust-2024-orange.svg)](https://doc.rust-lang.org/edition-guide/rust-2024/)
 
-A production-grade, open-source Hardware Security Module (HSM) firmware written in Rust for the Raspberry Pi RP2350/RP2354 microcontroller. MIT licensed.
+A production-grade, open-source Hardware Security Module (HSM) firmware written in Rust for the Raspberry Pi RP2350 microcontroller. MIT licensed.
 
 ## Overview
 
@@ -25,21 +25,49 @@ All applets share one flash keystore with per-applet key namespace isolation. Ap
 The firmware provides hardware-backed key storage with:
 - On-chip TRNG for key generation (ChaCha20 keystream seeded from hardware TRNG)
 - Device-tied AES-256-GCM storage encryption (key derived from OTP fuses)
-- RAID-1 mirrored key storage across multiple SPI flash chips
-- Write-ahead logging for power-failure safety
+- Keystore on the board's internal flash, or on its microSD card (SD-card builds)
+- A/B directory sectors for power-cut safety (a journaled keystore replaces them in 2.0)
 - BLAKE2s + CRC32 integrity verification on every read
 - PIN-protected key access with configurable retry lockout
 
 ## Supported Boards
 
-| Board | Flash | Keystore Capacity | Features |
-|-------|-------|-------------------|---------|
-| Raspberry Pi Pico 2 | 4MB | 2MB internal | GPIO LED |
-| Waveshare RP2350-One 4MB | 4MB | 2MB internal | WS2812B LED |
-| Waveshare RP2350-Geek 16MB | 16MB | 14MB internal | ST7789 LCD |
-| Waveshare RP2350-Geek + SDCard | 16MB | 14MB + SDCard | ST7789 LCD, SDCard |
-| Waveshare RP2350-LCD-1.47-B | 16MB | 14MB internal | ST7789V3 LCD, WS2812B LED |
-| Waveshare RP2350-LCD-1.47-B + SDCard | 16MB | SDCard | ST7789V3 LCD, SDCard |
+pico2hsm runs on off-the-shelf RP2350 boards only, used as sold. There is
+no custom board and no added hardware: no external flash chips and no
+RAID. SC-HSM key references are one byte, for SmartCard-HSM / OpenSC
+compatibility. That bounds what one device can usefully hold, so extra or
+mirrored flash would buy nothing.
+
+| Board | Flash | Keystore | Display / LED | Feature flag |
+|-------|-------|----------|---------------|--------------|
+| Raspberry Pi Pico 2 | 4MB | 2MB internal | GPIO LED | `pico2_4m` |
+| Waveshare RP2350-One | 4MB | 2MB internal | WS2812B LED | `rp2350_one_4m` |
+| Waveshare RP2350-Geek | 16MB | 2MB internal | ST7789 LCD | `rp2350_geek_16m` |
+| Waveshare RP2350-Geek, SD-card build | 16MB | microSD card | ST7789 LCD | `rp2350_geek_sdcard` |
+| Waveshare RP2350-LCD-1.47-B | 16MB | 2MB internal | ST7789V3 LCD, WS2812B LED | `waveshare_rp2350_lcd_16m` |
+| Waveshare RP2350-LCD-1.47-B, SD-card build | 16MB | microSD card | ST7789V3 LCD, WS2812B LED | `waveshare_rp2350_lcd_sdcard` |
+
+The 1.x keystore uses 2MB of internal flash on every board, 16MB boards
+included. The PIN/PUK retry counters always stay on internal flash.
+
+### Why SD-card builds
+
+An SD-card board can be enrolled in a domain and shipped to a remote party
+with the card sent separately. The card alone is useless: its objects are
+encrypted under keys derived from the device's OTP-based storage master
+key. The device alone holds no user keys. When the card goes back in, the
+device verifies it (store ID, MACs, a rollback anchor on internal flash)
+and resumes domain sync. The card checks are **planned for 2.0**
+([docs/STORAGE_V2.md](docs/STORAGE_V2.md) §8, §11); domains and sync are
+designed in [docs/CLUSTER_PLAN_V3.md](docs/CLUSTER_PLAN_V3.md).
+
+### 2.0.0 (upcoming): breaking
+
+The next release series is 2.0.0. It brings a new flash layout and a
+journaled keystore format ([docs/STORAGE_V2.md](docs/STORAGE_V2.md)), and
+removes the unused RAID-1 / WAL / multi-chip storage code. There is no
+migration from 1.x: 1.x keys do not carry over, and devices must be
+re-initialised after the update.
 
 The default feature flag is `rp2350_one_4m` for historical reasons; the primary debug/test target is `pico2_4m` (Raspberry Pi Pico 2 stock board) as documented in `CLAUDE.md`. See `docs/BUILD_CONFIGURATIONS.md` for all flag combinations.
 
@@ -126,7 +154,7 @@ pico2hsm/
 │       │   ├── piv/            # PIV applet (applet-piv feature)
 │       │   └── openpgp/        # OpenPGP Card 3.4 (applet-openpgp feature)
 │       ├── crypto/             # ECDSA, ECDH, AES, KDFs, RNG
-│       ├── storage/            # RAID, WAL, filesystem, integrity
+│       ├── storage/            # Keystore, flash/SD drivers, integrity, retry counters
 │       ├── security/           # OTP, secure boot, PIN management
 │       └── dkek/               # DKEK exchange via Noise_XX
 ├── tests/hw/                   # Hardware integration tests (Python/pytest)

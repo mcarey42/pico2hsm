@@ -14,13 +14,17 @@ build instructions for all three firmware variants are covered.
 | External flash    | 16 MB QSPI (W25Q128JV or equivalent)     |
 | Form factor       | USB-A dongle (no castellated edge)       |
 | Display           | 1.14" ST7789 LCD, 240×135 px, RGB444     |
-| SD card           | Optional (see variant table)             |
+| SD card           | Built-in microSD slot (used by `rp2350_geek_sdcard`) |
+| Keystore          | Internal flash, or the SD card (see §4)  |
 | USB connector     | USB-A male (plug-in directly)            |
 
 The RP2350-Geek is a compact USB-A dongle with a built-in colour LCD and an
 optional microSD slot.  Unlike the RP2350-One (which has a WS2812B LED and
 castellated headers), the Geek exposes its GPIO as a standard 2.54 mm header
 row along the bottom edge.
+
+pico2hsm uses the board as sold.  It adds no hardware: no external flash
+chips, no carrier board.
 
 ---
 
@@ -73,7 +77,7 @@ example (`melastmohican/rp2350-geek-rust-examples / examples/mipidsi.rs`):
 |--------|------|-----------|--------------------------------|
 | DC     |   8  | Output    | LOW = command, HIGH = data     |
 | CS     |   9  | Output    | Active-low chip select         |
-| SCK    |  10  | Output    | SPI1 clock (shared bus)        |
+| SCK    |  10  | Output    | SPI1 clock                     |
 | MOSI   |  11  | Output    | SPI1 data out                  |
 | RST    |  12  | Output    | Active-low hardware reset      |
 | BL     |  25  | Output    | Active-high backlight enable   |
@@ -136,50 +140,27 @@ fill_screen(0x0000)          — clear to black
 
 ---
 
-## 4. SPI0 Bus — Keystore Flash
+## 4. Keystore
 
-SPI0 is the primary keystore flash bus, shared with up to four W25Q/IS25
-serial NOR flash chips.  Each chip has its own software chip-select GPIO.
+The keystore location depends on the build:
 
-| Signal | GPIO | Note                                |
-|--------|------|-------------------------------------|
-| SCK    |  18  | SPI0 clock                          |
-| MOSI   |  19  | SPI0 data out                       |
-| MISO   |  20  | SPI0 data in                        |
-| CS[0]  |  17  | Keystore flash chip 0               |
-| CS[1]  |  21  | Keystore flash chip 1               |
-| CS[2]  |  22  | Keystore flash chip 2               |
-| CS[3]  |  26  | Keystore flash chip 3               |
+| Feature flag          | Keystore                                              |
+|-----------------------|-------------------------------------------------------|
+| `rp2350_geek_16m`     | Internal QSPI flash via QMI (`QmiFlash`), 2 MB at offset 0x200000 |
+| `rp2350_geek_sdcard`  | The microSD card on SPI0 (`SdCardFlash`, §6)          |
 
-Frequency: **40 MHz**, Mode 0 (CPOL=0, CPHA=0).
+On both, the PIN/PUK retry-counter log stays on internal flash
+(16 KB at offset 0x1FC000).  The linker script reserves 14 MB above the
+firmware, but the 1.x keystore uses only the first 2 MB of it
+(`docs/STORAGE_V2.md` F3).  No external SPI flash chips are used or
+supported.
 
 ---
 
-## 5. SPI1 Bus — LCD and Mirror Flash
+## 5. SPI1 Bus — LCD
 
-SPI1 is shared between the ST7789 LCD (always present) and optional mirror
-flash chips used for RAID-1 key storage redundancy.
-
-The LCD is always the primary consumer of SPI1 — it owns the bus and the
-`St7789StatusDisplay` struct holds the `Rp2350GeekSpi1` handle.  Mirror flash
-chips are accessed via `Board::spi1()`, which borrows the bus from the display
-struct.  Callers must ensure no LCD render is in progress during flash access
-(the LCD deasserts CS at the end of each `set_status()` call, so borrowing
-between renders is safe).
-
-| Signal | GPIO | Note                                |
-|--------|------|-------------------------------------|
-| SCK    |  10  | SPI1 clock (shared)                 |
-| MOSI   |  11  | SPI1 data out (shared)              |
-| MISO   |  24  | SPI1 data in (unused for LCD)       |
-| CS[0]  |   9  | LCD CS (owned by display driver)    |
-| CS[1]  |  13  | Mirror flash chip 1                 |
-| CS[2]  |  14  | Mirror flash chip 2                 |
-| CS[3]  |  15  | Mirror flash chip 3                 |
-
-Frequency: **30 MHz** for LCD writes.  If mirror flash chips require a
-different frequency, the SPI1 bus must be reconfigured before each flash
-transaction.  Both ST7789 and typical SPI NOR flash operate in Mode 0.
+SPI1 drives the ST7789 LCD only (pins in §3).  It runs at **30 MHz**,
+Mode 0, async with DMA.  `St7789StatusDisplay` owns the bus.
 
 ---
 
@@ -188,6 +169,7 @@ transaction.  Both ST7789 and typical SPI NOR flash operate in Mode 0.
 ### Single SD card variant (`rp2350_geek_sdcard`)
 
 The built-in microSD slot connects to SPI0 (separate from the LCD on SPI1).
+In this build the card is the keystore.
 The SD card interface is wired for SDIO 4-bit mode on the PCB, but the RP2350
 lacks an SDIO controller, so we use SPI mode with only SCK, MOSI, MISO, and
 CS (DAT3).  SDIO D1 (GPIO21) and D2 (GPIO22) are unused.
@@ -210,6 +192,14 @@ CS (DAT3).  SDIO D1 (GPIO21) and D2 (GPIO22) are unused.
 
 Both variants include the full ST7789 LCD driver.  The SD card feature
 flag gates the `SDCARD0_CS` constant and any SD-specific init logic.
+
+**Why an SD-card build?**  An SD-card board can be enrolled in a domain and
+shipped to a remote party with the card sent separately.  The card alone is
+useless: its objects are encrypted under keys derived from the device's
+OTP-based storage master key.  The device alone holds no user keys.  When
+the card goes back in, the device checks it and resumes domain sync.  The
+card checks (store ID, MACs, rollback anchor on internal flash) are planned
+for 2.0; see `docs/STORAGE_V2.md` §8 and §11 and `docs/CLUSTER_PLAN_V3.md`.
 
 ---
 
@@ -253,7 +243,7 @@ workflow details.
 
 ### GPIO ownership at construction
 
-`Rp2350GeekBoard::new(spi0, spi1)` takes both SPI buses.  SPI1 is
+`Rp2350GeekBoard::new(spi1)` takes the SPI1 bus.  SPI1 is
 immediately transferred into `St7789StatusDisplay`, which also acquires the
 four LCD GPIO pins (DC=8, CS=9, RST=12, BL=25) via
 `embassy_rp::gpio::AnyPin::steal()`.  This avoids changing the `new()`
@@ -269,11 +259,3 @@ At 30 MHz with 8-bit transfers, theoretical minimum is ~17 ms per fill.
 In practice, including CS toggling and CASET/RASET commands, a full fill
 takes approximately 20–25 ms on hardware.  This is acceptable for status
 updates (which change at most once per APDU).
-
-### SPI1 sharing with mirror flash
-
-When a mirror flash storage layer is added, it must borrow SPI1 via
-`Board::spi1()`.  Since `set_status()` deasserts LCD CS before returning,
-the bus is free between status updates.  If the storage layer and LCD driver
-are ever called concurrently (which is not the case today — both run on
-core1 synchronously), a mutex or bus-sharing abstraction will be needed.

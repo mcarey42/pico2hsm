@@ -1,5 +1,8 @@
 # pico2hsm Multi-HSM Cluster — Design & Implementation Plan
 
+> **Superseded by [CLUSTER_PLAN_V2.md](CLUSTER_PLAN_V2.md) and
+> [CLUSTER_PLAN_V3.md](CLUSTER_PLAN_V3.md).** Kept for history.
+
 *Synthesized from four concurrent architecture, security, Python, and Rust design reviews.*
 *Date: 2026-04-08*
 

@@ -70,7 +70,8 @@ pub struct DisplayState {
     /// Number of key objects currently stored.
     pub key_count: u8,
 
-    /// `true` when both flash mirrors are healthy (RAID intact).
+    /// `true` while the keystore is healthy.  (No firmware path clears it
+    /// in 1.x; the RAID-mirror health it once meant is gone.)
     pub storage_ok: bool,
 
     /// `true` when a PIN session is active (VERIFY succeeded, not yet timed out).

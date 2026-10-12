@@ -1,5 +1,13 @@
 # Network Sync Setup (Two Hosts)
 
+> **Superseded by [CLUSTER_PLAN_V3.md](CLUSTER_PLAN_V3.md).** This guide
+> describes 1.x two-host sync through the Python daemon.
+> Domains, enrollment against any member, and multi-way sync replace
+> this model. The production daemon will be `pico2hsm-syncd`, in the
+> companion pico2hsm-tool repository; the Python daemon is kept only as a
+> reference and test harness. Daemon and peer-enrollment steps below may not
+> match current firmware. Keys from 1.x do not carry over to 2.0.
+
 A complete guide for synchronizing pico2hsm devices across two separate
 hosts over a network. This covers firewall configuration, TLS identity
 setup, daemon configuration, and verification procedures.

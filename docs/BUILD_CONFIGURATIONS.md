@@ -82,7 +82,7 @@ cargo build --release --no-default-features --features rp2350_one_4m
 # 16 MB flash, no SD card
 cargo build --release --no-default-features --features rp2350_geek_16m
 
-# 16 MB flash + built-in SD card slot (GPIO5 CS)
+# SD card as keystore (built-in slot on SPI0, CS=GPIO23)
 cargo build --release --no-default-features --features rp2350_geek_sdcard
 
 ```
@@ -90,7 +90,7 @@ cargo build --release --no-default-features --features rp2350_geek_sdcard
 ### Waveshare RP2350-LCD-1.47-B
 
 ```sh
-# 16 MB flash + built-in SD card (SPI1 GPIO10/11/12/15) + 1.47" LCD
+# 16 MB flash, keystore on internal flash, 1.47" LCD (SD slot unused)
 cargo build --release --no-default-features --features waveshare_rp2350_lcd_16m
 
 # SD card as sole keystore (replaces QMI flash)
@@ -109,7 +109,22 @@ cargo build --release --no-default-features \
 
 **Flash budget**: Same as `waveshare_rp2350_lcd_16m`.
 **RAM budget**: Same as `waveshare_rp2350_lcd_16m`; no framebuffer change.
-**Keystore**: SD card raw blocks. Keys do not survive SD card removal without the hybrid variant.
+**Keystore**: SD card raw blocks. Keys, the DKEK and domain records live on
+the card; the PIN/PUK retry counters stay on internal flash. With the card
+removed, the device holds no user keys.
+
+#### Why SD-card builds exist
+
+Both SD-card builds (`rp2350_geek_sdcard`, `waveshare_rp2350_lcd_sdcard`)
+serve one use case. An SD-card board is enrolled in a domain, then shipped
+to a remote party with the card sent separately. The card alone is useless:
+its objects are encrypted under keys derived from the device's OTP-based
+storage master key. The device alone holds no user keys. When the card goes
+back in, the device verifies it and resumes domain sync.
+
+Card verification on reinsertion (store ID, MACs, a rollback anchor on
+internal flash) is **planned for 2.0**; see `docs/STORAGE_V2.md` §8 and §11.
+Domain sync is designed in `docs/CLUSTER_PLAN_V3.md`.
 
 ---
 

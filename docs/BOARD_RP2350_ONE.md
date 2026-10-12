@@ -5,6 +5,9 @@ board as used in the pico2hsm firmware.  Pin assignments, bus topology, WS2812B
 LED driver details, external SD card recommendations, and build instructions for
 all firmware variants are covered.
 
+The RP2350-One is used as sold.  pico2hsm adds no hardware to it: no external
+flash chips, no SD card, no carrier board.
+
 ---
 
 ## 1. Board Overview
@@ -14,13 +17,13 @@ all firmware variants are covered.
 | MCU                    | RP2350A (Cortex-M33 × 2 + Hazard3 RISC-V × 2, up to 150 MHz)|
 | SRAM                   | 520 KB on-chip                                                |
 | Flash — 4 MB variant   | 4 MB QSPI NOR flash (W25Q32JV or equivalent)                 |
-| Flash — 16 MB variant  | 16 MB QSPI NOR flash (W25Q128JV or equivalent)               |
+| Flash — 16 MB variant  | 16 MB QSPI NOR flash (no firmware build for it)              |
 | Form factor            | USB-A dongle with castellated edge pads                       |
 | USB connector          | PCB Type-A male (plug directly into host port)                |
 | Status LED             | Single WS2812B RGB LED on GPIO 16                             |
 | GPIO count             | 29 total (20 via edge pinout; 9 via solder castellations)     |
 | SD card slot           | None built-in (external SPI module required)                  |
-| SPI buses in firmware  | SPI0 (keystore flash, 40 MHz) + SPI1 (RAID-1 mirror, 40 MHz) |
+| Keystore               | Internal QSPI flash via QMI, upper 2 MB (no external flash)   |
 | PIO state machines     | 12 total; PIO0 SM0 claimed by WS2812B driver                  |
 | ADC channels           | 4 × 12-bit                                                    |
 | PWM channels           | 16 controllable                                               |
@@ -67,24 +70,24 @@ functions, and its assignment in the pico2hsm `rp2350_one` firmware build.
 |  6         | 0x06       | SPI0 SCK / UART1 CTS                    | — (free)                                         |
 |  7         | 0x07       | SPI0 MOSI / UART1 RTS                   | — (free)                                         |
 |  8         | 0x08       | SPI1 RX / I2C0 SDA                      | — (free)                                         |
-|  9         | 0x09       | SPI1 CSn / I2C0 SCL                     | **SPI1 CS[0]** — mirror flash chip 0             |
-| 10         | 0x0A       | SPI1 SCK / I2C1 SDA                     | **SPI1 SCK**   — mirror flash bus clock          |
-| 11         | 0x0B       | SPI1 MOSI / I2C1 SCL                    | **SPI1 MOSI**  — mirror flash data out           |
-| 12         | 0x0C       | SPI1 MISO / UART0 TX                    | **SPI1 MISO**  — mirror flash data in            |
-| 13         | 0x0D       | SPI1 CSn / UART0 RX                     | **SPI1 CS[1]** — mirror flash chip 1             |
-| 14         | 0x0E       | SPI1 CSn / UART0 CTS                    | **SPI1 CS[2]** — mirror flash chip 2             |
-| 15         | 0x0F       | SPI1 CSn / UART0 RTS                    | **SPI1 CS[3]** — mirror flash chip 3             |
+|  9         | 0x09       | SPI1 CSn / I2C0 SCL                     | — (free)                                         |
+| 10         | 0x0A       | SPI1 SCK / I2C1 SDA                     | SPI1 SCK — bus set up at boot, unused (see §5)   |
+| 11         | 0x0B       | SPI1 MOSI / I2C1 SCL                    | SPI1 MOSI — bus set up at boot, unused           |
+| 12         | 0x0C       | SPI1 MISO / UART0 TX                    | SPI1 MISO — bus set up at boot, unused           |
+| 13         | 0x0D       | SPI1 CSn / UART0 RX                     | — (free)                                         |
+| 14         | 0x0E       | SPI1 CSn / UART0 CTS                    | — (free)                                         |
+| 15         | 0x0F       | SPI1 CSn / UART0 RTS                    | — (free)                                         |
 | 16         | 0x10       | SPI0 RX / PIO0                          | **WS2812B DIN** (PIO0 SM0 side-set output)       |
-| 17         | 0x11       | SPI0 CSn                                | **SPI0 CS[0]** — keystore flash chip 0           |
-| 18         | 0x12       | SPI0 SCK                                | **SPI0 SCK**   — keystore flash bus clock        |
-| 19         | 0x13       | SPI0 MOSI                               | **SPI0 MOSI**  — keystore flash data out         |
-| 20         | 0x14       | SPI0 MISO                               | **SPI0 MISO**  — keystore flash data in          |
-| 21         | 0x15       | SPI0 CSn                                | **SPI0 CS[1]** — keystore flash chip 1           |
-| 22         | 0x16       | SPI0 CSn                                | **SPI0 CS[2]** — keystore flash chip 2           |
+| 17         | 0x11       | SPI0 CSn                                | — (free)                                         |
+| 18         | 0x12       | SPI0 SCK                                | SPI0 SCK — bus set up at boot, unused (see §5)   |
+| 19         | 0x13       | SPI0 MOSI                               | SPI0 MOSI — bus set up at boot, unused           |
+| 20         | 0x14       | SPI0 MISO                               | SPI0 MISO — bus set up at boot, unused           |
+| 21         | 0x15       | SPI0 CSn                                | — (free)                                         |
+| 22         | 0x16       | SPI0 CSn                                | — (free)                                         |
 | 23         | 0x17       | (USB D+ on-chip routing / GPIO)         | — (not broken out on this board)                 |
 | 24         | 0x18       | (USB D− on-chip routing / GPIO)         | — (not broken out on this board)                 |
 | 25         | 0x19       | SPI1 CSn / I2C0 SDA                     | — (free)                                         |
-| 26         | 0x1A       | SPI0 CSn / ADC0                         | **SPI0 CS[3]** — keystore flash chip 3           |
+| 26         | 0x1A       | SPI0 CSn / ADC0                         | — (free)                                         |
 | 27         | 0x1B       | ADC1 / I2C1 SDA                         | — (free)                                         |
 | 28         | 0x1C       | ADC2 / I2C1 SCL                         | — (free)                                         |
 | 29         | 0x1D       | ADC3 / VBUS sense                       | — (VBUS sensing; not a general-purpose output)   |
@@ -93,10 +96,9 @@ functions, and its assignment in the pico2hsm `rp2350_one` firmware build.
 - GPIO 16 is driven exclusively by PIO0 SM0 after `Ws2812Led::new()` runs.
   It must not be configured as a regular GPIO output or claimed by any other
   peripheral in the same firmware build.
-- GPIO 26 is also ADC channel 0.  If ADC use is needed, SPI0 CS[3] must be
-  reassigned to another free GPIO and `SPI0_CS` updated in
-  `firmware/src/board/rp2350_one.rs`.
-- GPIOs 0–3 and 8 are fully free and available for UART, I2C, or GPIO
+- GPIOs 10–12 and 18–20 are taken by the SPI1 and SPI0 buses that
+  `run_one_board()` still sets up.  Nothing is attached to them (§5).
+- The other GPIOs marked free are available for UART, I2C, or GPIO
   expansion.
 
 ---
@@ -246,78 +248,37 @@ Total blocking time per LED update: **~130 µs** (30 µs transmit + 100 µs rese
 
 ---
 
-## 4. SPI0 Bus — Keystore Flash
+## 4. Keystore — Internal Flash
 
-SPI0 is the primary keystore flash bus.  Up to four W25Q-series or IS25-series
-SPI NOR flash chips can be wired in parallel with independent software-driven
-chip-select lines.
+The keystore lives on the board's own QSPI flash chip, read and written
+through the RP2350 QMI.  The 4 MB chip is split in two:
 
-| Signal  | GPIO (dec) | GPIO (hex) | Direction | Note                          |
-|---------|------------|-----------|-----------|-------------------------------|
-| SCK     | 18         | 0x12       | Output    | SPI0 clock                    |
-| MOSI    | 19         | 0x13       | Output    | SPI0 data out (controller→flash) |
-| MISO    | 20         | 0x14       | Input     | SPI0 data in  (flash→controller) |
-| CS[0]   | 17         | 0x11       | Output    | Keystore chip 0, active-low   |
-| CS[1]   | 21         | 0x15       | Output    | Keystore chip 1, active-low   |
-| CS[2]   | 22         | 0x16       | Output    | Keystore chip 2, active-low   |
-| CS[3]   | 26         | 0x1A       | Output    | Keystore chip 3, active-low   |
+| Range (offset)          | Size    | Use                                      |
+|-------------------------|---------|------------------------------------------|
+| 0x000000 – 0x1FBFFF     | ~2 MB   | Firmware image (XIP)                     |
+| 0x1FC000 – 0x1FFFFF     | 16 KB   | PIN/PUK retry-counter log                |
+| 0x200000 – 0x3FFFFF     | 2 MB    | Keystore (`QmiFlash`)                    |
 
-**Bus frequency:** 40 MHz (`SPI_FREQ_HZ = 40_000_000`)  
-**SPI mode:** Mode 0 — CPOL=0 (idle low), CPHA=0 (capture on first transition)  
-**Embassy type alias:** `Rp2350OneSpi0 = Spi<'static, SPI0, Blocking>`
+The layout is set in `boards/rp2350_one_4m.x` and
+`firmware/src/storage/flash_layout.rs`.  It is the same as on the stock
+Pico 2.  No external flash chips are used or supported.
 
-Source constants (`firmware/src/board/rp2350_one.rs`):
-
-```rust
-pub const SPI0_SCK:  u8    = 18;
-pub const SPI0_MOSI: u8    = 19;
-pub const SPI0_MISO: u8    = 20;
-pub const SPI0_CS:   [u8; 4] = [17, 21, 22, 26];
-```
-
-The storage layer drives the CS GPIOs as plain register-write outputs,
-asserting exactly one chip select before each SPI transaction and de-asserting
-immediately after.  All unselected CS lines are held high (inactive).
+pico2hsm 2.0 replaces the keystore format with a journaled store
+(see `docs/STORAGE_V2.md`).  The partition stays on internal flash.
 
 ---
 
-## 5. SPI1 Bus — RAID-1 Mirror Flash
+## 5. SPI0 and SPI1 — Unused
 
-SPI1 is dedicated to the RAID-1 mirror flash array.  Unlike the RP2350-Geek
-board where SPI1 is shared with an LCD, on the RP2350-One SPI1 carries only
-flash traffic.  Up to four chips can be attached with independent CS lines.
+`run_one_board()` still sets up SPI0 (GPIO 18/19/20) and SPI1
+(GPIO 10/11/12) at 40 MHz and hands both to `Rp2350OneBoard`.  Nothing
+uses them.  They are left over from an abandoned design that mirrored the
+keystore (RAID-1) across external SPI flash chips.  That design is dead
+code: no supported board carries the chips, and it is removed in 2.0
+(`docs/STORAGE_V2.md` §12).
 
-| Signal  | GPIO (dec) | GPIO (hex) | Direction | Note                          |
-|---------|------------|-----------|-----------|-------------------------------|
-| SCK     | 10         | 0x0A       | Output    | SPI1 clock                    |
-| MOSI    | 11         | 0x0B       | Output    | SPI1 data out                 |
-| MISO    | 12         | 0x0C       | Input     | SPI1 data in                  |
-| CS[0]   |  9         | 0x09       | Output    | Mirror flash chip 0, active-low |
-| CS[1]   | 13         | 0x0D       | Output    | Mirror flash chip 1, active-low |
-| CS[2]   | 14         | 0x0E       | Output    | Mirror flash chip 2, active-low |
-| CS[3]   | 15         | 0x0F       | Output    | Mirror flash chip 3, active-low |
-
-**Bus frequency:** 40 MHz  
-**SPI mode:** Mode 0 — CPOL=0, CPHA=0  
-**Embassy type alias:** `Rp2350OneSpi1 = Spi<'static, SPI1, Blocking>`
-
-Source constants (`firmware/src/board/rp2350_one.rs`):
-
-```rust
-pub const SPI1_SCK:  u8    = 10;
-pub const SPI1_MOSI: u8    = 11;
-pub const SPI1_MISO: u8    = 12;
-pub const SPI1_CS:   [u8; 4] = [9, 13, 14, 15];
-```
-
-### Current Status (v0.3.0)
-
-As of v0.3.0, the SPI buses are constructed in `run_one_board()` and stored in
-`Rp2350OneBoard` but not yet forwarded to the `SpiFlash` storage layer.  The
-keystore runs in degraded mode (no physical chips attached).  This is a known
-TODO pending a board struct refactor — the GPIO topology above is the intended
-final wiring.  See the TODO comment in `firmware/src/main.rs` →
-`run_one_board()` for the full explanation.
+The `SPI0_CS` / `SPI1_CS` constants in `firmware/src/board/rp2350_one.rs`
+are never driven.  Treat those GPIOs as free.
 
 ---
 
@@ -325,9 +286,9 @@ final wiring.  See the TODO comment in `firmware/src/main.rs` →
 
 ### 6.1 Board Variant Flags
 
-| Feature flag              | Flash  | RAID-1 SPI1 | Notes                    |
-|---------------------------|--------|-------------|--------------------------|
-| `rp2350_one_4m`           | 4 MB   | yes         | **Default** in Cargo.toml |
+| Feature flag              | Flash  | Keystore                | Notes                     |
+|---------------------------|--------|-------------------------|---------------------------|
+| `rp2350_one_4m`           | 4 MB   | Internal flash, 2 MB    | **Default** in Cargo.toml |
 
 Always pass `--no-default-features` when selecting a non-default board flag to
 prevent conflicting features from being simultaneously active (see `CLAUDE.md`
@@ -440,13 +401,12 @@ the test suite in a second terminal:
 | PIO0        | `Ws2812Led::new()` — **stolen** inside board init     |
 | GPIO 16     | `Ws2812Led::new()` — **stolen** inside board init     |
 
-The CS GPIO lines (9, 13, 14, 15, 17, 21, 22, 26) are driven via direct
-register writes by the storage layer; they do not go through the Embassy
-`Output<PIN_N>` ownership model.
+The keystore takes `p.FLASH` for `QmiFlash`.  SPI0 and SPI1 are claimed
+but unused (§5).
 
 ### 8.2 SPI Mode 0 Configuration
 
-Both SPI buses are configured identically:
+Both (unused) SPI buses are configured identically:
 
 ```rust
 spi_cfg.phase    = Phase::CaptureOnFirstTransition;  // CPHA = 0
@@ -454,8 +414,6 @@ spi_cfg.polarity = Polarity::IdleLow;                // CPOL = 0
 spi_cfg.frequency = SPI_FREQ_HZ;                    // 40_000_000 Hz
 ```
 
-Mode 0 (CPOL=0, CPHA=0) is compatible with all standard W25Q-series and
-IS25-series SPI NOR flash chips.
 
 ### 8.3 Core1 Stack Headroom
 
