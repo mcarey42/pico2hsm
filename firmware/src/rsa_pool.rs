@@ -1063,10 +1063,105 @@ mod tests {
         panic!("pool never settled");
     }
 
+    /// BER-TLV walk (1- or 2-byte tags, lengths up to `82 xx xx`), as
+    /// OpenSC's `sc_pkcs15emu_sc_hsm_decode_cvc` reads the CVC.
+    fn tlvs(mut d: &[u8]) -> std::vec::Vec<(std::vec::Vec<u8>, &[u8])> {
+        let mut out = std::vec::Vec::new();
+        while !d.is_empty() {
+            let mut tl = 1;
+            if d[0] & 0x1F == 0x1F {
+                tl = 2;
+            }
+            let tag = d[..tl].to_vec();
+            let mut i = tl;
+            let mut len = usize::from(d[i]);
+            i += 1;
+            if len & 0x80 != 0 {
+                let n = len & 0x7F;
+                assert!((1..=2).contains(&n));
+                len = d[i..i + n]
+                    .iter()
+                    .fold(0, |a, &b| (a << 8) | usize::from(b));
+                i += n;
+            }
+            out.push((tag, &d[i..i + len]));
+            d = &d[i + len..];
+        }
+        out
+    }
+
+    fn tlv<'a>(d: &'a [u8], tag: &[u8]) -> &'a [u8] {
+        tlvs(d)
+            .into_iter()
+            .find(|(t, _)| t == tag)
+            .map(|(_, v)| v)
+            .unwrap_or_else(|| panic!("no tag {tag:02X?}"))
+    }
+
+    /// GENERATE KEY PAIR for RSA-2048 through the SC-HSM handler; decode
+    /// the CVC like OpenSC (67 / 7F21 / 7F4E / 7F49 / 81, 82) and check it
+    /// against the stored private key: e = 65537, n = the key's modulus.
+    fn generate_and_check_cvc(s: &mut Store, key_ref: u8) {
+        use crate::protocol::sc_hsm::ScHsm;
+        use rsa::pkcs1::DecodeRsaPrivateKey;
+        use rsa::traits::PublicKeyParts;
+        let mut hsm = ScHsm::new();
+        hsm.state.initialized = true;
+        hsm.state.pin_verified = true;
+        let data = [
+            0x5F, 0x29, 0x01, 0x00, 0x7F, 0x49, 0x04, 0x02, 0x02, 0x08, 0x00,
+        ];
+        let mut a = std::vec![0x00, 0x46, key_ref, 0x00, data.len() as u8];
+        a.extend_from_slice(&data);
+        let r = hsm.process_apdu_with_store(&a, s);
+        assert_eq!(&r[r.len() - 2..], &[0x90, 0x00]);
+        let cvc = &r[..r.len() - 2];
+        let pk = tlv(
+            tlv(tlv(tlv(cvc, &[0x67]), &[0x7F, 0x21]), &[0x7F, 0x4E]),
+            &[0x7F, 0x49],
+        );
+        let fields = tlvs(pk);
+        let tags: std::vec::Vec<_> = fields.iter().map(|(t, _)| t.clone()).collect();
+        assert_eq!(tags, [std::vec![0x06], std::vec![0x81], std::vec![0x82]]);
+        let n = fields[1].1;
+        let e = fields[2].1;
+        assert_eq!(e, &[0x01, 0x00, 0x01]);
+        assert_eq!(n.len(), 256);
+        let (_, _, _, der, _) = s.saved.last().unwrap().clone();
+        let key = rsa::RsaPrivateKey::from_pkcs1_der(&der).unwrap();
+        assert_eq!(key.n().to_bytes_be(), n);
+        assert_eq!(key.e(), &rsa::BigUint::from(65_537u32));
+    }
+
+    /// Tests that drive GENERATE through the handler share the global
+    /// engine: one at a time.
+    static GLOBAL_ENGINE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn generate_response_decodes_like_opensc_pooled_and_live() {
+        let _g = GLOBAL_ENGINE.lock().unwrap_or_else(|e| e.into_inner());
+        let mut s = Store::new();
+        let mut rng = TestRng(22);
+        with_engine(|e| {
+            e.reboot();
+            e.set_rng_ok(true);
+            e.set_config(&mut s, small_cfg(), 0).unwrap();
+            settle(e, &mut s, &mut rng, 0, 5000);
+        });
+        // Pooled.
+        generate_and_check_cvc(&mut s, 0x10);
+        assert_eq!(with_engine(|e| e.status(&mut s, 0).issued), 1);
+        // Live (pool off).
+        with_engine(|e| e.set_config(&mut s, PoolConfig::FAIL_CLOSED, 0)).unwrap();
+        generate_and_check_cvc(&mut s, 0x11);
+        assert_eq!(with_engine(|e| e.status(&mut s, 0).live), 1);
+    }
+
     /// SC-HSM GENERATE KEY PAIR (RSA-2048) through the real handler takes
     /// the newest pooled key, marks it taken, and stores it as a fresh key.
     #[test]
     fn sc_hsm_generate_issues_the_newest_pooled_key() {
+        let _g = GLOBAL_ENGINE.lock().unwrap_or_else(|e| e.into_inner());
         use crate::protocol::sc_hsm::ScHsm;
         let mut s = Store::new();
         let mut rng = TestRng(21);

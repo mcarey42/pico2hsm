@@ -126,34 +126,49 @@ def gakp_rsa(bits: int) -> bytes:
     return b"\x5F\x29\x01\x00" + b"\x7F\x49" + bytes([len(pk)]) + pk
 
 
-def find_tlv(data: bytes, tag: bytes) -> bytes | None:
-    """First occurrence of a (1- or 2-byte) tag with DER length; a naive scan
-    good enough for the CVC the card returns (7F49 holds 81 n, 82 e)."""
-    i = data.find(tag)
-    while i >= 0:
-        j = i + len(tag)
-        if j < len(data):
-            ln = data[j]
-            if ln < 0x80:
-                return data[j + 1:j + 1 + ln]
+def tlvs(data: bytes):
+    """Walk a BER-TLV sequence (1- or 2-byte tags, lengths up to 82 xx xx),
+    as OpenSC's CVC decoder does: yields (tag, value)."""
+    i = 0
+    while i < len(data):
+        tag = data[i:i + 1]
+        i += 1
+        if tag[0] & 0x1F == 0x1F:
+            tag += data[i:i + 1]
+            i += 1
+        ln = data[i]
+        i += 1
+        if ln & 0x80:
             n = ln & 0x7F
-            if n <= 2 and j + 1 + n <= len(data):
-                ln = int.from_bytes(data[j + 1:j + 1 + n], "big")
-                return data[j + 1 + n:j + 1 + n + ln]
-        i = data.find(tag, i + 1)
-    return None
+            assert 1 <= n <= 2, f"length form {ln:#x}"
+            ln = int.from_bytes(data[i:i + n], "big")
+            i += n
+        assert i + ln <= len(data), "truncated TLV"
+        yield tag, data[i:i + ln]
+        i += ln
+
+
+def find_tlv(data: bytes, path: list[bytes]) -> bytes | None:
+    """The value at a path of tags, e.g. [67, 7F21, 7F4E, 7F49]."""
+    for want in path:
+        for tag, value in tlvs(data):
+            if tag == want:
+                data = value
+                break
+        else:
+            return None
+    return data
 
 
 def public_key_from_cvc(cvc: bytes, bits: int) -> rsa.RSAPublicKey:
-    pk = find_tlv(cvc, b"\x7F\x49")
-    assert pk is not None, "no 7F49 in the GENERATE response"
-    # Skip the algorithm OID (06 ...), then 81 modulus, 82 exponent.
-    assert pk[0] == 0x06
-    rest = pk[2 + pk[1]:]
-    n = find_tlv(rest, b"\x81")
-    e = find_tlv(rest, b"\x82")
+    pk = find_tlv(cvc, [b"\x67", b"\x7F\x21", b"\x7F\x4E", b"\x7F\x49"])
+    assert pk is not None, "no 67/7F21/7F4E/7F49 in the GENERATE response"
+    fields = dict(tlvs(pk))  # 06 OID, 81 modulus, 82 exponent
+    assert b"\x06" in fields, "no algorithm OID in 7F49"
+    n, e = fields.get(b"\x81"), fields.get(b"\x82")
     assert n is not None and e is not None
     assert len(n) * 8 == bits, f"modulus is {len(n) * 8} bits, want {bits}"
+    assert int.from_bytes(e, "big") == 65537, f"exponent {e.hex()}"
     return rsa.RSAPublicNumbers(int.from_bytes(e, "big"), int.from_bytes(n, "big")).public_key()
 
 
@@ -319,6 +334,13 @@ class TestRsaPool:
     def test_reset_during_fill_recovers(self, device):
         if shutil.which("probe-rs") is None:
             pytest.skip("probe-rs not installed")
+        # Do not depend on the previous test having switched the pool back
+        # on (it may have failed half-way): set the factory configuration.
+        with session() as s:
+            s.ok(SELECT_SC_HSM)
+            verify_so_pin(s, device)
+            st = PoolStatus(s.ok(apdu(0x80, 0x54, 0x51, 0x00, DEFAULT_CONFIG)))
+            assert st.enabled, f"pool not enabled: {st!r}"
         st = wait_for(lambda st: st.generating_bits != 0 and not st.full, 600,
                       "a key being generated", poll=1)
         kept = dict(st.ready)
