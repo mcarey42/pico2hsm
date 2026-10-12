@@ -93,6 +93,10 @@ rand_core = { version = "0.6", default-features = false }
 ed25519-dalek = { version = "2", default-features = false, features = ["rand_core"], optional = true }
 x25519-dalek  = { version = "2", default-features = false, features = ["static_secrets"], optional = true }
 
+# Display rendering (DrawTarget, mono fonts).  Platform-agnostic so the
+# render code is host-tested (firmware/src/display/tests.rs).
+embedded-graphics = { version = "0.8" }
+
 # RSA — feature-gated because it adds ~1MB to the binary
 rsa = { version = "0.9", default-features = false, features = ["hazmat"], optional = true }
 
@@ -137,12 +141,11 @@ chacha20 = { version = "0.9", default-features = false }
 # Noise Protocol Framework (DKEK exchange — not yet used on x86_64 tests)
 snow = { version = "0.10", default-features = false }
 
-# Display rendering — embedded-graphics provides DrawTarget trait + text rendering
-# mono_font feature enables MonoTextStyle + built-in ASCII font data (FONT_6X10, FONT_8X13)
-embedded-graphics = { version = "0.8" }
 
 [dev-dependencies]
 hex = { version = "0.4" }
+# Display preview images (host render harness only).
+png = { version = "0.17" }
 heapless = { version = "0.9" }
 rand_core = { version = "0.6" }
 

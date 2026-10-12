@@ -25,6 +25,7 @@
 pub mod allocator;
 pub mod apdu;
 pub mod crypto;
+pub mod display_snapshot;
 pub mod domain;
 pub mod protocol;
 pub mod security;
@@ -33,6 +34,8 @@ pub mod watchdog;
 
 // These modules depend on embassy-rp / embassy-usb / embassy-time which
 // only compile for ARM bare-metal targets. They are excluded from host tests.
+// (`display` compiles on the host; only its task and the board panels are
+// ARM-only.)
 #[cfg(target_arch = "arm")]
 pub mod board;
 #[cfg(target_arch = "arm")]
@@ -41,7 +44,6 @@ pub mod image_def;
 // required by protocol/sc_hsm/mod.rs on all targets. ARM-specific sub-modules
 // (board_chips, flash_chip, filesystem, StorageManager) are gated inside
 // storage/mod.rs via #[cfg(target_arch = "arm")].
-#[cfg(target_arch = "arm")]
 pub mod display;
 pub mod storage;
 #[cfg(target_arch = "arm")]
