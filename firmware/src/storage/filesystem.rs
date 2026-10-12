@@ -347,13 +347,44 @@ pub struct ScrubReport {
 
 // ─── KeyFilesystem<Chip> ──────────────────────────────────────────────────────
 
+/// Chip slots per filesystem.  Every board adds exactly one chip (internal
+/// QMI flash or the SD card); each slot costs over 1 KB of RAM (a
+/// `QmiFlash` carries its bad-sector list).
+pub const MAX_CHIPS: usize = 1;
+
+/// Run `f` with the 4 KB sector buffer for the boot-time directory scans
+/// (`StorageManager::init`, then `KeyFilesystem::mount`, one after the
+/// other on core0 before dispatch starts).  On the device it is one static
+/// shared by both, keeping 4 KB off core0's stack; a nested call panics.
+pub(crate) fn with_boot_sector<R>(f: impl FnOnce(&mut [u8; SECTOR_SIZE]) -> R) -> R {
+    #[cfg(target_arch = "arm")]
+    {
+        use core::sync::atomic::{AtomicBool, Ordering};
+        static IN_USE: AtomicBool = AtomicBool::new(false);
+        static mut BUF: [u8; SECTOR_SIZE] = [0u8; SECTOR_SIZE];
+        assert!(
+            !IN_USE.swap(true, Ordering::Acquire),
+            "boot sector buffer in use"
+        );
+        // SAFETY: IN_USE makes this the only live reference.
+        let r = f(unsafe { &mut *core::ptr::addr_of_mut!(BUF) });
+        IN_USE.store(false, Ordering::Release);
+        r
+    }
+    #[cfg(not(target_arch = "arm"))]
+    {
+        let mut buf = [0u8; SECTOR_SIZE];
+        f(&mut buf)
+    }
+}
+
 /// Logical key filesystem on top of a set of `FlashChip` instances.
 ///
-/// Owns up to 8 chip slots (heapless Vec).  Each chip is accessed
+/// Owns up to `MAX_CHIPS` chip slots (heapless Vec).  Each chip is accessed
 /// directly — the caller (StorageManager) is responsible for choosing
 /// which chip to use and handling RAID mirroring above this layer.
 pub struct KeyFilesystem<Chip: FlashChip> {
-    pub chips: Vec<Chip, 8>,
+    pub chips: Vec<Chip, MAX_CHIPS>,
     pub directory: Directory,
     /// Index into `DIR_SLOTS` of the current directory copy.
     dir_slot: usize,
@@ -398,12 +429,10 @@ impl<Chip: FlashChip> KeyFilesystem<Chip> {
     /// directory sector.  WAL recovery is run on every chip that has a
     /// valid WAL sector.
     pub fn mount(&mut self) -> Result<(), StorageError> {
-        // Static buffer avoids 4 KB stack allocation — critical on SD card
-        // boards with tight core0 stack headroom.
-        // SAFETY: mount() is single-threaded, called once at init.
-        static mut SECTOR0: [u8; SECTOR_SIZE] = [0u8; SECTOR_SIZE];
-        let buf = unsafe { &mut *core::ptr::addr_of_mut!(SECTOR0) };
+        with_boot_sector(|buf| self.mount_with(buf))
+    }
 
+    fn mount_with(&mut self, buf: &mut [u8; SECTOR_SIZE]) -> Result<(), StorageError> {
         // The newest valid copy on any chip: (chip, slot, seq).
         let mut best: Option<(usize, usize, u32)> = None;
         for chip_index in 0..self.chips.len() {

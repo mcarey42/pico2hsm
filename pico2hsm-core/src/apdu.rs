@@ -256,9 +256,15 @@ impl ApduResponse {
     /// The returned buffer is at most 4098 bytes (4096 data + 2 status).
     pub fn serialize(&self) -> Vec<u8, 4098> {
         let mut out: Vec<u8, 4098> = Vec::new();
+        self.serialize_into(&mut out);
+        out
+    }
+
+    /// Serialize into `out` (cleared first), without a 4 KB temporary.
+    pub fn serialize_into(&self, out: &mut Vec<u8, 4098>) {
+        out.clear();
         let _ = out.extend_from_slice(&self.data);
         let _ = out.push((self.sw >> 8) as u8);
         let _ = out.push((self.sw & 0xFF) as u8);
-        out
     }
 }

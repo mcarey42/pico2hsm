@@ -356,23 +356,37 @@ impl Dispatcher {
         raw_apdu: &[u8],
         store: &mut dyn crate::storage::KeyStore,
     ) -> Vec<u8, 4098> {
+        let mut out = Vec::new();
+        self.dispatch_into(raw_apdu, store, &mut out);
+        out
+    }
+
+    /// [`dispatch_with_store`](Self::dispatch_with_store), writing the
+    /// response into `out` (core1 passes the response mailbox, so the
+    /// response is not copied again on its way out).
+    pub fn dispatch_into(
+        &mut self,
+        raw_apdu: &[u8],
+        store: &mut dyn crate::storage::KeyStore,
+        out: &mut Vec<u8, 4098>,
+    ) {
         // Parse the APDU
         let cmd = match ApduCommand::parse(raw_apdu) {
             Ok(c) => c,
-            Err(_) => return ApduResponse::err(SW_INS_NOT_SUPPORTED).serialize(),
+            Err(_) => return ApduResponse::err(SW_INS_NOT_SUPPORTED).serialize_into(out),
         };
 
         // Intercept SELECT by AID before forwarding.
         if cmd.ins == INS_SELECT && cmd.p1 == P1_SELECT_BY_AID {
             self.shared_buf.invalidate();
             let resp = self.select_aid(cmd.data);
-            return resp.serialize();
+            return resp.serialize_into(out);
         }
 
         // Intercept GET RESPONSE — serve from shared_buf, not protocols.
         if cmd.ins == INS_GET_RESPONSE {
             let resp = self.handle_get_response(cmd.le);
-            return resp.serialize();
+            return resp.serialize_into(out);
         }
 
         // Clear stale chaining data before routing to protocol.
@@ -380,15 +394,21 @@ impl Dispatcher {
 
         // Route all active protocols through the storage-aware path.
         crate::CORE1_PROGRESS.store(20, core::sync::atomic::Ordering::Relaxed);
-        let resp = match self.active {
+        let mut resp = match self.active {
             ActiveProtocol::ScHsm => self.sc_hsm.process_apdu_with_store(raw_apdu, store),
             ActiveProtocol::Piv => self.piv.process_apdu_with_store(raw_apdu, store),
             ActiveProtocol::OpenPgp => self.openpgp.process_apdu_with_store(raw_apdu, store),
-            ActiveProtocol::None => return ApduResponse::err(SW_INS_NOT_SUPPORTED).serialize(),
+            ActiveProtocol::None => {
+                return ApduResponse::err(SW_INS_NOT_SUPPORTED).serialize_into(out)
+            }
         };
+        out.clear();
+        let _ = out.extend_from_slice(&resp);
+        // The response may hold secrets (plaintext, ECDH output).
+        zeroize::Zeroize::zeroize(resp.as_mut_slice());
 
         // Apply Le-truncation with GET RESPONSE chaining.
-        self.apply_le_truncation(resp, cmd.le)
+        self.truncate_for_le(out, cmd.le);
     }
 
     /// Dispatch a raw APDU byte slice.
@@ -473,21 +493,29 @@ impl Dispatcher {
     /// and the truncated response is returned with SW=0x61xx.
     ///
     /// `raw_resp` is the serialized response from the protocol (data + SW1 + SW2).
-    fn apply_le_truncation(&mut self, raw_resp: Vec<u8, 4098>, le: Option<u16>) -> Vec<u8, 4098> {
-        // Deserialize: last 2 bytes are SW, rest is data.
-        if raw_resp.len() < 2 {
-            let mut out: Vec<u8, 4098> = Vec::new();
-            let _ = out.extend_from_slice(&raw_resp);
-            return out;
+    fn apply_le_truncation(
+        &mut self,
+        mut raw_resp: Vec<u8, 4098>,
+        le: Option<u16>,
+    ) -> Vec<u8, 4098> {
+        self.truncate_for_le(&mut raw_resp, le);
+        raw_resp
+    }
+
+    /// Le-truncation in place: a successful response with more data than
+    /// Le (or than one CCID message) keeps the first part and SW 61xx; the
+    /// rest goes to `shared_buf` for GET RESPONSE, and is wiped from `resp`.
+    fn truncate_for_le(&mut self, resp: &mut Vec<u8, 4098>, le: Option<u16>) {
+        // Last 2 bytes are SW, the rest is data.
+        if resp.len() < 2 {
+            return;
         }
-        let data_len = raw_resp.len() - 2;
-        let sw = ((raw_resp[data_len] as u16) << 8) | (raw_resp[data_len + 1] as u16);
+        let data_len = resp.len() - 2;
+        let sw = ((resp[data_len] as u16) << 8) | (resp[data_len + 1] as u16);
 
         // Only truncate successful responses (SW=9000).
         if sw != SW_OK {
-            let mut out: Vec<u8, 4098> = Vec::new();
-            let _ = out.extend_from_slice(&raw_resp);
-            return out;
+            return;
         }
 
         // Never more data than one CCID message can carry: the descriptor
@@ -503,22 +531,19 @@ impl Dispatcher {
 
         if data_len <= le_val {
             // Response fits — no truncation needed.
-            let mut out: Vec<u8, 4098> = Vec::new();
-            let _ = out.extend_from_slice(&raw_resp);
-            return out;
+            return;
         }
 
-        // Store overflow in shared_buf, return first le_val bytes + SW=0x61xx.
-        self.shared_buf.store_response(&raw_resp[le_val..data_len]);
+        // Store overflow in shared_buf, keep the first le_val bytes + SW=0x61xx.
+        self.shared_buf.store_response(&resp[le_val..data_len]);
         let remaining = data_len - le_val;
         let xx = remaining.min(0xFF) as u8;
         let sw_chained = 0x6100 | (xx as u16);
 
-        let mut out: Vec<u8, 4098> = Vec::new();
-        let _ = out.extend_from_slice(&raw_resp[..le_val]);
-        let _ = out.push((sw_chained >> 8) as u8);
-        let _ = out.push((sw_chained & 0xFF) as u8);
-        out
+        zeroize::Zeroize::zeroize(&mut resp[le_val..]);
+        resp.truncate(le_val);
+        let _ = resp.push((sw_chained >> 8) as u8);
+        let _ = resp.push((sw_chained & 0xFF) as u8);
     }
 
     /// End the host session: drop every applet's authentication state and the
