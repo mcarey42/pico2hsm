@@ -23,19 +23,24 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Target reader selection
 # ---------------------------------------------------------------------------
-# OPENSC_DEFAULT_READER=N selects the device under test.  The pyscard helpers
-# honour it, but OpenSC's tools and GnuPG do not (they always use reader 0),
+# PICO2HSM_READER=<substring of one reader name> (e.g. the board's USB serial,
+# its chip ID) selects the device under test, resolved on every connection:
+# reader indexes shift whenever a board re-enumerates (flash, probe-rs reset).
+# OPENSC_DEFAULT_READER=N selects it by index instead.  The pyscard helpers
+# honour both, but OpenSC's tools and GnuPG do not (they always use reader 0),
 # so with several devices attached a bare `opensc-tool` would silently test
-# another device.  When it is set, the shims in helpers/bin add the reader to
+# another device.  When either is set, the shims in helpers/bin add the reader to
 # opensc-tool / sc-hsm-tool / pkcs11-tool.  GnuPG 2.4's scdaemon opens every
-# reader and ignores reader-port, and our devices share one serial number, so
-# gpg can only test reader 0: `gpg_skip_reason()` skips those checks otherwise.
+# reader and ignores reader-port, and firmware before the per-chip USB serial
+# shared one serial number, so gpg can only test reader 0: `gpg_skip_reason()` skips those checks otherwise.
 
 _HW_DIR = Path(__file__).resolve().parent
 
 
 def target_reader() -> int:
-    return int(os.environ.get("OPENSC_DEFAULT_READER", "0"))
+    from helpers.pcsc import dut_index
+
+    return dut_index()
 
 
 def _reader_name(index: int) -> str | None:
@@ -72,7 +77,7 @@ def gpg_skip_reason() -> str | None:
 
 
 def pytest_configure(config):
-    if "OPENSC_DEFAULT_READER" not in os.environ:
+    if "OPENSC_DEFAULT_READER" not in os.environ and "PICO2HSM_READER" not in os.environ:
         return
     os.environ["PATH"] = f"{_HW_DIR / 'helpers' / 'bin'}{os.pathsep}{os.environ['PATH']}"
     name = _reader_name(target_reader())

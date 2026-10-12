@@ -35,6 +35,7 @@ from typing import Optional
 import pytest
 
 from helpers.cli import CLIRunner
+from helpers.pcsc import dut_index as R0, peer_index as R1
 
 log = logging.getLogger(__name__)
 
@@ -137,7 +138,7 @@ def require_two_readers():
 @pytest.fixture(scope="module")
 def init_both_devices(runner: CLIRunner, config: dict) -> None:
     """Initialize BOTH devices (readers 0 and 1) with DKEK shares=1."""
-    for reader in (0, 1):
+    for reader in (R0(), R1()):
         result = subprocess.run(
             [
                 "sc-hsm-tool",
@@ -177,7 +178,7 @@ def dkek_loaded_source(init_both_devices, runner: CLIRunner, config: dict) -> No
     result = subprocess.run(
         [
             "sc-hsm-tool",
-            "-r", "0",
+            "-r", str(R0()),
             "--create-dkek-share", str(share_file),
             "--so-pin", config["so_pin"],
             "--password", DKEK_PASSPHRASE,
@@ -194,7 +195,7 @@ def dkek_loaded_source(init_both_devices, runner: CLIRunner, config: dict) -> No
     result = subprocess.run(
         [
             "sc-hsm-tool",
-            "-r", "0",
+            "-r", str(R0()),
             "--import-dkek-share", str(share_file),
             "--so-pin", config["so_pin"],
             "--password", DKEK_PASSPHRASE,
@@ -211,7 +212,7 @@ def dkek_loaded_source(init_both_devices, runner: CLIRunner, config: dict) -> No
 def source_key_generated(dkek_loaded_source, runner: CLIRunner, config: dict) -> None:
     """Generate one P-256 key on reader 0 so the manifest / state root are non-trivial."""
     env = os.environ.copy()
-    env["OPENSC_DEFAULT_READER"] = "0"
+    env["OPENSC_DEFAULT_READER"] = str(R0())
     result = subprocess.run(
         [
             "pkcs11-tool", "--module", config["module"],
@@ -231,13 +232,13 @@ def source_key_generated(dkek_loaded_source, runner: CLIRunner, config: dict) ->
 
 class TestGetDevicePublicKeyBothDevices:
     def test_reader0_returns_65_bytes(self, init_both_devices, runner: CLIRunner) -> None:
-        result = runner.send_apdu(SELECT_SC_HSM, APDU_GET_PUBKEY, reader=0)
+        result = runner.send_apdu(SELECT_SC_HSM, APDU_GET_PUBKEY, reader=R0())
         data = _parse_received_bytes(result.stdout)
         assert len(data) == 65, f"Reader 0: expected 65 bytes, got {len(data)}"
         assert data[0] == 0x04
 
     def test_reader1_returns_65_bytes(self, init_both_devices, runner: CLIRunner) -> None:
-        result = runner.send_apdu(SELECT_SC_HSM, APDU_GET_PUBKEY, reader=1)
+        result = runner.send_apdu(SELECT_SC_HSM, APDU_GET_PUBKEY, reader=R1())
         data = _parse_received_bytes(result.stdout)
         assert len(data) == 65, f"Reader 1: expected 65 bytes, got {len(data)}"
         assert data[0] == 0x04
@@ -246,8 +247,8 @@ class TestGetDevicePublicKeyBothDevices:
         self, init_both_devices, runner: CLIRunner
     ) -> None:
         """Each device must have its own unique static key pair."""
-        r0 = runner.send_apdu(SELECT_SC_HSM, APDU_GET_PUBKEY, reader=0)
-        r1 = runner.send_apdu(SELECT_SC_HSM, APDU_GET_PUBKEY, reader=1)
+        r0 = runner.send_apdu(SELECT_SC_HSM, APDU_GET_PUBKEY, reader=R0())
+        r1 = runner.send_apdu(SELECT_SC_HSM, APDU_GET_PUBKEY, reader=R1())
         d0 = _parse_received_bytes(r0.stdout)
         d1 = _parse_received_bytes(r1.stdout)
         assert len(d0) == 65 and len(d1) == 65
@@ -267,10 +268,10 @@ def enrolled_peers(dkek_loaded_source, runner: CLIRunner) -> None:
     other's signatures against the enrolled key, and all steps need SO-PIN.
     """
     pubs = {}
-    for reader in (0, 1):
+    for reader in (R0(), R1()):
         result = runner.send_apdu(SELECT_SC_HSM, APDU_GET_PUBKEY, reader=reader)
         pubs[reader] = _parse_received_bytes(result.stdout)[-65:]
-    for reader, peer in ((0, 1), (1, 0)):
+    for reader, peer in ((R0(), R1()), (R1(), R0())):
         enroll = f"80543D0041{pubs[peer].hex()}"
         result = runner.send_apdu(
             SELECT_SC_HSM, VERIFY_SO_PIN, enroll,
@@ -296,11 +297,11 @@ class TestDkekExchangeV2:
         self, enrolled_peers, runner: CLIRunner
     ) -> None:
         """TARGET: NOISE_TARGET_INIT(source_static_pub) → 161 bytes."""
-        source_pub = self._get_pubkey(runner, reader=0)
+        source_pub = self._get_pubkey(runner, reader=R0())
         apdu = self._apdu_with_lc_data(0x35, source_pub)
         result = runner.send_apdu(
             SELECT_SC_HSM, VERIFY_SO_PIN, apdu,
-            reader=1, save_as="10_noise_target_init",
+            reader=R1(), save_as="10_noise_target_init",
         )
         sws = _parse_sw(result.stdout)
         assert sws[-1] == 0x9000, f"NOISE_TARGET_INIT SW={sws[-1]:04X}"
@@ -326,10 +327,10 @@ class TestDkekExchangeV2:
         """
         from helpers.pcsc import session
 
-        source_pub = self._get_pubkey(runner, reader=0)
-        target_pub = self._get_pubkey(runner, reader=1)
+        source_pub = self._get_pubkey(runner, reader=R0())
+        target_pub = self._get_pubkey(runner, reader=R1())
 
-        with session(0) as src, session(1) as tgt:
+        with session(R0()) as src, session(R1()) as tgt:
             for s in (src, tgt):
                 s.ok(SELECT_SC_HSM)
                 s.ok(VERIFY_SO_PIN)
@@ -369,8 +370,8 @@ class TestDkekExchangeV2:
         self, dkek_loaded_source, runner: CLIRunner
     ) -> None:
         """Each device tracks its own generation counter independently."""
-        r0 = runner.send_apdu(SELECT_SC_HSM, APDU_GET_GEN_V2, reader=0)
-        r1 = runner.send_apdu(SELECT_SC_HSM, APDU_GET_GEN_V2, reader=1)
+        r0 = runner.send_apdu(SELECT_SC_HSM, APDU_GET_GEN_V2, reader=R0())
+        r1 = runner.send_apdu(SELECT_SC_HSM, APDU_GET_GEN_V2, reader=R1())
         d0 = _parse_received_bytes(r0.stdout)
         d1 = _parse_received_bytes(r1.stdout)
         assert len(d0) == 8 and len(d1) == 8
@@ -383,8 +384,8 @@ class TestDkekExchangeV2:
         self, source_key_generated, runner: CLIRunner
     ) -> None:
         """Before sync, devices with different key sets must have different state roots."""
-        r0 = runner.send_apdu(SELECT_SC_HSM, APDU_GET_STATE_HASH, reader=0)
-        r1 = runner.send_apdu(SELECT_SC_HSM, APDU_GET_STATE_HASH, reader=1)
+        r0 = runner.send_apdu(SELECT_SC_HSM, APDU_GET_STATE_HASH, reader=R0())
+        r1 = runner.send_apdu(SELECT_SC_HSM, APDU_GET_STATE_HASH, reader=R1())
         d0 = _parse_received_bytes(r0.stdout)
         d1 = _parse_received_bytes(r1.stdout)
         assert len(d0) == 104 and len(d1) == 104
@@ -463,16 +464,16 @@ def test_wrapped_key_moves_between_devices(enrolled_peers, runner: CLIRunner, co
     if ref is None:
         # Fall back to the newest key reference.
         from helpers.pcsc import session
-        with session(0) as s:
+        with session(R0()) as s:
             s.ok(SELECT_SC_HSM)
             listing = s.ok("0058000000")
         ref = max(listing[i + 1] for i in range(0, len(listing), 2) if listing[i] == 0xCC)
 
     wky = tmp_path / "move.wky"
-    w = runner.sc_hsm_tool("-r", "0", "--wrap-key", str(wky), "--key-reference", str(ref),
+    w = runner.sc_hsm_tool("-r", str(R0()), "--wrap-key", str(wky), "--key-reference", str(ref),
                            "--pin", config["pin"], save_as="10_xdev_wrap")
     assert w.returncode == 0, w.stderr[-2000:]
-    u = runner.sc_hsm_tool("-r", "1", "--unwrap-key", str(wky), "--key-reference", str(ref),
+    u = runner.sc_hsm_tool("-r", str(R1()), "--unwrap-key", str(wky), "--key-reference", str(ref),
                            "--pin", config["pin"], "--force", save_as="10_xdev_unwrap")
     assert u.returncode == 0 and "successfully imported" in u.stdout, u.stdout + u.stderr[-2000:]
 
