@@ -13,7 +13,10 @@
 //! - **Age**: the *pool clock* counts minutes of powered-on time; there is
 //!   no RTC, so time with the device unplugged does not count.  The clock
 //!   is persisted every [`CLOCK_PERSIST_MIN`] minutes (and every key
-//!   records its birth time), so at most that much is lost per power cut.
+//!   records its birth time).  A boot assumes that whole interval passed
+//!   and persists the advanced clock at once, so the clock never runs
+//!   backwards and frequent resets cannot stop it; each power cut ages
+//!   the pool by at most that much extra.
 //! - **Rotation / age-out** (default on): a pooled key whose age reaches
 //!   [`PoolConfig::max_age_min`] is erased and replaced; GENERATE never
 //!   issues a key past that age.  Default 4 hours of powered-on time.
@@ -301,8 +304,13 @@ impl Engine {
         self.config_ok = cfg.is_some();
         self.config = cfg.unwrap_or(PoolConfig::FAIL_CLOSED);
         self.clock_ok = clock.is_some();
-        let mut clock = clock.unwrap_or(0);
-        self.persisted_clock = clock;
+        let persisted = clock.unwrap_or(0);
+        self.persisted_clock = persisted;
+        // Up to CLOCK_PERSIST_MIN minutes since the last persist were lost
+        // with the power.  Count them as elapsed: resets more often than
+        // that must not stop the clock (and keep pooled keys from ageing
+        // out).  The next background step persists the advanced value.
+        let mut clock = persisted.saturating_add(CLOCK_PERSIST_MIN);
         self.persisted_seq = seq;
         if let Some(pool) = store.rsa_pool() {
             if let Ok(slots) = pool.pool_slots() {
@@ -1590,10 +1598,31 @@ mod tests {
         settle(&mut e, &mut s, &mut rng, 0, 5000);
         // 40 powered-on minutes, then a reboot (uptime restarts at 0).
         settle(&mut e, &mut s, &mut rng, 40, 5000);
+        let before = e.status(&mut s, 40).clock_min;
         e.reboot();
-        assert_eq!(e.status(&mut s, 0).clock_min, 40);
-        // 25 more minutes after the reboot: 65 > 60, the keys age out.
-        assert_eq!(e.status(&mut s, 25).ready, [0, 0, 0]);
+        // Every boot (the first included) counts the unpersisted interval
+        // as elapsed: the keys are 40 + 10 minutes old now.
+        assert_eq!(e.status(&mut s, 0).clock_min, before + CLOCK_PERSIST_MIN);
+        assert_ne!(e.status(&mut s, 0).ready, [0, 0, 0]);
+        // 15 more minutes after the reboot: 65 > 60, the keys age out.
+        assert_eq!(e.status(&mut s, 15).ready, [0, 0, 0]);
+    }
+
+    #[test]
+    fn frequent_resets_do_not_stop_the_clock() {
+        let mut e = engine();
+        let mut s = Store::new();
+        let mut rng = TestRng(11);
+        e.set_config(&mut s, small_cfg(), 0).unwrap();
+        settle(&mut e, &mut s, &mut rng, 0, 5000);
+        let start = e.status(&mut s, 0).clock_min;
+        // Reset every 5 minutes, always before the 10-minute persist.
+        for _ in 0..6 {
+            settle(&mut e, &mut s, &mut rng, 5, 5000);
+            e.reboot();
+            settle(&mut e, &mut s, &mut rng, 0, 50);
+        }
+        assert!(e.status(&mut s, 0).clock_min >= start + 30);
     }
 
     #[test]
