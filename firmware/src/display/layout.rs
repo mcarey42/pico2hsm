@@ -12,6 +12,8 @@ use embedded_graphics::{
     primitives::Rectangle,
 };
 
+use super::color::{self, C444};
+
 /// A font reference.
 pub type Font = &'static MonoFont<'static>;
 
@@ -38,6 +40,9 @@ pub struct Layout {
     pub status_at: Point,
     /// Status word font.
     pub status_font: Font,
+    /// Double-strike the status word (a bold weight with no extra font
+    /// data; FONT_10X20 has no bold face).
+    pub status_bold: bool,
     /// Applet chip.
     pub applet_chip: Rectangle,
     /// Admin chip.
@@ -84,6 +89,8 @@ pub struct Layout {
     pub footer: Rectangle,
     /// Footer font.
     pub footer_font: Font,
+    /// Footer text colour (healthy storage token included).
+    pub footer_text: C444,
 
     // ── Error / notice template ──────────────────────────────────────────
     /// Band.
@@ -156,6 +163,7 @@ pub static WAVESHARE_320X172: Layout = Layout {
     bar_w: 6,
     status_at: Point::new(14, 7),
     status_font: &FONT_10X20,
+    status_bold: true,
     applet_chip: r(260, 5, 57, 24),
     admin_chip: r(186, 5, 67, 24),
     chip_font: &FONT_9X18_BOLD,
@@ -179,6 +187,7 @@ pub static WAVESHARE_320X172: Layout = Layout {
 
     footer: r(0, 150, 320, 22),
     footer_font: &FONT_6X13,
+    footer_text: color::DIM,
 
     err_band: r(0, 0, 320, 36),
     err_font: &FONT_10X20,
@@ -224,6 +233,7 @@ pub static GEEK_240X135: Layout = Layout {
     bar_w: 4,
     status_at: Point::new(8, 4),
     status_font: &FONT_9X18_BOLD,
+    status_bold: false,
     applet_chip: r(196, 4, 41, 18),
     admin_chip: r(146, 4, 45, 18),
     chip_font: &FONT_6X13,
@@ -247,6 +257,8 @@ pub static GEEK_240X135: Layout = Layout {
 
     footer: r(0, 120, 240, 15),
     footer_font: &FONT_6X10,
+    // The 6×10 font is under 1 mm tall on the 1.14" panel: TEXT2, not DIM.
+    footer_text: color::TEXT2,
 
     err_band: r(0, 0, 240, 28),
     err_font: &FONT_9X18_BOLD,

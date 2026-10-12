@@ -143,15 +143,9 @@ impl Controller {
     /// Footer for `snap` at `now_ms`.
     pub fn footer(&self, snap: &Snapshot, now_ms: u64) -> FooterView {
         let uptime = (now_ms / 1000) as u32;
-        if let Some(r) = self.info.reset {
-            if now_ms < RESET_WARNING_MS {
-                return FooterView::ResetWarning(r);
-            }
-        }
         let f = snap.health.flags;
-        if f & health::PROVISIONED == 0 && f & health::SMK_MISSING == 0 {
-            return FooterView::DevUnprovisioned { uptime };
-        }
+        // Every footer strip carries storage health, so neither warning
+        // strip can hide it.
         let failed = f & (health::KS_INIT_FAILED | health::STORE_WRITE_FAILED) != 0;
         let storage = match (self.info.storage, failed) {
             (StorageKind::Sd, _) if f & health::SD_MISSING != 0 => StorageLine::SdMissing,
@@ -160,6 +154,14 @@ impl Controller {
             (StorageKind::Qmi, true) => StorageLine::QmiFail,
             (StorageKind::Qmi, false) => StorageLine::QmiOk,
         };
+        if let Some(info) = self.info.reset {
+            if now_ms < RESET_WARNING_MS {
+                return FooterView::ResetWarning { info, storage };
+            }
+        }
+        if f & health::PROVISIONED == 0 && f & health::SMK_MISSING == 0 {
+            return FooterView::DevUnprovisioned { uptime, storage };
+        }
         let reset = self
             .info
             .reset
@@ -416,15 +418,22 @@ impl Controller {
                 phase: ((ms / WORKING_TICK_MS as u32) % 256) as u8,
             }
         } else {
+            // The last operation outlives its session (pcscd ends sessions
+            // between commands), dimmed once that session has ended; "Idle"
+            // means nothing since boot.  It shows what production already
+            // shows (category, result, age; detail only in debug builds),
+            // and drops the hint, which is about the ended session's PIN.
             match self.last {
-                Some(f) if f.epoch == i.session_epoch || note.is_some() => {
+                Some(f) => {
                     let age = (now.saturating_sub(f.at_ms) / 1000) as u32;
+                    let ended = !(i.usb_configured && f.epoch == i.session_epoch);
                     ActivityView::Done {
                         op: f.activity.op,
                         result: f.activity.result,
                         age: Age::of_secs(age),
                         fade: Fade::of_secs(age),
                         hint: match f.activity.hint {
+                            _ if ended => Hint::None,
                             hint::PIV_PIN_ALWAYS => Hint::PivPinAlways,
                             hint::PGP_SINGLE_USE => Hint::PgpSingleUse,
                             _ => Hint::None,
@@ -435,9 +444,10 @@ impl Controller {
                             sw: f.sw,
                         }),
                         note,
+                        ended,
                     }
                 }
-                _ => ActivityView::Idle,
+                None => ActivityView::Idle,
             }
         };
 
@@ -595,9 +605,69 @@ mod tests {
         assert_eq!(at(&mut c, 5_000), (Age::Secs(4), Fade::Fresh));
         assert_eq!(at(&mut c, 30_000), (Age::Secs(29), Fade::Recent));
         assert_eq!(at(&mut c, 3_601_000), (Age::Hours(1), Fade::Old));
-        // A new session starts idle.
-        let mut i = inputs(3_602_000, s);
+    }
+
+    #[test]
+    fn last_op_outlives_its_session_dimmed() {
+        let mut c = Controller::new(info(), 0);
+        let mut s = snap();
+        s.session.auth = auth::PIV_PIN | auth::PIV_MGMT;
+        s.activity = Activity {
+            op_seq: 1,
+            op: OpCode::Sign,
+            state: OpState::Done,
+            result: OpResult::Ok,
+            hint: hint::PIV_PIN_ALWAYS,
+            ..Default::default()
+        };
+        let done = |f: &Frame| match home(f).activity {
+            ActivityView::Done {
+                op,
+                age,
+                hint,
+                ended,
+                detail,
+                ..
+            } => (op, age, hint, ended, detail),
+            other => panic!("{other:?}"),
+        };
+        let f = c.step(&inputs(1_000, s));
+        assert_eq!(
+            done(&f),
+            (OpCode::Sign, Age::Secs(0), Hint::PivPinAlways, false, None)
+        );
+        assert!(home(&f).admin);
+        // pcscd ended the session: the op stays, dimmed, with its age and
+        // without the hint; authentication and ADMIN clear as before.
+        let mut i = inputs(5_000, s);
+        i.session_epoch = 4;
+        let f = c.step(&i);
+        assert_eq!(
+            done(&f),
+            (OpCode::Sign, Age::Secs(4), Hint::None, true, None),
+            "production shows no detail"
+        );
+        let h = home(&f);
+        assert!(!h.admin);
+        assert_eq!(h.pin.value, PinValue::NoApplet);
+        assert_eq!(h.applet, Applet::None);
+        // USB down ends it too.
+        let mut i = inputs(6_000, s);
+        i.usb_configured = false;
+        let f = c.step(&i);
+        assert!(done(&f).3);
+        assert!(!home(&f).admin);
+        assert_eq!(home(&f).status, Status::NoHost);
+    }
+
+    #[test]
+    fn idle_only_before_the_first_op() {
+        let mut c = Controller::new(info(), 0);
+        let s = snap();
+        let mut i = inputs(1_000, s);
+        assert_eq!(home(&c.step(&i)).activity, ActivityView::Idle);
         i.session_epoch = 9;
+        i.usb_configured = false;
         assert_eq!(home(&c.step(&i)).activity, ActivityView::Idle);
     }
 
@@ -866,7 +936,19 @@ mod tests {
         s.health.flags = 0;
         assert!(matches!(
             c.footer(&s, 0),
-            FooterView::DevUnprovisioned { .. }
+            FooterView::DevUnprovisioned {
+                storage: StorageLine::QmiOk,
+                ..
+            }
+        ));
+        // A dev board still reports a failed store.
+        s.health.flags = health::STORE_WRITE_FAILED;
+        assert!(matches!(
+            c.footer(&s, 0),
+            FooterView::DevUnprovisioned {
+                storage: StorageLine::QmiFail,
+                ..
+            }
         ));
         let mut c = Controller::new(
             StaticInfo {
@@ -879,7 +961,13 @@ mod tests {
             0,
         );
         let s = snap();
-        assert!(matches!(c.footer(&s, 59_999), FooterView::ResetWarning(_)));
+        assert!(matches!(
+            c.footer(&s, 59_999),
+            FooterView::ResetWarning {
+                storage: StorageLine::QmiOk,
+                ..
+            }
+        ));
         assert!(matches!(
             c.footer(&s, 60_000),
             FooterView::Normal {

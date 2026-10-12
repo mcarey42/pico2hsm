@@ -156,6 +156,7 @@ fn home_base() -> HomeView {
                 sw: 0x9000,
             }),
             note: None,
+            ended: false,
         },
         footer: NORMAL_FOOTER,
     }
@@ -190,6 +191,7 @@ fn fixtures(l: &Layout) -> Vec<(&'static str, Screen)> {
                 hint: Hint::None,
                 detail: None,
                 note: None,
+                ended: false,
             },
             ..base
         }),
@@ -249,6 +251,7 @@ fn fixtures(l: &Layout) -> Vec<(&'static str, Screen)> {
                     sw: 0x6983,
                 }),
                 note: Some(Note::Unblock(Applet::Pgp)),
+                ended: false,
             },
             ..base
         }),
@@ -274,6 +277,7 @@ fn fixtures(l: &Layout) -> Vec<(&'static str, Screen)> {
                 hint: Hint::PivPinAlways,
                 detail: None,
                 note: None,
+                ended: false,
             },
             ..base
         }),
@@ -298,6 +302,7 @@ fn fixtures(l: &Layout) -> Vec<(&'static str, Screen)> {
                     sw: 0x63C1,
                 }),
                 note: None,
+                ended: false,
             },
             ..base
         }),
@@ -311,8 +316,21 @@ fn fixtures(l: &Layout) -> Vec<(&'static str, Screen)> {
                 value: PinValue::NoApplet,
                 ..base.pin
             },
-            // USB down ended the session: no last op.
-            activity: ActivityView::Idle,
+            // USB down ended the session: its last op stays, dimmed.
+            activity: ActivityView::Done {
+                op: OpCode::Sign,
+                result: OpResult::Ok,
+                age: Age::Secs(14),
+                fade: Fade::Recent,
+                hint: Hint::None,
+                detail: Some(OpDetail {
+                    algo: algo::P256,
+                    key_ref: 0x9A,
+                    sw: 0x9000,
+                }),
+                note: None,
+                ended: true,
+            },
             // Past the 60 s reset warning, within the 24 h reset note.
             footer: FooterView::Normal {
                 uptime: 75,
@@ -340,6 +358,7 @@ fn fixtures(l: &Layout) -> Vec<(&'static str, Screen)> {
                     sw: 0x6581,
                 }),
                 note: Some(Note::NotSaved),
+                ended: false,
             },
             // A write to a pulled card: NOT saved, SD MISSING.  The reset
             // note is gone after 24 h.
@@ -357,6 +376,7 @@ fn fixtures(l: &Layout) -> Vec<(&'static str, Screen)> {
             // Widest strings: the age stays within the uptime.
             footer: FooterView::DevUnprovisioned {
                 uptime: 9999 * 86_400 + 3599,
+                storage: StorageLine::QmiOk,
             },
             pin: PinTile {
                 value: PinValue::Verified,
@@ -384,6 +404,7 @@ fn fixtures(l: &Layout) -> Vec<(&'static str, Screen)> {
                     sw: 0x6A80,
                 }),
                 note: None,
+                ended: false,
             },
             ..base
         }),
@@ -399,10 +420,13 @@ fn fixtures(l: &Layout) -> Vec<(&'static str, Screen)> {
                 max: 3,
                 sig_armed: false,
             },
-            footer: FooterView::ResetWarning(ResetInfo {
-                kind: ResetKind::Core1Stall,
-                count: 2,
-            }),
+            footer: FooterView::ResetWarning {
+                info: ResetInfo {
+                    kind: ResetKind::Core1Stall,
+                    count: 2,
+                },
+                storage: StorageLine::QmiOk,
+            },
             activity: ActivityView::Done {
                 op: OpCode::Sign,
                 result: OpResult::Ok,
@@ -411,6 +435,7 @@ fn fixtures(l: &Layout) -> Vec<(&'static str, Screen)> {
                 hint: Hint::PgpSingleUse,
                 detail: None,
                 note: None,
+                ended: false,
             },
             ..base
         }),
@@ -528,49 +553,49 @@ fn layouts() -> [(&'static str, &'static Layout); 2] {
 /// FNV-1a of each packed RGB444 frame.  After an intended visual change,
 /// review the previews and paste the table the failing test prints.
 const GOLDEN: &[(&str, &str, u64)] = &[
-    ("320x172", "home_ready", 0x627da0ed0972c0a9),
-    ("320x172", "home_ready_production", 0xbdd5f623ac2c39e7),
-    ("320x172", "home_idle", 0xe917a05fac71d61d),
-    ("320x172", "home_working", 0xcf10ea33a4fc3da0),
-    ("320x172", "home_locked", 0xe1b89a2fb34f69a9),
-    ("320x172", "home_admin", 0xf6c7c3f816325526),
-    ("320x172", "home_self_domain", 0xc8936cce938314c1),
-    ("320x172", "home_no_host", 0xb126811dab17f7d3),
-    ("320x172", "home_error", 0x26df370bde651cb6),
-    ("320x172", "home_dev_unprovisioned", 0x5271f4d02322a7e1),
-    ("320x172", "home_reset_warning", 0xbd7d495c2866c8e2),
-    ("320x172", "error_e10", 0x4f3f75292f218a24),
-    ("320x172", "error_e11", 0xdb4282bc268bdebf),
-    ("320x172", "error_e20", 0x3f98f14b030b7f27),
-    ("320x172", "error_e31", 0x189a3a0be0fb7940),
+    ("320x172", "home_ready", 0x1b28e029d64e4a03),
+    ("320x172", "home_ready_production", 0x3e32dbdce282c009),
+    ("320x172", "home_idle", 0x1bc37b1f250710f7),
+    ("320x172", "home_working", 0x25b45a68427058d4),
+    ("320x172", "home_locked", 0x582ac11cf3aa2ecb),
+    ("320x172", "home_admin", 0xebcc570053d4141c),
+    ("320x172", "home_self_domain", 0xab8c729f3b6ed893),
+    ("320x172", "home_no_host", 0x9334b23762287dc2),
+    ("320x172", "home_error", 0xad5f86f22f7cd6db),
+    ("320x172", "home_dev_unprovisioned", 0x640966920ae177a8),
+    ("320x172", "home_reset_warning", 0xeba036cebfff83a3),
+    ("320x172", "error_e10", 0xf322e5b7134dfaa8),
+    ("320x172", "error_e11", 0xa3cbb5fec2db2a07),
+    ("320x172", "error_e20", 0x0e83bedec9f700e7),
+    ("320x172", "error_e31", 0x8257a608ca9e6470),
     ("320x172", "sas", 0x9d50546a1ae4fd33),
     ("320x172", "sas_joiner", 0xd6fd795734312e93),
-    ("320x172", "notice_enrolled", 0x9dcb42f99313328f),
-    ("320x172", "notice_cancelled", 0x4b8795ad7198a0b8),
-    ("320x172", "notice_expired", 0x0625dbda9ef5338c),
+    ("320x172", "notice_enrolled", 0x8f5ac5ba3c45450f),
+    ("320x172", "notice_cancelled", 0xa5fbf7b461cb8088),
+    ("320x172", "notice_expired", 0x6627ae816f3d016c),
     ("320x172", "splash", 0x6bb098a138ac7399),
     ("320x172", "splash_reset", 0x8c4f3e6f6c5a1859),
     ("320x172", "splash_starting", 0xc5c875866acee383),
-    ("240x135", "home_ready", 0x43a389b4412bd678),
-    ("240x135", "home_ready_production", 0x274611b82e4763c7),
-    ("240x135", "home_idle", 0x46e9af0bf86674b8),
-    ("240x135", "home_working", 0x720c47340248b528),
-    ("240x135", "home_locked", 0x4d9a3814a22c279f),
-    ("240x135", "home_admin", 0x51119cfb949c1799),
-    ("240x135", "home_self_domain", 0xb3d6ab1e23558354),
-    ("240x135", "home_no_host", 0xfb794b54e7e657a8),
-    ("240x135", "home_error", 0x6ec642baafd8b35b),
-    ("240x135", "home_dev_unprovisioned", 0x1ba5d7cf9e4340cd),
-    ("240x135", "home_reset_warning", 0x5977d6371adcba64),
-    ("240x135", "error_e10", 0xdffc3e2658f794a8),
-    ("240x135", "error_e11", 0x48d93efaa1149e07),
-    ("240x135", "error_e20", 0x6f7cf50a6b61c279),
-    ("240x135", "error_e31", 0x0e7574f1ca5c6759),
+    ("240x135", "home_ready", 0x4ab23c9529618ddc),
+    ("240x135", "home_ready_production", 0x7a04966c33bc852f),
+    ("240x135", "home_idle", 0x48475df02946971c),
+    ("240x135", "home_working", 0xa7aea8861112684c),
+    ("240x135", "home_locked", 0x4ec96c96b4f13f67),
+    ("240x135", "home_admin", 0x46d93ac1e76c63b1),
+    ("240x135", "home_self_domain", 0x8951adb4300909c8),
+    ("240x135", "home_no_host", 0x00ac4d4bc80bc963),
+    ("240x135", "home_error", 0x3bd09dc7a1e91f93),
+    ("240x135", "home_dev_unprovisioned", 0x25f20eba93012404),
+    ("240x135", "home_reset_warning", 0x91c52674eb1cb205),
+    ("240x135", "error_e10", 0x7933e5c2f1dc4da6),
+    ("240x135", "error_e11", 0xf0eb8948ebead2b9),
+    ("240x135", "error_e20", 0x76907a08f42afe0b),
+    ("240x135", "error_e31", 0xcb89cdf1c07a17f1),
     ("240x135", "sas", 0x23a77eb2546c997f),
     ("240x135", "sas_joiner", 0xb14ceabcb49fd407),
-    ("240x135", "notice_enrolled", 0xc62a492f0411f347),
-    ("240x135", "notice_cancelled", 0x4873b63b9609a86a),
-    ("240x135", "notice_expired", 0x07cccb611ba46863),
+    ("240x135", "notice_enrolled", 0x6b815d92febb3f2f),
+    ("240x135", "notice_cancelled", 0x48c260ad55363ef6),
+    ("240x135", "notice_expired", 0xe2646de9298c6e4b),
     ("240x135", "splash", 0x7f35e6b0ed0ee6bb),
     ("240x135", "splash_reset", 0x08735cb2a3511dd1),
     ("240x135", "splash_starting", 0xa5dd5e3c52b01ee1),
@@ -689,6 +714,173 @@ fn sas_colour_is_reserved() {
             assert_eq!(has, matches!(s, Screen::Sas(_)), "{res}/{name}");
         }
     }
+}
+
+#[test]
+fn cyan_means_no_host() {
+    // NO HOST is cyan and WORKING blue, on the LCD and the LED; nothing
+    // else uses either, and neither is the SAS colour.
+    use super::color::{BUSY, CYAN, SAS};
+    let all = [
+        Status::Error,
+        Status::Locked,
+        Status::Working,
+        Status::NoHost,
+        Status::Ready,
+    ];
+    for s in all {
+        assert_eq!(s.color() == CYAN, s == Status::NoHost, "{s:?}");
+        assert_eq!(s.color() == BUSY, s == Status::Working, "{s:?}");
+        let led = LedTone::of_status(s);
+        assert_eq!(led == LedTone::Cyan, s == Status::NoHost, "{s:?}");
+        assert_eq!(led == LedTone::Blue, s == Status::Working, "{s:?}");
+    }
+    assert_ne!(CYAN, SAS);
+    // In the frames: cyan only on the NO HOST home screen.
+    let cyan = CYAN.rgb888();
+    for (res, l) in layouts() {
+        for (name, s) in fixtures(l) {
+            let (fb, _) = draw(l, &s);
+            let mut p = FramePanel::new(l);
+            p.fb = fb;
+            let has = p.rgb888().chunks_exact(3).any(|px| px == cyan);
+            let no_host = matches!(
+                s,
+                Screen::Home(HomeView {
+                    status: Status::NoHost,
+                    ..
+                })
+            );
+            assert_eq!(has, no_host, "{res}/{name}");
+        }
+    }
+}
+
+#[test]
+fn footer_keeps_storage_at_the_right() {
+    use super::color::{BG, ERR, PANEL, WARN};
+    use super::render::footer_boxes;
+    use embedded_graphics::{
+        geometry::Point,
+        primitives::{PointsIter, Rectangle},
+    };
+    // Worst-case text in every strip, with every storage token, in the
+    // home and the error/notice footers: no overlap, nothing cut, and the
+    // token sits at the right edge.
+    let storages = [
+        StorageLine::QmiOk,
+        StorageLine::QmiFail,
+        StorageLine::SdOk,
+        StorageLine::SdFail,
+        StorageLine::SdMissing,
+    ];
+    for (res, l) in layouts() {
+        for storage in storages {
+            let footers = [
+                FooterView::Normal {
+                    uptime: 999 * 86_400 + 86_399,
+                    storage,
+                    reset: Some(ResetKind::Core1Stall),
+                },
+                FooterView::ResetWarning {
+                    info: ResetInfo {
+                        kind: ResetKind::Core1Stall,
+                        count: 99,
+                    },
+                    storage,
+                },
+                FooterView::DevUnprovisioned {
+                    uptime: 999 * 86_400 + 86_399,
+                    storage,
+                },
+            ];
+            for footer in footers {
+                let strip = !matches!(footer, FooterView::Normal { .. });
+                for (screen, r) in [
+                    (
+                        Screen::Home(HomeView {
+                            footer,
+                            ..home_base()
+                        }),
+                        l.footer,
+                    ),
+                    (
+                        Screen::Error(ErrorView {
+                            code: ErrorCode::E31RngFailure,
+                            footer,
+                        }),
+                        l.err_footer,
+                    ),
+                ] {
+                    let what = format!("{res}/{footer:?}");
+                    let (fb, overflow) = draw(l, &screen);
+                    assert_eq!(overflow, 0, "{what}: text outside its box");
+                    let b = footer_boxes(storage, strip, r, l);
+                    let right = r.top_left.x + r.size.width as i32;
+                    let token_right = b.token.top_left.x + b.token.size.width as i32;
+                    assert!(right - token_right <= 6, "{what}: token not at the right");
+                    assert!(
+                        b.text.top_left.x + (b.text.size.width as i32) < b.token.top_left.x,
+                        "{what}: text runs into the token"
+                    );
+                    // The token's pixels are there: ERR for a failure, and
+                    // on a strip the dark chip over the WARN fill.
+                    let mut p = FramePanel::new(l);
+                    p.fb = fb;
+                    let rgb = p.rgb888();
+                    let px = |pt: Point| {
+                        let i = (pt.y as usize * l.w as usize + pt.x as usize) * 3;
+                        [rgb[i], rgb[i + 1], rgb[i + 2]]
+                    };
+                    let inside = |q: &Rectangle| q.points().map(px).collect::<Vec<_>>();
+                    let tok = inside(&b.token);
+                    if strip {
+                        assert!(tok.contains(&PANEL.rgb888()), "{what}: no chip");
+                        assert!(!tok.contains(&WARN.rgb888()), "{what}: chip not opaque");
+                    } else {
+                        assert!(tok.contains(&BG.rgb888()), "{what}");
+                    }
+                    let failed = !matches!(storage, StorageLine::QmiOk | StorageLine::SdOk);
+                    assert_eq!(tok.contains(&ERR.rgb888()), failed, "{what}: token colour");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn status_word_is_bold_on_the_waveshare() {
+    // Double-struck: each column of the regular glyph also lit 1 px right.
+    let l = &WAVESHARE_320X172;
+    assert!(l.status_bold && !GEEK_240X135.status_bold);
+    let (fb, _) = draw(l, &Screen::Home(home_base()));
+    let mut p = FramePanel::new(l);
+    p.fb = fb;
+    let rgb = p.rgb888();
+    let ok = super::color::OK.rgb888();
+    let lit = |x: i32, y: i32| {
+        let i = (y as usize * l.w as usize + x as usize) * 3;
+        rgb[i..i + 3] == ok
+    };
+    let (x0, y0) = (l.status_at.x, l.status_at.y);
+    let w = "READY".len() as i32 * 10 + 1;
+    let mut runs = 0;
+    for y in y0..y0 + 20 {
+        for x in x0..x0 + w {
+            if lit(x, y) && !lit(x - 1, y) {
+                runs += 1;
+                assert!(lit(x + 1, y), "single-pixel stroke at ({x}, {y})");
+            }
+        }
+    }
+    assert!(runs > 0);
+}
+
+#[test]
+fn geek_footer_uses_the_brighter_text() {
+    use super::color::{DIM, TEXT2};
+    assert_eq!(GEEK_240X135.footer_text, TEXT2);
+    assert_eq!(WAVESHARE_320X172.footer_text, DIM);
 }
 
 // ── Image output ─────────────────────────────────────────────────────────────

@@ -224,8 +224,12 @@ of a notice.
 - **ADMIN chip** whenever SO-PIN, PIV management key or PW3 is live in any
   applet.
 - **Last operation** stays on screen with its age (seen-at time on core0)
-  and fades: TEXT under 10 s, TEXT2 under 60 s, DIM after.  A new session
-  starts at "Idle".
+  and fades: TEXT under 10 s, TEXT2 under 60 s, DIM after.  It outlives its
+  session: once the session has ended (epoch moved on, or USB down) it is
+  drawn DIM without the policy hint, while authentication and ADMIN clear
+  as above.  "Idle" only before the first operation since boot.
+- **Footer**: every variant (normal, reset warning, dev board) carries the
+  storage health, drawn at the right of the strip.
 - **Full-screen errors**: E20 while `SMK_MISSING`; E11 while
   `KS_INIT_FAILED` and the host has not yet run an operation (afterwards an
   ERROR band).  E10 is drawn by the boot code (no SD card) before it waits

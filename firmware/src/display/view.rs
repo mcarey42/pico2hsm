@@ -44,7 +44,7 @@ impl Status {
         match self {
             Status::Error | Status::Locked => color::ERR,
             Status::Working => color::BUSY,
-            Status::NoHost => color::INFO,
+            Status::NoHost => color::CYAN,
             Status::Ready => color::OK,
         }
     }
@@ -178,7 +178,7 @@ pub enum Note {
 /// The activity area.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ActivityView {
-    /// No operation yet in this session.
+    /// No operation since boot.
     Idle,
     /// An operation is running.
     Working {
@@ -189,7 +189,7 @@ pub enum ActivityView {
         /// Progress-bar animation step.
         phase: u8,
     },
-    /// The last operation.
+    /// The last operation (kept across sessions).
     Done {
         /// What.
         op: OpCode,
@@ -205,6 +205,9 @@ pub enum ActivityView {
         detail: Option<OpDetail>,
         /// Overrides the age line.
         note: Option<Note>,
+        /// Its session has ended (card power-off, USB down): drawn DIM,
+        /// without the hint.
+        ended: bool,
     },
 }
 
@@ -288,11 +291,18 @@ pub enum FooterView {
         reset: Option<ResetKind>,
     },
     /// First 60 s after a non-power-on reset.
-    ResetWarning(ResetInfo),
+    ResetWarning {
+        /// Cause and count.
+        info: ResetInfo,
+        /// Storage health (kept at the right of the strip).
+        storage: StorageLine,
+    },
     /// Unprovisioned device with the development storage key.
     DevUnprovisioned {
         /// Seconds since boot.
         uptime: u32,
+        /// Storage health (kept at the right of the strip).
+        storage: StorageLine,
     },
 }
 

@@ -22,21 +22,22 @@ Both run COLMOD RGB444 (two pixels in three bytes) with INVON.
 |---|---|
 | Backgrounds | BG #000, PANEL #111, PANEL2 #222, RULE #333 |
 | Text | TEXT #EEE, TEXT2 #AAA, DIM #888 |
-| Status | OK #3D5, WARN #FB2, ERR #F44, BUSY #4AF, INFO #6CF |
+| Status | OK #3D5, WARN #FB2, ERR #F44, BUSY #4AF, INFO #6CF, CYAN #2DD |
 | Reserved | SAS #D4F — only the pending-SAS screen |
 
 The palette is defined in RGB444 directly (`display/color.rs`), so no two
 tokens collapse after truncation (the old RGB565 palette mapped the header
 and the cells to the same #111 and "teal" to green).  Black text on OK,
-WARN and INFO fills; white on ERR and BUSY.  Every status colour is paired
+WARN, INFO and CYAN fills; white on ERR and BUSY.  CYAN is NO HOST's
+alone, so it never reads as WORKING's blue (INFO is the PIN tile's `OK`).  Every status colour is paired
 with a word: colour is never the only signal.
 
 | Use | Waveshare | Geek |
 |---|---|---|
-| Status word | 10x20 | 9x18 bold |
+| Status word | 10x20 double-struck (bold, no extra font data) | 9x18 bold |
 | Tile value | 9x18 bold | 9x18 bold |
 | Labels, body | 6x13 | 6x13 (tile labels and sub-lines 6x10) |
-| Footer | 6x13 | 6x10 |
+| Footer | 6x13 DIM | 6x10 TEXT2 (the 6x10 is tiny on the 1.14" panel) |
 | SAS digits | 20x40 (10x20 drawn ×2) | 18x36 (9x18 drawn ×2) |
 
 All embedded-graphics mono fonts (ASCII), in flash.
@@ -47,7 +48,7 @@ All embedded-graphics mono fonts (ASCII), in flash.
 
 ```text
 y   0 ┌─▌READY─────────────────────────[ADMIN][ PIV ]┐  band 0–33: PANEL, 6 px status bar,
-      │                                               │  status word 10x20 @ (14,7),
+      │                                               │  status word 10x20 bold @ (14,7),
  34   ├───────────────────────────────────────────────┤  admin chip 186–252, applet chip 260–316 (y 5–28)
  36   │ PIN          │ KEYS          │ DOMAIN         │  tiles 104×62 @ x 2 / 108 / 214, y 36–97
       │ OK           │ 6             │ 3F9A           │  label 6x13 (+6,+4), value 9x18B (+6,+20),
@@ -55,7 +56,7 @@ y   0 ┌─▌READY────────────────────
 100   │ Sign                                          │  activity 2–317 × 100–143, PANEL2
       │ 4s ago  P-256 #9A 9000                        │  line 1 9x18 (+8,+3), line 2 6x13 (+8,+23)
 138   │ ▂▂▂▂▂▂▂██████▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂ │  progress bar 10–309 × 138–141 (WORKING only)
-150   │ up 2d 04:11  fw 1.0.1  QMI ok  rst: core1     │  footer 0–319 × 150–171, 6x13 DIM
+150   │ up 2d 04:11  fw 1.0.1  rst: core1      QMI ok │  footer 0–319 × 150–171, 6x13 DIM
 172   └───────────────────────────────────────────────┘
 ```
 
@@ -65,7 +66,7 @@ Band 0–25 (4 px bar, status 9x18 bold @ (8,4), admin chip 146–190, applet
 chip 196–236, y 4–21, 6x13); tiles 77 × 46 at x 2 / 81 / 160, y 28–73
 (label 6x10 +4,+3; value 9x18 bold +4,+14; sub-line 6x10 +4,+33);
 activity 2–236 × 76–111 (two 6x13 lines at +3 / +17, 3 px progress bar at
-y 107); footer 0–239 × 120–134 (6x10).  Short forms: `3/3`, `H4P1G1`,
+y 107); footer 0–239 × 120–134 (6x10, TEXT2).  Short forms: `3/3`, `H4P1G1`,
 `SIG1`, `fw1.0.1`.  The footer drops its `rst:` note if it would not fit.
 
 ### Status word (also the band bar and the LED)
@@ -75,7 +76,7 @@ y 107); footer 0–239 × 120–134 (6x10).  Short forms: `3/3`, `H4P1G1`,
 | 1 | ERROR | ERR | keystore init failed, the last write failed (sticky until a write succeeds), or the SD card stopped answering |
 | 2 | LOCKED | ERR | the active applet's primary credential is blocked |
 | 3 | WORKING | BUSY | an operation has run for more than 300 ms |
-| 4 | NO HOST | INFO | USB not configured |
+| 4 | NO HOST | CYAN | USB not configured |
 | 5 | READY | OK | otherwise |
 
 Before core1 has published any snapshot the display shows the boot splash
@@ -98,13 +99,16 @@ with `Starting...` (fail closed: never READY).
 
 ### Activity
 
-- `Idle` (DIM): no operation yet in this host session.
+- `Idle` (DIM): no operation since boot.
 - `Working: Sign` + elapsed `m:ss` right-aligned + an indeterminate bar
   (40 px BUSY segment, 8 px per 250 ms step): an operation running for more
   than 300 ms.
 - `Sign` / `Sign REFUSED` (WARN) / `Sign FAILED` (ERR), then the age
   (`4s ago`).  The text fades TEXT → TEXT2 after 10 s → DIM after 60 s; it
-  is never removed.  Debug builds add `algorithm #keyref SW`.  Policy
+  is never removed, not even when the host session ends (pcscd ends
+  sessions between commands): once its session has ended (card power-off,
+  USB down) the whole line is DIM and the policy hint goes.  It shows no
+  more than production already shows.  Debug builds add `algorithm #keyref SW`.  Policy
   hints replace the debug detail: `PIN-always: re-verify next` (PIV 9C),
   `PW1 single-use spent` (OpenPGP).
 - Notes replace the age line in ERR: `Last change NOT saved` (E12, a write
@@ -113,13 +117,17 @@ with `Starting...` (fail closed: never READY).
 
 ### Footer
 
-`up 2d 04:11  fw 1.0.1  QMI ok  rst: core1` in DIM.  Uptime is
-`HH:MM:SS` under a day, `Nd HH:MM` under 1000 days, then `Nd`.  Storage:
-`QMI ok`, `SD ok`, or in ERR `QMI FAIL` / `SD FAIL` / `SD MISSING`.
-`rst:` names a non-power-on reset for 24 h after boot.  During the first
-60 s after such a reset the whole footer is a WARN strip:
-`Last reset: core1 stall x2`.  An unprovisioned device running on the
-development storage key shows a WARN strip `DEV - UNPROVISIONED  up …`.
+`up 2d 04:11  fw 1.0.1  rst: core1` on the left and the storage token at
+the right, in DIM (TEXT2 on the Geek).  Uptime is `HH:MM:SS` under a day,
+`Nd HH:MM` under 1000 days, then `Nd`.  Storage: `QMI ok`, `SD ok`, or in
+ERR `QMI FAIL` / `SD FAIL` / `SD MISSING`.  `rst:` names a non-power-on
+reset for 24 h after boot.  During the first 60 s after such a reset the
+footer is a WARN strip: `Last reset: core1 stall x2`.  An unprovisioned
+device running on the development storage key shows a WARN strip
+`DEV - UNPROVISIONED  up …`.  Every strip keeps the storage token at its
+right (on a WARN strip in a dark PANEL chip), so neither strip hides
+storage health; the optional tail (`rst:`, ` x2`, `up …`) is dropped
+first when the text would run into it.
 
 ## 3. Boot splash
 

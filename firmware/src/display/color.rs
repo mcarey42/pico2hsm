@@ -69,8 +69,11 @@ pub const WARN: C444 = C444::hex(0xFB2);
 pub const ERR: C444 = C444::hex(0xF44);
 /// Work in progress.
 pub const BUSY: C444 = C444::hex(0x4AF);
-/// No host, PIN verified.
+/// PIN verified.
 pub const INFO: C444 = C444::hex(0x6CF);
+/// No host: cyan, so it never reads as WORKING's blue (the LED shows only
+/// the colour).
+pub const CYAN: C444 = C444::hex(0x2DD);
 
 /// Reserved for the pending-SAS screen: nothing else may use it.
 pub const SAS: C444 = C444::hex(0xD4F);
@@ -81,9 +84,9 @@ pub const BLACK: C444 = C444::hex(0x000);
 pub const WHITE: C444 = C444::hex(0xFFF);
 
 /// Text colour on a fill of `c`: black on the light status colours (OK,
-/// WARN, INFO), white on the dark ones (ERR, BUSY) and everything else.
+/// WARN, INFO, CYAN), white on the dark ones (ERR, BUSY) and everything else.
 pub const fn on(c: C444) -> C444 {
-    if c.0 == OK.0 || c.0 == WARN.0 || c.0 == INFO.0 {
+    if c.0 == OK.0 || c.0 == WARN.0 || c.0 == INFO.0 || c.0 == CYAN.0 {
         BLACK
     } else {
         WHITE

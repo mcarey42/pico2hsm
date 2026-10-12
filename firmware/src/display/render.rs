@@ -103,6 +103,32 @@ impl<'a, D: DrawTarget<Color = C444>> Painter<'a, D> {
         at.x + bb.size.width as i32
     }
 
+    /// `s` double-struck (drawn again 1 px to the right): a bold weight
+    /// from a regular font, with no extra font data.  Returns the x just
+    /// past it.
+    pub fn text_bold(
+        &mut self,
+        s: &str,
+        at: Point,
+        font: Font,
+        col: C444,
+        region: Rectangle,
+    ) -> i32 {
+        let small = text_box(s, at, font);
+        let bb = Rectangle::new(at, small.size + Size::new(1, 0));
+        if !contains(&region, &bb) {
+            self.overflow += 1;
+        }
+        if self.visible(&bb) {
+            let style = MonoTextStyle::new(font, col);
+            for dx in 0..2 {
+                let _ = Text::with_baseline(s, at + Point::new(dx, 0), style, Baseline::Top)
+                    .draw(self.t);
+            }
+        }
+        at.x + bb.size.width as i32
+    }
+
     /// `s` centred horizontally in `region` at `y`.
     pub fn text_center(&mut self, s: &str, y: i32, font: Font, col: C444, region: Rectangle) {
         let x = region.top_left.x + (region.size.width as i32 - text_width(s, font)) / 2;
@@ -178,13 +204,23 @@ fn home<D: DrawTarget<Color = C444>>(p: &mut Painter<'_, D>, v: &HomeView, l: &L
         Rectangle::new(band.top_left, Size::new(l.bar_w, band.size.height)),
         v.status.color(),
     );
-    p.text(
-        v.status.word(),
-        l.status_at,
-        l.status_font,
-        v.status.color(),
-        band,
-    );
+    if l.status_bold {
+        p.text_bold(
+            v.status.word(),
+            l.status_at,
+            l.status_font,
+            v.status.color(),
+            band,
+        );
+    } else {
+        p.text(
+            v.status.word(),
+            l.status_at,
+            l.status_font,
+            v.status.color(),
+            band,
+        );
+    }
     p.frame(l.applet_chip, 1, c::RULE);
     let (name, col) = match v.applet {
         Applet::Hsm => ("HSM", c::TEXT),
@@ -396,18 +432,29 @@ fn activity<D: DrawTarget<Color = C444>>(p: &mut Painter<'_, D>, v: &ActivityVie
             hint,
             detail,
             note,
+            ended,
         } => {
+            // An operation from a session that has ended stays, all DIM.
+            let fade_col = if ended { c::DIM } else { fade.color() };
             let mut s: String<24> = String::new();
             let _ = s.push_str(op.name());
             let col = match result {
-                OpResult::Ok => fade.color(),
+                OpResult::Ok => fade_col,
                 OpResult::Refused => {
                     let _ = s.push_str(" REFUSED");
-                    c::WARN
+                    if ended {
+                        c::DIM
+                    } else {
+                        c::WARN
+                    }
                 }
                 OpResult::Error => {
                     let _ = s.push_str(" FAILED");
-                    c::ERR
+                    if ended {
+                        c::DIM
+                    } else {
+                        c::ERR
+                    }
                 }
             };
             p.text(&s, line1, l.act_font1, col, a);
@@ -415,7 +462,7 @@ fn activity<D: DrawTarget<Color = C444>>(p: &mut Painter<'_, D>, v: &ActivityVie
                 p.text(note_text(n, l), line2, l.act_font2, c::ERR, a);
                 return;
             }
-            let x = p.text(&age.text(false), line2, l.act_font2, fade.color(), a);
+            let x = p.text(&age.text(false), line2, l.act_font2, fade_col, a);
             let gap = l.act_font2.character_size.width as i32 * 2;
             let hint_text = match hint {
                 Hint::None => None,
@@ -437,13 +484,52 @@ fn activity<D: DrawTarget<Color = C444>>(p: &mut Painter<'_, D>, v: &ActivityVie
     }
 }
 
-fn storage_text(s: StorageLine) -> (&'static str, C444) {
+fn storage_text(s: StorageLine, l: &Layout) -> (&'static str, C444) {
     match s {
-        StorageLine::QmiOk => ("QMI ok", c::DIM),
+        StorageLine::QmiOk => ("QMI ok", l.footer_text),
         StorageLine::QmiFail => ("QMI FAIL", c::ERR),
-        StorageLine::SdOk => ("SD ok", c::DIM),
+        StorageLine::SdOk => ("SD ok", l.footer_text),
         StorageLine::SdFail => ("SD FAIL", c::ERR),
         StorageLine::SdMissing => ("SD MISSING", c::ERR),
+    }
+}
+
+/// Where a footer strip's parts go: the storage token at the right, the
+/// text left of it.
+pub struct FooterBoxes {
+    /// The storage token's box (the dark chip on a WARN strip).
+    pub token: Rectangle,
+    /// What is left for the text.
+    pub text: Rectangle,
+}
+
+/// Footer geometry for `storage` in the footer `r`; `chip` for a strip on
+/// a WARN fill.
+pub fn footer_boxes(storage: StorageLine, chip: bool, r: Rectangle, l: &Layout) -> FooterBoxes {
+    let font = l.footer_font;
+    let pad = if l.compact { 4 } else { 6 };
+    let (st, _) = storage_text(storage, l);
+    let right = r.top_left.x + r.size.width as i32;
+    let token = if chip {
+        // Inset from the strip edge, padded around the text.
+        let inset: u32 = if l.compact { 1 } else { 2 };
+        let w = text_width(st, font) as u32 + 2 * (pad as u32 / 2);
+        Rectangle::new(
+            Point::new(right - inset as i32 - w as i32, r.top_left.y + inset as i32),
+            Size::new(w, r.size.height - 2 * inset),
+        )
+    } else {
+        let w = text_width(st, font) as u32;
+        Rectangle::new(
+            Point::new(right - pad - w as i32, r.top_left.y),
+            Size::new(w, r.size.height),
+        )
+    };
+    let gap = font.character_size.width as i32;
+    let text_w = (token.top_left.x - gap - r.top_left.x).max(0) as u32;
+    FooterBoxes {
+        token,
+        text: Rectangle::new(r.top_left, Size::new(text_w, r.size.height)),
     }
 }
 
@@ -458,45 +544,64 @@ fn footer<D: DrawTarget<Color = C444>>(
     let y = r.top_left.y + (r.size.height as i32 - font.character_size.height as i32) / 2;
     let start = Point::new(r.top_left.x + pad, y);
     let sep = if l.compact { " " } else { "  " };
-    match *v {
+    // Every strip keeps the storage token at its right.  The text is a
+    // main part and an optional tail, the first thing to go when the two
+    // do not fit left of the token.
+    let mut main: String<40> = String::new();
+    let mut tail: String<24> = String::new();
+    let (storage, strip) = match *v {
         FooterView::Normal {
             uptime,
             storage,
             reset,
         } => {
-            let mut s: String<40> = String::new();
             let fw = if l.compact { "fw" } else { "fw " };
-            let _ = write!(s, "up {}{sep}{fw}{}{sep}", fmt_uptime(uptime), FW_VERSION);
-            let (st, col) = storage_text(storage);
-            let mut rst: String<24> = String::new();
+            let _ = write!(main, "up {}{sep}{fw}{}", fmt_uptime(uptime), FW_VERSION);
             if let Some(k) = reset {
-                let _ = write!(rst, "{sep}rst: {}", k.short());
+                let _ = write!(tail, "{sep}rst: {}", k.short());
             }
-            // The reset note is the first thing to go on a narrow panel.
-            let total = text_width(&s, font) + text_width(st, font) + text_width(&rst, font);
-            if start.x + total > r.top_left.x + r.size.width as i32 {
-                rst.clear();
-            }
-            let x = p.text(&s, start, font, c::DIM, r);
-            let x = p.text(st, Point::new(x, y), font, col, r);
-            p.text(&rst, Point::new(x, y), font, c::DIM, r);
+            (storage, false)
         }
-        FooterView::ResetWarning(info) => {
-            p.fill(r, c::WARN);
-            let mut s: String<40> = String::new();
-            let _ = write!(s, "Last reset: {}", info.kind.name());
+        FooterView::ResetWarning { info, storage } => {
+            let _ = write!(main, "Last reset: {}", info.kind.name());
             if info.count > 1 {
-                let _ = write!(s, " x{}", info.count);
+                let _ = write!(tail, " x{}", info.count);
             }
-            p.text(&s, start, font, c::on(c::WARN), r);
+            (storage, true)
         }
-        FooterView::DevUnprovisioned { uptime } => {
-            p.fill(r, c::WARN);
-            let x = p.text("DEV - UNPROVISIONED", start, font, c::on(c::WARN), r);
-            let mut s: String<24> = String::new();
-            let _ = write!(s, "{sep}up {}", fmt_uptime(uptime));
-            p.text(&s, Point::new(x, y), font, c::on(c::WARN), r);
+        FooterView::DevUnprovisioned { uptime, storage } => {
+            let _ = main.push_str("DEV - UNPROVISIONED");
+            let _ = write!(tail, "{sep}up {}", fmt_uptime(uptime));
+            (storage, true)
         }
+    };
+    let boxes = footer_boxes(storage, strip, r, l);
+    let text_col = if strip {
+        p.fill(r, c::WARN);
+        c::on(c::WARN)
+    } else {
+        l.footer_text
+    };
+    let room = boxes.text.top_left.x + boxes.text.size.width as i32;
+    if start.x + text_width(&main, font) + text_width(&tail, font) > room {
+        tail.clear();
+    }
+    let x = p.text(&main, start, font, text_col, boxes.text);
+    p.text(&tail, Point::new(x, y), font, text_col, boxes.text);
+    let (st, col) = storage_text(storage, l);
+    if strip {
+        // A dark chip keeps the token legible, in the normal footer's
+        // colours, on the WARN fill.
+        p.fill(boxes.token, c::PANEL);
+        p.text_mid(st, font, col, boxes.token);
+    } else {
+        p.text(
+            st,
+            Point::new(boxes.token.top_left.x, y),
+            font,
+            col,
+            boxes.token,
+        );
     }
 }
 

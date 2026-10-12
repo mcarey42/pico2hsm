@@ -41,6 +41,14 @@ See `docs/DISPLAY_ARCHITECTURE.md` and `docs/DISPLAY_LAYOUT.md`.
 - Geek LCD init is async (no 0.7 s busy-wait under the armed watchdog) and
   no longer paints solid blue/green before storage is up; SPI1 now runs at
   37.5 MHz (40 MHz requested; the old 30 MHz request gave 25 MHz).
+- Design decisions (2026-10-12): the last operation outlives its host
+  session, dimmed once that session has ended, and "Idle" means nothing
+  since boot (authentication and ADMIN still clear with the session);
+  the Waveshare status word is bold (double-struck, no RAM); NO HOST is
+  cyan on the LCD (it was INFO light blue, next to WORKING's blue) as on
+  the LED; every footer strip, including the reset warning and the
+  dev-board strip, keeps the storage token at its right; the Geek footer
+  is drawn in TEXT2 instead of DIM.  No `.bss` change.
 - Host render harness: golden-hash snapshots of every screen at both
   resolutions, text-fit and partial-update checks, PPM / PNG previews
   (`DISPLAY_PREVIEW_DIR`).  `png` is a dev-dependency only.
