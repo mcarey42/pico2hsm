@@ -73,7 +73,7 @@ QSPI flash (W25Q128) is connected to the RP2350A QSPI interface (not general GPI
 
 | Signal     | GPIO | Embassy-rp peripheral  | Note                           |
 |------------|------|-------------------------|--------------------------------|
-| SCK        |  18  | SPI0 CLK                | 40 MHz, SPI mode 0 (CPOL=0/CPHA=0); async DMA for framebuffer transfers |
+| SCK        |  18  | SPI0 CLK                | 40 MHz, SPI mode 0 (CPOL=0/CPHA=0); async DMA for band transfers (no framebuffer) |
 | MOSI / DIN |  19  | SPI0 TX                 | Data to display                |
 | MISO       |   4  | SPI0 RX (hardware only) | Display never drives this pin  |
 | DC         |  16  | GPIO Output             | Low = command, High = data     |
@@ -127,13 +127,19 @@ After `CASET`/`RASET`, send `RAMWR (2Ch)` then stream pixel data:
 - CS asserted (low) for the entire `RAMWR` + data transfer
 - DC high during data bytes
 - Each pixel pair: 3 bytes packed RGB444 (ST7789 Interface II)
-- Full-screen fill: 110 080 bytes, sent in 128-byte chunks
-- Framebuffer flush is **async** (`flush_display().await`): DMA_CH1/CH2 transfer the 83 KB in ~17 ms while yielding to the Embassy executor, keeping USB serviced
+- No framebuffer: the screen is sent as 16-row full-width bands (7 680
+  bytes each, one window + one DMA transfer); only changed bands are
+  redrawn (see `DISPLAY_ARCHITECTURE.md`)
+- A full screen is 82 560 bytes (~18 ms at 37.5 MHz); the 1 Hz uptime
+  tick redraws only the footer bands
 
-### Status colours (RGB565 values, converted to RGB444 internally)
+### Screens
 
-| `LedStatus`   | RGB565   | Hex    | Description        |
-|---------------|----------|--------|--------------------|
+Status band, tiles, activity line and footer, plus the boot splash, error
+and SAS screens: see `DISPLAY_LAYOUT.md`.  The palette is RGB444
+(`display/color.rs`).
+
+---------------|----------|--------|--------------------|
 | Off           | Black    | 0x0000 | Display blank      |
 | Ready         | Green    | 0x07E0 | HSM idle           |
 | Busy          | Blue     | 0x001F | Command processing |
@@ -160,7 +166,10 @@ DMA transfer.
 
 **Byte order**: Green, Red, Blue (GRB) — the LED expects green byte first.
 The `PioWs2812<_, _, _, Grb>` driver handles GRB packing automatically;
-callers pass standard `RGB8 { r, g, b }` values.
+callers pass standard `RGB8 { r, g, b }` values.  (Firmware before the
+display redesign swapped R and G itself as well, so the two swaps cancelled
+and READY showed red.  `PioWs2812Writer::write_rgb` now passes the channels
+through unswapped.  Confirm on hardware: READY must be green.)
 
 **Reset signal**: 55 µs low after the last bit (handled automatically by
 `PioWs2812::write()`).
@@ -174,21 +183,21 @@ callers pass standard `RGB8 { r, g, b }` values.
 | DMA channel | DMA_CH0                             |
 | Pixel count | N = 1                                |
 
-> **DMA channel allocation**: DMA_CH0 is used by the WS2812B PIO driver. DMA_CH1 and DMA_CH2 are used by the async SPI0 LCD framebuffer transfers (`flush_display`, `fill_screen`). All three channels are registered in the `DMA_IRQ_0` handler in `main.rs`.
+> **DMA channel allocation**: DMA_CH0 is used by the WS2812B PIO driver. DMA_CH1 and DMA_CH2 are used by the async SPI0 LCD band transfers (`WavesharePanel`). All three channels are registered in the `DMA_IRQ_0` handler in `main.rs`.
 
-### GRB colour mapping
+### LED colours
 
-| `LedStatus`   | GRB tuple  | Description       |
-|---------------|------------|-------------------|
-| Off           | (0,  0,  0)| LED off           |
-| Ready         | (8,  0,  0)| Dim green         |
-| Busy          | (0,  0,  8)| Dim blue          |
-| Error         | (0,  8,  0)| Dim red           |
-| Degraded      | (8,  8,  0)| Dim yellow        |
-| Resyncing     | (8,  0,  8)| Dim cyan          |
-| WaitingForPin | (0,  0, 24)| Brighter blue     |
+| Display status | RGB (per channel 8; 2 while the screen sleeps) |
+|---|---|
+| READY | green (0, 8, 0) |
+| WORKING | blue (0, 0, 8) |
+| NO HOST | cyan (0, 8, 8) |
+| notices | yellow (8, 8, 0) |
+| ERROR, LOCKED, error screens | red (8, 0, 0) |
+| SAS pending | magenta (8, 0, 8) |
 
-Values ≤ 24/255 keep current draw within the USB 100 mA power budget.
+The LED is written only when its colour changes.  Low levels keep the
+current draw within the USB 100 mA budget.
 
 ### Wiring the PIO driver in `main.rs`
 
@@ -282,43 +291,16 @@ The debug script sets `DEFMT_LOG=trace` and uses the debug profile; see
 
 ## Async rendering wiring
 
-`LedController::set_status()` is synchronous — it stores the desired status
-and returns immediately.  Actual LCD rendering and WS2812B updates require
-async operations and GPIO handles that cannot be stored in `St7789V3StatusDisplay`
-without changing the `WaveshareRp2350LcdBoard::new(spi0, spi1)` call site.
+The LCD and the LED are one `WavesharePanel` (`crate::display::Panel`),
+owned by the display task.  `run_waveshare_lcd_board()` builds it from
+SPI0, the four control pins and the `PioWs2812Writer`, runs the async
+`init()` (reset, init sequence, GRAM clear from the band buffer), draws the
+boot splash, and then hands it to `display::task::run` (see
+`DISPLAY_ARCHITECTURE.md`).  `LedController::set_status()` on the board
+struct only records a status.
 
-SPI0 operates in async mode; `flush_display()` and `fill_screen()` are async and must be `.await`ed. The DMA transfer yields to the executor during the ~17 ms framebuffer write.
-
-The intended usage pattern in `run_waveshare_lcd_board()`:
-
-```rust
-use embassy_rp::gpio::{Level, Output};
-use pico2hsm_firmware::board::waveshare_rp2350_lcd::{
-    init_lcd, update_status_display, PioWs2812Writer,
-};
-
-// Claim LCD control pins.
-let mut dc  = Output::new(p.PIN_16, Level::Low);
-let mut cs  = Output::new(p.PIN_17, Level::High);
-let mut rst = Output::new(p.PIN_20, Level::High);
-let mut bl  = Output::new(p.PIN_21, Level::Low);
-
-// Initialise the ST7789V3 (hardware reset + init sequence).
-init_lcd(&mut board.spi0, &mut dc, &mut cs, &mut rst, &mut bl).await;
-
-// After any set_status() call, push the colour to hardware:
-board.led().set_status(LedStatus::Ready);
-update_status_display(
-    board.led(),
-    &mut board.spi0,
-    &mut dc,
-    &mut cs,
-    &mut led_writer,   // PioWs2812Writer from the WS2812B section above
-).await;
-```
-
-`update_status_display()` reads `pending_rgb565` and `pending_grb` set by
-`set_status()` and performs both the LCD fill and the WS2812B update.
+SPI0 operates in async mode; `WavesharePanel::write_rows()` sends each
+16-row band as one DMA transfer and yields to the executor while it runs.
 
 ---
 

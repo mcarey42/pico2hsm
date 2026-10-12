@@ -25,14 +25,20 @@
 pub mod allocator;
 pub mod apdu;
 pub mod crypto;
+pub mod display_snapshot;
 pub mod domain;
 pub mod protocol;
+/// RSA key pool: idle-time pre-generation, rotation and issue (`rsa`).
+#[cfg(feature = "rsa")]
+pub mod rsa_pool;
 pub mod security;
 pub mod serial_debug;
 pub mod watchdog;
 
 // These modules depend on embassy-rp / embassy-usb / embassy-time which
 // only compile for ARM bare-metal targets. They are excluded from host tests.
+// (`display` compiles on the host; only its task and the board panels are
+// ARM-only.)
 #[cfg(target_arch = "arm")]
 pub mod board;
 #[cfg(target_arch = "arm")]
@@ -41,7 +47,6 @@ pub mod image_def;
 // required by protocol/sc_hsm/mod.rs on all targets. ARM-specific sub-modules
 // (board_chips, flash_chip, filesystem, StorageManager) are gated inside
 // storage/mod.rs via #[cfg(target_arch = "arm")].
-#[cfg(target_arch = "arm")]
 pub mod display;
 pub mod storage;
 #[cfg(target_arch = "arm")]
@@ -92,7 +97,8 @@ pub static WATCHDOG_SUPPRESS_UNTIL: core::sync::atomic::AtomicU32 =
 /// test suite allows an hour.
 pub const WATCHDOG_SUPPRESS_MAX_SECS: u32 = 3600;
 
-fn uptime_secs() -> u32 {
+/// Seconds since boot (0 on the host).
+pub fn uptime_secs() -> u32 {
     #[cfg(target_arch = "arm")]
     {
         embassy_time::Instant::now().as_secs() as u32
@@ -122,9 +128,14 @@ pub static SESSION_EPOCH: core::sync::atomic::AtomicU32 = core::sync::atomic::At
 /// authenticate) the new one.
 pub static APDU_EPOCH: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
-/// Start a new host session (see [`SESSION_EPOCH`]).
+/// Start a new host session (see [`SESSION_EPOCH`]) and wake the display,
+/// which drops the old session's authentication at once.  Core0 only (USB
+/// handler, CCID power on/off, an abandoned bulk-IN write): core1 must
+/// never signal the display kick.
 pub fn bump_session_epoch() {
     SESSION_EPOCH.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+    #[cfg(target_arch = "arm")]
+    display::task::kick();
 }
 
 /// Suppresses stall detection (for at most [`WATCHDOG_SUPPRESS_MAX_SECS`])

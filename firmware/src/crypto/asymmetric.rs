@@ -372,7 +372,7 @@ pub fn generate_rsa_keypair(
 /// Both integers are encoded as DER INTEGERs with a leading 0x00 byte when
 /// the MSB is set (to distinguish from negative numbers in BER/DER).
 #[cfg(feature = "rsa")]
-fn build_pkcs1_pub_der<const N: usize>(
+pub(crate) fn build_pkcs1_pub_der<const N: usize>(
     modulus: &[u8],
     exponent: &[u8],
     out: &mut Vec<u8, N>,

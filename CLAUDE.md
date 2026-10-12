@@ -48,10 +48,10 @@ To run the integration test suite against the flashed device:
 
 Start `build-all-debug.sh` in the background first (it blocks on RTT streaming), then wait ~5 s for USB re-enumeration before running `run_tests.sh`.
 
-If multiple pico2hsm devices are connected, use `OPENSC_DEFAULT_READER=N ./run_tests.sh` to target a specific reader (e.g. `N=1` for the second reader). Run `opensc-tool --list-readers` to see which index is which.
+If multiple pico2hsm devices are connected, select the device under test by its USB serial (the RP2350 chip ID, part of the reader name): `PICO2HSM_READER=<serial> ./run_tests.sh`. Two-device tests take the second device from `PICO2HSM_PEER_READER=<serial>` (default: the first other reader). Run `opensc-tool --list-readers` to see the names. Both are resolved on every connection; `OPENSC_DEFAULT_READER=N` (an index) still works, but indexes shift whenever a board re-enumerates (a flash, a probe-rs reset), so a run selected by index can move to another board half-way.
 
-- **OpenSC tools ignore `OPENSC_DEFAULT_READER`.** Only pyscard honours it. When it is set, `tests/hw/conftest.py` puts the shims in `tests/hw/helpers/bin` first on PATH; they add `-r N` (`opensc-tool`, `sc-hsm-tool`) or `--slot-description` (`pkcs11-tool`). A bare `opensc-tool` in a shell still talks to reader 0.
-- **gpg can only reach reader 0** once several readers exist: GnuPG 2.4's scdaemon ignores `reader-port` and the devices share a serial number. The gpg checks skip for other readers.
+- **OpenSC tools ignore `OPENSC_DEFAULT_READER`.** Only pyscard honours it. When it or `PICO2HSM_READER` is set, `tests/hw/conftest.py` puts the shims in `tests/hw/helpers/bin` first on PATH; they add `-r N` (`opensc-tool`, `sc-hsm-tool`) or `--slot-description` (`pkcs11-tool`). A bare `opensc-tool` in a shell still talks to reader 0.
+- **gpg picks the device by OpenPGP serial.** GnuPG 2.4's scdaemon ignores `reader-port`, and its current card is per connection, so `scd switchcard` can't steer a later `gpg --card-status`. The tests use `gpg-card list <serial>` (or one `gpg-connect-agent` session: `scd switchcard`, `scd learn`), where the serial is the device's OpenPGP AID; bytes 10–13 come from the chip ID, so every board differs. Firmware before that gave every board AID serial `00000001` (and USB serial `0001`); the gpg checks then skip unless the device under test is reader 0.
 - **probe-rs resets** need `PROBE_RS_PROBE=2e8a:000c:<serial>` when several probes are attached (`probe-rs list`). Without it the reset tests skip.
 
 If `probe-rs` reports "interface is busy (errno 16)", a previous probe-rs process is still holding the USB device:
@@ -63,8 +63,16 @@ pkill -9 -f "probe-rs"
 ## Architecture overview
 
 **Concurrency model** (RP2350 dual-core):
-- **Core0** — Embassy async executor: USB device driver + CCID transport loop, plus the hardware-watchdog feeder task. Sends APDUs to core1 via `APDU_CHANNEL` and waits for responses on `RESP_CHANNEL`.
-- **Core1** — Synchronous `dispatcher_loop()`: no Embassy executor.  Sleeps via ARM `wfe` (Wait For Event) while idle; woken by core0 via `sev` (Send Event) after each channel send.  Calls `blocking_receive()`/`blocking_send()` on the shared channels using `try_receive()`/`try_send()`.
+- **Core0** — Embassy async executor: USB device driver + CCID transport loop, plus the hardware-watchdog feeder task. Sends APDUs to core1 via `APDU_CHANNEL` and waits for responses on `RESP_CHANNEL`.  A `flash_service` future (joined with USB and CCID in every board runner) runs core1's `FlashOp`s whenever they come — during an APDU and between APDUs.
+- **Core1** — Synchronous `dispatcher_loop()`: no Embassy executor.  Between APDUs `next_apdu()` runs the RSA key pool's idle work in slices (`rsa_pool::background`, ≤ 20 ms, ending as soon as `APDU_CHANNEL` is non-empty); with nothing to do it sleeps via ARM `wfe` (Wait For Event) and is woken by core0 via `sev` (Send Event) after each channel send.  Calls `blocking_receive()`/`blocking_send()` on the shared channels using `try_receive()`/`try_send()`.
+
+**RSA key pool** (`rsa` feature; `firmware/src/rsa_pool.rs`, `storage/rsa_pool.rs`,
+`crypto/rsa_keygen.rs`): pre-generated RSA-2048/3072/4096 keys in 12 sectors of
+internal flash at `0x1F0000` (every board), encrypted under the storage key;
+SC-HSM GENERATE KEY PAIR takes one (slot marked taken on flash first) or
+generates live with the sliced generator.  Config / clock / sequence are
+value records in the retry-counter log.  The generator state (~9 KB) is a
+static (`rsa_pool::ENGINE`), never on the stack.
 
 Both channels use RP2350 hardware spinlocks (29 and 30) for SMP-safe cross-core signalling.
 Core0 issues `cortex_m::asm::sev()` after every `APDU_CHANNEL.send()` and `FLASH_RESP.send()` to wake core1 from WFE.
@@ -109,19 +117,23 @@ cargo build --release --no-default-features \
     --features pico2_4m,applet-piv,applet-openpgp,applet-openpgp-curve25519
 ```
 
-**Flash / RAM budget (release, all applets + RSA + curve25519, v0.9.9):**
+**Flash / RAM budget (release, all applets + RSA + curve25519, v1.0.1 after the
+display redesign; `arm-none-eabi-size -A`):**
 
-| Board | Flash | RAM | SRAM % |
+| Board | .text | .bss | .bss before the redesign |
 |---|---|---|---|
-| Pico 2 4MB | 522 KB | 398 KB | 77% |
-| RP2350-One 4MB | 529 KB | 398 KB | 77% |
-| RP2350-Geek 16MB/SDCard | 539 KB | 450 KB | 87% |
-| Waveshare LCD 16MB | 539 KB | 449 KB | 87% |
-| Waveshare LCD SDCard | 542 KB | 442 KB | 85% |
+| Pico 2 4MB | 510 KB | 297.4 KB | — |
+| RP2350-One 4MB | 515 KB | 297.6 KB | — |
+| RP2350-Geek 16MB | 532 KB | 276.6 KB | 321.7 KB |
+| RP2350-Geek SDCard | 535 KB | 269.3 KB | 314.4 KB |
+| Waveshare LCD 16MB | 534 KB | 278.5 KB | 354.8 KB |
+| Waveshare LCD SDCard | 537 KB | 271.2 KB | 347.5 KB |
 
-Flash is not a concern.  RAM is the metric to watch; the 128 KB core1 stack and the
-display framebuffers (48 KB Geek, 83 KB Waveshare LCD, RGB444) dominate on display boards.
-Non-display boards have ~90 KB free SRAM; Waveshare LCD 16MB has ~39 KB free.
+Flash is not a concern.  RAM is the metric to watch; the 128 KB core1 stack
+dominates.  The display boards no longer hold a framebuffer (48 KB Geek,
+83 KB Waveshare): they render through a 16-row band buffer (5.6 KB / 7.5 KB),
+which freed ~45 KB on the Geek and ~76 KB on the Waveshare boards (Waveshare
+LCD 16MB: ~39 KB → ~115 KB free SRAM).
 
 **Storage hardware:** off-the-shelf boards only. The keystore is internal QMI
 flash, or the microSD card on the two `_sdcard` builds. No external SPI flash,
@@ -180,18 +192,33 @@ Each board's LED/display driver is fully implemented (not stubbed):
   `fixed` crate dep); int=18, frac=192 at 150 MHz → 8 MHz PIO clock.
 - Write is synchronous (spin-wait on TX FIFO); no DMA or async required.
 
+**Display boards (Geek, Waveshare LCD)** — see `docs/DISPLAY_ARCHITECTURE.md`.
+- Core1 publishes a seqlocked snapshot (`display_snapshot::SNAP`) before
+  each response; core0's display task (`display::task::run`, joined with
+  USB and the CCID loop) renders it.  The CCID loop never renders and never
+  guesses state from APDU bytes; it stores `APDU_STARTED_MS` and signals
+  `DISPLAY_KICK`.  Core1 must never signal `DISPLAY_KICK`.
+- No framebuffer: 16-row band buffer (`DISPLAY_BAND`, 7.5 KB / 5.6 KB),
+  dirty bands only.  The render code is host-tested
+  (`firmware/src/display/tests.rs`: golden hashes, text fit, previews via
+  `DISPLAY_PREVIEW_DIR`).  After a visual change, review the previews and
+  paste the new golden table the failing test prints.
+
 **rp2350_geek — ST7789 240×135 on SPI1 (GPIO8/9/10/11/12/25)**
-- `St7789StatusDisplay::new(spi1)` steals DC=GPIO8, CS=GPIO9, RST=GPIO12,
+- `Rp2350GeekBoard::new(spi1)` steals DC=GPIO8, CS=GPIO9, RST=GPIO12,
   BL=GPIO25 via `AnyPin::steal()`.  `main.rs` must not claim those four pins.
-- Fills entire screen with a solid RGB444 colour per `LedStatus` variant.
-- Delays use `cortex_m::asm::delay` (cycle-counted; no embassy-time needed).
+- `St7789StatusDisplay` is the display `Panel`: async `init()`
+  (`embassy_time` delays), band writes, sleep/wake.  MADCTL 0x70 = MX+MV+ML.
+- Window offsets CASET 52 / RASET 40 are unverified (possibly portrait
+  offsets): do not change them without checking on a Geek (debug builds draw
+  a 1 px border on the boot splash).
 
 **waveshare_rp2350_lcd — ST7789V3 320×172 landscape on SPI0 + WS2812B on GPIO22**
-- LCD driven via async `init_lcd()` / `update_status_display()` free functions.
+- `WavesharePanel` (LCD + LED) is the display `Panel`; async `init()`.
 - MADCTL=0xA0 (MY+MV): landscape 320×172, 180°-corrected from broken 0x60 attempt.
 - RASET 34–205 (not 0–171): physical GRAM columns 34–205 map to landscape height.
-- Full 320×172 RGB444 framebuffer (83 KB in BSS); `ScreenLayout::waveshare_320x172()`.
-- Both LCD colour and WS2812B GRB are set simultaneously via `status_to_colors()`.
+- WS2812: the `Grb` driver orders the bytes; pass `RGB8 {r, g, b}` unswapped.
+- SPI on both LCDs: 40 MHz requested = 37.5 MHz.  Never request more.
 
 ## Security invariants
 
@@ -236,6 +263,12 @@ when changing the code.
 - **Secrets are wiped in place.** Zeroize before moving or dropping; use
   `security::zeroize::key_buf` for fixed key buffers; `mem::replace` /
   assigning `None` does not wipe the old bytes.
+- **On-screen text is firmware-static.** The display never renders
+  host-supplied bytes (labels, DOs, names, APDU data); only firmware strings
+  and numbers from firmware state (counts, fingerprints, SAS digits computed
+  on the device).  Authentication is shown only from core1's snapshot for
+  the current `SESSION_EPOCH` with USB configured (stale = not
+  authenticated).  The SAS colour #D4F is reserved for a pending SAS.
 
 ## Known pitfalls
 
@@ -245,7 +278,7 @@ when changing the code.
 
 **Cause**: core1 runs the whole dispatch chain on its own 128 KB stack (`CORE1_STACK` in `firmware/src/main.rs`). Large stack temporaries — `Vec<u8, 4096>` response buffers, `KeyObject`s (~3 KB), 4 KB flash sector buffers, PKCS#1 DER buffers — add up across `dispatcher_loop → Dispatcher::dispatch_with_store → <protocol>::process_apdu_with_store → route_with_store → handler → store`. MSPLIM is set at the stack base, so an overflow faults (UsageFault) instead of silently corrupting memory, but core1 still stops. (The protocol *state*, e.g. `ScHsmState`, lives in BSS via `DISPATCHER_CELL`, not on this stack.)
 
-**Measured** (2026-10, debug, pico2_4m and SD boards, worst path): dispatcher_loop 20.6 KB → dispatch_with_store 8.2 KB → Piv::process_apdu_with_store 11.2 KB → route 7.1 KB → PIV put_data::handle_with_store 20.6 KB → save_key / fetch_key chain ~20 KB ≈ **89 KB of 128 KB**. Before the synchronous `Core1KeyStore` (which removed a queue of by-value `KeyObject`s) it was ~123 KB.
+**Measured** (2026-10, debug, pico2_4m and SD boards, worst path): dispatcher_loop 20.6 KB → dispatch_with_store 8.2 KB → Piv::process_apdu_with_store 11.2 KB → route 7.1 KB → PIV put_data::handle_with_store 20.6 KB → save_key / fetch_key chain ~20 KB ≈ **89 KB of 128 KB**. Before the synchronous `Core1KeyStore` (which removed a queue of by-value `KeyObject`s) it was ~123 KB.  RSA GENERATE from the key pool: … → route_handler 4.1 KB → generate_keypair::handle 9.1 KB → Engine::take_pooled 6.3 KB → PoolRegion::get_key 12.1 KB → KeyObject::decrypt chain ~9.8 KB ≈ **86 KB**; the idle-time pool slice ≈ 31 KB.  The display snapshot (2026-10, display redesign) added 8 B to dispatcher_loop (20,576 B); its `display_end → refresh_display_facts (0.6 KB) → member::count (9.0 KB) → fetch_key` branch stays far below the dispatch path.
 
 **Re-measure** after adding large locals or a deeper call path:
 ```sh
@@ -272,7 +305,8 @@ write/erase and key load, for blocking storage work on core0.
 - Code on core0 that blocks the executor for more than a few seconds must
   call `watchdog::progress()` as it goes (or the chip resets ~8 s in).
 - Core1 work longer than 30 s must bump `WATCHDOG_HEARTBEAT` (RNG calls and
-  storage ops do) or hold a `WatchdogSuppressGuard`.
+  storage ops do) or hold a `WatchdogSuppressGuard`.  RSA keygen no longer
+  needs the guard: the sliced generator bumps the heartbeat every unit.
 - Send work to core1 only via `send_to_core1()`, and count each reply
   (`note_core1_response`), or the feeder's busy/idle accounting drifts.
 - Reset with `watchdog::reset_now(cause)`, not `SCB::sys_reset()` (on

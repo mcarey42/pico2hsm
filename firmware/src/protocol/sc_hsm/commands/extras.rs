@@ -25,6 +25,8 @@
 //! - P1=0x47: GET_MEMBERS (no auth; paged, P2 = first slot; data 02 = v2)
 //! - P1=0x49: IMPORT_MEMBER_CERT (no auth; the domain signature is checked)
 //! - P1=0x4A: IMPORT_REVOCATION (no auth; the domain signature is checked)
+//! - P1=0x50: RSA_POOL_STATUS (no auth)
+//! - P1=0x51: RSA_POOL_CONFIG (SO-PIN; data = flags, max age, depths)
 
 use pico2hsm_core::apdu::{
     ApduCommand, ApduResponse, SW_CONDITIONS_NOT_SATISFIED, SW_SECURITY_STATUS, SW_WRONG_DATA,
@@ -57,6 +59,15 @@ pub fn handle(
         // Authority is the domain signature, checked on the device (§12.1).
         0x49 => handle_import_member_cert(state, store, cmd),
         0x4A => handle_import_revocation(state, store, cmd),
+        0x50 => handle_pool_status(store),
+
+        // RSA key pool settings: a device policy, SO-PIN only.
+        0x51 => {
+            if !state.so_pin_verified {
+                return ApduResponse::err(SW_SECURITY_STATUS);
+            }
+            handle_pool_config(store, cmd)
+        }
 
         // SO-PIN required.
         0x3B => {
@@ -116,6 +127,80 @@ pub fn handle(
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// P1=0x50  RSA_POOL_STATUS, P1=0x51  RSA_POOL_CONFIG
+// ---------------------------------------------------------------------------
+
+/// Status of the RSA key pool (no PIN), 43 bytes, big-endian:
+///
+/// ```text
+/// [0]      version (1)
+/// [1]      health: bit 0 RNG ready, bit 1 pool region present,
+///          bit 2 background filling stopped (write failures)
+/// [2..10]  config: flags (bit 0 enabled, bit 1 rotation / age-out),
+///          max age in minutes (u32), depth 2048 / 3072 / 4096
+/// [10..13] issuable keys: 2048 / 3072 / 4096
+/// [13..15] size being generated in bits (0: none)
+/// [15..23] pool clock, minutes of powered-on time (u64)
+/// [23..27] sequence number of the newest pooled key
+/// [27..31] keys pooled since boot      [31..35] rotated since boot
+/// [35..39] pooled keys issued since boot
+/// [39..43] keys generated live since boot
+/// ```
+#[cfg(feature = "rsa")]
+fn pool_status_bytes(st: &crate::rsa_pool::PoolStatus) -> heapless::Vec<u8, 43> {
+    let mut out: heapless::Vec<u8, 43> = heapless::Vec::new();
+    let _ = out.push(1);
+    let _ = out.push(st.health);
+    let _ = out.extend_from_slice(&st.config.to_bytes());
+    let _ = out.extend_from_slice(&st.ready);
+    let _ = out.extend_from_slice(&st.generating_bits.to_be_bytes());
+    let _ = out.extend_from_slice(&st.clock_min.to_be_bytes());
+    let _ = out.extend_from_slice(&st.seq.to_be_bytes());
+    let _ = out.extend_from_slice(&st.generated.to_be_bytes());
+    let _ = out.extend_from_slice(&st.rotated.to_be_bytes());
+    let _ = out.extend_from_slice(&st.issued.to_be_bytes());
+    let _ = out.extend_from_slice(&st.live.to_be_bytes());
+    out
+}
+
+#[cfg(feature = "rsa")]
+fn handle_pool_status(store: &mut dyn KeyStore) -> ApduResponse {
+    let up = crate::rsa_pool::uptime_min();
+    let st = crate::rsa_pool::with_engine(|e| e.status(store, up));
+    ApduResponse::ok(&pool_status_bytes(&st))
+}
+
+/// Set the RSA key pool configuration (SO-PIN).  Data: `flags(1)
+/// max_age_minutes(4, BE) depth_2048(1) depth_3072(1) depth_4096(1)` —
+/// flags bit 0 = pool enabled, bit 1 = rotation / age-out; max age
+/// 60..=525600 minutes; depths 0..=4.  Persisted before it takes effect;
+/// disabling the pool erases every pooled key.  Answers with the status.
+#[cfg(feature = "rsa")]
+fn handle_pool_config(store: &mut dyn KeyStore, cmd: &ApduCommand<'_>) -> ApduResponse {
+    if cmd.data.len() != 8 {
+        return ApduResponse::err(SW_WRONG_LENGTH);
+    }
+    let Some(cfg) = crate::rsa_pool::PoolConfig::from_bytes(cmd.data) else {
+        return ApduResponse::err(SW_WRONG_DATA);
+    };
+    let up = crate::rsa_pool::uptime_min();
+    match crate::rsa_pool::with_engine(|e| e.set_config(store, cfg, up)) {
+        Ok(()) => handle_pool_status(store),
+        Err(_) => ApduResponse::err(pico2hsm_core::apdu::SW_MEMORY_FAILURE),
+    }
+}
+
+#[cfg(not(feature = "rsa"))]
+fn handle_pool_status(_: &mut dyn KeyStore) -> ApduResponse {
+    ApduResponse::err(pico2hsm_core::apdu::SW_FUNC_NOT_SUPPORTED)
+}
+
+#[cfg(not(feature = "rsa"))]
+fn handle_pool_config(_: &mut dyn KeyStore, _: &ApduCommand<'_>) -> ApduResponse {
+    ApduResponse::err(pico2hsm_core::apdu::SW_FUNC_NOT_SUPPORTED)
 }
 
 // ---------------------------------------------------------------------------

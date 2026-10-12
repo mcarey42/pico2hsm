@@ -71,6 +71,65 @@ pub struct Dispatcher {
     openpgp: OpenPgp,
     /// Shared GET RESPONSE chaining buffer — replaces per-protocol buffers.
     shared_buf: SharedResponseBuffer,
+    /// What the status display is told (see [`DisplayBook`]).
+    display: DisplayBook,
+}
+
+/// Core1's display bookkeeping: the operation in flight and the health and
+/// inventory facts that cannot be read from applet state on every publish.
+/// Survives [`Dispatcher::reset_in_place`] (boot health, op history).
+#[derive(Clone, Copy, Debug)]
+pub struct DisplayBook {
+    /// Chained-command tracking for [`pico2hsm_core::op::classify_op`].
+    tracker: pico2hsm_core::op::OpTracker,
+    /// The last tracked operation (W1).
+    activity: crate::display_snapshot::Activity,
+    /// Its status word (W4).
+    last_sw: u16,
+    /// INS / P1 of the command being dispatched, and whether it is tracked.
+    current: Option<(u8, u8, bool)>,
+    /// `display_snapshot::oneshot` bits before that command.
+    armed_before: u8,
+    /// The session epoch core1 is in (all 32 bits).
+    epoch: u32,
+    /// The last tracked operation, or the GET RESPONSE that continued it,
+    /// answered 61xx: the next GET RESPONSE completes it.
+    awaiting_get_response: bool,
+    /// `display_snapshot::health` bits.
+    health: u8,
+    /// Domain facts, refreshed from the store when they can change.
+    domain: crate::display_snapshot::DomainState,
+    members: u8,
+    domain_id_hi16: u16,
+    /// SC-HSM user-PIN allowance (tries granted at the last reset).
+    hsm_pin_max: u8,
+}
+
+impl DisplayBook {
+    const fn new() -> Self {
+        DisplayBook {
+            tracker: pico2hsm_core::op::OpTracker::new(),
+            activity: crate::display_snapshot::Activity {
+                op_seq: 0,
+                op: pico2hsm_core::op::OpCode::None,
+                state: crate::display_snapshot::OpState::Idle,
+                result: pico2hsm_core::op::OpResult::Ok,
+                algo: 0,
+                key_ref: 0,
+                hint: 0,
+            },
+            last_sw: 0,
+            current: None,
+            armed_before: 0,
+            epoch: 0,
+            awaiting_get_response: false,
+            health: 0,
+            domain: crate::display_snapshot::DomainState::None,
+            members: 0,
+            domain_id_hi16: 0,
+            hsm_pin_max: 3,
+        }
+    }
 }
 
 impl Dispatcher {
@@ -82,6 +141,7 @@ impl Dispatcher {
             piv: Piv::new(),
             openpgp: OpenPgp::new(),
             shared_buf: SharedResponseBuffer::new(),
+            display: DisplayBook::new(),
         }
     }
 
@@ -122,6 +182,7 @@ impl Dispatcher {
                 core::ptr::addr_of_mut!((*sb).state)
                     .write(crate::apdu::shared_buffer::SharedBufState::Empty);
             }
+            core::ptr::addr_of_mut!((*ptr).display).write(DisplayBook::new());
             &mut *ptr
         }
     }
@@ -156,6 +217,8 @@ impl Dispatcher {
     /// via `load_keys_from_store`; this method only resets in-memory state.
     #[inline(never)]
     pub fn reset_in_place(&mut self) {
+        // Boot health and the op history outlive the reset.
+        let display = self.display;
         let ptr: *mut Self = self;
         // SAFETY: `self` is a valid, initialised Dispatcher.  After
         // `drop_in_place` the memory is logically uninitialised, and
@@ -165,12 +228,17 @@ impl Dispatcher {
             core::ptr::drop_in_place(ptr);
             Self::init_in_place(&mut *ptr.cast::<core::mem::MaybeUninit<Self>>());
         }
+        self.display = DisplayBook {
+            tracker: pico2hsm_core::op::OpTracker::new(),
+            current: None,
+            awaiting_get_response: false,
+            ..display
+        };
     }
 
-    /// Return the total number of keys in the key_index, clamped to u8.
-    ///
-    /// Used by core1 to update the `KEY_COUNT` atomic without needing access
-    /// to the flash keystore (which lives on core0).
+    /// Return the total number of entries in SC-HSM's key_index (keys and
+    /// files), clamped to u8.  The display counts user keys only
+    /// ([`Self::display_snapshot`]).
     pub fn in_memory_key_count(&self) -> u8 {
         self.sc_hsm.state.key_index.len().min(255) as u8
     }
@@ -227,6 +295,7 @@ impl Dispatcher {
         ScHsm::load_pin_state_from_store(&mut self.sc_hsm.state, store);
         ScHsm::load_dkek_from_store(&mut self.sc_hsm.state, store);
         ScHsm::load_domain_from_store(&mut self.sc_hsm.state, store);
+        self.refresh_display_facts(store);
     }
 
     /// Boot-time domain migration (cluster plan V3 P1), after
@@ -485,10 +554,23 @@ impl Dispatcher {
         pgp.pw1_verified_sign = false;
         pgp.pw1_verified_other = false;
         pgp.pw3_verified = false;
+        self.display.tracker.reset();
+        self.display.awaiting_get_response = false;
+        // A comparison code never outlives its session.
+        crate::display_snapshot::sas_clear(crate::display_snapshot::SasState::Cancelled);
     }
 
     /// Route a SELECT-by-AID command and return the appropriate FCI response.
     fn select_aid(&mut self, aid: &[u8]) -> ApduResponse {
+        let before = self.active;
+        let resp = self.select_aid_inner(aid);
+        if self.active != before {
+            crate::display_snapshot::sas_clear(crate::display_snapshot::SasState::Cancelled);
+        }
+        resp
+    }
+
+    fn select_aid_inner(&mut self, aid: &[u8]) -> ApduResponse {
         // SC-HSM AID
         if aid == SC_HSM_AID {
             self.active = ActiveProtocol::ScHsm;
@@ -528,6 +610,414 @@ impl Dispatcher {
 
         // Unknown AID
         ApduResponse::err(SW_FILE_NOT_FOUND)
+    }
+}
+
+// ─── Status display (core1 side) ─────────────────────────────────────────────
+
+/// Status word the keystore layer reports for a failed write.
+const SW_MEMORY_FAILURE: u16 = 0x6581;
+
+/// Small display algorithm id for a `pico2hsm_core::key::KeyType`
+/// discriminant (as stored in `KeyMeta::key_type`).
+fn display_algo_of_key_type(key_type: u8) -> u8 {
+    use crate::display_snapshot::algo;
+    match key_type {
+        0 | 1 | 15 => algo::RSA,
+        2 => algo::P256,
+        3 => algo::P384,
+        4 => algo::P521,
+        5 => algo::K256,
+        6..=8 => algo::BRAINPOOL,
+        9..=11 => algo::AES,
+        13 => algo::ED25519,
+        14 => algo::X25519,
+        _ => algo::NONE,
+    }
+}
+
+/// Small display algorithm id for a PIV algorithm reference (P1).
+fn display_algo_of_piv(p1: u8) -> u8 {
+    use crate::display_snapshot::algo;
+    match p1 {
+        0x05 | 0x06 | 0x07 | 0x16 => algo::RSA,
+        0x11 => algo::P256,
+        0x14 => algo::P384,
+        0xE0 => algo::ED25519,
+        0xE1 => algo::X25519,
+        _ => algo::NONE,
+    }
+}
+
+impl Dispatcher {
+    fn display_applet(&self) -> pico2hsm_core::op::Applet {
+        use pico2hsm_core::op::Applet;
+        match self.active {
+            ActiveProtocol::None => Applet::None,
+            ActiveProtocol::ScHsm => Applet::Hsm,
+            ActiveProtocol::Piv => Applet::Piv,
+            ActiveProtocol::OpenPgp => Applet::Pgp,
+        }
+    }
+
+    /// Boot-time health facts (`display_snapshot::health` bits), set by
+    /// core0 before core1 starts.
+    pub fn set_boot_health(&mut self, flags: u8) {
+        use crate::display_snapshot::health::STORE_WRITE_FAILED;
+        self.display.health = flags & !STORE_WRITE_FAILED;
+    }
+
+    /// Record the host session core1 now serves (after
+    /// [`Self::clear_session`], and at boot).
+    pub fn note_session(&mut self, epoch: u32) {
+        self.display.epoch = epoch;
+    }
+
+    /// Debug detail for the activity line: (algorithm, key reference).
+    fn op_subject(
+        &self,
+        applet: pico2hsm_core::op::Applet,
+        op: pico2hsm_core::op::OpCode,
+        cmd: &ApduCommand<'_>,
+    ) -> (u8, u8) {
+        use crate::display_snapshot::algo;
+        use pico2hsm_core::op::{Applet, OpCode};
+        match applet {
+            Applet::Hsm => {
+                let key_ref = match op {
+                    OpCode::Sign
+                    | OpCode::Decrypt
+                    | OpCode::Derive
+                    | OpCode::KeyGen
+                    | OpCode::Import => cmd.p1,
+                    _ => 0,
+                };
+                let algo = self
+                    .sc_hsm
+                    .state
+                    .key_index
+                    .iter()
+                    .find(|m| (m.key_id >> 8) & 0xFF == 0 && m.key_id as u8 == key_ref)
+                    .map_or(algo::NONE, |m| display_algo_of_key_type(m.key_type));
+                (algo, key_ref)
+            }
+            Applet::Piv => match op {
+                OpCode::Sign | OpCode::Decrypt | OpCode::Derive | OpCode::KeyGen => {
+                    (display_algo_of_piv(cmd.p1), cmd.p2)
+                }
+                _ => (algo::NONE, 0),
+            },
+            Applet::Pgp => {
+                let st = &self.openpgp.state;
+                let (slot, kt) = match op {
+                    OpCode::Sign => (0x90, st.sig_key_type),
+                    OpCode::Decipher => (0x91, st.dec_key_type),
+                    OpCode::Auth => (0x92, st.auth_key_type),
+                    _ => return (algo::NONE, 0),
+                };
+                (
+                    kt.map_or(algo::NONE, |k| display_algo_of_key_type(k as u8)),
+                    slot,
+                )
+            }
+            Applet::None => (algo::NONE, 0),
+        }
+    }
+
+    /// Before dispatch (core1): classify the command.  Returns `true` if it
+    /// is a tracked operation, now marked in progress — publish then.
+    pub fn display_begin(&mut self, raw_apdu: &[u8]) -> bool {
+        use crate::display_snapshot::OpState;
+        use pico2hsm_core::op::{OpCode, OpResult};
+        let Ok(cmd) = ApduCommand::parse(raw_apdu) else {
+            self.display.current = None;
+            return false;
+        };
+        let applet = self.display_applet();
+        let op = self
+            .display
+            .tracker
+            .observe(applet, cmd.cla, cmd.ins, cmd.p1, cmd.p2, cmd.data);
+        let tracked = !matches!(op, OpCode::Other | OpCode::None);
+        self.display.current = Some((cmd.ins, cmd.p1, tracked));
+        self.display.armed_before = self.display_oneshot();
+        if tracked {
+            let (algo, key_ref) = self.op_subject(applet, op, &cmd);
+            let a = &mut self.display.activity;
+            a.op_seq = a.op_seq.wrapping_add(1);
+            a.op = op;
+            a.state = OpState::InProgress;
+            a.result = OpResult::Ok;
+            a.algo = algo;
+            a.key_ref = key_ref;
+            a.hint = 0;
+        }
+        tracked
+    }
+
+    /// The live one-shot authorisations (`display_snapshot::oneshot`).
+    fn display_oneshot(&self) -> u8 {
+        use crate::display_snapshot::oneshot;
+        let mut one = 0;
+        #[cfg(feature = "applet-piv")]
+        if self.piv.state.pin_always_ok {
+            one |= oneshot::PIV_9C_ARMED;
+        }
+        let pgp = &self.openpgp.state;
+        if pgp.pw1_verified_sign && pgp.pw1_status == 0 {
+            one |= oneshot::PGP_SIG_SINGLE;
+        }
+        one
+    }
+
+    /// After dispatch (core1): record the outcome of the command that
+    /// [`Self::display_begin`] saw, and refresh what it may have changed.
+    pub fn display_end(&mut self, response: &[u8], store: &mut dyn crate::storage::KeyStore) {
+        use crate::display_snapshot::{health, hint, oneshot, OpState, SasState};
+        use pico2hsm_core::op::OpResult;
+        let Some((ins, p1, tracked)) = self.display.current.take() else {
+            return;
+        };
+        let sw = match response {
+            [.., a, b] => u16::from_be_bytes([*a, *b]),
+            _ => 0x6F00,
+        };
+        let result = OpResult::of_sw(sw);
+        // A GET RESPONSE that continues a tracked operation's 61xx answer
+        // carries that operation's final status: record it (same op, same
+        // op_seq, so the display keeps its age).
+        let continues = !tracked && ins == 0xC0 && self.display.awaiting_get_response;
+        self.display.awaiting_get_response = (tracked || continues) && sw >> 8 == 0x61;
+        if continues {
+            self.display.activity.result = result;
+            self.display.last_sw = sw;
+        }
+        if tracked {
+            // A signature that spent a one-shot authorisation says so.
+            let spent = self.display.armed_before & !self.display_oneshot();
+            let a = &mut self.display.activity;
+            a.state = OpState::Done;
+            a.result = result;
+            a.hint = match (a.op, result) {
+                (pico2hsm_core::op::OpCode::Sign, OpResult::Ok)
+                    if spent & oneshot::PIV_9C_ARMED != 0 && a.key_ref == 0x9C =>
+                {
+                    hint::PIV_PIN_ALWAYS
+                }
+                (pico2hsm_core::op::OpCode::Sign, OpResult::Ok)
+                    if spent & oneshot::PGP_SIG_SINGLE != 0 =>
+                {
+                    hint::PGP_SINGLE_USE
+                }
+                _ => hint::NONE,
+            };
+            self.display.last_sw = sw;
+        }
+        if sw == SW_MEMORY_FAILURE {
+            self.display.health |= health::STORE_WRITE_FAILED;
+        } else if result == OpResult::Ok && tracked && self.display.activity.op.writes_storage() {
+            self.display.health &= !health::STORE_WRITE_FAILED;
+        }
+        if result != OpResult::Ok || self.active != ActiveProtocol::ScHsm {
+            return;
+        }
+        match ins {
+            // INITIALIZE: new credentials, no DKEK, no domain.
+            0x50 => {
+                self.display.hsm_pin_max = self.sc_hsm.state.pin_retry_count.max(1);
+                crate::display_snapshot::sas_clear(SasState::Cancelled);
+                self.refresh_display_facts(store);
+            }
+            // RESET RETRY COUNTER restores the allowance.
+            0x2C => {
+                self.display.hsm_pin_max = self
+                    .display
+                    .hsm_pin_max
+                    .max(self.sc_hsm.state.pin_retry_count);
+            }
+            // DKEK import (KEY DOMAIN).
+            0x52 => self.refresh_display_facts(store),
+            // EXTRAS sub-commands that change the DKEK, the member list or
+            // the pinned peer.  A newly pinned peer ends any pending code.
+            0x54 if (0x35..=0x4F).contains(&p1)
+                && !matches!(p1, 0x39 | 0x3A | 0x3C | 0x40 | 0x47) =>
+            {
+                if p1 == 0x3D {
+                    crate::display_snapshot::sas_clear(SasState::Cancelled);
+                }
+                self.refresh_display_facts(store);
+            }
+            // Provisioning may have changed the OTP state.
+            #[cfg(target_arch = "arm")]
+            0xF0..=0xF2 => {
+                if crate::security::otp::Otp::new().is_provisioned() {
+                    self.display.health |= health::PROVISIONED;
+                } else {
+                    self.display.health &= !health::PROVISIONED;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Re-read the display facts that live on the store: domain membership
+    /// and the SC-HSM user-PIN allowance.  Boot / reload, and after the
+    /// commands that change them (never on every publish).
+    #[inline(never)] // keeps the member-list KeyObject temporaries off the caller's frame
+    fn refresh_display_facts(&mut self, store: &mut dyn crate::storage::KeyStore) {
+        use crate::display_snapshot::DomainState;
+        use crate::domain::member;
+        use crate::storage::retry_counter::Credential;
+
+        if let Some(Ok(Some(st))) = store
+            .retry_counters()
+            .map(|log| log.get(Credential::ScHsmUserPin))
+        {
+            self.display.hsm_pin_max = st.allowance.max(1);
+        }
+
+        let Some(domain) = self.sc_hsm.state.domain.as_ref() else {
+            self.display.domain = DomainState::None;
+            self.display.members = 0;
+            self.display.domain_id_hi16 = 0;
+            return;
+        };
+        self.display.domain_id_hi16 = u16::from_be_bytes([domain.id[0], domain.id[1]]);
+        let members = member::count(store).unwrap_or(0);
+        self.display.members = members;
+        let mut state = DomainState::SelfOnly;
+        if let Some(own) = ScHsm::device_member_pub(store).map(|p| member::member_id(&p)) {
+            for slot in 0..members {
+                if let Ok(Some(e)) = member::load(store, slot) {
+                    if e.cert.member_id == own {
+                        state = if e.status() == member::STATUS_REVOKED {
+                            DomainState::Revoked
+                        } else {
+                            DomainState::Member
+                        };
+                        break;
+                    }
+                }
+            }
+        }
+        self.display.domain = state;
+    }
+
+    /// The display snapshot (W0–W4) from the live applet state.  Reads RAM
+    /// only: retry counts are the applets' RAM copies, which every
+    /// `with_persisted_attempt` keeps equal to what flash holds.
+    pub fn display_snapshot(&self) -> crate::display_snapshot::Snapshot {
+        use crate::display_snapshot::{auth, blocked, Health, Inventory, Session, Snapshot};
+        use pico2hsm_core::op::Applet;
+
+        let sc = &self.sc_hsm.state;
+        let pgp = &self.openpgp.state;
+        let mut a = 0u8;
+        let one = self.display_oneshot();
+        let mut blk = 0u8;
+        if sc.pin_verified {
+            a |= auth::HSM_USER;
+        }
+        if sc.so_pin_verified {
+            a |= auth::HSM_SO;
+        }
+        if sc.initialized && sc.user_pin_hash.is_some() && sc.pin_retry_count == 0 {
+            blk |= blocked::HSM;
+        }
+        #[cfg(feature = "applet-piv")]
+        let (piv_left, piv_max, piv_keys) = {
+            let piv = &self.piv.state;
+            if piv.pin_verified {
+                a |= auth::PIV_PIN;
+            }
+            if piv.mgmt_key_authenticated {
+                a |= auth::PIV_MGMT;
+            }
+            let ps = &piv.pin_state;
+            if ps.pin_blocked || ps.pin_retries_remaining == 0 {
+                blk |= blocked::PIV;
+            }
+            (
+                ps.pin_retries_remaining,
+                ps.pin_max_retries,
+                piv.key_index.len(),
+            )
+        };
+        #[cfg(not(feature = "applet-piv"))]
+        let (piv_left, piv_max, piv_keys) = (0u8, 0u8, 0usize);
+        if pgp.pw1_verified_sign {
+            a |= auth::PGP_PW1_81;
+        }
+        if pgp.pw1_verified_other {
+            a |= auth::PGP_PW1_82;
+        }
+        if pgp.pw3_verified {
+            a |= auth::PGP_PW3;
+        }
+        if pgp.pw1_retries == 0 {
+            blk |= blocked::PGP;
+        }
+
+        let applet = self.display_applet();
+        let (left, max) = match applet {
+            Applet::Hsm => (
+                sc.pin_retry_count,
+                self.display.hsm_pin_max.max(sc.pin_retry_count),
+            ),
+            Applet::Piv => (piv_left, piv_max.max(piv_left)),
+            Applet::Pgp => (
+                pgp.pw1_retries,
+                crate::protocol::openpgp::PW1_MAX_RETRIES.max(pgp.pw1_retries),
+            ),
+            Applet::None => (0, 0),
+        };
+
+        // User keys only: no files (type 16), no firmware records.
+        let keys_hsm = sc
+            .key_index
+            .iter()
+            .filter(|m| {
+                m.key_type != 16
+                    && (m.key_id >> 8) & 0xFF == 0
+                    && !matches!(m.key_id as u8, 0xFC..=0xFF)
+            })
+            .count();
+        let keys_pgp = [pgp.sig_key_type, pgp.dec_key_type, pgp.auth_key_type]
+            .iter()
+            .filter(|k| k.is_some())
+            .count();
+
+        Snapshot {
+            session: Session {
+                epoch: self.display.epoch,
+                applet,
+                auth: a,
+                oneshot: one,
+                pri_left: left.min(15),
+                pri_max: max.min(15),
+                blocked: blk,
+            },
+            activity: self.display.activity,
+            inventory: Inventory {
+                keys_hsm: keys_hsm.min(255) as u8,
+                keys_piv: piv_keys.min(15) as u8,
+                keys_pgp: keys_pgp as u8,
+                domain: self.display.domain,
+                members: self.display.members.min(63),
+            },
+            health: Health {
+                domain_id_hi16: self.display.domain_id_hi16,
+                flags: self.display.health
+                    | if crate::display_snapshot::SD_FAULT
+                        .load(core::sync::atomic::Ordering::Acquire)
+                    {
+                        crate::display_snapshot::health::SD_MISSING
+                    } else {
+                        0
+                    },
+            },
+            last_sw: self.display.last_sw,
+        }
     }
 }
 
@@ -693,11 +1183,11 @@ fn build_piv_fci() -> ApduResponse {
 ///     9F6E 04 03 04 00 00   — version 3.4
 /// ```
 fn build_openpgp_fci(openpgp: &mut OpenPgp) -> ApduResponse {
-    use crate::protocol::openpgp::OPENPGP_AID;
+    use crate::protocol::openpgp::openpgp_aid;
 
     openpgp.state.reset_security_state();
 
-    let aid = &OPENPGP_AID;
+    let aid = &openpgp_aid();
     let version: &[u8] = &[0x03, 0x04, 0x00, 0x00];
 
     let a5_inner_len: u8 = 2 + 1 + version.len() as u8;
@@ -790,6 +1280,172 @@ mod tests {
         #[cfg(feature = "applet-piv")]
         assert!(!d.piv.state.pin_verified && !d.piv.state.mgmt_key_authenticated);
         assert!(!d.openpgp.state.pw1_verified_sign && !d.openpgp.state.pw3_verified);
+    }
+
+    /// Run one APDU through the display hooks and the dispatcher, as
+    /// core1's `dispatcher_loop` does.
+    fn run(d: &mut Dispatcher, store: &mut crate::storage::NullKeyStore, apdu: &[u8]) -> u16 {
+        d.display_begin(apdu);
+        let resp = d.dispatch_with_store(apdu, store);
+        d.display_end(&resp, store);
+        u16::from_be_bytes([resp[resp.len() - 2], resp[resp.len() - 1]])
+    }
+
+    #[cfg(feature = "applet-piv")]
+    #[test]
+    fn display_snapshot_follows_session_auth() {
+        use crate::display_snapshot::{auth, OpState};
+        use pico2hsm_core::op::{Applet, OpCode};
+        let mut slot = core::mem::MaybeUninit::<Dispatcher>::uninit();
+        let d = Dispatcher::init_in_place(&mut slot);
+        let mut store = crate::storage::NullKeyStore;
+        d.note_session(7);
+        let mut select = [0u8; 16];
+        select[..5].copy_from_slice(&[0x00, 0xA4, 0x04, 0x00, 0x0B]);
+        select[5..].copy_from_slice(PIV_AID);
+        assert_eq!(run(d, &mut store, &select), 0x9000);
+        assert_eq!(d.display_snapshot().session.applet, Applet::Piv);
+        assert_eq!(
+            d.display_snapshot().activity.op,
+            OpCode::None,
+            "SELECT is not an op"
+        );
+
+        let verify = [
+            0x00, 0x20, 0x00, 0x80, 0x08, b'1', b'2', b'3', b'4', b'5', b'6', 0xFF, 0xFF,
+        ];
+        assert_eq!(run(d, &mut store, &verify), 0x9000);
+        let snap = d.display_snapshot();
+        assert_ne!(
+            snap.session.auth & auth::PIV_PIN,
+            0,
+            "VERIFY 9000 shows the PIN"
+        );
+        assert_eq!(snap.activity.op, OpCode::Verify);
+        assert_eq!(snap.activity.state, OpState::Done);
+        let seq = snap.activity.op_seq;
+
+        // VERIFY P1=FF logs out: PIV_PIN back to 0, and it is no operation.
+        run(d, &mut store, &[0x00, 0x20, 0xFF, 0x80, 0x00]);
+        let snap = d.display_snapshot();
+        assert_eq!(
+            snap.session.auth & auth::PIV_PIN,
+            0,
+            "logout leaves PIV_PIN at 0"
+        );
+        assert_eq!(snap.activity.op_seq, seq);
+
+        // Verify again, then end the session.
+        assert_eq!(run(d, &mut store, &verify), 0x9000);
+        d.piv.state.mgmt_key_authenticated = true;
+        d.sc_hsm.state.so_pin_verified = true;
+        d.openpgp.state.pw3_verified = true;
+        assert_ne!(d.display_snapshot().session.auth, 0);
+        d.clear_session();
+        d.note_session(8);
+        let snap = d.display_snapshot();
+        assert_eq!(
+            snap.session.auth, 0,
+            "every auth bit drops with the session"
+        );
+        assert_eq!(snap.session.oneshot, 0);
+        assert_eq!(snap.session.epoch, 8);
+        // All 32 bits: 256 silent power cycles later is another session.
+        d.note_session(8 + 256);
+        assert_eq!(d.display_snapshot().session.epoch, 264);
+        assert_eq!(snap.session.applet, Applet::None);
+    }
+
+    #[test]
+    fn display_counts_user_keys_only() {
+        use crate::protocol::sc_hsm::KeyMeta;
+        let mut slot = core::mem::MaybeUninit::<Dispatcher>::uninit();
+        let d = Dispatcher::init_in_place(&mut slot);
+        let key = |key_id: u32, key_type: u8| KeyMeta {
+            key_id,
+            key_type,
+            algo: 0,
+            key_flags: 0,
+        };
+        let index = &mut d.sc_hsm.state.key_index;
+        index.push(key(0x01, 2)).unwrap();
+        index.push(key(0x02, 0)).unwrap();
+        index.push(key(0xFE, 2)).unwrap(); // device identity key
+        index.push(key(0xC401, 16)).unwrap(); // a file
+        assert_eq!(d.display_snapshot().inventory.keys_hsm, 2);
+    }
+
+    #[test]
+    fn store_write_failure_is_sticky_until_a_write_succeeds() {
+        use crate::display_snapshot::health;
+        let mut slot = core::mem::MaybeUninit::<Dispatcher>::uninit();
+        let d = Dispatcher::init_in_place(&mut slot);
+        let mut store = crate::storage::NullKeyStore;
+        d.active = ActiveProtocol::ScHsm;
+        let failed =
+            |d: &Dispatcher| d.display_snapshot().health.flags & health::STORE_WRITE_FAILED;
+        assert!(d.display_begin(&[0x00, 0x46, 0x01, 0x00]));
+        d.display_end(&[0x65, 0x81], &mut store);
+        assert_ne!(failed(d), 0);
+        // A read-only command does not clear it.
+        assert!(!d.display_begin(&[0x00, 0xCA, 0x01, 0x00]));
+        d.display_end(&[0x90, 0x00], &mut store);
+        assert_ne!(failed(d), 0);
+        // A successful write does.
+        assert!(d.display_begin(&[0x00, 0x46, 0x01, 0x00]));
+        d.display_end(&[0x90, 0x00], &mut store);
+        assert_eq!(failed(d), 0);
+        // Boot health survives a reset.
+        d.set_boot_health(health::PROVISIONED);
+        d.reset_in_place();
+        assert_eq!(d.display_snapshot().health.flags, health::PROVISIONED);
+    }
+
+    #[test]
+    fn chained_result_and_get_response_keep_the_op() {
+        use pico2hsm_core::op::{OpCode, OpResult};
+        let mut slot = core::mem::MaybeUninit::<Dispatcher>::uninit();
+        let d = Dispatcher::init_in_place(&mut slot);
+        let mut store = crate::storage::NullKeyStore;
+        d.active = ActiveProtocol::ScHsm;
+        assert!(d.display_begin(&[0x80, 0x68, 0x01, 0x70, 0x01, 0xAA]));
+        d.display_end(&[0x01, 0x61, 0x10], &mut store);
+        let a = d.display_snapshot().activity;
+        assert_eq!(
+            (a.op, a.result),
+            (OpCode::Sign, OpResult::Ok),
+            "61xx is success"
+        );
+        assert_eq!(d.display_snapshot().last_sw, 0x6110);
+        // A GET RESPONSE that is itself cut short (61xx) keeps waiting.
+        assert!(!d.display_begin(&[0x00, 0xC0, 0x00, 0x00, 0x10]));
+        d.display_end(&[0x01, 0x61, 0x08], &mut store);
+        assert_eq!(d.display_snapshot().last_sw, 0x6108);
+        // The last one carries the final status into the same op.
+        assert!(!d.display_begin(&[0x00, 0xC0, 0x00, 0x00, 0x08]));
+        d.display_end(&[0x6F, 0x00], &mut store);
+        let b = d.display_snapshot();
+        assert_eq!(
+            (
+                b.activity.op_seq,
+                b.activity.op,
+                b.activity.result,
+                b.last_sw
+            ),
+            (a.op_seq, OpCode::Sign, OpResult::Error, 0x6F00)
+        );
+        // Another GET RESPONSE has nothing to complete.
+        assert!(!d.display_begin(&[0x00, 0xC0, 0x00, 0x00, 0x08]));
+        d.display_end(&[0x6A, 0x86], &mut store);
+        assert_eq!(d.display_snapshot().last_sw, 0x6F00);
+        // Nor does one after an unrelated command broke the sequence.
+        assert!(d.display_begin(&[0x80, 0x68, 0x01, 0x70, 0x01, 0xAA]));
+        d.display_end(&[0x01, 0x61, 0x10], &mut store);
+        assert!(!d.display_begin(&[0x00, 0xCA, 0x01, 0x00]));
+        d.display_end(&[0x90, 0x00], &mut store);
+        assert!(!d.display_begin(&[0x00, 0xC0, 0x00, 0x00, 0x10]));
+        d.display_end(&[0x6F, 0x00], &mut store);
+        assert_eq!(d.display_snapshot().activity.result, OpResult::Ok);
     }
 
     #[test]

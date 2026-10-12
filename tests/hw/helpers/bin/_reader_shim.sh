@@ -17,7 +17,15 @@ for d in "${dirs[@]}"; do
 done
 [[ -n "$real" ]] || { echo "shim: $tool not found on PATH" >&2; exit 127; }
 
+# PICO2HSM_READER (a substring of one reader name, e.g. the board's USB
+# serial) wins over the OPENSC_DEFAULT_READER index, and is resolved on every
+# call: indexes shift whenever a board re-enumerates.
 reader="${OPENSC_DEFAULT_READER:-}"
+if [[ -n "${PICO2HSM_READER:-}" ]]; then
+    hits="$("$(dirname "$real")/opensc-tool" --list-readers 2>/dev/null | awk -v s="$PICO2HSM_READER" '$1 ~ /^[0-9]+$/ && index($0, s) { print $1 }')"
+    [[ "$(wc -w <<< "$hits")" -eq 1 ]] || { echo "shim: PICO2HSM_READER=$PICO2HSM_READER matches $(wc -w <<< "$hits") readers" >&2; exit 1; }
+    reader="$hits"
+fi
 [[ -n "$reader" ]] || exec "$real" "$@"
 
 for a in "$@"; do
@@ -33,7 +41,7 @@ case "$tool" in
     opensc-tool|sc-hsm-tool) exec "$real" -r "$reader" "$@" ;;
     pkcs11-tool)
         # Slot descriptions are the PC/SC reader names.
-        name="$(opensc-tool --list-readers 2>/dev/null | awk -v n="$reader" '$1 == n { sub(/^[ ]*[0-9]+[ ]+(Yes|No)[ ]+/, ""); print; exit }')"
+        name="$("$(dirname "$real")/opensc-tool" --list-readers 2>/dev/null | awk -v n="$reader" '$1 == n { sub(/^[ ]*[0-9]+[ ]+(Yes|No)[ ]+/, ""); print; exit }')"
         [[ -n "$name" ]] || { echo "shim: no PC/SC reader $reader" >&2; exit 1; }
         exec "$real" --slot-description "$name" "$@" ;;
     *) exec "$real" "$@" ;;
