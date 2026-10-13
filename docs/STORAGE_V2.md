@@ -3,12 +3,14 @@
 Status: **design approved by the owner (2026-10-12), revised after a
 security review and re-reviewed the same day (§17, §18); owner decisions
 in §16.  Implemented: phase 1 (counter log v2, binding ring, interim
-layout, #14); the engine and its wiring (phases 2–4 core: object format,
-journal, snapshots, lookup, allocation, anchor checks, formatting rules,
-fail-closed boot, FORMAT STORE).  Still to do: OPEN DEGRADED and ACCEPT
-STORE commands (the engine has the read-only mount), the SO-PIN verifier
-in the binding, removal of the 1.x code (phase 5), the partition-table
-layout (phase 6), the SD power-pull campaign.**  Ships in the 2.0.0 series.  It is a
+layout, #14); the engine, its wiring and the removal of the 1.x code
+(phases 2–5: object format, journal, snapshots, lookup, allocation,
+anchor checks, formatting rules, fail-closed boot, FORMAT STORE, E12;
+#15, hardware-verified on the Pico 2 and the Waveshare LCD SD board).
+Still to do: OPEN DEGRADED and ACCEPT STORE commands (the engine has the
+read-only mount), the SO-PIN verifier in the binding, removing the
+SC-HSM key index and EF cache from RAM, the partition-table layout
+(phase 6), the SD power-pull campaign, then `v2.0.0-rc1` (phase 7).**  Ships in the 2.0.0 series.  It is a
 breaking change: 1.x keystores are not migrated (no devices are in use),
 and 2.0 firmware refuses a 1.x keystore with a clear error.
 

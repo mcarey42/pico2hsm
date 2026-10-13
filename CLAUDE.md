@@ -74,7 +74,7 @@ generates live with the sliced generator.  Config / clock / sequence are
 value records in the retry-counter log.  The generator state (~9 KB) is a
 static (`rsa_pool::ENGINE`), never on the stack.
 
-The mailboxes hand over with an Acquire/Release flag (single producer, single consumer); the channels (`RESP_READY`, `FLASH_REQ`, `FLASH_RESP`) use RP2350 hardware spinlocks for SMP-safe cross-core signalling.
+The mailboxes hand over with an Acquire/Release flag (single producer, single consumer); the channels use RP2350 hardware spinlocks for SMP-safe cross-core signalling: 25 `CDC_LOG_CHANNEL`, 26 `FLASH_RESP`, 27 `FLASH_REQ`, 30 `RESP_READY` (31 is embassy-rp's).
 Core0 issues `cortex_m::asm::sev()` after every `APDU_BOX` fill and `FLASH_RESP.send()` to wake core1 from WFE.
 
 **CDC serial logger**: Core0 runs a `drain_one()` task that forwards buffered log lines to `/dev/ttyACMx`. `drain_one()` checks DTR before writing; if no terminal has `/dev/ttyACMx` open, the line is dropped silently (no CCID stall).
@@ -352,8 +352,9 @@ taken reentrantly") and the watchdog resets the chip.  Nothing that core1
 runs may log through defmt, **including embassy-rp internals**:
 `embassy_rp::flash::Flash::blocking_read` logs a `trace!` in debug builds,
 so internal-flash reads go through `flash_chip::xip_read` instead.  For
-core1 diagnostics use `watchdog::crumb`.  (`cdc_log!` from core1 is not
-safe yet either: its channel's critical section is the single-core one.)
+core1 diagnostics use `cdc_log!` (its channel takes hardware spinlock 25)
+or `watchdog::crumb`.  Any other lock core1 shares with core0 must be a
+`SpinlockRawMutex<N>`, never a `CriticalSectionRawMutex`.
 
 ### CCID timeout on long operations (P-384 / P-521 / K-256 sign)
 
