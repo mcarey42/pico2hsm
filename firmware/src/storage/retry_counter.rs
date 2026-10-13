@@ -598,13 +598,17 @@ fn absorb(table: &mut RawTable, r: Raw) -> bool {
     }
 }
 
+/// A region scan: the newest sector, its header `seq`, its next free slot,
+/// its records, and the highest header `seq` seen anywhere.
+type RegionScan = (u32, u32, u16, RawTable, u32);
+
 /// Find the newest sector with a valid `version` header in a region and
 /// read its records.  `Ok(None)`: no valid header (unformatted).
 fn scan_region<F: CounterFlash>(
     flash: &mut F,
     sectors: u32,
     version: u8,
-) -> Result<Option<(u32, u32, u16, RawTable, u32)>, StorageError> {
+) -> Result<Option<RegionScan>, StorageError> {
     let read_slot =
         |flash: &mut F, sector: u32, slot: u16| -> Result<[u8; SLOT_SIZE], StorageError> {
             let mut b = [0u8; SLOT_SIZE];

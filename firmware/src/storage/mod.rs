@@ -37,6 +37,7 @@
 //! same type for all type parameters.  For mixed boards (e.g. SDCard + SPI
 //! flash) use the `AnyChip` enum or a board-specific concrete type.
 
+pub mod binding;
 pub mod flash_layout;
 pub mod keystore;
 pub mod retry_counter;
