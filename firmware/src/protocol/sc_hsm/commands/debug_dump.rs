@@ -25,6 +25,10 @@
 //!   4096-bit).  Runs 256 Montgomery squarings plus 256 multiplications
 //!   modulo a fixed odd number and returns the elapsed microseconds (4
 //!   bytes, big-endian): the inner loop of RSA key generation.
+//! - P1=0x21: self-test of the M33 two-row multiply-accumulate (UMAAL
+//!   assembly) against its portable Rust twin, on pseudo-random inputs of
+//!   every length 0..=130 with random carries; 9000 if every word matches,
+//!   else 6F00 and the first failing length.
 
 use pico2hsm_core::apdu::{ApduCommand, ApduResponse, SW_WRONG_DATA};
 
@@ -39,6 +43,8 @@ pub const P1_WEDGE_CORE0: u8 = 0x11;
 pub const P1_WATCHDOG_RESET: u8 = 0x12;
 /// P1: Montgomery multiplication benchmark.
 pub const P1_BENCH_MONT: u8 = 0x20;
+/// P1: self-test the UMAAL kernel against the portable one.
+pub const P1_SELFTEST_MAC2: u8 = 0x21;
 
 /// Handle a DEBUG MEMORY DUMP APDU command.
 pub fn handle(cmd: &ApduCommand<'_>) -> ApduResponse {
@@ -54,6 +60,8 @@ pub fn handle(cmd: &ApduCommand<'_>) -> ApduResponse {
         P1_WATCHDOG_RESET => crate::watchdog::reset_now(crate::watchdog::ResetCause::DebugTest),
         #[cfg(all(target_arch = "arm", feature = "rsa"))]
         P1_BENCH_MONT => return bench_mont(cmd.p2 as usize),
+        #[cfg(all(target_arch = "arm", feature = "rsa"))]
+        P1_SELFTEST_MAC2 => return selftest_mac2(),
         _ => {}
     }
     // TODO: implement — read memory region and return raw bytes.
@@ -91,4 +99,44 @@ fn bench_mont(words: usize) -> ApduResponse {
     // Keep the result live.
     core::hint::black_box(&x);
     ApduResponse::ok(&us.to_be_bytes())
+}
+
+/// See `P1_SELFTEST_MAC2`.
+#[cfg(all(target_arch = "arm", feature = "rsa"))]
+fn selftest_mac2() -> ApduResponse {
+    use crate::crypto::bignum::{mac2_m33, mac2_portable};
+    let mut x = 0x2545_F491u32;
+    let mut next = || {
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        x
+    };
+    let mut a = [0u32; 130];
+    let mut t1 = [0u32; 130];
+    let mut t2 = [0u32; 130];
+    for round in 0..4u32 {
+        for n in 0..=130usize {
+            for i in 0..n {
+                // Round 0: all ones (every carry at its limit).
+                a[i] = if round == 0 { u32::MAX } else { next() };
+                t1[i] = if round == 0 { u32::MAX } else { next() };
+                t2[i] = t1[i];
+            }
+            let (b0, b1, c0, c1, p) = if round == 0 {
+                (u32::MAX, u32::MAX, u32::MAX, u32::MAX, u32::MAX)
+            } else {
+                (next(), next(), next(), next(), next())
+            };
+            let r1 = mac2_m33(&mut t1[..n], &a[..n], b0, b1, (c0, c1), p);
+            let r2 = mac2_portable(&mut t2[..n], &a[..n], b0, b1, (c0, c1), p);
+            if r1 != r2 || t1[..n] != t2[..n] {
+                return ApduResponse {
+                    data: heapless::Vec::from_slice(&[round as u8, n as u8]).unwrap_or_default(),
+                    sw: 0x6F00,
+                };
+            }
+        }
+    }
+    ApduResponse::ok(&[])
 }
