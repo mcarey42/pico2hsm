@@ -1,5 +1,13 @@
 # Local Two-Device Cluster Setup
 
+> **Superseded by [CLUSTER_PLAN_V3.md](CLUSTER_PLAN_V3.md).** This guide
+> describes the 1.x two-device pair synced by the Python daemon.
+> Domains, enrollment against any member, and multi-way sync replace
+> this model. The production daemon will be `pico2hsm-syncd`, in the
+> companion pico2hsm-tool repository; the Python daemon is kept only as a
+> reference and test harness. Daemon and peer-enrollment steps below may not
+> match current firmware. Keys from 1.x do not carry over to 2.0.
+
 This guide walks you through setting up two pico2hsm devices as a synchronised pair on a single Linux host. When complete, both devices will hold identical cryptographic keys, the daemon will automatically sync new keys when the second device is connected, and any PKCS#11 application can use either device interchangeably. If one device fails, the other continues operating with the same keys -- no manual recovery is needed unless both fail simultaneously.
 
 ---

@@ -1,5 +1,18 @@
 # Mirrored Cluster Setup (Two Devices)
 
+> **Superseded by [CLUSTER_PLAN_V3.md](CLUSTER_PLAN_V3.md).** This guide
+> describes the 1.x two-device "mirrored pair".
+> "Mirrored" here means two devices that hold the same keys. It has nothing
+> to do with mirrored (RAID) flash, which pico2hsm does not use.
+> Domains, enrollment against any member, and multi-way sync replace
+> this model. The production daemon will be `pico2hsm-syncd`, in the
+> companion pico2hsm-tool repository; the Python daemon is kept only as a
+> reference and test harness. Daemon and peer-enrollment steps below may not
+> match current firmware. Keys from 1.x do not carry over to 2.0.
+>
+> The manual steps (DKEK share, `sc-hsm-tool --wrap-key` / `--unwrap-key`)
+> use standard SmartCard-HSM formats and still work.
+
 A complete guide for running two pico2hsm devices as an active-active
 mirrored pair. Both devices hold identical keys and can serve any
 cryptographic operation independently.

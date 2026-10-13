@@ -5,6 +5,11 @@
 **Supersedes**: P2K4 format (no backwards compatibility maintained)
 **Upgrade path**: Re-INITIALIZE required after firmware update. All P2K2/P2K3/P2K4 read paths are removed.
 
+> **Note (2026-10-12):** this spec predates [STORAGE_V2.md](STORAGE_V2.md), the
+> 2.0 keystore design. Its references to the WAL assume a write-ahead log the
+> firmware never used; 2.0 removes it. Check STORAGE_V2 before implementing
+> anything here.
+
 ## 1. Overview
 
 P2K5 restructures the on-flash key object format to separate encrypted and
@@ -403,7 +408,7 @@ policy.
 
 **Write**: Each config modification increments `config_version` (u16 LE,
 wrapping at 65535 back to 0) and `generation` (u32 BE in the sector header).
-The sector is erased and rewritten atomically via the WAL.
+The sector is erased and rewritten atomically via the WAL (never implemented; see the note at the top).
 
 **INITIALIZE**: Erases the config block along with all key material. A fresh
 config block with all flags cleared is written. This requires SO-PIN

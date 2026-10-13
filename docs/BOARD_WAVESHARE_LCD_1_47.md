@@ -8,7 +8,8 @@
 ## Board overview
 
 The Waveshare RP2350-LCD-1.47-B is a compact RP2350A development board with an
-integrated 1.47" colour LCD and a single WS2812B RGB LED.
+integrated 1.47" colour LCD and a single WS2812B RGB LED.  pico2hsm uses it
+as sold, with no added hardware.
 
 | Parameter       | Value                                            |
 |-----------------|--------------------------------------------------|
@@ -18,6 +19,7 @@ integrated 1.47" colour LCD and a single WS2812B RGB LED.
 | Display         | 1.47" ST7789V3 IPS, 172 × 320 pixels, RGB444     |
 | RGB LED         | Single WS2812B RGB LED                           |
 | SD card         | MicroSD slot (SPI1)                              |
+| Keystore        | Internal flash (`_16m`) or the SD card (`_sdcard`) |
 | USB             | USB 1.1 full-speed (USB-C connector)             |
 | Power           | 3.3 V from USB via onboard regulator             |
 
@@ -143,7 +145,7 @@ and SAS screens: see `DISPLAY_LAYOUT.md`.  The palette is RGB444
 | Busy          | Blue     | 0x001F | Command processing |
 | Error         | Red      | 0xF800 | Unrecoverable error|
 | Degraded      | Yellow   | 0xFFE0 | Storage degraded   |
-| Resyncing     | Cyan     | 0x07FF | RAID resync        |
+| Resyncing     | Cyan     | 0x07FF | Not set by the firmware (left from the dropped RAID design) |
 | WaitingForPin | Bright blue | 0x031F | PIN entry required |
 
 ---
@@ -234,24 +236,25 @@ let mut led_writer = PioWs2812Writer::new(ws2812);
 Source: Waveshare MicroPython example `MicroPython/02-SD/boot.py`
 (`machine.SPI(1, sck=Pin(10), mosi=Pin(11), miso=Pin(12))`).
 
-### Integration with `embedded-sdmmc`
+### Keystore on the SD card (`waveshare_rp2350_lcd_sdcard`)
 
-The `embedded-sdmmc` crate (v0.9, already in `Cargo.toml`) provides `SdCard`
-and `VolumeManager` for FAT32 access.
+In the SD-card build the card is the keystore.  `init_sd_keystore()` in
+`main.rs` sets up SPI1 at 400 kHz for card identification and leaves it
+there.  `SdCardFlash` (`firmware/src/storage/sdcard.rs`) uses the
+`embedded-sdmmc` block driver only: raw 512-byte block I/O, no FAT
+filesystem.  The PIN/PUK retry-counter log stays on internal flash.
 
-```rust
-use embedded_sdmmc::{SdCard, VolumeManager};
-use embassy_rp::gpio::{Level, Output};
+In the `waveshare_rp2350_lcd_16m` build, SPI1 is set up at 40 MHz but the
+slot is not used; the keystore is on internal flash (2 MB at offset
+0x200000).
 
-let cs = Output::new(p.PIN_15, Level::High);
-let sdcard = SdCard::new(board.spi1(), cs, embassy_time::Delay);
-let mut volume_mgr = VolumeManager::new(sdcard, FakeTimesource);
-```
-
-SPI1 is already constructed at 40 MHz in `run_waveshare_lcd_board()`.  SD
-cards accept up to 25 MHz in SPI mode; 40 MHz may work but 25 MHz is safer
-for long traces or non-SDHC cards.  Reduce `SPI_FREQ_HZ` for SPI1 or use a
-separate SPI1 config if needed.
+**Why an SD-card build?**  An SD-card board can be enrolled in a domain and
+shipped to a remote party with the card sent separately.  The card alone is
+useless: its objects are encrypted under keys derived from the device's
+OTP-based storage master key.  The device alone holds no user keys.  When
+the card goes back in, the device checks it and resumes domain sync.  The
+card checks (store ID, MACs, rollback anchor on internal flash) are planned
+for 2.0; see `docs/STORAGE_V2.md` §8 and §11 and `docs/CLUSTER_PLAN_V3.md`.
 
 ---
 
@@ -259,7 +262,8 @@ separate SPI1 config if needed.
 
 | Feature flag                  | Effect                                          |
 |-------------------------------|-------------------------------------------------|
-| `waveshare_rp2350_lcd_16m`    | Enables `WaveshareRp2350LcdBoard` and the `Board` trait impl |
+| `waveshare_rp2350_lcd_16m`    | Enables `WaveshareRp2350LcdBoard` and the `Board` trait impl; keystore on internal flash |
+| `waveshare_rp2350_lcd_sdcard` | Same board; keystore on the SD card (SPI1, CS=GPIO15) |
 
 The feature flag activates:
 - `impl Board for WaveshareRp2350LcdBoard` in `waveshare_rp2350_lcd.rs`

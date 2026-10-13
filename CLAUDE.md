@@ -135,6 +135,11 @@ dominates.  The display boards no longer hold a framebuffer (48 KB Geek,
 which freed ~45 KB on the Geek and ~76 KB on the Waveshare boards (Waveshare
 LCD 16MB: ~39 KB → ~115 KB free SRAM).
 
+**Storage hardware:** off-the-shelf boards only. The keystore is internal QMI
+flash, or the microSD card on the two `_sdcard` builds. No external SPI flash,
+no RAID: `storage/raid.rs`, `wal.rs` and multi-chip support are dead code,
+removed in 2.0 (`docs/STORAGE_V2.md` §12).
+
 **Storage namespace — implemented:**
 
 All three applets share one flash keystore.  Ownership is encoded in the `KeyId` u32
@@ -172,6 +177,8 @@ The `docs/` directory contains generated reference documents:
 | `BOARD_WAVESHARE_LCD_1_47.md` | ST7789V3 + WS2812B, SD card topology |
 | `SD_CARD_WIRING.md` | Per-board SD card wiring tables, embedded-sdmmc integration notes |
 | `BUILD_CONFIGURATIONS.md` | All feature flag combinations with exact cargo commands, flash/RAM budget |
+| `STORAGE_V2.md` | 2.0 journaled keystore design (breaking, no 1.x migration); removal of the unused RAID-1/WAL/multi-chip code |
+| `CLUSTER_PLAN_V3.md` | Domains, enrollment, sync records, tombstones; `pico2hsm-syncd` daemon design |
 
 ## Board peripheral implementation
 

@@ -233,7 +233,9 @@ Row  0x140       : Boot flags (raw 24-bit word)
 > key: re-provisioning is impossible (OTP is permanent), so retire it.
 
 **Unprovisioned devices:** with blank IKM rows the derived storage key is a
-fixed, public value. Debug builds (and release builds with the
+fixed, public value: **nothing stored on such a board is protected**.  Anyone
+with the board's flash or SD card can read every key, the DKEK and any domain
+key.  Use unprovisioned boards for development only. Debug builds (and release builds with the
 `insecure-dev-keystore` feature) accept this for development and log a
 warning at boot; release builds disable the keystore entirely until the IKM
 is written, so INITIALIZE and key generation fail rather than store keys
@@ -270,6 +272,14 @@ xxd -p -c 64 device-001-ikm.bin
 ```
 
 ### Step 2: Write IKM to OTP
+
+> **Warning: provisioning loses every key already on the board.** The
+> storage key is derived from the IKM, so once the IKM is written, the
+> keystore written before (under the public development key) can no
+> longer be opened. Export anything you need first (DKEK-wrapped key
+> export, or keep the keys on a domain peer), then re-INITIALIZE after
+> provisioning and import it again. OTP writes are permanent; this step
+> cannot be undone.
 
 The IKM must be written to OTP rows 0x100–0x11F as ECC-protected words.
 This can be done via:

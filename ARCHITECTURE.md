@@ -22,17 +22,11 @@ This document describes all significant design decisions for the pico2hsm projec
 0x10200000  KEYSTORE (14MB) — pico2hsm keystore sectors
 ```
 
-SDCard storage extends the keystore beyond the internal flash address space. The RAID manager treats SDCard FlashChip instances identically to SPI flash instances; no additional linker regions are required.
+The linker reserves 14MB, but the 1.x keystore uses only the first 2MB of it (`docs/STORAGE_V2.md` F3).
 
-### RP2354 (Embedded Flash)
+On the SD-card builds (`rp2350_geek_sdcard`, `waveshare_rp2350_lcd_sdcard`) the keystore is the microSD card in the board's built-in slot (`SdCardFlash`). The PIN/PUK retry-counter log (16KB at 0x101FC000) stays on internal flash on every board.
 
-```
-0x10000000  BOOT2    (256 bytes)
-0x10000100  FLASH    (2MB - 256 bytes) — firmware
-(no KEYSTORE region — external SPI flash only)
-```
-
-The RP2354's embedded flash is used only for firmware. All keystore data is stored on external SPI flash chips attached to SPI0/SPI1.
+There is no RP2354 build and no external-flash board. pico2hsm targets off-the-shelf boards only (see `README.md`, Supported Boards).
 
 ### Firmware Size Hard Limit
 
@@ -56,122 +50,29 @@ The storage system is layered. Each layer has one responsibility:
 │  Integrity Verification  (integrity.rs)                  │
 │  — CRC32 of header + ciphertext (fast, checked on read)  │
 │  — BLAKE2s-256 of plaintext (checked after decrypt)      │
-│  — seq_no monotonicity check (rollback protection)       │
-├──────────────────────────────────────────────────────────┤
-│  Write-Ahead Log  (wal.rs)                               │
-│  — WAL sectors 1 and 2 per chip                          │
-│  — Atomic write: WAL write → commit → data write → clear │
-│  — Boot-time replay of committed-but-unapplied entries   │
-├──────────────────────────────────────────────────────────┤
-│  RAID-1 Mirror Layer  (raid.rs)                          │
-│  — Reads: primary-first, mirror fallback on failure      │
-│  — Writes: both members, WAL must be committed first     │
-│  — Bad sector tracking, chip health state machine        │
+│  — seq_no is written, but not yet compared on read       │
 ├──────────────────────────────────────────────────────────┤
 │  FlashChip Trait  (flash_chip.rs, sdcard.rs)             │
-│  — SpiFlash: SPI0/SPI1 external flash chips              │
 │  — QmiFlash: RP2350 built-in QMI flash (firmware chip)   │
-│  — SdCardFlash: SDCard via embedded-sdmmc                │
+│  — SdCardFlash: SDCard via embedded-sdmmc (raw blocks)   │
 └──────────────────────────────────────────────────────────┘
 ```
 
----
+Each build uses exactly one chip: `QmiFlash`, or `SdCardFlash` on the SD-card builds.
 
-## 3. Multi-Chip SPI Topology
-
-### QMI (Quad SPI Memory Interface) — CS0 only
-
-The RP2350 QMI interface provides XIP (execute-in-place) for CS0. pico2hsm uses CS0 exclusively for firmware execution. The firmware binary is in the first 2MB; the keystore occupies the remaining flash of the same chip (addressed via memory-mapped reads or explicit SPI commands after exiting XIP).
-
-CS1 on QMI is not used (reserved for future use).
-
-### SPI0 and SPI1 — Keystore Flash
-
-Two independent SPI buses (SPI0, SPI1) each support up to 4 flash chips using software GPIO chip-select lines:
-
-```
-SPI0: CLK=GPIO2, MOSI=GPIO3, MISO=GPIO4
-  CS0: GPIO5   (chip 0)
-  CS1: GPIO6   (chip 1)
-  CS2: GPIO7   (chip 2)
-  CS3: GPIO8   (chip 3)
-
-SPI1: CLK=GPIO10, MOSI=GPIO11, MISO=GPIO12
-  CS0: GPIO13  (chip 4 — mirrors chip 0)
-  CS1: GPIO14  (chip 5 — mirrors chip 1)
-  CS2: GPIO15  (chip 6 — mirrors chip 2)
-  CS3: GPIO9   (chip 7 — mirrors chip 3)
-```
-
-GPIO pin assignments are board-specific and finalized in the board module.
+The tree still contains a write-ahead log (`wal.rs`), a RAID-1 mirror layer (`raid.rs`), `SpiFlash` for external SPI flash chips, `HybridKeyStore` and multi-chip support. None of it is used: no supported board has external flash chips, and the WAL is never replayed. That code is removed in 2.0, which replaces the 1.x keystore with a journaled store (`docs/STORAGE_V2.md`, §12 for the removal list). Do not build on it.
 
 ---
 
-## 4. 3-Byte vs 4-Byte Address Auto-Detection
+## 3. Storage Hardware
 
-Flash chips up to 128 Mbit (16 MB) use 3-byte addressing (24-bit addresses, opcodes 0x03/0x02/0x20). Larger chips require 4-byte addressing (32-bit addresses, opcodes 0x13/0x12/0x21).
+The keystore lives on the board's own QSPI flash chip (through the RP2350 QMI), or on the microSD card in the SD-card builds. pico2hsm adds no hardware: no external SPI flash chips, no mirrored flash, no custom board. SC-HSM key references are one byte (SmartCard-HSM / OpenSC compatibility), which bounds what one device can usefully hold, so more flash buys nothing.
 
-The `SpiFlash` implementation detects the addressing mode at init time via the JEDEC ID:
-- If capacity > 16MB → switch to 4-byte mode (send EN4B command 0xB7)
-- Record in `SpiFlash::addr_mode` field
-- All subsequent read/write/erase commands use the appropriate opcode
+Redundancy comes from other devices instead: members of a domain hold the same keys and keep them in sync (`docs/CLUSTER_PLAN_V3.md`).
 
-No manual configuration is required; the firmware auto-detects and adapts.
+The SD-card builds exist for one use case: enroll the board in a domain, then ship it with the card sent separately. The card alone is useless (objects are encrypted under keys derived from the device's OTP-based storage master key); the device alone holds no user keys. Verifying the card on reinsertion (store ID, MACs, rollback anchor on internal flash) is planned for 2.0 (`docs/STORAGE_V2.md` §8, §11).
 
----
-
-## 5. RAID-1 Bilateral Symmetry
-
-Mirror pairs are always SPI0/n ↔ SPI1/n (same CS index, different bus):
-
-```
-Pair 0: SPI0/CS0 (chip 0) ↔ SPI1/CS0 (chip 4)
-Pair 1: SPI0/CS1 (chip 1) ↔ SPI1/CS1 (chip 5)
-Pair 2: SPI0/CS2 (chip 2) ↔ SPI1/CS2 (chip 6)
-Pair 3: SPI0/CS3 (chip 3) ↔ SPI1/CS3 (chip 7)
-```
-
-This bilateral symmetry means that a failure of an entire SPI bus (broken trace, failed SPI controller) loses only one side of each mirror pair — all data remains accessible from the other bus.
-
-All writes are mirrored: the WAL is written to both chips in a pair before the commit record is written. If the primary write fails, the firmware degrades the pair and continues with mirror-only operation.
-
----
-
-## 6. Bad Chip Detection, Replacement Workflow, Resync
-
-### Detection
-
-Bad sectors are detected when:
-- A flash read returns unexpected data (SPI error or bit flip)
-- A CRC32 integrity check fails on a sector header
-- An erase or write operation fails (flash returns error status)
-
-When a sector fails, `mark_bad_sector()` is called, recording the sector in the chip's directory sector bad-block table. After N bad sectors (configurable, default 8), the chip is marked `Degraded`.
-
-If `jedec_id()` returns `None`, the chip is immediately marked `Dead` (physically unresponsive).
-
-### Replacement Workflow
-
-1. Operator removes the dead chip and inserts a new blank chip
-2. On the next JEDEC probe, the new chip responds but its directory sector does not contain `SECTOR_MAGIC` → state becomes `Blank`
-3. Firmware reports this via `chip_state()` (visible to hsm-tool)
-4. StorageManager initiates resync for the affected pair
-
-### Resync Procedure
-
-Resync copies all sectors from the healthy pair member to the recovering member:
-
-1. Set pair state to `Resyncing { progress_sector: 0 }`
-2. For each sector from `DATA_START_SECTOR` to `capacity / SECTOR_SIZE`:
-   a. Read sector from healthy member (with integrity check)
-   b. Erase corresponding sector on recovering member
-   c. Write sector to recovering member
-   d. Verify write succeeded (read-back CRC32 check)
-   e. Increment `progress_sector`
-3. Copy directory sector and WAL sectors last
-4. Set pair state to `InSync`
-
-Resync is interruptible: `progress_sector` is persisted in the directory sector of the healthy member. After a power cycle, resync resumes from the last recorded `progress_sector`.
+Sections 4–6 of earlier versions of this document (SPI flash address modes, RAID-1 pairs, chip replacement and resync) described the unused multi-chip design and have been removed.
 
 ---
 

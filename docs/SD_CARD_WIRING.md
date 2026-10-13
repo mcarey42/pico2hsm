@@ -1,13 +1,24 @@
 # SD Card Wiring Guide
 
-This document covers how to wire SPI-mode SD card modules to each supported
-board variant and which feature flag to enable for each configuration.
+This document covers the SD card wiring of the supported boards and which
+feature flag to enable for each configuration.
+
+Two off-the-shelf boards have a built-in microSD slot: the Waveshare
+RP2350-Geek and the Waveshare RP2350-LCD-1.47-B.  pico2hsm uses that slot
+only, with one card per device.  No external module or added wiring is
+needed or supported.
+
+The SD-card builds exist for one use case: enroll the board in a domain,
+then ship it with the card sent separately.  The card alone is useless (its
+objects are encrypted under keys derived from the device's OTP-based storage
+master key); the device alone holds no user keys.  Verifying the card on
+reinsertion is planned for 2.0 (`docs/STORAGE_V2.md` §8, §11).
 
 ---
 
 ## SD Card Module Specifications
 
-A standard SPI SD card breakout module exposes six signals:
+For reference, an SPI-mode SD card uses six signals:
 
 | Module pin | Signal  | Description                        |
 |------------|---------|------------------------------------|
@@ -53,7 +64,7 @@ controller, so we use SPI mode with SCK/MOSI/MISO/CS only.
 | Feature flag              | Description                              |
 |---------------------------|------------------------------------------|
 | `rp2350_geek_16m`         | No SD card — flash keystore only         |
-| `rp2350_geek_sdcard`      | Built-in SD slot (GPIO5 CS)              |
+| `rp2350_geek_sdcard`      | Built-in SD slot as keystore (GPIO23 CS) |
 
 ### Build commands
 
@@ -70,7 +81,7 @@ cargo build --release --no-default-features --features rp2350_geek_sdcard
 ## Waveshare RP2350-LCD-1.47-B — SD Card Wiring
 
 The RP2350-LCD-1.47-B has a **built-in microSD slot** on SPI1. The LCD uses
-SPI0. A second external SD card can be added using an unused SPI1 CS pin.
+SPI0. A second card is not supported.
 
 ### Built-in SD card (SPI1)
 
@@ -102,7 +113,11 @@ cargo build --release --no-default-features --features waveshare_rp2350_lcd_sdca
 
 ## embedded-sdmmc Integration Notes
 
-`embedded-sdmmc` 0.9 is already a dependency in `firmware/Cargo.toml`. The
+`embedded-sdmmc` 0.9 is already a dependency in `firmware/Cargo.toml`.
+pico2hsm uses only its block driver: `SdCardFlash`
+(`firmware/src/storage/sdcard.rs`) reads and writes raw 512-byte blocks and
+never mounts a FAT volume.  The `VolumeManager` lines below show the crate's
+general API, not what the firmware does.  The
 `SdCard` type is constructed by providing a SPI device (bus + CS) and a delay
 source:
 

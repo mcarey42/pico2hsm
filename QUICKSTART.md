@@ -332,11 +332,14 @@ Follow [docs/SINGLE_DEVICE_SETUP.md](docs/SINGLE_DEVICE_SETUP.md) to
 initialize the device with DKEK key backup, generate production keys, and
 configure key recovery.
 
-### Set up a mirrored pair for redundancy
+### Run two devices with the same keys
 
-Follow [docs/SETUP_LOCAL_CLUSTER.md](docs/SETUP_LOCAL_CLUSTER.md) to
-run two pico2hsm devices with identical keys — if one device fails, the other
-has everything.
+Redundancy comes from a second device, not from extra flash on one board.
+[docs/SETUP_LOCAL_CLUSTER.md](docs/SETUP_LOCAL_CLUSTER.md) shows the 1.x way
+to run two pico2hsm devices with identical keys, so that if one fails the
+other has everything. That guide is superseded by domains and multi-way sync
+([docs/CLUSTER_PLAN_V3.md](docs/CLUSTER_PLAN_V3.md)); its daemon steps will
+change.
 
 ### Connect with an application
 
