@@ -228,6 +228,51 @@ pub fn object_header(
     h
 }
 
+/// Why a format is allowed (§8.3: nothing else formats).  The engine
+/// checks [`FormatAuth::first_boot`] itself (blank ring, no anchor); the
+/// other two record the caller's decision at every call site.
+pub struct FormatAuth(FormatWhy);
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FormatWhy {
+    FirstBoot,
+    Resume,
+    Command,
+}
+
+impl FormatAuth {
+    /// First boot: refused by [`Store::format`] unless the journal ring is
+    /// blank and the counter log holds no anchor.
+    pub fn first_boot() -> Self {
+        FormatAuth(FormatWhy::FirstBoot)
+    }
+    /// Resume an interrupted format: the binding block is in FORMATTING
+    /// (same store_id, §8.3).
+    pub fn resume_formatting(binding_is_formatting: bool) -> Option<Self> {
+        binding_is_formatting.then_some(FormatAuth(FormatWhy::Resume))
+    }
+    /// FORMAT STORE: the SO-PIN was verified, or the store is refused and
+    /// has no verifiable binding (R9).
+    pub fn format_store(authorized: bool) -> Option<Self> {
+        authorized.then_some(FormatAuth(FormatWhy::Command))
+    }
+    /// Whether this is the first-boot authorisation.
+    pub fn is_first_boot(&self) -> bool {
+        self.0 == FormatWhy::FirstBoot
+    }
+}
+
+/// Proof that the SO-PIN was verified, for OPEN DEGRADED (§9.3): without
+/// the gate, corrupting one record could bring a deleted key back.
+pub struct DegradedAuth(());
+
+impl DegradedAuth {
+    /// After a successful SO-PIN verification.
+    pub fn so_pin_verified(verified: bool) -> Option<Self> {
+        verified.then_some(DegradedAuth(()))
+    }
+}
+
 /// What the binding block says about the store (STORAGE_V2 §8.1).
 pub struct MountInfo {
     pub store_id: [u8; 16],
@@ -764,7 +809,17 @@ impl<F: StoreFlash> Store<F> {
     /// anchor `(format_gen, 0, slot 0)`.  The caller has put the binding in
     /// FORMATTING before and moves it to ACTIVE after; both steps are
     /// idempotent, so a cut anywhere is resumed by calling this again.
-    pub fn format(&mut self, info: MountInfo, env: &mut dyn Env) -> Result<(), StorageError> {
+    pub fn format(
+        &mut self,
+        info: MountInfo,
+        env: &mut dyn Env,
+        auth: FormatAuth,
+    ) -> Result<(), StorageError> {
+        if auth.0 == FormatWhy::FirstBoot && (!self.ring_blank()? || env.anchor()?.is_some()) {
+            // Not a first boot: a store (or its anchor) exists.  Never
+            // format it implicitly.
+            return Err(StorageError::IntegrityFailure);
+        }
         self.m = None;
         for pos in 0..self.geo.ring {
             self.flash.get_mut().erase_sector(pos)?;
@@ -794,11 +849,26 @@ impl<F: StoreFlash> Store<F> {
 
     // ── Mount ───────────────────────────────────────────────────────────
 
-    /// Mount the store (§9.1 steps 3–6): ring headers, newest checkpoint and
-    /// its snapshot, the contiguous tail, torn-tail repair, the anchor.
-    /// Read-write unless `read_only` (OPEN DEGRADED, which also accepts a
-    /// head behind the anchor and stops at the first damaged record).
-    pub fn mount(
+    /// Mount the store read-write (§9.1 steps 3–6): ring headers, newest
+    /// checkpoint and its snapshot, the contiguous tail, torn-tail repair,
+    /// the anchor.
+    pub fn mount(&mut self, info: MountInfo, env: &mut dyn Env) -> Result<(), Refusal> {
+        self.mount_inner(info, env, false)
+    }
+
+    /// OPEN DEGRADED (§9.3): mount read-only, accepting a head behind the
+    /// anchor and stopping at the first damaged record (the longest
+    /// verifiable state).  Needs the SO-PIN.
+    pub fn mount_degraded(
+        &mut self,
+        info: MountInfo,
+        env: &mut dyn Env,
+        _auth: DegradedAuth,
+    ) -> Result<(), Refusal> {
+        self.mount_inner(info, env, true)
+    }
+
+    fn mount_inner(
         &mut self,
         info: MountInfo,
         env: &mut dyn Env,

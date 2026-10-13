@@ -312,6 +312,55 @@ pub struct SdCardSignature {
 const SD_SIG_MAGIC: [u8; 9] = *b"P2HSDCARD";
 const SD_SIG_VERSION: u8 = 0x01;
 
+// ─── Storage V2: the card as a `StoreFlash` ──────────────────────────────────
+
+impl<SPI, DELAY> super::store_v2::StoreFlash for SdCardFlash<SPI, DELAY>
+where
+    SPI: embedded_hal::spi::SpiDevice<u8>,
+    DELAY: embedded_hal::delay::DelayNs,
+{
+    fn media(&self) -> super::store_v2::Media {
+        super::store_v2::Media::Sd
+    }
+
+    fn sectors(&self) -> u32 {
+        (self.capacity_bytes / u64::from(super::store_v2::SECTOR)) as u32
+    }
+
+    fn read(&mut self, offset: u32, buf: &mut [u8]) -> Result<(), StorageError> {
+        FlashChip::read(self, offset, buf)
+    }
+
+    /// Whole 512-byte blocks, written as they are: no read-modify-write
+    /// (STORAGE_V2 §6.4).  `write` returns once the card has accepted the
+    /// block and left busy.
+    fn program(&mut self, offset: u32, data: &[u8]) -> Result<(), StorageError> {
+        if offset % SD_SECTOR_BYTES != 0 || data.len() % SD_SECTOR_BYTES as usize != 0 {
+            return Err(StorageError::WriteError);
+        }
+        let first = (offset + SD_BYTE_OFFSET) / SD_SECTOR_BYTES;
+        for (i, chunk) in data.chunks(SD_SECTOR_BYTES as usize).enumerate() {
+            crate::watchdog::progress();
+            let mut block = Block::new();
+            block.contents.copy_from_slice(chunk);
+            if self
+                .card
+                .write(core::slice::from_ref(&block), BlockIdx(first + i as u32))
+                .is_err()
+            {
+                crate::display_snapshot::note_sd_io(false);
+                return Err(StorageError::WriteError);
+            }
+        }
+        crate::display_snapshot::note_sd_io(true);
+        Ok(())
+    }
+
+    fn erase_sector(&mut self, sector: u32) -> Result<(), StorageError> {
+        FlashChip::erase_sector(self, sector * super::store_v2::SECTOR)
+    }
+}
+
 /// Compute device fingerprint: SHA-256 of the 8-byte flash chip unique ID.
 /// This is stable, hardware-unique, and works before OTP provisioning.
 pub fn compute_device_fingerprint(flash_uid: &[u8; 8]) -> [u8; 32] {

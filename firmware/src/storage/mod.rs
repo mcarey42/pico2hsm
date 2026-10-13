@@ -40,6 +40,7 @@
 pub mod binding;
 pub mod flash_layout;
 pub mod keystore;
+pub mod keystore_v2;
 pub mod retry_counter;
 #[cfg(feature = "rsa")]
 pub mod rsa_pool;

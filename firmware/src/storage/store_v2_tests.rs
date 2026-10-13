@@ -178,14 +178,15 @@ fn fresh(media: Media, sectors: usize) -> (Store<Sim>, Mem) {
     let mut st = Store::new(Sim::new(media, sectors));
     let mut env = Mem::default();
     assert!(st.is_blank().unwrap());
-    st.format(info([0; 3]), &mut env).unwrap();
-    st.mount(info([0; 3]), &mut env, false).unwrap();
+    st.format(info([0; 3]), &mut env, FormatAuth::first_boot())
+        .unwrap();
+    st.mount(info([0; 3]), &mut env).unwrap();
     (st, env)
 }
 
 fn remount(st: &mut Store<Sim>, env: &mut Mem, gen: [u32; 3]) -> Result<Store<Sim>, Refusal> {
     let mut again = Store::new(st.flash_mut().reboot());
-    again.mount(info(gen), env, false).map(|_| again)
+    again.mount(info(gen), env).map(|_| again)
 }
 
 /// The "sealed blob": key ID, seq and a payload tag, so a stale or moved
@@ -388,7 +389,7 @@ fn power_cut_property(media: Media, seed: u64, rounds: usize) {
         let probe_flash = st.flash_mut().reboot();
         let mut probe = Store::new(probe_flash);
         let mut probe_env = env.clone();
-        probe.mount(info([0; 3]), &mut probe_env, false).unwrap();
+        probe.mount(info([0; 3]), &mut probe_env).unwrap();
         let before_units = units(probe.flash_mut());
         let _ = apply(&mut probe, &mut probe_env, op);
         let total = units(probe.flash_mut()) - before_units;
@@ -408,7 +409,7 @@ fn power_cut_property(media: Media, seed: u64, rounds: usize) {
             f.budget = Some(cut);
             let mut s2 = Store::new(f);
             let mut e2 = env.clone();
-            s2.mount(info([0; 3]), &mut e2, false).unwrap();
+            s2.mount(info([0; 3]), &mut e2).unwrap();
             // Re-arm the cut relative to now.
             s2.flash_mut().budget = Some(cut);
             let _ = apply(&mut s2, &mut e2, op);
@@ -472,7 +473,7 @@ fn a_torn_tail_record_is_voided_and_the_store_goes_on() {
         f.budget = Some(cut);
         let mut s2 = Store::new(f);
         let mut e2 = env.clone();
-        s2.mount(info([0; 3]), &mut e2, false).unwrap();
+        s2.mount(info([0; 3]), &mut e2).unwrap();
         s2.flash_mut().budget = Some(cut);
         let _ = put(&mut s2, &mut e2, 2, 2);
         let mut s3 = remount(&mut s2, &mut e2, [0; 3]).unwrap();
@@ -508,12 +509,18 @@ fn an_old_image_is_refused_as_a_rollback() {
         put(&mut st, &mut env, 2, 2).unwrap();
         let mut replay = Store::new(old);
         assert_eq!(
-            replay.mount(info([0; 3]), &mut env, false),
+            replay.mount(info([0; 3]), &mut env),
             Err(Refusal::BehindAnchor(2)),
             "{media:?}"
         );
         // OPEN DEGRADED mounts it read-only.
-        replay.mount(info([0; 3]), &mut env, true).unwrap();
+        replay
+            .mount_degraded(
+                info([0; 3]),
+                &mut env,
+                DegradedAuth::so_pin_verified(true).unwrap(),
+            )
+            .unwrap();
         assert_eq!(get(&replay, 1), Some(1));
         assert!(put(&mut replay, &mut env, 3, 3).is_err());
     }
@@ -536,19 +543,23 @@ fn the_fork_of_r1_is_refused() {
     let mut copy = original.clone();
     let mut probe = Store::new(original.clone());
     probe
-        .mount(info([0; 3]), &mut env_before.clone(), true)
+        .mount_degraded(
+            info([0; 3]),
+            &mut env_before.clone(),
+            DegradedAuth::so_pin_verified(true).unwrap(),
+        )
         .unwrap();
     // Ring sector 0: CHECKPOINT (slot 0), the first mount's VOID (1),
     // PUT 1 (2), R1 = PUT 2 (3); slot i is block i + 1 on SD.
     let off = (3 + 1) * 512;
     copy.mem[off..off + 512].fill(0xFF);
     let mut dev = Store::new(copy);
-    dev.mount(info([0; 3]), &mut env_before, false).unwrap();
+    dev.mount(info([0; 3]), &mut env_before).unwrap();
     st = dev;
     st.delete(&mut env_before, 1).unwrap(); // R2: same seq as R1
     let mut back = Store::new(original);
     assert!(matches!(
-        back.mount(info([0; 3]), &mut env_before, false),
+        back.mount(info([0; 3]), &mut env_before),
         Err(Refusal::BehindAnchor(_))
     ));
 }
@@ -568,14 +579,14 @@ fn a_moved_or_dropped_record_is_refused() {
     swapped.mem[a..a + 32].copy_from_slice(&rb);
     swapped.mem[b..b + 32].copy_from_slice(&ra);
     assert!(matches!(
-        Store::new(swapped).mount(info([0; 3]), &mut env.clone(), false),
+        Store::new(swapped).mount(info([0; 3]), &mut env.clone()),
         Err(Refusal::Corrupt(_))
     ));
     // Drop a record (VOID it): the seqs no longer run on.
     let mut dropped = img.clone();
     dropped.mem[a..a + 32].fill(0);
     assert!(matches!(
-        Store::new(dropped).mount(info([0; 3]), &mut env.clone(), false),
+        Store::new(dropped).mount(info([0; 3]), &mut env.clone()),
         Err(Refusal::Corrupt(_))
     ));
 }
@@ -588,12 +599,12 @@ fn another_store_or_no_anchor_is_refused_and_nothing_is_written() {
     let before = img.mem.clone();
     let mut other = Store::new(img.clone());
     assert_eq!(
-        other.mount(info_for([0x99; 16], 1, [0; 3]), &mut env.clone(), false),
+        other.mount(info_for([0x99; 16], 1, [0; 3]), &mut env.clone()),
         Err(Refusal::WrongStore)
     );
     let mut no_anchor = Store::new(img.clone());
     assert_eq!(
-        no_anchor.mount(info([0; 3]), &mut Mem::default(), false),
+        no_anchor.mount(info([0; 3]), &mut Mem::default()),
         Err(Refusal::NoAnchor)
     );
     assert_eq!(other.flash_mut().mem, before);
@@ -601,7 +612,7 @@ fn another_store_or_no_anchor_is_refused_and_nothing_is_written() {
     // A blank card is blank, not formatted.
     let mut blank = Store::new(Sim::new(Media::Sd, 96));
     assert_eq!(
-        blank.mount(info([0; 3]), &mut env.clone(), false),
+        blank.mount(info([0; 3]), &mut env.clone()),
         Err(Refusal::Blank)
     );
 }
@@ -622,7 +633,7 @@ fn a_tampered_snapshot_or_object_header_is_caught() {
         }
     }
     assert!(matches!(
-        Store::new(bad).mount(info([0; 3]), &mut env.clone(), false),
+        Store::new(bad).mount(info([0; 3]), &mut env.clone()),
         Err(Refusal::Corrupt(_))
     ));
     // An object whose header says another seq: that key fails, not others.
@@ -638,7 +649,7 @@ fn a_tampered_snapshot_or_object_header_is_caught() {
     let key = u32::from_le_bytes(bad.mem[s * SS + 20..s * SS + 24].try_into().unwrap());
     bad.mem[s * SS + 24] ^= 1; // seq
     let mut st2 = Store::new(bad);
-    st2.mount(info([0; 3]), &mut env.clone(), false).unwrap();
+    st2.mount(info([0; 3]), &mut env.clone()).unwrap();
     let mut out = vec![0u8; MAX_OBJECT_BLOB];
     assert_eq!(
         st2.fetch_into(key, &mut out).err(),
@@ -720,4 +731,37 @@ fn keys_are_bound_to_store_group_epoch_and_full_key_id() {
         "epoch"
     );
     let _ = Zeroizing::new(0u8);
+}
+
+#[test]
+fn first_boot_format_refuses_an_existing_store_or_anchor() {
+    let (mut st, mut env) = fresh(Media::Nor, 64);
+    put(&mut st, &mut env, 1, 1).unwrap();
+    let img = st.flash_mut().reboot();
+    // A store exists: no implicit format.
+    let mut again = Store::new(img.clone());
+    assert_eq!(
+        again.format(info([0; 3]), &mut env.clone(), FormatAuth::first_boot()),
+        Err(StorageError::IntegrityFailure)
+    );
+    // The ring erased but the anchor still there: not a first boot either.
+    let mut wiped = Store::new(Sim::new(Media::Nor, 64));
+    assert_eq!(
+        wiped.format(info([0; 3]), &mut env.clone(), FormatAuth::first_boot()),
+        Err(StorageError::IntegrityFailure)
+    );
+    // An explicit, authorised format does it.
+    let mut cmd = Store::new(img);
+    // (A format always bumps format_gen: the anchor of the old store
+    // cannot be reused.)
+    cmd.format(
+        info_for(SID, 2, [0; 3]),
+        &mut env,
+        FormatAuth::format_store(true).unwrap(),
+    )
+    .unwrap();
+    cmd.mount(info_for(SID, 2, [0; 3]), &mut env).unwrap();
+    assert_eq!(state(&cmd), BTreeMap::new());
+    assert!(FormatAuth::format_store(false).is_none());
+    assert!(DegradedAuth::so_pin_verified(false).is_none());
 }

@@ -696,3 +696,35 @@ impl FlashChip for SpiFlashLegacy {
         Err(StorageError::WriteError)
     }
 }
+
+// ─── Storage V2: the QMI keystore region as a `StoreFlash` ───────────────────
+
+impl super::store_v2::StoreFlash for QmiFlash {
+    fn media(&self) -> super::store_v2::Media {
+        super::store_v2::Media::Nor
+    }
+
+    fn sectors(&self) -> u32 {
+        (self.capacity / u64::from(super::store_v2::SECTOR)) as u32
+    }
+
+    fn read(&mut self, offset: u32, buf: &mut [u8]) -> Result<(), StorageError> {
+        FlashChip::read(self, offset, buf)
+    }
+
+    /// NOR program through the bootrom (core0 only), any length; the
+    /// engine verifies what it needs to.
+    fn program(&mut self, offset: u32, data: &[u8]) -> Result<(), StorageError> {
+        crate::watchdog::progress();
+        if offset as u64 + data.len() as u64 > self.capacity {
+            return Err(StorageError::WriteError);
+        }
+        self.flash
+            .blocking_write(QMI_KEYSTORE_OFFSET + offset, data)
+            .map_err(|_| StorageError::WriteError)
+    }
+
+    fn erase_sector(&mut self, sector: u32) -> Result<(), StorageError> {
+        FlashChip::erase_sector(self, sector * super::store_v2::SECTOR)
+    }
+}
