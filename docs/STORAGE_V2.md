@@ -1,18 +1,17 @@
 # Storage V2 — journaled keystore for pico2hsm 2.0
 
-Status: **design, approved in principle by the owner (2026-10-12), revised
-after the security review of the same day**; the revision is to be
-re-reviewed before any code is written.  Ships in the 2.0.0 series.  It is
-a breaking change: 1.x keystores are not migrated (no devices are in use),
+Status: **design approved by the owner (2026-10-12), revised after a
+security review and re-reviewed the same day (§17, §18); owner decisions
+in §16.  Phase 1 in progress.**  Ships in the 2.0.0 series.  It is a
+breaking change: 1.x keystores are not migrated (no devices are in use),
 and 2.0 firmware refuses a 1.x keystore with a clear error.
 
-**Review (2026-10-12).**  A security review of the first draft found 3
-critical, 6 high, 5 medium and several low issues: a torn journal tail
-that bricks the store, SD block rewrites that lose committed records,
-auto-format orphaning the real store, droppable records, substitutable
-snapshots, ring exhaustion, no recovery path, an anchor that did not fit
-its slot.  This revision resolves each one; §17 maps every finding to its
-fix.  Two decisions need the owner (§16).
+**Reviews (2026-10-12).**  The first review of the draft found 3
+critical, 6 high, 5 medium and several low issues; §17 maps each to its
+fix.  A second review of the revision found 3 high and 7 medium/low
+issues in the fixes themselves (an anchor fork, ACCEPT STORE, runtime
+write failures, the torn-tail VOID at a sector boundary, …); §18 resolves
+them and wins where it disagrees with the text.
 
 ## 1. Why
 
@@ -71,7 +70,7 @@ listed here so the store's place is fixed.
 |---|---|---|
 | Partition table | bootrom block | bootrom block |
 | Firmware | slot A, 1.5 MB | slots A and B, 1.5 MB each |
-| Binding block | 8 KB (2 sectors, A/B) | 8 KB |
+| Binding block | 32 KB (ring of 8 sectors, R8) | 32 KB |
 | Counter log | 64 KB (16 sectors) | 64 KB |
 | RSA key pool | 48 KB | 48 KB |
 | Keystore (QMI boards) | rest, ~2.4 MB | rest, ~12.9 MB |
@@ -88,6 +87,14 @@ listed here so the store's place is fixed.
 - Exact offsets go in `storage/flash_layout.rs` with the existing
   compile-time checks; the linker scripts end the firmware slot where the
   constants say.
+- **Interim placement (phases 1–5, until the partition table of phase
+  6):** the new regions come out of the top of the firmware region, not
+  the keystore (the 1.x filesystem allocates anywhere above 0x200000):
+  firmware 0x000000–0x1D8000 (1.84 MB; the debug image is ~1.3 MB),
+  binding ring 0x1D8000–0x1E0000, counter log v2 0x1E0000–0x1F0000, RSA
+  pool 0x1F0000–0x1FC000 (unchanged, pooled keys survive), the v1 counter
+  log 0x1FC000–0x200000 (migrated once, then erased and left spare),
+  keystore 0x200000+.
 
 ## 4. Keys
 
@@ -366,7 +373,9 @@ away.
 
 ### 8.1 Binding block (internal flash)
 
-Two sectors, A/B.  Content:
+A ring of 8 sectors (R8; was A/B): each write goes to the sector after
+the current one, with `gen + 1`; at boot the valid copy with the highest
+`gen` wins and every other sector is erased.  Content:
 
 ```
 "P2B2" | gen u32 | state (FORMATTING | ACTIVE) | store_id(16) |
@@ -375,10 +384,12 @@ epoch generation per group (3 × u32) | SO-PIN salt(16) |
 SO-PIN verifier(32) | HMAC(K_bind)(32)
 ```
 
-- Written to the sector not holding the current copy, with a higher
-  `gen`; **then the old sector is erased** (that erase is what destroys a
-  replaced epoch).  At boot the valid copy with the highest `gen` wins and
-  any other valid copy is erased.
+- Written to the next ring sector with a higher `gen`; **then the old
+  sector is erased** (that erase is what destroys a replaced epoch).  At
+  boot the valid copy with the highest `gen` wins and any other sector is
+  erased.  Two valid copies with the same `gen`: identical bytes → keep
+  one; different → fail closed.  `gen` at its maximum → refuse further
+  writes (R14).
 - **The SO-PIN verifier lives here**, not in the keystore:
   `HMAC(K_bind, salt ‖ SO-PIN)`, retries spent in the counter log as
   today.  The SO-PIN therefore works when the store is missing or
@@ -392,10 +403,18 @@ SO-PIN verifier(32) | HMAC(K_bind)(32)
 
 ### 8.2 Anchor (counter log, fixes H6)
 
-The per-commit anchor is a counter-log record on internal flash, kind
-`'A'`: `format_gen` (u24, from the binding block) and `head_seq` (u64,
-the seq of the newest committed journal record).  It fits the existing
-16-byte slot (12 payload bytes).
+The per-commit anchor is a counter-log record on internal flash (R1, R6):
+
+```
+[0] 'A' | [1] id = 0 | [2..4] format_gen u16 (low half of the binding's)
+| [4..10] head_seq u48 | [10..12] head slot u16 (ring position × slots
+per sector + slot) | [12..16] CRC (as every counter-log record)
+```
+
+- `head slot` binds the anchor to *where* the head record is, not only to
+  its seq: at mount the head must be exactly there, or be `head_seq + 1`
+  at a later slot with only VOIDs between (R1).  A u48 seq lasts ~89 000
+  years at 100 commits a second.
 
 - Updated after every commit (journal first, then anchor).
 - **One commit in flight.**  If the anchor write fails after the record
@@ -711,3 +730,53 @@ domain key imported into one is exposed to anyone with its flash or card.
 | M4 | Boot scans every SD sector | Bitmap from the index; blank-check at allocation (§7) |
 | M5 | Snapshot arithmetic; merge RAM | 168 entries/sector; 1 KB static merge table, threshold 128 (§7) |
 | L | Counter-log budget, bitmap and capacity numbers; dev-board SMK; constant-time MAC; metadata cross-check; cleartext metadata | Fixed in §10, §7; OD-2; §4; §5; §5 |
+
+## 18. Re-review findings and resolutions (2026-10-12, second pass)
+
+The revision above was re-reviewed before any code was written.  The §17
+fixes hold; these are the new or remaining issues and what the design
+does about them.  Where this section and the text above disagree, this
+section wins.
+
+| ID | Severity | Finding | Resolution |
+|---|---|---|---|
+| R1 | High | The anchor proves a seq count, not which record holds it: an SD attacker cuts after a record, VOIDs its slot on a copy, lets the device commit a different record with the same seq, then restores the original card (fork; a DELETE undone). | The anchor carries the head's ring slot (§8.2); the head must be at that slot, or anchor + 1 later with only VOIDs between. |
+| R2 | High | ACCEPT STORE had no mechanism; lowering the anchor and appending reuses seqs under the same K_idx and K_obj, so lost records or an old object version could be replayed. | ACCEPT STORE is a **re-index**: the binding goes to a new `E_store` and `format_gen + 1` (same `store_id`, same group epochs, state REINDEXING, resumable like FORMATTING); a fresh ring with a CHECKPOINT of the accepted index; new seqs start above max(old anchor, head) + 1.  Invariant: a seq is never reused under one (`store_id`, `E_group`). |
+| R3 | High | A program or verify failure at run time (not a cut) left a slot that is neither blank, VOID nor valid before later records — corruption by §6.1; SD CMD13 errors are ambiguous. | On failure: VOID the slot and verify it, retry the same seq in the next slot.  If the VOID fails: stop all commits, drop RAM state, remount.  These VOIDs count against the 4-slot reserve. |
+| R4 | Medium-high | The mount VOID could land in the first slot of the *next* ring sector, which may still hold live records when checkpoints lag. | The mount VOID goes only into the current head sector; a full head sector has nothing to tear (a cut in a recycle is §6.3). |
+| R5 | Medium | "At most one invalid header" contradicts a freshly formatted ring (only sector 0 has a header). | Blank and invalid are distinct: blank headers are allowed after the head while the ring is in its first lap (head `ring_seq < n`).  The head sector is the valid header with the highest `ring_seq`, `ring_seq mod n` = position. |
+| R6 | Medium | The anchor's u24 + u64 left no id byte, against the v2 carry-over key (tag, id). | Anchor layout of §8.2: id byte 0, u16 `format_gen`, u48 `head_seq`, u16 head slot. |
+| R7 | Medium | A pending epoch rotation could be lost (a checkpoint moves the WIPE_OWNER out of the tail) or bypassed (a PUT under the old epoch after a failed binding write). | No commit of any kind while a WIPE_OWNER's generation is above the binding's; snapshots carry the three group generations, checked against the binding at mount. |
+| R8 | Medium | Binding-block wear is host-drivable: a PIV or OpenPGP reset needs only blocked PINs, and each reset writes the binding; 2 sectors last ~200 000 writes. | Ring of 8 sectors (§8.1; 32 KB); 800 000 writes. |
+| R9 | Medium | FORMAT STORE "without a PIN if none was ever set" is a remote wipe of a PIV/OpenPGP-only device. | The PIN-less form only while the store is refused or the binding is absent or fails its HMAC (e.g. after OTP provisioning changed the SMK, OD-2).  A format carries the SO-PIN verifier forward when the binding verified. |
+| R10 | Medium | INITIALIZE (WIPE_OWNER → binding → PIN record) cut after the binding leaves a new SO-PIN and no user PIN. | Defined state "uninitialised, SO-PIN set", recovered by re-INITIALIZE; the new SO-PIN verifier goes in the same binding write as the new epoch. |
+| R11 | Low | Erased SD cards often read 0x00, which is VOID: a new card on a new device would fail the first-boot test. | For first-boot detection only, ring header blocks reading all 0x00 or all 0xFF count as blank. |
+| R12 | Low | embedded-sdmmc has no public raw-command API for CMD13. | Check what `SdCard::write` issues after the data token; else a small patched driver.  Phase 3. |
+| R13 | Low | A card swapped between commands is caught on reads only; an append could land on the other card. | Before each SD append, re-read and MAC-check the tail record block (or compare the CID). |
+| R14 | Low | Binding edge cases: two valid copies with the same `gen`, `gen` overflow, a FORMATTING resume with another card inserted. | §8.1 rules; FORMATTING records a fingerprint of the card's ring sector 0 header. |
+| R15 | Low | "QMI, keystore only" is not a real attacker class: the counter log is CRC-only on the same chip. | Accepted: anyone who can rewrite the keystore over SWD can rewrite the log; the anchor stays CRC-protected, and the table row means a keystore-region-only fault or edit. |
+
+**Phase 1 decisions** (binding block + counter log v2):
+
+- Counter-log v2 keeps a RAM table of raw records keyed by (tag, id),
+  capped at 32; a write that would add a 33rd key is refused, never
+  dropped.  Rotation carries every entry, known kinds or not.
+- The v1 log (4 sectors at 0x1FC000, header version 1) is migrated once:
+  its credentials and values become v2 records in the new 16-sector log,
+  the sequence continues above v1's, then the v1 sectors are erased.  A
+  v1 log is never treated as unformatted (that would reseed PIN state
+  from the PIN records).
+- The OpenPGP signature counter becomes counter-log value 0x05 (not
+  monotonic: key generation and import reset it).  The key's PUT commits
+  before the counter resets; a cut between leaves the count high, which
+  is harmless.  The DO 93 keystore object is migrated once, then deleted.
+- The binding module, its ring region and its tests land in phase 1, but
+  the binding is written only by the format path (phases 3–4); the
+  fail-closed rules of §8.3 are not enforced while the 1.x keystore is
+  live.  The SO-PIN verifier moves to the binding in phase 4.
+- WIPE_OWNER `aux`: group u8 + generation u24 (the binding keeps u32).
+- `put_anchor` refuses a lower `head_seq` within one `format_gen`; only
+  format and re-index change `format_gen`; a counter log in its Failed
+  state blocks every keystore commit; an anchor write failure sets a RAM
+  commit-blocked flag, cleared only by a successful anchor write.
+
