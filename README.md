@@ -66,8 +66,18 @@ designed in [docs/CLUSTER_PLAN_V3.md](docs/CLUSTER_PLAN_V3.md).
 The next release series is 2.0.0. It brings a new flash layout and a
 journaled keystore format ([docs/STORAGE_V2.md](docs/STORAGE_V2.md)), and
 removes the unused RAID-1 / WAL / multi-chip storage code. There is no
-migration from 1.x: 1.x keys do not carry over, and devices must be
-re-initialised after the update.
+migration from 1.x: **1.x keys do not carry over.**
+
+What happens on the first boot of 2.0 on a 1.x device:
+
+- The PIN/PUK retry counters, the RSA key pool and the domain counter
+  carry over (the counter log is moved to its new place automatically).
+- The keystore itself is **refused**, not erased: the device reports that
+  it needs **FORMAT STORE** and every key operation fails until then.
+  FORMAT STORE (`80 54 4E 00 0F "FORMAT-STORE-V2"` on the SC-HSM applet)
+  creates the new, empty store; on a device whose store is not a 2.0 one
+  it needs no PIN.  Afterwards initialise the applets as on a new device.
+- A device that was never used (blank keystore) formats itself.
 
 The default feature flag is `rp2350_one_4m` for historical reasons; the primary debug/test target is `pico2_4m` (Raspberry Pi Pico 2 stock board) as documented in `CLAUDE.md`. See `docs/BUILD_CONFIGURATIONS.md` for all flag combinations.
 

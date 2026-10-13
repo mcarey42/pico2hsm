@@ -155,9 +155,22 @@ bits  7–0:  proto_ref     (u8)  — protocol-level key reference
 ```
 
 Constructors: `KeyId::sc_hsm(partition, key_ref)`, `KeyId::piv(key_ref)`,
-`KeyId::openpgp(slot)`.  Flash magic `"P2K4"` is the current format (with `key_flags` byte); `"P2K2"` and
-`"P2K3"` are recognized as legacy and surfaced as incompatible (re-INITIALIZE
-required after firmware update from older builds).
+`KeyId::openpgp(slot)`.
+
+**Storage V2 (2.0) — the keystore engine** (`docs/STORAGE_V2.md`):
+`storage/store_v2.rs` (journal ring, snapshots, lookup, allocation; host
+fault-injection tests in `store_v2_tests.rs`), `storage/keystore_v2.rs`
+(`KeyStore` over it; `BoardKeyStore` is `FlashKeyStoreV2`),
+`storage/binding.rs` (binding block ring, internal flash),
+`storage/retry_counter.rs` (counter log v2: retry counters, device values,
+the keystore anchor, the OpenPGP signature counter).  Objects are
+`KeyObject` blobs sealed under `K_obj(store, group epoch, full key ID)`
+with the V2 object header as AAD.  SC-HSM INITIALIZE, PIV reset and
+OpenPGP TERMINATE wipe their *group* (one journal record, epoch rotated in
+the binding: core0 only).  A 1.x keystore is refused until FORMAT STORE
+(`80 54 4E`, data `FORMAT-STORE-V2`; PIN-less only without a valid
+binding).  The 1.x filesystem (`filesystem.rs`, `raid.rs`, `wal.rs`,
+`StorageManager`) is still compiled but unused until phase 5 removes it.
 
 **Still required before PIV/OpenPGP command handlers:**
 Per-applet PIN slots in flash.  SC-HSM already has a PIN slot; PIV needs its own;

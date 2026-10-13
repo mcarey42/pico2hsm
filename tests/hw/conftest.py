@@ -216,6 +216,42 @@ RSA_KEY_SLOTS: list[dict] = [
 # Session-scoped fixtures
 # ---------------------------------------------------------------------------
 
+_FORMAT_STORE = "80544E000F" + b"FORMAT-STORE-V2".hex().upper()
+
+
+def _format_store_if_needed(index: int) -> None:
+    """Storage V2: a board flashed with 2.0 over a 1.x keystore refuses its
+    store until FORMAT STORE.  The PIN-less form only works when there is
+    no valid binding, so on a board that already has a 2.0 store this is
+    refused (6982) and changes nothing; firmware before 2.0 does not know
+    it."""
+    from helpers.pcsc import session
+
+    try:
+        with session(index) as s:
+            s.send(bytes.fromhex("00A404000BE82B0601040181C31F020100"))
+            _, sw = s.send(bytes.fromhex(_FORMAT_STORE))
+        if sw == 0x9000:
+            log.info("reader %d: Storage V2 store formatted (was a 1.x keystore)", index)
+    except Exception as e:  # no device, or no pyscard: the tests will say so
+        log.debug("format-store probe on reader %d: %s", index, e)
+
+
+@pytest.fixture(scope="session", autouse=True)
+def storage_v2_ready():
+    from helpers.pcsc import dut_index, peer_index
+
+    indexes = set()
+    for pick in (dut_index, peer_index):
+        try:
+            indexes.add(pick())
+        except Exception:  # no such device (single-board run)
+            pass
+    for idx in indexes:
+        _format_store_if_needed(idx)
+    yield
+
+
 @pytest.fixture(scope="session")
 def config() -> dict:
     """Return HSM configuration from environment variables (with defaults)."""
