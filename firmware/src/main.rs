@@ -691,10 +691,18 @@ static KEYSTORE_CELL: StaticCell<pico2hsm_firmware::storage::BoardKeyStore> = St
 
 /// Health facts known at boot (`display_snapshot::health` bits).
 #[cfg(target_arch = "arm")]
-fn boot_health(ks_ok: bool, smk_present: bool) -> u8 {
+fn boot_health(
+    ks_ok: bool,
+    smk_present: bool,
+    store: &pico2hsm_firmware::storage::BoardKeyStore,
+) -> u8 {
     use pico2hsm_firmware::display_snapshot::health;
+    use pico2hsm_firmware::storage::keystore_v2::StoreStatus;
     let mut f = 0;
-    if !ks_ok {
+    if store.status() == StoreStatus::NeedsFormat {
+        // Not damage: the routine 1.x → 2.0 upgrade step.
+        f |= health::NEEDS_FORMAT;
+    } else if !ks_ok {
         f |= health::KS_INIT_FAILED;
     }
     if !smk_present {
@@ -987,6 +995,7 @@ fn dispatcher_loop(ptr_wrapper: DispatcherPtr) -> ! {
                 .swap(false, core::sync::atomic::Ordering::SeqCst)
             {
                 dispatcher.reset_in_place();
+                dispatcher.note_store_formatted();
                 let _ = Core1KeyStore::on_core0(FlashOp::ReloadKeys);
                 publish(&dispatcher.display_snapshot());
             }
@@ -1743,7 +1752,7 @@ async fn run_one_board(p: embassy_rp::Peripherals) {
         dispatcher_ref.load_keys_from_store(store);
         dispatcher_ref.migrate_domain(store);
     }
-    publish_boot_snapshot(dispatcher_ref, boot_health(ks_ok, smk_present));
+    publish_boot_snapshot(dispatcher_ref, boot_health(ks_ok, smk_present, store));
     let dispatcher_ptr = dispatcher_ref as *mut pico2hsm_firmware::apdu::dispatcher::Dispatcher;
     let dispatcher_send = DispatcherPtr(dispatcher_ptr, store as *mut _);
 
@@ -2146,7 +2155,7 @@ async fn run_geek_board(
         dispatcher_ref.load_keys_from_store(store);
         dispatcher_ref.migrate_domain(store);
     }
-    publish_boot_snapshot(dispatcher_ref, boot_health(ks_ok, smk_present));
+    publish_boot_snapshot(dispatcher_ref, boot_health(ks_ok, smk_present, store));
     {
         let inv = dispatcher_ref.display_snapshot().inventory;
         let keys = u16::from(inv.keys_hsm) + u16::from(inv.keys_piv) + u16::from(inv.keys_pgp);
@@ -2334,7 +2343,7 @@ async fn run_pico2_board(p: embassy_rp::Peripherals) {
         dispatcher_ref.load_keys_from_store(store);
         dispatcher_ref.migrate_domain(store);
     }
-    publish_boot_snapshot(dispatcher_ref, boot_health(ks_ok, smk_present));
+    publish_boot_snapshot(dispatcher_ref, boot_health(ks_ok, smk_present, store));
     let dispatcher_ptr = dispatcher_ref as *mut pico2hsm_firmware::apdu::dispatcher::Dispatcher;
     let dispatcher_send = DispatcherPtr(dispatcher_ptr, store as *mut _);
 
@@ -2655,7 +2664,7 @@ async fn run_waveshare_lcd_board(
         dispatcher_ref.load_keys_from_store(store);
         dispatcher_ref.migrate_domain(store);
     }
-    publish_boot_snapshot(dispatcher_ref, boot_health(ks_ok, smk_present));
+    publish_boot_snapshot(dispatcher_ref, boot_health(ks_ok, smk_present, store));
     {
         let inv = dispatcher_ref.display_snapshot().inventory;
         let keys = u16::from(inv.keys_hsm) + u16::from(inv.keys_piv) + u16::from(inv.keys_pgp);

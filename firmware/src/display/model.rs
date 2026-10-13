@@ -146,7 +146,8 @@ impl Controller {
         let f = snap.health.flags;
         // Every footer strip carries storage health, so neither warning
         // strip can hide it.
-        let failed = f & (health::KS_INIT_FAILED | health::STORE_WRITE_FAILED) != 0;
+        let failed =
+            f & (health::KS_INIT_FAILED | health::STORE_WRITE_FAILED | health::NEEDS_FORMAT) != 0;
         let storage = match (self.info.storage, failed) {
             (StorageKind::Sd, _) if f & health::SD_MISSING != 0 => StorageLine::SdMissing,
             (StorageKind::Sd, true) => StorageLine::SdFail,
@@ -303,6 +304,9 @@ impl Controller {
         // ── Full-screen errors ───────────────────────────────────────────
         let error = if flags & health::SMK_MISSING != 0 {
             Some(ErrorCode::E20NotProvisioned)
+        } else if flags & health::NEEDS_FORMAT != 0 {
+            // Until FORMAT STORE: no key operation can work before it.
+            Some(ErrorCode::E12FormatStoreNeeded)
         } else if flags & health::KS_INIT_FAILED != 0 && !self.seen_op {
             Some(ErrorCode::E11StorageUnreadable)
         } else {
@@ -924,6 +928,26 @@ mod tests {
                 ..
             })
         ));
+        // A 1.x keystore after the upgrade: E12, not E11, and it stays
+        // up through host operations until FORMAT STORE clears the flag.
+        let mut c2 = Controller::new(info(), 0);
+        let mut s2 = snap();
+        s2.health.flags = health::NEEDS_FORMAT | health::PROVISIONED;
+        s2.activity = Activity {
+            op_seq: 1,
+            op: OpCode::Verify,
+            state: OpState::Done,
+            ..Default::default()
+        };
+        assert!(matches!(
+            c2.step(&inputs(2, s2)).screen,
+            Screen::Error(ErrorView {
+                code: ErrorCode::E12FormatStoreNeeded,
+                ..
+            })
+        ));
+        s2.health.flags = health::PROVISIONED;
+        assert!(!matches!(c2.step(&inputs(3, s2)).screen, Screen::Error(_)));
         // Once the host works with the device, it is an ERROR band.
         s.activity = Activity {
             op_seq: 1,

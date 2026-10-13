@@ -716,6 +716,17 @@ fn error<D: DrawTarget<Color = C444>>(p: &mut Painter<'_, D>, v: &ErrorView, l: 
             "Run pico2hsm-tool diag.",
             "Keystore directory could not be read.",
         ),
+        ErrorCode::E12FormatStoreNeeded => (
+            "E12",
+            "FORMAT STORE NEEDED",
+            "No 2.0 keystore found.",
+            "See README, 2.0.0 notes.",
+            if l.compact {
+                "1.x keys can't be read by 2.0."
+            } else {
+                "Keys stored by 1.x can't be read by 2.0."
+            },
+        ),
         ErrorCode::E20NotProvisioned => (
             "E20",
             "NOT PROVISIONED",

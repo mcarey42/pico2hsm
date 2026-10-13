@@ -74,6 +74,7 @@ What happens on the first boot of 2.0 on a 1.x device:
   carry over (the counter log is moved to its new place automatically).
 - The keystore itself is **refused**, not erased: the device reports that
   it needs **FORMAT STORE** and every key operation fails until then.
+  Boards with a display show **E12 FORMAT STORE NEEDED** until it is done.
   FORMAT STORE (`80 54 4E 00 0F "FORMAT-STORE-V2"` on the SC-HSM applet)
   creates the new, empty store; on a device whose store is not a 2.0 one
   it needs no PIN.  Afterwards initialise the applets as on a new device.

@@ -364,6 +364,8 @@ pub enum ErrorCode {
     },
     /// The keystore could not be read at boot.
     E11StorageUnreadable,
+    /// The keystore region holds no 2.0 store (after a 1.x → 2.0 upgrade).
+    E12FormatStoreNeeded,
     /// Release build without a storage key.
     E20NotProvisioned,
     /// The TRNG failed its self-test.

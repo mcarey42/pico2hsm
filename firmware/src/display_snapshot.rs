@@ -133,6 +133,9 @@ pub mod health {
     // mirrored store, so it could never be set).
     /// OTP holds a storage key (the device is provisioned).
     pub const PROVISIONED: u8 = 1 << 5;
+    /// The keystore region holds no 2.0 store (a 1.x keystore after the
+    /// upgrade): FORMAT STORE is needed.  Cleared when it succeeds.
+    pub const NEEDS_FORMAT: u8 = 1 << 6;
 }
 
 /// Per-applet primary-credential bit in [`Session::blocked`].
