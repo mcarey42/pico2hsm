@@ -19,6 +19,12 @@
 //!   yielding.  Expected: watchdog timeout ~8 s later, logged as "core0
 //!   stopped feeding".
 //! - P1=0x12: reset the chip now through the watchdog trigger (from core1).
+//!
+//! Benchmark (`rsa` builds):
+//! - P1=0x20: P2 = modulus size in 32-bit words (64 = 2048-bit, 128 =
+//!   4096-bit).  Runs 256 Montgomery squarings plus 256 multiplications
+//!   modulo a fixed odd number and returns the elapsed microseconds (4
+//!   bytes, big-endian): the inner loop of RSA key generation.
 
 use pico2hsm_core::apdu::{ApduCommand, ApduResponse, SW_WRONG_DATA};
 
@@ -31,6 +37,8 @@ pub const P1_WEDGE_CORE1: u8 = 0x10;
 pub const P1_WEDGE_CORE0: u8 = 0x11;
 /// P1: immediate watchdog reset (watchdog test).
 pub const P1_WATCHDOG_RESET: u8 = 0x12;
+/// P1: Montgomery multiplication benchmark.
+pub const P1_BENCH_MONT: u8 = 0x20;
 
 /// Handle a DEBUG MEMORY DUMP APDU command.
 pub fn handle(cmd: &ApduCommand<'_>) -> ApduResponse {
@@ -44,9 +52,43 @@ pub fn handle(cmd: &ApduCommand<'_>) -> ApduResponse {
         }
         #[cfg(target_arch = "arm")]
         P1_WATCHDOG_RESET => crate::watchdog::reset_now(crate::watchdog::ResetCause::DebugTest),
+        #[cfg(all(target_arch = "arm", feature = "rsa"))]
+        P1_BENCH_MONT => return bench_mont(cmd.p2 as usize),
         _ => {}
     }
     // TODO: implement — read memory region and return raw bytes.
     // NOTE: This is a debug-only stub. Production builds never compile this.
     ApduResponse::err(SW_WRONG_DATA)
+}
+
+/// See `P1_BENCH_MONT`.
+#[cfg(all(target_arch = "arm", feature = "rsa"))]
+fn bench_mont(words: usize) -> ApduResponse {
+    use crate::crypto::bignum as bn;
+    if !(2..=bn::MAX_WORDS).contains(&words) {
+        return ApduResponse::err(SW_WRONG_DATA);
+    }
+    let mut m = [0u32; bn::MAX_WORDS];
+    let mut x = [0u32; bn::MAX_WORDS];
+    let mut y = [0u32; bn::MAX_WORDS];
+    // Fixed, full-size operands: m odd with its top bit set, x and y < m.
+    for i in 0..words {
+        m[i] = 0x9E37_79B9u32.wrapping_mul(i as u32 + 1) | 1;
+        x[i] = 0x7F4A_7C15u32.wrapping_mul(i as u32 + 3);
+        y[i] = 0x2545_F491u32.wrapping_mul(i as u32 + 5);
+    }
+    m[words - 1] |= 0x8000_0000;
+    x[words - 1] &= 0x7FFF_FFFF;
+    y[words - 1] &= 0x7FFF_FFFF;
+    let minv = bn::neg_inv32(m[0]);
+    let (m, x, y) = (&m[..words], &mut x[..words], &y[..words]);
+    let start = embassy_time::Instant::now();
+    for _ in 0..256 {
+        bn::mont_sqr_assign(x, m, minv);
+        bn::mont_mul_assign(x, y, m, minv);
+    }
+    let us = start.elapsed().as_micros() as u32;
+    // Keep the result live.
+    core::hint::black_box(&x);
+    ApduResponse::ok(&us.to_be_bytes())
 }
