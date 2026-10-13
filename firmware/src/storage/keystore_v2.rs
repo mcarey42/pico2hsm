@@ -367,10 +367,17 @@ impl<F: StoreFlash, B: CounterFlash, L: RetryCounterBackend> FlashKeyStoreV2<F, 
             .map_err(HsmError::Storage)
     }
 
-    /// Whether a PIN-less FORMAT STORE is allowed (R9): only when the
-    /// store is not up.
+    /// Whether a PIN-less FORMAT STORE is allowed (R9): only when there is
+    /// no valid binding — a 1.x keystore or a store formatted elsewhere
+    /// (`NeedsFormat`), or a binding that does not verify under this SMK.
+    /// A store that is merely refused next to a valid binding (a missing
+    /// or rolled-back card, damage) keeps its binding: formatting it would
+    /// destroy the epochs the real card needs, so it takes the SO-PIN.
+    /// (Until the SO-PIN verifier moves into the binding, phase 4, such a
+    /// store fails closed.)
     pub fn format_needs_no_pin(&self) -> bool {
-        !matches!(self.status, StoreStatus::Up | StoreStatus::Degraded)
+        matches!(self.status, StoreStatus::NeedsFormat | StoreStatus::BindingUnverifiable)
+            && self.binding.is_none()
     }
 
     /// Wipe one group: one record, the binding with its new epoch, the

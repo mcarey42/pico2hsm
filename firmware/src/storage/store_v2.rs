@@ -1734,11 +1734,24 @@ impl<F: StoreFlash> Store<F> {
                     more = true;
                 }
             });
+            let mut erase_failed = false;
             for &s in batch.iter() {
-                let _ = self.flash.get_mut().erase_sector(s);
+                if self.flash.get_mut().erase_sector(s).is_err() {
+                    // Unreferenced and crypto-erased (the epoch is gone);
+                    // reclaimed by the next allocation's blank check.
+                    erase_failed = true;
+                }
                 Self::mark(&mut m, s, false);
             }
-            if walked.is_err() || !more {
+            if let Err(e) = walked {
+                self.m = Some(m);
+                return Err(e);
+            }
+            if erase_failed {
+                self.m = Some(m);
+                return Err(StorageError::EraseError);
+            }
+            if !more {
                 break;
             }
         }
