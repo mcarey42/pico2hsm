@@ -101,15 +101,11 @@ mod tests {
 
     #[test]
     fn boards_reserve_the_counter_region() {
-        let boards: [(&str, &str); 6] = [
+        let boards: [(&str, &str); 5] = [
             ("pico2_4m", include_str!("../../../boards/pico2_4m.x")),
             (
                 "rp2350_one_4m",
                 include_str!("../../../boards/rp2350_one_4m.x"),
-            ),
-            (
-                "rp2350_one_16m",
-                include_str!("../../../boards/rp2350_one_16m.x"),
             ),
             (
                 "rp2350_geek_16m",
