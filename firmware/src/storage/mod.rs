@@ -266,36 +266,35 @@ impl<Chip: FlashChip> StorageManager<Chip> {
     /// Initialise: scan chips, load directory, run WAL recovery on all chips.
     pub fn init(&mut self) -> Result<(), StorageError> {
         // Probe each chip slot.
-        for (idx, chip) in self.filesystem.chips.iter_mut().enumerate() {
-            if chip.is_degraded() {
-                self.chip_states[idx] = ChipState::Degraded;
-                continue;
-            }
-            if chip.jedec_id().is_none() && chip.capacity() == 0 {
-                self.chip_states[idx] = ChipState::NotPresent;
-                continue;
-            }
-            // Try reading sector 0 to detect blank vs formatted.
-            // Use a static buffer to avoid putting 4 KB on the stack —
-            // critical on SD card boards where BSS leaves < 50 KB for core0.
-            // SAFETY: init() is called once, single-threaded, before dispatch.
-            static mut SECTOR0: [u8; SECTOR_SIZE] = [0u8; SECTOR_SIZE];
-            let sector0 = unsafe { &mut *core::ptr::addr_of_mut!(SECTOR0) };
-            // Blank only if both directory copies are: copy A is legitimately
-            // erased after a power cut mid-flush while copy B is current.
-            let mut state = ChipState::Blank;
-            for &sector in filesystem::DIR_SLOTS.iter() {
-                match chip.read(sector * SECTOR_SIZE as u32, sector0) {
-                    Ok(()) if integrity::is_blank(sector0) => {}
-                    Ok(()) => state = ChipState::Healthy,
-                    Err(_) => {
-                        state = ChipState::Dead;
-                        break;
+        let chip_states = &mut self.chip_states;
+        let chips = &mut self.filesystem.chips;
+        filesystem::with_boot_sector(|sector0| {
+            for (idx, chip) in chips.iter_mut().enumerate() {
+                if chip.is_degraded() {
+                    chip_states[idx] = ChipState::Degraded;
+                    continue;
+                }
+                if chip.jedec_id().is_none() && chip.capacity() == 0 {
+                    chip_states[idx] = ChipState::NotPresent;
+                    continue;
+                }
+                // Blank only if both directory copies are: copy A is
+                // legitimately erased after a power cut mid-flush while
+                // copy B is current.
+                let mut state = ChipState::Blank;
+                for &sector in filesystem::DIR_SLOTS.iter() {
+                    match chip.read(sector * SECTOR_SIZE as u32, sector0) {
+                        Ok(()) if integrity::is_blank(sector0) => {}
+                        Ok(()) => state = ChipState::Healthy,
+                        Err(_) => {
+                            state = ChipState::Dead;
+                            break;
+                        }
                     }
                 }
+                chip_states[idx] = state;
             }
-            self.chip_states[idx] = state;
-        }
+        });
 
         // Update mirror pair states from chip states.
         for pair in self.mirror_pairs.iter_mut() {

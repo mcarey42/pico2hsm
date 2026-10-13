@@ -38,10 +38,10 @@ the host.
                                                  DISPLAY_KICK.signal()
  display_begin(apdu) ─ tracked op? ─┐
    SNAP.write(W0..W4) [in progress] │
- dispatch_with_store(...)           │         display task wakes:
+ dispatch_into(..., RESP_BOX)       │         display task wakes:
  display_end(response, store)       │           step(inputs) → Screen
  SNAP.write(W0..W4) [outcome]       │           dirty bands → render → DMA
- blocking_send(RESP_CHANNEL)        │
+ post_response() → RESP_READY       │
                                               await_core1_response
                                               APDU_STARTED_MS = 0
                                               DISPLAY_KICK.signal()

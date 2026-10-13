@@ -27,6 +27,7 @@ pub mod apdu;
 pub mod crypto;
 pub mod display_snapshot;
 pub mod domain;
+pub mod mailbox;
 pub mod protocol;
 /// RSA key pool: idle-time pre-generation, rotation and issue (`rsa`).
 #[cfg(feature = "rsa")]

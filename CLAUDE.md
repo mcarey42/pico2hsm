@@ -63,8 +63,8 @@ pkill -9 -f "probe-rs"
 ## Architecture overview
 
 **Concurrency model** (RP2350 dual-core):
-- **Core0** — Embassy async executor: USB device driver + CCID transport loop, plus the hardware-watchdog feeder task. Sends APDUs to core1 via `APDU_CHANNEL` and waits for responses on `RESP_CHANNEL`.  A `flash_service` future (joined with USB and CCID in every board runner) runs core1's `FlashOp`s whenever they come — during an APDU and between APDUs.
-- **Core1** — Synchronous `dispatcher_loop()`: no Embassy executor.  Between APDUs `next_apdu()` runs the RSA key pool's idle work in slices (`rsa_pool::background`, ≤ 20 ms, ending as soon as `APDU_CHANNEL` is non-empty); with nothing to do it sleeps via ARM `wfe` (Wait For Event) and is woken by core0 via `sev` (Send Event) after each channel send.  Calls `blocking_receive()`/`blocking_send()` on the shared channels using `try_receive()`/`try_send()`.
+- **Core0** — Embassy async executor: USB device driver + CCID transport loop, plus the hardware-watchdog feeder task. Hands APDUs to core1 through the `APDU_BOX` mailbox and waits for `RESP_READY`, then reads the response from `RESP_BOX` (`firmware/src/mailbox.rs`: one static buffer each, filled and read in place, wiped after use).  A `flash_service` future (joined with USB and CCID in every board runner) runs core1's `FlashOp`s whenever they come — during an APDU and between APDUs.
+- **Core1** — Synchronous `dispatcher_loop()`: no Embassy executor.  Between APDUs `next_apdu()` runs the RSA key pool's idle work in slices (`rsa_pool::background`, ≤ 20 ms, ending as soon as `APDU_BOX` is full); with nothing to do it sleeps via ARM `wfe` (Wait For Event) and is woken by core0 via `sev` (Send Event) after each APDU.  The dispatcher writes its response straight into `RESP_BOX` (`Dispatcher::dispatch_into`), then `RESP_READY` wakes core0.  The flash channels use `blocking_receive()`/`blocking_send()` (`try_receive()`/`try_send()`).
 
 **RSA key pool** (`rsa` feature; `firmware/src/rsa_pool.rs`, `storage/rsa_pool.rs`,
 `crypto/rsa_keygen.rs`): pre-generated RSA-2048/3072/4096 keys in 12 sectors of
@@ -74,8 +74,8 @@ generates live with the sliced generator.  Config / clock / sequence are
 value records in the retry-counter log.  The generator state (~9 KB) is a
 static (`rsa_pool::ENGINE`), never on the stack.
 
-Both channels use RP2350 hardware spinlocks (29 and 30) for SMP-safe cross-core signalling.
-Core0 issues `cortex_m::asm::sev()` after every `APDU_CHANNEL.send()` and `FLASH_RESP.send()` to wake core1 from WFE.
+The mailboxes hand over with an Acquire/Release flag (single producer, single consumer); the channels (`RESP_READY`, `FLASH_REQ`, `FLASH_RESP`) use RP2350 hardware spinlocks for SMP-safe cross-core signalling.
+Core0 issues `cortex_m::asm::sev()` after every `APDU_BOX` fill and `FLASH_RESP.send()` to wake core1 from WFE.
 
 **CDC serial logger**: Core0 runs a `drain_one()` task that forwards buffered log lines to `/dev/ttyACMx`. `drain_one()` checks DTR before writing; if no terminal has `/dev/ttyACMx` open, the line is dropped silently (no CCID stall).
 
@@ -129,7 +129,7 @@ display redesign; `arm-none-eabi-size -A`):**
 | Waveshare LCD 16MB | 534 KB | 278.5 KB | 354.8 KB |
 | Waveshare LCD SDCard | 537 KB | 271.2 KB | 347.5 KB |
 
-Flash is not a concern.  RAM is the metric to watch; the 128 KB core1 stack
+Flash is not a concern.  RAM is the metric to watch; the 96 KB core1 stack (128 KB before the 2026-10 RAM pass, which freed 52 KB on the Waveshare LCD 16MB board)
 dominates.  The display boards no longer hold a framebuffer (48 KB Geek,
 83 KB Waveshare): they render through a 16-row band buffer (5.6 KB / 7.5 KB),
 which freed ~45 KB on the Geek and ~76 KB on the Waveshare boards (Waveshare
@@ -269,11 +269,11 @@ when changing the code.
 
 **Symptom**: APDU is received and logged by core0 (`APDU XX XX XX XX len=N`), time extensions fire every 1.5 s, but the command never completes; after ~30 s core0 sends 6F00 and resets the chip through the hardware watchdog (next boot logs `reset: WATCHDOG RESET: core1 stuck during an APDU`).
 
-**Cause**: core1 runs the whole dispatch chain on its own 128 KB stack (`CORE1_STACK` in `firmware/src/main.rs`). Large stack temporaries — `Vec<u8, 4096>` response buffers, `KeyObject`s (~3 KB), 4 KB flash sector buffers, PKCS#1 DER buffers — add up across `dispatcher_loop → Dispatcher::dispatch_with_store → <protocol>::process_apdu_with_store → route_with_store → handler → store`. MSPLIM is set at the stack base, so an overflow faults (UsageFault) instead of silently corrupting memory, but core1 still stops. (The protocol *state*, e.g. `ScHsmState`, lives in BSS via `DISPATCHER_CELL`, not on this stack.)
+**Cause**: core1 runs the whole dispatch chain on its own 96 KB stack (`CORE1_STACK` in `firmware/src/main.rs`). Large stack temporaries — `Vec<u8, 4096>` response buffers, `KeyObject`s (~3 KB), 4 KB flash sector buffers, PKCS#1 DER buffers — add up across `dispatcher_loop → Dispatcher::dispatch_into → <protocol>::process_apdu_with_store → route_with_store → handler → store`. MSPLIM is set at the stack base, so an overflow faults (UsageFault) instead of silently corrupting memory, but core1 still stops. (The protocol *state*, e.g. `ScHsmState`, lives in BSS via `DISPATCHER_CELL`, not on this stack.)
 
-**Measured** (2026-10, debug, pico2_4m and SD boards, worst path): dispatcher_loop 20.6 KB → dispatch_with_store 8.2 KB → Piv::process_apdu_with_store 11.2 KB → route 7.1 KB → PIV put_data::handle_with_store 20.6 KB → save_key / fetch_key chain ~20 KB ≈ **89 KB of 128 KB**. Before the synchronous `Core1KeyStore` (which removed a queue of by-value `KeyObject`s) it was ~123 KB.  RSA GENERATE from the key pool: … → route_handler 4.1 KB → generate_keypair::handle 9.1 KB → Engine::take_pooled 6.3 KB → PoolRegion::get_key 12.1 KB → KeyObject::decrypt chain ~9.8 KB ≈ **86 KB**; the idle-time pool slice ≈ 31 KB.  The display snapshot (2026-10, display redesign) added 8 B to dispatcher_loop (20,576 B); its `display_end → refresh_display_facts (0.6 KB) → member::count (9.0 KB) → fetch_key` branch stays far below the dispatch path.
+**Measured on hardware** (2026-10-12, debug, full `run_tests.sh`): the stack is painted at boot and the watchdog feeder logs `core1 stack high water: N of 98304 bytes` (RTT and the CDC log) whenever it grows by 1 KB.  Peak on pico2_4m: **60.5 KB** (81 KB before the core0/core1 mailboxes, which took `dispatcher_loop`'s frame from 20.6 KB to 72 B); on waveshare_rp2350_lcd_sdcard (storage I/O on core1): **62.9 KB** of the 96 KB stack.  Static frame sums, for orientation (pre-mailbox): PIV PUT DATA on an SD board ≈ 89 KB; RSA GENERATE from the key pool ≈ 86 KB; the idle-time pool slice ≈ 31 KB.
 
-**Re-measure** after adding large locals or a deeper call path:
+**Re-measure** after adding large locals or a deeper call path (the boot log is the real number; the frame sizes below show where it goes):
 ```sh
 cargo build -p pico2hsm-firmware --no-default-features --features pico2_4m,rsa,applet-piv,applet-openpgp-curve25519
 arm-none-eabi-objdump -d --no-show-raw-insn -C target/thumbv8m.main-none-eabihf/debug/pico2hsm \

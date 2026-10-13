@@ -64,26 +64,73 @@ use static_cell::StaticCell;
 
 // ─── Core1 stack (ARM only) ──────────────────────────────────────────────────
 
-/// Stack for core1.  Measured worst path (2026-10, pico2_4m debug, from the
-/// `sub sp` prologues): dispatcher_loop 16 KB → dispatch_with_store 8 KB →
-/// process_apdu_with_store 8 KB → route_with_store 4 KB → bip_slip 13 KB →
-/// fetch_key 12 KB → read_key 7 KB ≈ 70 KB, so 128 KB leaves ~58 KB.
-/// Do not reduce below 96 KB.
+/// Stack for core1.  Measured on hardware (2026-10-12, full hardware suite,
+/// debug build, painted stack, see `core1_stack_high_water`): 60.5 KB peak
+/// on pico2_4m after the core0/core1 mailboxes (81 KB before them), 62.9 KB
+/// on waveshare_rp2350_lcd_sdcard, where storage I/O runs on core1.  The
+/// older static estimate of the deepest path (PIV PUT DATA on an SD-card
+/// board) was ~89 KB before the mailboxes removed ~20 KB of it.  96 KB
+/// keeps well over the 15 KB margin; MSPLIM turns an overflow into a fault
+/// (core1 stops, the watchdog resets the chip) rather than corruption.
+/// Re-measure (the boot log prints the high water) before going lower.
 ///
 /// Core1 runs a synchronous dispatch loop (no Embassy executor) — the
-/// full 128 KB is available as call-stack, with no async state machine
-/// overhead.
+/// whole stack is call-stack, with no async state machine overhead.
 #[cfg(target_arch = "arm")]
-static mut CORE1_STACK: Stack<131072> = Stack::new();
+const CORE1_STACK_SIZE: usize = 96 * 1024;
+#[cfg(target_arch = "arm")]
+static mut CORE1_STACK: Stack<CORE1_STACK_SIZE> = Stack::new();
 
-/// Core0 → Core1: raw APDU bytes.  Empty Vec = reset-dispatcher signal.
-/// Uses RP2350 hardware spinlock 29 for SMP-safe access across both cores.
+/// Fill pattern for the unused part of the core1 stack.
 #[cfg(target_arch = "arm")]
-static APDU_CHANNEL: Channel<SpinlockRawMutex<29>, heapless::Vec<u8, 4096>, 1> = Channel::new();
-/// Core1 → Core0: serialised response bytes (data + SW1 SW2).
+const CORE1_STACK_PAINT: u32 = 0xC1C1_C1C1;
+
+/// Paint the whole core1 stack, so `core1_stack_high_water` can measure the
+/// deepest use.  Called first thing in `main`, before the watchdog feeder
+/// (which reads the high water) runs: on SD-card boards the keystore mount
+/// takes long enough that the feeder used to read an unpainted stack.
+#[cfg(target_arch = "arm")]
+fn paint_core1_stack() {
+    let base = addr_of_mut!(CORE1_STACK) as *mut u32;
+    for i in 0..CORE1_STACK_SIZE / 4 {
+        // SAFETY: core1 has not started; nothing else uses this memory.
+        unsafe { base.add(i).write_volatile(CORE1_STACK_PAINT) };
+    }
+}
+
+/// Deepest core1 stack use so far, in bytes: the stack grows down from the
+/// top, so count from the base up to the first word that is not the paint.
+#[cfg(target_arch = "arm")]
+fn core1_stack_high_water() -> usize {
+    let base = core::ptr::addr_of!(CORE1_STACK) as *const u32;
+    let words = CORE1_STACK_SIZE / 4;
+    // SAFETY: plain reads of a static; a racing write by core1 only makes
+    // the answer one word stale.
+    let untouched = (0..words)
+        .take_while(|&i| unsafe { base.add(i).read_volatile() } == CORE1_STACK_PAINT)
+        .count();
+    (words - untouched) * 4
+}
+
+/// Core0 → Core1: raw APDU bytes, filled and read in place (no copies on
+/// either core's stack; wiped when core1 is done).  Empty = reset-dispatcher
+/// signal.  Core0 `sev`s after filling it to wake core1.
+#[cfg(target_arch = "arm")]
+static APDU_BOX: pico2hsm_firmware::mailbox::Mailbox<4096> =
+    pico2hsm_firmware::mailbox::Mailbox::new();
+/// Core1 → Core0: serialised response bytes (data + SW1 SW2), written in
+/// place by the dispatcher; wiped once core0 has sent them.
+#[cfg(target_arch = "arm")]
+static RESP_BOX: pico2hsm_firmware::mailbox::Mailbox<4098> =
+    pico2hsm_firmware::mailbox::Mailbox::new();
+/// Core1 → Core0: "`RESP_BOX` is ready" (wakes core0's async receiver).
 /// Uses RP2350 hardware spinlock 30.
 #[cfg(target_arch = "arm")]
-static RESP_CHANNEL: Channel<SpinlockRawMutex<30>, heapless::Vec<u8, 4098>, 1> = Channel::new();
+static RESP_READY: Channel<SpinlockRawMutex<30>, (), 1> = Channel::new();
+
+/// A response taken from `RESP_BOX`; wiped and released when dropped.
+#[cfg(target_arch = "arm")]
+type Response = pico2hsm_firmware::mailbox::Taken<'static, 4098>;
 
 /// Core1 → Core0: flash operation requests.
 /// Uses RP2350 hardware spinlock 27.
@@ -601,7 +648,7 @@ fn blocking_send<M: embassy_sync::blocking_mutex::raw::RawMutex, T, const N: usi
 /// Block until a message is received from the channel.
 ///
 /// Uses `try_receive` (no async runtime required) and `wfe` to sleep between
-/// attempts.  Core0 issues `sev` after each `APDU_CHANNEL.send()` and
+/// attempts.  Core0 issues `sev` after each `APDU_BOX` fill and
 /// `FLASH_RESP.send()` to wake core1.
 #[cfg(target_arch = "arm")]
 fn blocking_receive<M: embassy_sync::blocking_mutex::raw::RawMutex, T, const N: usize>(
@@ -631,7 +678,7 @@ struct SliceBudget {
 #[cfg(all(target_arch = "arm", feature = "rsa"))]
 impl pico2hsm_firmware::crypto::rsa_keygen::Budget for SliceBudget {
     fn should_yield(&mut self) -> bool {
-        !APDU_CHANNEL.is_empty() || embassy_time::Instant::now() >= self.deadline
+        APDU_BOX.is_full() || embassy_time::Instant::now() >= self.deadline
     }
 }
 
@@ -648,20 +695,39 @@ fn pool_slice(store_ptr: *mut pico2hsm_firmware::storage::BoardKeyStore) -> bool
     act == pico2hsm_firmware::rsa_pool::Activity::Worked
 }
 
+/// Core1: write a response into `RESP_BOX` with `f`.  Core0 releases the
+/// previous one before it sends the next APDU, so the wait is only for the
+/// moment core0 takes to drop it.  Core0 isn't told until `post_response`.
+#[cfg(target_arch = "arm")]
+fn fill_response(f: impl FnOnce(&mut heapless::Vec<u8, 4098>)) {
+    while RESP_BOX.is_full() {
+        core::hint::spin_loop();
+    }
+    let _ = RESP_BOX.try_fill(f);
+}
+
+/// Core1: tell core0 that `RESP_BOX` holds the response.
+#[cfg(target_arch = "arm")]
+fn post_response() {
+    blocking_send(&RESP_READY, ());
+}
+
 /// Wait for the next APDU (or reset signal), doing idle-time work while
 /// none is waiting.
 ///
-/// Core0 `sev`s after every `APDU_CHANNEL` send.  The channel is checked
+/// Core0 `sev`s after every `APDU_BOX` fill.  The mailbox is checked
 /// before every slice, and a slice checks it before every unit of work, so
 /// an APDU is picked up within one unit.  With no work left core1 sleeps
 /// in `wfe` exactly as before; a `sev` that lands between the check and
 /// the `wfe` is latched in the event register, so the `wfe` returns at once.
 #[cfg(target_arch = "arm")]
-fn next_apdu(store_ptr: *mut pico2hsm_firmware::storage::BoardKeyStore) -> heapless::Vec<u8, 4096> {
+fn next_apdu(
+    store_ptr: *mut pico2hsm_firmware::storage::BoardKeyStore,
+) -> pico2hsm_firmware::mailbox::Taken<'static, 4096> {
     let _ = store_ptr;
     loop {
-        if let Ok(v) = APDU_CHANNEL.try_receive() {
-            return v;
+        if let Some(apdu) = APDU_BOX.try_take() {
+            return apdu;
         }
         #[cfg(feature = "rsa")]
         if pool_slice(store_ptr) {
@@ -716,7 +782,7 @@ fn dispatcher_loop(ptr_wrapper: DispatcherPtr) -> ! {
 
     let mut session = pico2hsm_firmware::SESSION_EPOCH.load(core::sync::atomic::Ordering::SeqCst);
     loop {
-        let mut apdu_bytes = next_apdu(store_ptr);
+        let apdu_bytes = next_apdu(store_ptr);
         // A new host session (USB reset/deconfigure or card power cycle)
         // must not inherit PIN/key authentication from the previous one.
         // Key off the session the APDU was *sent in*, not the current one:
@@ -754,14 +820,17 @@ fn dispatcher_loop(ptr_wrapper: DispatcherPtr) -> ! {
                 let _ = Core1KeyStore::on_core0(FlashOp::ReloadKeys);
             }
             publish(&dispatcher.display_snapshot());
-            blocking_send(&RESP_CHANNEL, heapless::Vec::new());
+            drop(apdu_bytes);
+            fill_response(|_| {});
+            post_response();
         } else if stale {
             // Its session ended while it was queued: never run it.  Core0
             // drops the reply (tagged with the old epoch) as well.
-            zeroize::Zeroize::zeroize(&mut apdu_bytes[..]);
-            let mut sw = heapless::Vec::new();
-            let _ = sw.extend_from_slice(&[0x6F, 0x00]);
-            blocking_send(&RESP_CHANNEL, sw);
+            drop(apdu_bytes); // wipes it
+            fill_response(|out| {
+                let _ = out.extend_from_slice(&[0x6F, 0x00]);
+            });
+            post_response();
         } else {
             CORE1_PROGRESS.store(10, core::sync::atomic::Ordering::Relaxed);
             // Display: the operation is in progress (only tracked ops).
@@ -769,10 +838,12 @@ fn dispatcher_loop(ptr_wrapper: DispatcherPtr) -> ! {
                 publish(&dispatcher.display_snapshot());
             }
             let mut ks = Core1KeyStore::new(store_ptr);
-            let response = dispatcher.dispatch_with_store(&apdu_bytes, &mut ks);
-            // The command may carry PINs or key material; don't leave it on the stack.
-            zeroize::Zeroize::zeroize(&mut apdu_bytes[..]);
-            dispatcher.display_end(&response, &mut ks);
+            fill_response(|out| {
+                dispatcher.dispatch_into(&apdu_bytes, &mut ks, out);
+                dispatcher.display_end(out, &mut ks);
+            });
+            // The command may carry PINs or key material: dropping it wipes it.
+            drop(apdu_bytes);
             // A reset during the command: whatever it authenticated belonged
             // to the session that just ended.
             let now = pico2hsm_firmware::SESSION_EPOCH.load(core::sync::atomic::Ordering::SeqCst);
@@ -784,7 +855,7 @@ fn dispatcher_loop(ptr_wrapper: DispatcherPtr) -> ! {
             // Display: the outcome, before the host can see the response.
             publish(&dispatcher.display_snapshot());
             CORE1_PROGRESS.store(60, core::sync::atomic::Ordering::Relaxed);
-            blocking_send(&RESP_CHANNEL, response);
+            post_response();
             CORE1_PROGRESS.store(0, core::sync::atomic::Ordering::Relaxed);
         }
     }
@@ -836,6 +907,9 @@ const USB_PID: u16 = 0x27C0;
 #[cfg(target_arch = "arm")]
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
+    // Before any task can read it (see `paint_core1_stack`).
+    paint_core1_stack();
+
     // ── 1. Initialise RP2350 clocks and peripherals ─────────────────────────
     let p = embassy_rp::init(Default::default());
 
@@ -1111,17 +1185,23 @@ async fn flash_service(
     }
 }
 
-/// Wait for core1's next `RESP_CHANNEL` message.
+/// Wait for core1's next response (`RESP_READY`, then `RESP_BOX`).
 ///
 /// Unbounded by design: a wedged core1 is caught by the hardware-watchdog
 /// feeder, which stops feeding after 30 s without progress.  Any flash
 /// operation core1 needs first (key writes, `ReloadKeys` after a
 /// USB-reconnect reset) runs in `flash_service`, which is always polled.
 #[cfg(target_arch = "arm")]
-async fn recv_core1_response() -> heapless::Vec<u8, 4098> {
-    let r = RESP_CHANNEL.receive().await;
+async fn recv_core1_response() -> Response {
+    RESP_READY.receive().await;
     pico2hsm_firmware::watchdog::note_core1_response();
-    r
+    take_response()
+}
+
+/// The response core1 announced on `RESP_READY` (always filled first).
+#[cfg(target_arch = "arm")]
+fn take_response() -> Response {
+    RESP_BOX.try_take().expect("RESP_READY without a response")
 }
 
 /// Wait for core1's response to an APDU, keeping the host and core1 serviced.
@@ -1135,15 +1215,15 @@ async fn recv_core1_response() -> heapless::Vec<u8, 4098> {
 ///   (`watchdog::Core1Monitor`, and stall detection is not suppressed),
 ///   returns `None`; the caller must reset the device (see `watchdog_reset`).
 ///
-/// On USB disconnect, drains core1's response and returns an empty Vec so the
-/// caller takes its normal disconnect path.  That drain (like the reset
+/// On USB disconnect, waits for core1's response and returns it; sending
+/// it fails, so the caller takes its normal disconnect path.  That drain (like the reset
 /// drains in the board loops) has no stall detector of its own: if core1 is
 /// wedged, the watchdog feeder stops feeding and the hardware watchdog
 /// resets the chip.
 #[cfg(target_arch = "arm")]
 async fn await_core1_response<'d, D: embassy_usb::driver::Driver<'d>>(
     ccid: &mut pico2hsm_firmware::transport::CcidTransport<'d, D>,
-) -> Option<heapless::Vec<u8, 4098>> {
+) -> Option<Response> {
     use core::sync::atomic::Ordering::Relaxed;
     use embassy_futures::select::{select, Either};
     use embassy_time::{Duration, Instant};
@@ -1156,10 +1236,10 @@ async fn await_core1_response<'d, D: embassy_usb::driver::Driver<'d>>(
     // heartbeat or reply); here it gets a 6F00 out before the reset.
     let mut monitor = Core1Monitor::new(Instant::now().as_millis(), Core1Activity::sample());
     loop {
-        match select(RESP_CHANNEL.receive(), Timer::at(deadline)).await {
-            Either::First(r) => {
+        match select(RESP_READY.receive(), Timer::at(deadline)).await {
+            Either::First(()) => {
                 pico2hsm_firmware::watchdog::note_core1_response();
-                return Some(r);
+                return Some(take_response());
             }
             Either::Second(()) => {
                 deadline = Instant::now() + WTX_INTERVAL;
@@ -1178,8 +1258,9 @@ async fn await_core1_response<'d, D: embassy_usb::driver::Driver<'d>>(
                 if let Err(pico2hsm_firmware::transport::ccid::CcidError::UsbDisconnected) =
                     ccid.send_time_extension().await
                 {
-                    let _ = recv_core1_response().await;
-                    return Some(heapless::Vec::new());
+                    // Sending it fails the same way (and a new session's
+                    // epoch would drop it): the caller takes its disconnect path.
+                    return Some(recv_core1_response().await);
                 }
             }
         }
@@ -1192,14 +1273,14 @@ async fn await_core1_response<'d, D: embassy_usb::driver::Driver<'d>>(
 #[cfg(target_arch = "arm")]
 async fn send_and_wipe<'d, D: embassy_usb::driver::Driver<'d>>(
     ccid: &mut pico2hsm_firmware::transport::CcidTransport<'d, D>,
-    response: &mut heapless::Vec<u8, 4098>,
+    response: Response,
     epoch: u32,
 ) -> Result<(), pico2hsm_firmware::transport::ccid::CcidError> {
     // A response computed for a previous host session must not be delivered
     // into the new one (it would answer the new session's first command).
     let current = pico2hsm_firmware::SESSION_EPOCH.load(core::sync::atomic::Ordering::SeqCst);
     let result = if current == epoch {
-        ccid.send_response(response).await
+        ccid.send_response(&response).await
     } else {
         Ok(())
     };
@@ -1210,9 +1291,8 @@ async fn send_and_wipe<'d, D: embassy_usb::driver::Driver<'d>>(
             core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
         }
     }
-    // The trailing SW is not secret; only the data is wiped.
-    let data_len = response.len().saturating_sub(2);
-    zeroize::Zeroize::zeroize(&mut response[..data_len]);
+    // Dropping the response wipes it and frees `RESP_BOX` for core1.
+    drop(response);
     result
 }
 
@@ -1274,9 +1354,33 @@ async fn watchdog_reset<'d, D: embassy_usb::driver::Driver<'d>>(
 /// it.  Counted for the watchdog feeder before the send, so a core1 that
 /// never takes the request is caught as well.
 #[cfg(target_arch = "arm")]
-async fn send_to_core1(apdu: heapless::Vec<u8, 4096>) {
+async fn send_to_core1(apdu: &mut heapless::Vec<u8, 4096>) {
+    post_apdu(|b| {
+        let _ = b.extend_from_slice(apdu);
+    })
+    .await;
+    // Core0's copy may carry PINs or key material.
+    zeroize::Zeroize::zeroize(apdu.as_mut_slice());
+    apdu.clear();
+}
+
+/// Tell core1 to reset the dispatcher (USB disconnect): an empty APDU.
+#[cfg(target_arch = "arm")]
+async fn send_reset_to_core1() {
+    post_apdu(|_| {}).await;
+}
+
+/// Fill `APDU_BOX` with `f` and wake core1.  Counted for the watchdog
+/// feeder first, so a core1 that never takes the request is caught too.
+#[cfg(target_arch = "arm")]
+async fn post_apdu(f: impl FnOnce(&mut heapless::Vec<u8, 4096>)) {
     pico2hsm_firmware::watchdog::note_core1_request();
-    APDU_CHANNEL.send(apdu).await;
+    // Core1 releases the previous APDU before it answers it, so the
+    // mailbox is free by now; wait out the rare overlap all the same.
+    while APDU_BOX.is_full() {
+        Timer::after_micros(50).await;
+    }
+    let _ = APDU_BOX.try_fill(f);
     cortex_m::asm::sev(); // wake core1 from WFE
 }
 
@@ -1294,7 +1398,22 @@ async fn watchdog_feeder() {
         ResetCause, FEED_INTERVAL_MS,
     };
     let mut monitor = Core1Monitor::new(Instant::now().as_millis(), Core1Activity::sample());
+    let mut stack_peak = 0;
     loop {
+        let peak = core1_stack_high_water();
+        if peak > stack_peak + 1024 {
+            stack_peak = peak;
+            defmt::info!(
+                "core1 stack high water: {} of {} bytes",
+                peak,
+                CORE1_STACK_SIZE
+            );
+            pico2hsm_firmware::cdc_log!(
+                "core1 stack high water: {} of {} bytes",
+                peak,
+                CORE1_STACK_SIZE
+            );
+        }
         let health = monitor.observe(Instant::now().as_millis(), Core1Activity::sample());
         if should_feed(health, reset_pending()) {
             feed();
@@ -1484,17 +1603,17 @@ async fn run_one_board(p: embassy_rp::Peripherals) {
             // Inner loop: forward APDUs to core1 and relay responses.
             loop {
                 match ccid.recv_apdu().await {
-                    Ok(apdu_bytes) => {
+                    Ok(mut apdu_bytes) => {
                         let epoch = ccid.apdu_epoch();
                         pico2hsm_firmware::APDU_EPOCH
                             .store(epoch, core::sync::atomic::Ordering::SeqCst);
                         board.led().set_status(LedStatus::Busy);
-                        send_to_core1(apdu_bytes).await;
-                        let mut response = match await_core1_response(&mut ccid).await {
+                        send_to_core1(&mut apdu_bytes).await;
+                        let response = match await_core1_response(&mut ccid).await {
                             Some(r) => r,
                             None => watchdog_reset(&mut ccid).await,
                         };
-                        match send_and_wipe(&mut ccid, &mut response, epoch).await {
+                        match send_and_wipe(&mut ccid, response, epoch).await {
                             Ok(()) => {
                                 for _ in 0..16 {
                                     if !pico2hsm_firmware::transport::cdc_serial::drain_one(
@@ -1507,7 +1626,7 @@ async fn run_one_board(p: embassy_rp::Peripherals) {
                                 }
                             }
                             Err(CcidError::UsbDisconnected) => {
-                                send_to_core1(heapless::Vec::new()).await;
+                                send_reset_to_core1().await;
                                 let _ = recv_core1_response().await;
                                 break;
                             }
@@ -1519,7 +1638,7 @@ async fn run_one_board(p: embassy_rp::Peripherals) {
                         board.led().set_status(LedStatus::Ready);
                     }
                     Err(CcidError::UsbDisconnected) => {
-                        send_to_core1(heapless::Vec::new()).await;
+                        send_reset_to_core1().await;
                         let _ = recv_core1_response().await;
                         board.led().set_status(LedStatus::Ready);
                         break;
@@ -1627,20 +1746,20 @@ async fn display_board_ccid_loop<'d, D: embassy_usb::driver::Driver<'d>>(
         defmt::info!("USB connected");
         loop {
             match ccid.recv_apdu().await {
-                Ok(apdu_bytes) => {
+                Ok(mut apdu_bytes) => {
                     let epoch = ccid.apdu_epoch();
                     pico2hsm_firmware::APDU_EPOCH
                         .store(epoch, core::sync::atomic::Ordering::SeqCst);
-                    send_to_core1(apdu_bytes).await;
+                    send_to_core1(&mut apdu_bytes).await;
                     set_apdu_started(Some(embassy_time::Instant::now().as_millis() as u32));
                     kick();
-                    let mut response = match await_core1_response(ccid).await {
+                    let response = match await_core1_response(ccid).await {
                         Some(r) => r,
                         None => watchdog_reset(ccid).await,
                     };
                     set_apdu_started(None);
                     kick();
-                    match send_and_wipe(ccid, &mut response, epoch).await {
+                    match send_and_wipe(ccid, response, epoch).await {
                         Ok(()) => {
                             for _ in 0..16 {
                                 if !pico2hsm_firmware::transport::cdc_serial::drain_one(cdc_sender)
@@ -1651,7 +1770,7 @@ async fn display_board_ccid_loop<'d, D: embassy_usb::driver::Driver<'d>>(
                             }
                         }
                         Err(CcidError::UsbDisconnected) => {
-                            send_to_core1(heapless::Vec::new()).await;
+                            send_reset_to_core1().await;
                             let _ = recv_core1_response().await;
                             break;
                         }
@@ -1661,7 +1780,7 @@ async fn display_board_ccid_loop<'d, D: embassy_usb::driver::Driver<'d>>(
                     }
                 }
                 Err(CcidError::UsbDisconnected) => {
-                    send_to_core1(heapless::Vec::new()).await;
+                    send_reset_to_core1().await;
                     let _ = recv_core1_response().await;
                     break;
                 }
@@ -2087,7 +2206,7 @@ async fn run_pico2_board(p: embassy_rp::Peripherals) {
 
             loop {
                 match ccid.recv_apdu().await {
-                    Ok(apdu_bytes) => {
+                    Ok(mut apdu_bytes) => {
                         let epoch = ccid.apdu_epoch();
                         pico2hsm_firmware::APDU_EPOCH
                             .store(epoch, core::sync::atomic::Ordering::SeqCst);
@@ -2095,12 +2214,12 @@ async fn run_pico2_board(p: embassy_rp::Peripherals) {
                         // No defmt logging here — the RTT buffer fills from trace-level
                         // embassy_rp USB logs; any defmt call here blocks Core0 before
                         // the APDU reaches Core1, causing a permanent hang.
-                        send_to_core1(apdu_bytes).await;
-                        let mut response = match await_core1_response(&mut ccid).await {
+                        send_to_core1(&mut apdu_bytes).await;
+                        let response = match await_core1_response(&mut ccid).await {
                             Some(r) => r,
                             None => watchdog_reset(&mut ccid).await,
                         };
-                        match send_and_wipe(&mut ccid, &mut response, epoch).await {
+                        match send_and_wipe(&mut ccid, response, epoch).await {
                             Ok(()) => {
                                 for _ in 0..16 {
                                     if !pico2hsm_firmware::transport::cdc_serial::drain_one(
@@ -2113,7 +2232,7 @@ async fn run_pico2_board(p: embassy_rp::Peripherals) {
                                 }
                             }
                             Err(CcidError::UsbDisconnected) => {
-                                send_to_core1(heapless::Vec::new()).await;
+                                send_reset_to_core1().await;
                                 let _ = recv_core1_response().await;
                                 break;
                             }
@@ -2125,7 +2244,7 @@ async fn run_pico2_board(p: embassy_rp::Peripherals) {
                         board.led().set_status(LedStatus::Ready);
                     }
                     Err(CcidError::UsbDisconnected) => {
-                        send_to_core1(heapless::Vec::new()).await;
+                        send_reset_to_core1().await;
                         let _ = recv_core1_response().await;
                         board.led().set_status(LedStatus::Ready);
                         break;

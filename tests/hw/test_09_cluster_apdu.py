@@ -54,15 +54,10 @@ def _parse_received_blocks(opensc_output: str) -> list[bytes]:
     Each Sending/Received pair is one exchange. We collect them into a list
     so callers can pick the last (or any specific) response.
 
-    The ASCII sideband column that opensc-tool appends is separated by at
-    least two spaces from the hex columns; we stop collecting hex tokens at
-    the first token that looks like printable-ASCII padding.  In practice,
-    the hex tokens on each line are exactly the data bytes; the ASCII
-    representation on the right is not valid hex (it contains printable
-    chars that happen to overlap 'A'-'F') but opensc-tool aligns it with
-    spaces so the regex '\b[0-9A-Fa-f]{2}\b' will mis-fire on them.
-    We guard against this by limiting to the first 16 two-hex tokens per
-    line (one full row of opensc-tool output is always ≤16 bytes wide).
+    Each data line is up to 16 hex bytes ("XX " each), padding, then an
+    ASCII column.  Only the leading run of "XX " tokens is data: searching
+    the whole line also matched ASCII that happens to look like hex on a
+    short last line (a random signature then grew a phantom byte).
     """
     blocks: list[bytes] = []
     current: bytearray | None = None
@@ -77,9 +72,9 @@ def _parse_received_blocks(opensc_output: str) -> list[bytes]:
             current = None
             continue
         if current is not None:
-            # Each hex data line from opensc-tool is at most 16 bytes wide.
-            tokens = re.findall(r'\b[0-9A-Fa-f]{2}\b', stripped)
-            for tok in tokens[:16]:
+            # The leading "XX " run, at most 16 bytes per line.
+            m = re.match(r'(?:[0-9A-Fa-f]{2}(?: |$))+', stripped)
+            for tok in (m.group(0).split() if m else [])[:16]:
                 current.append(int(tok, 16))
     if current is not None:
         blocks.append(bytes(current))
