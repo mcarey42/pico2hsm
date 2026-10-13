@@ -625,9 +625,9 @@ pub fn r_mod(m: &[u32], out: &mut [u32]) {
 ///
 /// On the RP2350 (Cortex-M33 with the DSP extension) the loop is two
 /// `UMAAL`s per iteration — `RdHi:RdLo = Rn·Rm + RdHi + RdLo`, exactly one
-/// multiply-accumulate-with-carry step — about 7 cycles per word instead of
-/// the ~15 the compiler produces at `opt-level = "z"` (no `+dsp` target
-/// feature, so it cannot emit `UMAAL` itself).  `UMAAL` is constant-time.
+/// multiply-accumulate-with-carry step — about 7.8 cycles per word.  Most
+/// rows now go through the two-row [`mac2`]; this one finishes odd rows.
+/// `UMAAL` is constant-time.
 /// The portable version below is what the host tests run; the M33 build is
 /// checked against it in QEMU (`-cpu cortex-m33`): identical keys for the
 /// same DRBG stream.
@@ -641,17 +641,13 @@ fn mac_row(t: &mut [u32], a: &[u32], b: u32, mut c: u32) -> u32 {
         // `a` (both at least `n` long); `t` is exclusively borrowed and does
         // not overlap `a`.  The asm touches no other memory and no stack.
         unsafe {
-            // Fixed registers: the two UMAALs are emitted as raw encodings
-            // (`.inst.w`), because the assembler only accepts UMAAL with the
-            // `dsp` target feature, which this target does not enable:
-            //   FBE8 2465 = umaal r2, r4, r8, r5     (t0, c, a0, b)
-            //   FBEA C465 = umaal r12, r4, r10, r5   (t1, c, a1, b)
+            // t0, t1 / c / a0, a1 / b in fixed registers.
             core::arch::asm!(
                 "2:",
                 "ldrd r8, r10, [r0], #8",
                 "ldrd r2, r12, [r1]",
-                ".inst.w 0xFBE82465",
-                ".inst.w 0xFBEAC465",
+                "umaal r2, r4, r8, r5",
+                "umaal r12, r4, r10, r5",
                 "strd r2, r12, [r1], #8",
                 "subs r3, r3, #1",
                 "bne 2b",
@@ -704,6 +700,117 @@ fn mac_row(t: &mut [u32], a: &[u32], b: u32, mut c: u32) -> u32 {
     c
 }
 
+/// Two rows of multiply-accumulate at once, offset by one word: for each
+/// `j`, `t[j] += p·b1 + c1` and then `t[j] += a[j]·b0 + c0`, where `p` is
+/// `a[j−1]` (`prev` for `j = 0`).  Returns the carries and the last `a`
+/// word, `(c0, c1, a[len−1])`, for the caller to finish the rows (which
+/// only depend on `c0 + c1`, not on how the carry is split).
+///
+/// Every `t` word is loaded and stored once per two multiplies, and every
+/// `a` word loaded once for both rows: half the memory traffic of two
+/// [`mac_row`] passes, which is where their time goes (UMAAL itself is
+/// single-cycle on the M33; SRAM accesses cost ~1.5 cycles each).
+#[inline(always)]
+fn mac2(t: &mut [u32], a: &[u32], b0: u32, b1: u32, c: (u32, u32), prev: u32) -> (u32, u32, u32) {
+    #[cfg(target_arch = "arm")]
+    {
+        mac2_m33(t, a, b0, b1, c, prev)
+    }
+    #[cfg(not(target_arch = "arm"))]
+    {
+        mac2_portable(t, a, b0, b1, c, prev)
+    }
+}
+
+/// Portable [`mac2`]: what the host tests run, and the reference the
+/// device checks the M33 version against (`80 FE 21`).
+#[inline(always)]
+pub(crate) fn mac2_portable(
+    t: &mut [u32],
+    a: &[u32],
+    b0: u32,
+    b1: u32,
+    (mut c0, mut c1): (u32, u32),
+    mut prev: u32,
+) -> (u32, u32, u32) {
+    for (tj, &aj) in t.iter_mut().zip(a) {
+        // Row 1's term first (as the M33 version, which so avoids waiting
+        // on the `a` load); the callers only use c0 + c1.
+        let (l, h) = mac(prev, b1, *tj, c1);
+        c1 = h;
+        let (l, h) = mac(aj, b0, l, c0);
+        c0 = h;
+        *tj = l;
+        prev = aj;
+    }
+    (c0, c1, prev)
+}
+
+/// [`mac2`] on the Cortex-M33: UMAAL (`RdHi:RdLo = Rn·Rm + RdHi + RdLo`)
+/// twice per word.  Fixed-length, branch-free per word: constant-time.
+/// Measured (RP2350, 150 MHz): ~4.4 cycles per multiply-accumulate; the
+/// one-row loop it replaces took ~7.8.
+#[cfg(target_arch = "arm")]
+#[inline(never)]
+// Run from SRAM (copied at boot with .data): measured ~5% faster than
+// from flash through the XIP cache.
+#[link_section = ".data.ramfunc.mac2_m33"]
+pub(crate) fn mac2_m33(
+    t: &mut [u32],
+    a: &[u32],
+    b0: u32,
+    b1: u32,
+    (mut c0, mut c1): (u32, u32),
+    mut prev: u32,
+) -> (u32, u32, u32) {
+    let n = t.len().min(a.len());
+    let pairs = n / 2;
+    if pairs > 0 {
+        // SAFETY: `ap` and `tp` walk exactly `2·pairs ≤ n` words of `a` and
+        // `t` (both at least `n` long); `t` is exclusively borrowed and
+        // does not overlap `a`.  No other memory, no stack.
+        unsafe {
+            core::arch::asm!(
+                // Two words per iteration, the roles of the two `a`
+                // registers swapped (x = a[j], p = a[j−1], then p = a[j+1],
+                // x = a[j]) so no move is needed.  Row 1's UMAAL comes first
+                // in each word, and each load has an instruction between it
+                // and its first use (the M33's load-use stall).
+                // (LDRD pairs measured no faster: the loop is bound by the
+                // number of memory accesses, ~1.5 cycles each.)
+                "2:",
+                "ldr {y}, [{tp}]",
+                "ldr {x}, [{ap}], #4",
+                "umaal {y}, {c1}, {p}, {b1}",
+                "umaal {y}, {c0}, {x}, {b0}",
+                "str {y}, [{tp}], #4",
+                "ldr {y}, [{tp}]",
+                "ldr {p}, [{ap}], #4",
+                "umaal {y}, {c1}, {x}, {b1}",
+                "umaal {y}, {c0}, {p}, {b0}",
+                "str {y}, [{tp}], #4",
+                "subs {n}, {n}, #1",
+                "bne 2b",
+                ap = inout(reg) a.as_ptr() => _,
+                tp = inout(reg) t.as_mut_ptr() => _,
+                n = inout(reg) pairs => _,
+                c0 = inout(reg) c0,
+                c1 = inout(reg) c1,
+                p = inout(reg) prev,
+                b0 = in(reg) b0,
+                b1 = in(reg) b1,
+                x = out(reg) _,
+                y = out(reg) _,
+                options(nostack),
+            );
+        }
+    }
+    if n % 2 == 1 {
+        return mac2_portable(&mut t[n - 1..n], &a[n - 1..n], b0, b1, (c0, c1), prev);
+    }
+    (c0, c1, prev)
+}
+
 /// Words of the double-width product buffer.
 const WIDE: usize = 2 * MAX_WORDS + 1;
 
@@ -712,7 +819,30 @@ const WIDE: usize = 2 * MAX_WORDS + 1;
 fn redc(out: &mut [u32], t: &mut [u32], m: &[u32], minv: u32) {
     let n = m.len();
     let mut top = 0;
-    for i in 0..n {
+    let mut i = 0;
+    // Two rows at a time.  Row i+1's multiplier depends on t[i+1] after
+    // row i has added into it, so row i's first two words, and row i+1's
+    // first, are done here; `mac2` runs both rows over the rest.
+    while i + 1 < n {
+        let u0 = t[i].wrapping_mul(minv);
+        let (_, c0) = mac(m[0], u0, t[i], 0); // t[i] becomes 0
+        let (y, c0) = mac(m[1], u0, t[i + 1], c0);
+        let u1 = y.wrapping_mul(minv);
+        let (_, c1) = mac(m[0], u1, y, 0); // t[i+1] becomes 0
+        t[i] = 0;
+        t[i + 1] = 0;
+        let (c0, c1, last) = mac2(&mut t[i + 2..i + n], &m[2..], u0, u1, (c0, c1), m[1]);
+        // t[i+n]: row i's carry and the incoming top; row i+1's last word.
+        let (lo, hi) = mac(last, u1, t[i + n], c1);
+        let (lo, k) = adc(lo, c0, top);
+        t[i + n] = lo;
+        // t[i+n+1]: row i+1's carry; what overflows is the next top.
+        let (s, k2) = adc(t[i + n + 1], hi, k);
+        t[i + n + 1] = s;
+        top = k2;
+        i += 2;
+    }
+    if i < n {
         let u = t[i].wrapping_mul(minv);
         let c = mac_row(&mut t[i..i + n], m, u, 0);
         let (s, c2) = adc(t[i + n], c, top);
@@ -739,8 +869,17 @@ fn redc(out: &mut [u32], t: &mut [u32], m: &[u32], minv: u32) {
 fn mul_wide(t: &mut [u32], a: &[u32], b: &[u32]) {
     let n = a.len();
     t.fill(0);
-    for (i, &bi) in b.iter().enumerate() {
-        t[i + n] = mac_row(&mut t[i..i + n], a, bi, 0);
+    let mut i = 0;
+    // Two rows at a time; t[i+n] and t[i+n+1] are still zero here.
+    while i + 1 < n {
+        let (c0, c1, last) = mac2(&mut t[i..i + n], a, b[i], b[i + 1], (0, 0), 0);
+        let (lo, hi) = mac(last, b[i + 1], c0, c1);
+        t[i + n] = lo;
+        t[i + n + 1] = hi;
+        i += 2;
+    }
+    if i < n {
+        t[i + n] = mac_row(&mut t[i..i + n], a, b[i], 0);
     }
 }
 
@@ -749,7 +888,28 @@ fn mul_wide(t: &mut [u32], a: &[u32], b: &[u32]) {
 fn sqr_wide(t: &mut [u32], a: &[u32]) {
     let n = a.len();
     t.fill(0);
-    for i in 0..n.saturating_sub(1) {
+    // Cross products a[i]·a[j], i < j: row i adds a[i+1..]·a[i] at
+    // t[2i+1..]; t[i+n] is still zero when it gets the row's carry.
+    let mut i = 0;
+    // Rows i and i+1 together (i+1 ≤ n−2): row i's first word here, then
+    // `mac2` with row i+1 one word behind (its first term lands at t[2i+3]).
+    while i + 2 < n {
+        let (l, c0) = mac(a[i + 1], a[i], t[2 * i + 1], 0);
+        t[2 * i + 1] = l;
+        let (c0, c1, last) = mac2(
+            &mut t[2 * i + 2..i + n],
+            &a[i + 2..],
+            a[i],
+            a[i + 1],
+            (c0, 0),
+            0,
+        );
+        let (lo, hi) = mac(last, a[i + 1], c0, c1);
+        t[i + n] = lo;
+        t[i + n + 1] = hi;
+        i += 2;
+    }
+    if i + 1 < n {
         t[i + n] = mac_row(&mut t[2 * i + 1..i + n], &a[i + 1..], a[i], 0);
     }
     let mut carry = 0;
@@ -914,6 +1074,117 @@ mod tests {
         m[0] |= 1;
         m[n - 1] |= 0x8000_0000;
         m
+    }
+
+    // The one-row-at-a-time versions the two-row (`mac2`) code replaced:
+    // the new code must produce exactly the same words.
+    fn ref_mul_wide(t: &mut [u32], a: &[u32], b: &[u32]) {
+        let n = a.len();
+        t.fill(0);
+        for (i, &bi) in b.iter().enumerate() {
+            t[i + n] = mac_row(&mut t[i..i + n], a, bi, 0);
+        }
+    }
+
+    fn ref_sqr_wide(t: &mut [u32], a: &[u32]) {
+        let n = a.len();
+        t.fill(0);
+        for i in 0..n.saturating_sub(1) {
+            t[i + n] = mac_row(&mut t[2 * i + 1..i + n], &a[i + 1..], a[i], 0);
+        }
+        let mut carry = 0;
+        for x in t.iter_mut() {
+            let next = *x >> 31;
+            *x = (*x << 1) | carry;
+            carry = next;
+        }
+        let mut c = 0u32;
+        for (i, &ai) in a.iter().enumerate() {
+            let (lo, hi) = mac(ai, ai, t[2 * i], c);
+            t[2 * i] = lo;
+            let (s, c2) = adc(t[2 * i + 1], hi, 0);
+            t[2 * i + 1] = s;
+            c = c2;
+        }
+    }
+
+    fn ref_redc(out: &mut [u32], t: &mut [u32], m: &[u32], minv: u32) {
+        let n = m.len();
+        let mut top = 0;
+        for i in 0..n {
+            let u = t[i].wrapping_mul(minv);
+            let c = mac_row(&mut t[i..i + n], m, u, 0);
+            let (s, c2) = adc(t[i + n], c, top);
+            t[i + n] = s;
+            top = c2;
+        }
+        let hi = &t[n..2 * n];
+        let mut br = 0;
+        for ((o, &tj), &mj) in out.iter_mut().zip(hi).zip(m) {
+            let (d, b2) = sbb(tj, mj, br);
+            *o = d;
+            br = b2;
+        }
+        let keep_t = mask((top ^ 1) & br);
+        for (o, &tj) in out.iter_mut().zip(hi) {
+            *o = (tj & keep_t) | (*o & !keep_t);
+        }
+    }
+
+    #[test]
+    fn two_row_products_match_one_row() {
+        let mut rng = Lcg(23);
+        for n in 1usize..=40 {
+            for round in 0..6 {
+                // Round 0: all-ones operands (every carry chain at its limit).
+                let (a, b) = if round == 0 {
+                    (vec![u32::MAX; n], vec![u32::MAX; n])
+                } else {
+                    (rng.fill(n), rng.fill(n))
+                };
+                let (mut t, mut r) = (vec![7u32; 2 * n], vec![9u32; 2 * n]);
+                mul_wide(&mut t, &a, &b);
+                ref_mul_wide(&mut r, &a, &b);
+                assert_eq!(t, r, "mul_wide n={n}");
+                assert_eq!(big(&t), big(&a) * big(&b), "mul_wide value n={n}");
+                sqr_wide(&mut t, &a);
+                ref_sqr_wide(&mut r, &a);
+                assert_eq!(t, r, "sqr_wide n={n}");
+                assert_eq!(big(&t), big(&a) * big(&a), "sqr_wide value n={n}");
+            }
+        }
+    }
+
+    #[test]
+    fn two_row_redc_matches_one_row() {
+        let mut rng = Lcg(29);
+        for n in 1usize..=40 {
+            for round in 0..6 {
+                let m = if round == 0 {
+                    vec![u32::MAX; n]
+                } else {
+                    odd_modulus(&mut rng, n)
+                };
+                let mb = big(&m);
+                // t < m·R: a product of two residues.
+                let a = words(&(big(&rng.fill(n)) % &mb), n);
+                let b = if round == 1 {
+                    let mut x = m.clone();
+                    x[0] -= 1; // m − 1
+                    x
+                } else {
+                    words(&(big(&rng.fill(n)) % &mb), n)
+                };
+                let minv = neg_inv32(m[0]);
+                let mut t = vec![0u32; 2 * n];
+                mul_wide(&mut t, &a, &b);
+                let mut t2 = t.clone();
+                let (mut out, mut r) = (vec![0u32; n], vec![0u32; n]);
+                redc(&mut out, &mut t, &m, minv);
+                ref_redc(&mut r, &mut t2, &m, minv);
+                assert_eq!(out, r, "redc n={n} round={round}");
+            }
+        }
     }
 
     #[test]

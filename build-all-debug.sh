@@ -9,6 +9,9 @@
 #   ./build-all-debug.sh rp2350_one_4m
 #   ./build-all-debug.sh rp2350_geek_16m
 #   EXTRA_FEATURES=debug ./build-all-debug.sh pico2_4m   # adds the debug-only APDUs
+#   PROFILE=release ./build-all-debug.sh pico2_4m       # release optimisation (opt-level z,
+#                                                       # as shipped), symbols kept for RTT;
+#                                                       # for benchmarks
 #
 # Valid board features:
 #   pico2_4m               Raspberry Pi Pico 2 4MB
@@ -56,17 +59,25 @@ done
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-ELF="target/thumbv8m.main-none-eabihf/debug/pico2hsm"
+PROFILE="${PROFILE:-debug}"
+case "$PROFILE" in
+    debug)   PROFILE_ARGS=() ;;
+    release) PROFILE_ARGS=(--release)
+             # probe-rs needs the symbols (RTT control block, defmt).
+             export CARGO_PROFILE_RELEASE_STRIP=false CARGO_PROFILE_RELEASE_DEBUG=true ;;
+    *)       echo "PROFILE must be debug or release" >&2; exit 1 ;;
+esac
+ELF="target/thumbv8m.main-none-eabihf/$PROFILE/pico2hsm"
 CHIP="RP235x"
 KEY_FILE="ec_firmware_signing_key.pem"
 
 # ── Build (debug profile) ─────────────────────────────────────────────────────
 FEATURES="$FEAT,rsa,applet-piv,applet-openpgp-curve25519${EXTRA_FEATURES:+,$EXTRA_FEATURES}"
-section "Debug build: $FEAT"
+section "Build ($PROFILE): $FEAT"
 info "cargo build --no-default-features --features $FEATURES"
 
 DEFMT_LOG=trace \
-cargo build \
+cargo build "${PROFILE_ARGS[@]}" \
     --manifest-path firmware/Cargo.toml \
     --no-default-features \
     --features "$FEATURES"
@@ -86,8 +97,8 @@ if [[ -f "$KEY_FILE" ]]; then
         die "ec_firmware_signing_key.pem found but picotool is not installed — cannot sign"
     fi
     mkdir -p dist
-    SIGNED_ELF="dist/pico2hsm-${FEAT}-debug-signed.elf"
-    OTP_JSON="dist/pico2hsm-${FEAT}-debug-otp.json"
+    SIGNED_ELF="dist/pico2hsm-${FEAT}-${PROFILE}-signed.elf"
+    OTP_JSON="dist/pico2hsm-${FEAT}-${PROFILE}-otp.json"
     section "Signing debug build: $FEAT"
     info "picotool seal --hash --sign $ELF → $SIGNED_ELF"
     SIGN_OUT=$(picotool seal --hash --sign \
