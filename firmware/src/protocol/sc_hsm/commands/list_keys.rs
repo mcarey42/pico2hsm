@@ -51,17 +51,19 @@ pub fn handle(state: &mut ScHsmState, cmd: &ApduCommand<'_>) -> ApduResponse {
         let _ = resp.push(proto_ref);
     }
 
-    // Emit C4 xx (PRKD) for every key — read_binary generates these
+    // Emit C4 xx (PRKD) for every user key — read_binary generates these
     // dynamically, so they always exist for any key in the keystore.
     // OpenSC's sc_pkcs15emu_sc_hsm_add_prkd needs them in the file list.
-    // Include slot 0 so OpenSC can read PRKD for the sentinel too
-    // (read_binary returns a valid descriptor for any key in key_index).
+    // Not for slot 0: the sentinel is listed (CC 00, above) only so the
+    // free-slot search skips it; with a PRKD, PKCS#11 showed it as a key
+    // with ID 00 that cannot be used.  A SmartCard-HSM's device key has no
+    // PRKD either.
     for meta in &state.key_index {
         if meta.key_type == 16 {
             continue;
         }
         let proto_ref = (meta.key_id & 0xFF) as u8;
-        if proto_ref >= 0xF0 {
+        if proto_ref == 0 || proto_ref >= 0xF0 {
             continue;
         }
         let _ = resp.push(0xC4);
