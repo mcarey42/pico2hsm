@@ -503,21 +503,29 @@ impl pico2hsm_firmware::storage::retry_counter::RetryCounterBackend for Core1Key
 #[cfg(target_arch = "arm")]
 fn init_retry_counters(store: &mut pico2hsm_firmware::storage::BoardKeyStore) {
     use pico2hsm_firmware::storage::{
-        flash_chip::{QmiCounterFlash, QMI_FLASH_SIZE},
-        flash_layout::RETRY_COUNTER_SECTORS,
+        flash_chip::{QmiCounterFlash, QmiLegacyCounterFlash, QMI_FLASH_SIZE},
+        flash_layout::{LEGACY_COUNTER_SECTORS, RETRY_COUNTER_SECTORS},
         retry_counter::CounterLog,
     };
     // SAFETY: on the QMI boards the keystore's `QmiFlash` owns `p.FLASH`.
-    // The blocking driver holds no state, and both drivers are used only
-    // from core0, one operation at a time, so a second handle is sound.
-    let flash =
+    // The blocking driver holds no state, and all these drivers are used
+    // only from core0, one operation at a time, so more handles are sound.
+    let handle = || {
         embassy_rp::flash::Flash::<_, embassy_rp::flash::Blocking, QMI_FLASH_SIZE>::new_blocking(
             unsafe { embassy_rp::peripherals::FLASH::steal() },
-        );
-    store.attach_retry_counters(CounterLog::open(
-        QmiCounterFlash::new(flash),
+        )
+    };
+    let mut legacy = QmiLegacyCounterFlash::new(handle());
+    let log = CounterLog::open_migrating(
+        QmiCounterFlash::new(handle()),
         RETRY_COUNTER_SECTORS,
-    ));
+        &mut legacy,
+        LEGACY_COUNTER_SECTORS,
+    );
+    if log.migrated_v1() {
+        defmt::info!("retry counters: version-1 log moved to the version-2 region");
+    }
+    store.attach_retry_counters(log);
     match pico2hsm_firmware::apdu::dispatcher::Dispatcher::migrate_retry_counters(store) {
         Ok(true) => defmt::info!("retry counters: migrated from the PIN records"),
         Ok(false) => {}

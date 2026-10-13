@@ -59,7 +59,7 @@ pub fn handle_with_store(
     let before = state.sig_counter;
     let resp = handle_cds(state, cmd);
     if resp.sw == pico2hsm_core::apdu::SW_OK
-        && super::put_data::save_sig_counter(state, store).is_err()
+        && super::put_data::save_sig_counter(state.sig_counter, store).is_err()
     {
         state.sig_counter = before;
         return ApduResponse::err(pico2hsm_core::apdu::SW_MEMORY_FAILURE);
