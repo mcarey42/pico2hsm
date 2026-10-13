@@ -43,6 +43,9 @@ pub mod keystore;
 pub mod retry_counter;
 #[cfg(feature = "rsa")]
 pub mod rsa_pool;
+pub mod store_v2;
+#[cfg(test)]
+mod store_v2_tests;
 pub use keystore::HybridKeyStore;
 pub use keystore::KeyStore;
 

@@ -103,6 +103,9 @@ const KEK_INFO_PREFIX: &[u8] = b"pico2hsm-keyobj-v1";
 /// P2K4 header size.
 const P2K4_HEADER_SIZE: usize = 21;
 
+/// Largest caller AAD prefix for [`KeyObject::seal`] / [`KeyObject::open`].
+pub const MAX_AAD_PREFIX: usize = 64;
+
 /// Maximum plaintext payload inside a P2K4 encrypted blob.
 ///
 /// Layout: `[opt 2-byte priv_len] || priv_key || pub_len(2) || pub_key`.
@@ -422,11 +425,32 @@ impl KeyObject {
     ) -> Result<heapless::Vec<u8, MAX_BLOB_SIZE>, KeyError> {
         // Derive per-key encryption key using the low-byte proto_ref.
         let kek = derive_key_encryption_key(smk, (self.key_id & 0xFF) as u8)?;
+        self.seal(&kek, &[], nonce, generation)
+    }
 
+    /// Encrypt under a caller-derived key `kek`, with `aad_prefix` in front
+    /// of the blob header in the GCM associated data (Storage V2: the
+    /// object header — store, key ID, seq, metadata — so a header cannot be
+    /// edited and an old version cannot pass for a newer one).  The blob
+    /// layout is [`Self::encrypt`]'s.
+    pub fn seal(
+        &self,
+        kek: &[u8; 32],
+        aad_prefix: &[u8],
+        nonce: &[u8; NONCE_SIZE],
+        generation: u32,
+    ) -> Result<heapless::Vec<u8, MAX_BLOB_SIZE>, KeyError> {
+        if aad_prefix.len() > MAX_AAD_PREFIX {
+            return Err(KeyError::BufferTooSmall);
+        }
         // Build AAD = header bytes.
         let mut header = [0u8; P2K4_HEADER_SIZE];
         self.write_header(&mut header);
         header[16..20].copy_from_slice(&generation.to_be_bytes());
+        let mut aad = [0u8; MAX_AAD_PREFIX + P2K4_HEADER_SIZE];
+        aad[..aad_prefix.len()].copy_from_slice(aad_prefix);
+        aad[aad_prefix.len()..aad_prefix.len() + P2K4_HEADER_SIZE].copy_from_slice(&header);
+        let aad = &aad[..aad_prefix.len() + P2K4_HEADER_SIZE];
 
         // Build plaintext:
         //   EC  keys (priv ≤ 255): priv_key || pub_len(2) || pub_key [|| policy]
@@ -472,13 +496,13 @@ impl KeyObject {
             .map_err(|_| KeyError::BufferTooSmall)?;
 
         // Encrypt the payload portion (everything after the header) in-place.
-        let cipher = Aes256Gcm::new_from_slice(&*kek).map_err(|_| KeyError::EncryptFailure)?;
+        let cipher = Aes256Gcm::new_from_slice(kek).map_err(|_| KeyError::EncryptFailure)?;
         let nonce_arr = GcmNonce::from_slice(nonce);
 
         let tag = cipher
             .encrypt_in_place_detached(
                 nonce_arr,
-                &header,
+                aad,
                 &mut ct_buf.as_mut_slice()[P2K4_HEADER_SIZE..],
             )
             .map_err(|_| KeyError::EncryptFailure)?;
@@ -508,6 +532,22 @@ impl KeyObject {
     /// with generation, key_flags defaults to 0), and the legacy `P2K2`
     /// (16-byte header, generation and key_flags default to 0).
     pub fn decrypt(blob: &[u8], key_id: u32, smk: &[u8; 32]) -> Result<Self, KeyError> {
+        // Derive per-key encryption key using the low-byte proto_ref.
+        let kek = derive_key_encryption_key(smk, (key_id & 0xFF) as u8)?;
+        Self::open(blob, key_id, &kek, &[])
+    }
+
+    /// Decrypt a [`Self::seal`]ed blob with the caller-derived `kek` and the
+    /// same `aad_prefix`.
+    pub fn open(
+        blob: &[u8],
+        key_id: u32,
+        kek: &[u8; 32],
+        aad_prefix: &[u8],
+    ) -> Result<Self, KeyError> {
+        if aad_prefix.len() > MAX_AAD_PREFIX {
+            return Err(KeyError::BufferTooSmall);
+        }
         // Minimum: header(16) + tag(16) + nonce(12) = 44 bytes (P2K2 minimum)
         if blob.len() < 44 {
             return Err(KeyError::InvalidFormat);
@@ -571,9 +611,6 @@ impl KeyObject {
             return Err(KeyError::InvalidFormat);
         }
 
-        // Derive per-key encryption key using the low-byte proto_ref.
-        let kek = derive_key_encryption_key(smk, (key_id & 0xFF) as u8)?;
-
         // Decrypt the payload portion (between header and tag).
         let ct_payload = &blob[header_size..tag_start];
 
@@ -584,12 +621,16 @@ impl KeyObject {
         }
         pt_buf[..ct_payload.len()].copy_from_slice(ct_payload);
 
-        let cipher = Aes256Gcm::new_from_slice(&*kek).map_err(|_| KeyError::DecryptFailure)?;
+        let cipher = Aes256Gcm::new_from_slice(kek).map_err(|_| KeyError::DecryptFailure)?;
         let nonce_arr = GcmNonce::from_slice(nonce);
         let tag_val = GcmTag::clone_from_slice(tag_bytes);
+        let mut aad = [0u8; MAX_AAD_PREFIX + 21];
+        aad[..aad_prefix.len()].copy_from_slice(aad_prefix);
+        aad[aad_prefix.len()..aad_prefix.len() + header_size].copy_from_slice(header);
+        let aad = &aad[..aad_prefix.len() + header_size];
 
         cipher
-            .decrypt_in_place_detached(nonce_arr, header, &mut pt_buf[..ct_payload.len()], &tag_val)
+            .decrypt_in_place_detached(nonce_arr, aad, &mut pt_buf[..ct_payload.len()], &tag_val)
             .map_err(|_| KeyError::DecryptFailure)?;
 
         // Parse plaintext.  Two layouts depending on priv_size sentinel:
