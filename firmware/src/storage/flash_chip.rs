@@ -578,6 +578,13 @@ pub type QmiCounterFlash = QmiRegionFlash<
     { super::flash_layout::RETRY_COUNTER_SIZE },
 >;
 
+/// The version-1 counter log region (`flash_layout::LEGACY_COUNTER_OFFSET`),
+/// read once to migrate it, then erased.
+pub type QmiLegacyCounterFlash = QmiRegionFlash<
+    { super::flash_layout::LEGACY_COUNTER_OFFSET },
+    { super::flash_layout::LEGACY_COUNTER_SIZE },
+>;
+
 /// The RSA key pool region (`flash_layout::RSA_POOL_OFFSET`).
 pub type QmiPoolFlash = QmiRegionFlash<
     { super::flash_layout::RSA_POOL_OFFSET },

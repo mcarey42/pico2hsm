@@ -141,10 +141,10 @@ fn signature_counter_counts_persists_and_resets() {
     assert_eq!(counter(&mut pgp, &mut store), [0, 0, 3], "survives reset");
     // A signature whose count can't be stored is not returned.
     assert_eq!(pw1(&mut pgp, &mut store, 0x81), SW_OK);
-    store.fail_saves = true;
+    store.counters.fail_values = true;
     let (sw_, sig) = send(&mut pgp, &mut store, &apdu(0x2A, 0x9E, 0x9A, &[0x42; 32]));
     assert_eq!((sw_, sig.len()), (0x6581, 0));
-    store.fail_saves = false;
+    store.counters.fail_values = false;
     assert_eq!(counter(&mut pgp, &mut store), [0, 0, 3]);
     // Mode 82 does not sign, and does not count.
     let mut pgp = reload(&mut store);
@@ -265,4 +265,50 @@ fn no_button_no_uif() {
     assert!(ard
         .windows(6)
         .any(|w| w == [0x7F, 0x74, 0x03, 0x81, 0x01, 0x00]));
+}
+
+#[test]
+fn signature_counter_lives_in_the_counter_log_and_moves_from_1x() {
+    use crate::storage::retry_counter::ValueId;
+    use crate::storage::KeyStore;
+    let (mut pgp, mut store) = card();
+    assert_eq!(
+        sw(&mut pgp, &mut store, &apdu(0xDA, 0x00, 0xC4, &[0x01])),
+        SW_OK
+    );
+    assert_eq!(pw1(&mut pgp, &mut store, 0x81), SW_OK);
+    let saves = store.saves;
+    assert_eq!(cds(&mut pgp, &mut store), SW_OK);
+    assert_eq!(store.saves, saves, "a signature writes no keystore object");
+    assert_eq!(
+        store.counters.values[ValueId::SignatureCounter.index()],
+        Some(1)
+    );
+    // A 1.x keystore record (count 0x000102) and no log value: moved into
+    // the log at load, then deleted.
+    store.counters.values[ValueId::SignatureCounter.index()] = None;
+    let mut rec = crate::security::key_management::KeyObject::new(
+        crate::security::key_management::KeyType::Generic,
+        put_data::sig_counter_key_id().0,
+        pico2hsm_core::key::AppletId::OpenPgp,
+        crate::security::key_management::AlgorithmId::AesGcm,
+    );
+    rec.private_key
+        .extend_from_slice(&[0x00, 0x01, 0x02])
+        .unwrap();
+    store.save_key(&rec).unwrap();
+    let pgp = reload(&mut store);
+    assert_eq!(pgp.state.sig_counter, 0x102);
+    assert_eq!(
+        store.counters.values[ValueId::SignatureCounter.index()],
+        Some(0x102)
+    );
+    assert!(store
+        .fetch_key(put_data::sig_counter_key_id())
+        .unwrap()
+        .is_none());
+    // The log unreadable: the counter loads as its maximum, never 0.
+    store.counters.unformatted = true;
+    let pgp = reload(&mut store);
+    assert_eq!(pgp.state.sig_counter, put_data::SIG_COUNTER_MAX);
 }

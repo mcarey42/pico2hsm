@@ -58,34 +58,81 @@ pub const PERSISTED_TAGS: [u16; 19] = [
 /// Largest digital signature counter (DO 93 is 3 bytes); it saturates.
 pub const SIG_COUNTER_MAX: u32 = 0x00FF_FFFF;
 
-/// KeyId of the persisted digital signature counter (DO 93).  Not a PUT
-/// DATA DO: only PSO:CDS and key generation change it.
+/// KeyId of the 1.x keystore record of the digital signature counter
+/// (DO 93).  2.0 keeps the counter in the counter log
+/// (`ValueId::SignatureCounter`, STORAGE_V2 F2: a keystore write per
+/// signature wore the directory out); a 1.x record is moved there once by
+/// [`load_sig_counter`] and deleted.
 pub fn sig_counter_key_id() -> pico2hsm_core::key::KeyId {
     do_key_id(0x0093)
 }
 
-/// Persist the signature counter (3 bytes BE); 0 is stored as no record.
+/// Persist the signature counter in the counter log (one 16-byte record,
+/// no keystore write).
 pub fn save_sig_counter(
-    state: &OpenPgpState,
+    count: u32,
     store: &mut dyn crate::storage::KeyStore,
 ) -> Result<(), pico2hsm_core::error::HsmError> {
-    use crate::security::key_management::{AlgorithmId, KeyObject, KeyType as KmKeyType};
-    if state.sig_counter == 0 {
-        return match store.fetch_key(sig_counter_key_id())? {
-            None => Ok(()),
-            Some(_) => store.erase_key(sig_counter_key_id()),
+    use crate::storage::retry_counter::ValueId;
+    let log = store
+        .retry_counters()
+        .ok_or(pico2hsm_core::error::HsmError::Storage(
+            pico2hsm_core::error::StorageError::NotFormatted,
+        ))?;
+    log.put_value(
+        ValueId::SignatureCounter,
+        u64::from(count.min(SIG_COUNTER_MAX)),
+    )?;
+    Ok(())
+}
+
+/// The persisted signature counter.  The counter log's value wins; with
+/// none there, a 1.x keystore record is moved into the log and deleted
+/// (the log write first, so a cut leaves the record to move again).  An
+/// unreadable counter loads as the largest count rather than 0: the counter
+/// must never go back.
+pub fn load_sig_counter(store: &mut dyn crate::storage::KeyStore) -> u32 {
+    use crate::storage::retry_counter::ValueId;
+    let logged = match store.retry_counters() {
+        Some(log) => log.value(ValueId::SignatureCounter),
+        None => return SIG_COUNTER_MAX,
+    };
+    let legacy =
+        |store: &mut dyn crate::storage::KeyStore| match store.fetch_key(sig_counter_key_id()) {
+            Ok(None) => Ok(None),
+            Ok(Some(rec)) => Ok(Some(match rec.private_key[..] {
+                [a, b, c] => u32::from_be_bytes([0, a, b, c]),
+                _ => SIG_COUNTER_MAX,
+            })),
+            Err(_) => Err(()),
         };
+    match logged {
+        Ok(Some(v)) => {
+            // A leftover 1.x record (a cut after the move): drop it.
+            if let Ok(Some(_)) = legacy(store) {
+                let _ = store.erase_key(sig_counter_key_id());
+            }
+            (v.min(u64::from(SIG_COUNTER_MAX))) as u32
+        }
+        Ok(None) => match legacy(store) {
+            Ok(None) => 0,
+            Ok(Some(v)) => {
+                let moved = store
+                    .retry_counters()
+                    .map(|log| {
+                        log.put_value(ValueId::SignatureCounter, u64::from(v))
+                            .is_ok()
+                    })
+                    .unwrap_or(false);
+                if moved {
+                    let _ = store.erase_key(sig_counter_key_id());
+                }
+                v
+            }
+            Err(()) => SIG_COUNTER_MAX,
+        },
+        Err(_) => SIG_COUNTER_MAX,
     }
-    let mut rec = KeyObject::new(
-        KmKeyType::Generic,
-        sig_counter_key_id().0,
-        pico2hsm_core::key::AppletId::OpenPgp,
-        AlgorithmId::AesGcm,
-    );
-    let _ = rec
-        .private_key
-        .extend_from_slice(&state.sig_counter.min(SIG_COUNTER_MAX).to_be_bytes()[1..]);
-    store.save_key(&rec)
 }
 
 /// KeyId of a persisted DO: 0xD0 in bits 15–8 keeps these apart from the

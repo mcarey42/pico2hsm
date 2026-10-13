@@ -62,6 +62,9 @@ pub fn handle_terminate_with_store(
     use crate::storage::retry_counter::{set, Credential};
     if set(store, Credential::OpenPgpPw1, PW1_MAX_RETRIES).is_err()
         || set(store, Credential::OpenPgpPw3, PW3_MAX_RETRIES).is_err()
+        // The signature counter lives in the counter log, not in the
+        // wiped keystore records: reset it with the passwords.
+        || super::put_data::save_sig_counter(0, store).is_err()
     {
         // Terminated and wiped all the same; a later TERMINATE (allowed
         // while PW3 is blocked) or ACTIVATE retries the reset.

@@ -571,40 +571,34 @@ impl OpenPgp {
         store: &mut dyn crate::storage::KeyStore,
     ) -> ApduResponse {
         match cmd.ins {
-            generate_keypair::INS_GENERATE_KEYPAIR
-                if cmd.p1 == 0x80
-                    && self.state.pw3_verified
-                    && cmd.data.first() == Some(&0xB6)
-                    && self.state.sig_counter != 0 =>
-            {
-                // A new signature key starts a new signature count (DO 93,
-                // OpenPGP Card 3.4 §4.4.3.9).  Reset on flash first.
-                let before = self.state.sig_counter;
-                self.state.sig_counter = 0;
-                if put_data::save_sig_counter(&self.state, store).is_err() {
-                    self.state.sig_counter = before;
-                    return ApduResponse::err(pico2hsm_core::apdu::SW_MEMORY_FAILURE);
-                }
-                self.route_with_store(cmd, store)
-            }
             pso::INS_PSO => pso::handle_with_store(&mut self.state, store, cmd),
-            generate_keypair::INS_GENERATE_KEYPAIR
-                if cmd.p1 == 0x80
-                    && self.state.pw3_verified
-                    && !self.state.credentials_persisted =>
-            {
-                // First key for this card: PW1/PW3 go to flash first (see
-                // `OpenPgpState::credentials_persisted`).
-                if Self::save_pw1_to_store(&self.state, store).is_err()
-                    || Self::save_pw3_to_store(&self.state, store).is_err()
-                {
-                    return ApduResponse::err(pico2hsm_core::apdu::SW_MEMORY_FAILURE);
-                }
-                self.state.credentials_persisted = true;
-                generate_keypair::handle_with_store(&mut self.state, store, cmd)
-            }
             generate_keypair::INS_GENERATE_KEYPAIR => {
-                generate_keypair::handle_with_store(&mut self.state, store, cmd)
+                let generating = cmd.p1 == 0x80 && self.state.pw3_verified;
+                if generating && !self.state.credentials_persisted {
+                    // First key for this card: PW1/PW3 go to flash first
+                    // (see `OpenPgpState::credentials_persisted`).
+                    if Self::save_pw1_to_store(&self.state, store).is_err()
+                        || Self::save_pw3_to_store(&self.state, store).is_err()
+                    {
+                        return ApduResponse::err(pico2hsm_core::apdu::SW_MEMORY_FAILURE);
+                    }
+                    self.state.credentials_persisted = true;
+                }
+                let resp = generate_keypair::handle_with_store(&mut self.state, store, cmd);
+                // A new signature key starts a new signature count (DO 93,
+                // OpenPGP Card 3.4 §4.4.3.9).  The key first, then the
+                // reset (STORAGE_V2 §18): a cut or a failed reset leaves
+                // the count too high for the new key, which is harmless;
+                // the other order could leave it too low for the old one.
+                if generating
+                    && cmd.data.first() == Some(&0xB6)
+                    && resp.sw == pico2hsm_core::apdu::SW_OK
+                    && self.state.sig_counter != 0
+                    && put_data::save_sig_counter(0, store).is_ok()
+                {
+                    self.state.sig_counter = 0;
+                }
+                resp
             }
             terminate_activate::INS_TERMINATE_DF => {
                 terminate_activate::handle_terminate_with_store(&mut self.state, store, cmd)
@@ -782,16 +776,8 @@ impl OpenPgp {
                 has_keys = true;
             }
         });
-        // Signature counter (DO 93).  An unreadable record loads as the
-        // largest count rather than 0: the counter must never go back.
-        self.state.sig_counter = match store.fetch_key(put_data::sig_counter_key_id()) {
-            Ok(None) => 0,
-            Ok(Some(rec)) => match rec.private_key[..] {
-                [a, b, c] => u32::from_be_bytes([0, a, b, c]),
-                _ => put_data::SIG_COUNTER_MAX,
-            },
-            Err(_) => put_data::SIG_COUNTER_MAX,
-        };
+        // Signature counter (DO 93), from the counter log.
+        self.state.sig_counter = put_data::load_sig_counter(store);
         for kid in do_ids.iter() {
             if let (Some(tag), Ok(Some(rec))) =
                 (put_data::tag_of_record(*kid), store.fetch_key(*kid))

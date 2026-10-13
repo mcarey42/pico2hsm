@@ -240,6 +240,17 @@ pub trait RetryCounterBackend {
         let _ = (id, value);
         Err(StorageError::WriteError)
     }
+
+    /// The keystore anchor (STORAGE_V2 §8.2); `Ok(None)`: never written.
+    fn anchor(&mut self) -> Result<Option<Anchor>, StorageError> {
+        Err(StorageError::NotFormatted)
+    }
+
+    /// Durably set the keystore anchor (see [`CounterLog::put_anchor`]).
+    fn put_anchor(&mut self, a: Anchor) -> Result<(), StorageError> {
+        let _ = a;
+        Err(StorageError::WriteError)
+    }
 }
 
 /// A 64-bit device value kept in the log next to the Lamport counter.
@@ -255,10 +266,13 @@ pub enum ValueId {
     PoolConfig = 0x03,
     /// RSA key pool sequence number of the last pooled key (monotonic).
     PoolSeq = 0x04,
+    /// OpenPGP digital-signature counter (DO 93).  Not monotonic: key
+    /// generation and import reset it.
+    SignatureCounter = 0x05,
 }
 
 /// Number of [`ValueId`]s (the in-RAM value table).
-pub const MAX_VALUES: usize = 4;
+pub const MAX_VALUES: usize = 5;
 
 impl ValueId {
     /// Every value, in table order (`id − 1`).
@@ -267,6 +281,7 @@ impl ValueId {
         ValueId::PoolClock,
         ValueId::PoolConfig,
         ValueId::PoolSeq,
+        ValueId::SignatureCounter,
     ];
 
     /// The value with record id `id`.
@@ -281,7 +296,7 @@ impl ValueId {
 
     /// Whether the value may only grow.
     pub fn monotonic(self) -> bool {
-        !matches!(self, ValueId::PoolConfig)
+        !matches!(self, ValueId::PoolConfig | ValueId::SignatureCounter)
     }
 }
 
@@ -382,7 +397,10 @@ pub const SLOT_SIZE: usize = 16;
 pub const SLOTS_PER_SECTOR: u16 = (pico2hsm_core::flash::SECTOR_SIZE / SLOT_SIZE) as u16;
 
 const HEADER_MAGIC: [u8; 4] = *b"P2RC";
-const FORMAT_VERSION: u8 = 1;
+/// Version 2 (STORAGE_V2): records are carried by (tag, id), known or not;
+/// the anchor and the signature counter are new kinds.  A version-1 log is
+/// migrated once ([`CounterLog::open_migrating`]).
+const FORMAT_VERSION: u8 = 2;
 const RECORD_TAG: u8 = 0x52;
 /// Tag of a Lamport-counter / device-value record.
 const LAMPORT_TAG: u8 = 0x4C;
@@ -408,9 +426,9 @@ fn encode_header(seq: u32) -> [u8; SLOT_SIZE] {
     b
 }
 
-fn decode_header(b: &[u8; SLOT_SIZE]) -> Option<u32> {
+fn decode_header(b: &[u8; SLOT_SIZE], version: u8) -> Option<u32> {
     let ok = b[0..4] == HEADER_MAGIC
-        && b[8] == FORMAT_VERSION
+        && b[8] == version
         && b[12..16] == crc(None, &b[0..12]).to_le_bytes();
     ok.then(|| u32::from_le_bytes([b[4], b[5], b[6], b[7]]))
 }
@@ -427,6 +445,7 @@ fn encode_record(seq: u32, cred: Credential, s: &CounterState) -> [u8; SLOT_SIZE
     b
 }
 
+#[cfg(test)]
 fn decode_record(seq: u32, b: &[u8; SLOT_SIZE]) -> Option<(Credential, CounterState)> {
     if b[0] != RECORD_TAG || b[12..16] != crc(Some(seq), &b[0..12]).to_le_bytes() {
         return None;
@@ -450,6 +469,7 @@ fn encode_value(seq: u32, id: ValueId, value: u64) -> [u8; SLOT_SIZE] {
     b
 }
 
+#[cfg(test)]
 fn decode_value(seq: u32, b: &[u8; SLOT_SIZE]) -> Option<(ValueId, u64)> {
     if b[0] != LAMPORT_TAG || b[12..16] != crc(Some(seq), &b[0..12]).to_le_bytes() {
         return None;
@@ -460,11 +480,170 @@ fn decode_value(seq: u32, b: &[u8; SLOT_SIZE]) -> Option<(ValueId, u64)> {
     Some((id, u64::from_le_bytes(v)))
 }
 
-/// The values carried by a sector rotation.
-type Values = [Option<u64>; MAX_VALUES];
-
 fn is_erased(b: &[u8]) -> bool {
     b.iter().all(|&x| x == 0xFF)
+}
+
+// ─── Raw records (format version 2) ──────────────────────────────────────────
+
+/// Distinct (tag, id) keys the log carries.  A write that would add one
+/// more is refused (`KeystoreFull`), never dropped: rotation must carry
+/// every key, including kinds this firmware does not know (STORAGE_V2
+/// §8.2), so later 2.x firmware can add kinds safely.
+pub const MAX_RAW: usize = 32;
+
+/// One record's payload, keyed by (tag, id): bytes 2..12 of its slot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Raw {
+    tag: u8,
+    id: u8,
+    body: [u8; 10],
+}
+
+impl Raw {
+    fn from_slot(b: &[u8; SLOT_SIZE]) -> Self {
+        let mut body = [0u8; 10];
+        body.copy_from_slice(&b[2..12]);
+        Raw {
+            tag: b[0],
+            id: b[1],
+            body,
+        }
+    }
+
+    fn encode(&self, seq: u32) -> [u8; SLOT_SIZE] {
+        let mut b = [0u8; SLOT_SIZE];
+        b[0] = self.tag;
+        b[1] = self.id;
+        b[2..12].copy_from_slice(&self.body);
+        let c = crc(Some(seq), &b[0..12]);
+        b[12..16].copy_from_slice(&c.to_le_bytes());
+        b
+    }
+
+    /// A slot bound to `seq` with a valid CRC.  The tag 0xFF is never a
+    /// record (it is the erased pattern).
+    fn decode(seq: u32, b: &[u8; SLOT_SIZE]) -> Option<Self> {
+        (b[0] != 0xFF && b[12..16] == crc(Some(seq), &b[0..12]).to_le_bytes())
+            .then(|| Raw::from_slot(b))
+    }
+
+    fn value(&self) -> u64 {
+        let mut v = [0u8; 8];
+        v.copy_from_slice(&self.body[2..10]);
+        u64::from_le_bytes(v)
+    }
+}
+
+type RawTable = heapless::Vec<Raw, MAX_RAW>;
+
+/// Tag of the keystore anchor record (STORAGE_V2 §8.2).
+const ANCHOR_TAG: u8 = 0x41;
+
+/// The keystore anchor: the newest committed journal record, by sequence
+/// number *and* ring slot (STORAGE_V2 §8.2, R1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Anchor {
+    /// Low 16 bits of the binding block's `format_gen`.
+    pub format_gen: u16,
+    /// Sequence number of the head record (48 bits).
+    pub head_seq: u64,
+    /// The head record's slot: ring position × slots per sector + slot.
+    pub head_slot: u16,
+}
+
+/// Largest `head_seq` an anchor can hold.
+pub const ANCHOR_SEQ_MAX: u64 = (1 << 48) - 1;
+
+impl Anchor {
+    fn to_raw(self) -> Option<Raw> {
+        if self.head_seq > ANCHOR_SEQ_MAX {
+            return None;
+        }
+        let mut body = [0u8; 10];
+        body[0..2].copy_from_slice(&self.format_gen.to_le_bytes());
+        body[2..8].copy_from_slice(&self.head_seq.to_le_bytes()[..6]);
+        body[8..10].copy_from_slice(&self.head_slot.to_le_bytes());
+        Some(Raw {
+            tag: ANCHOR_TAG,
+            id: 0,
+            body,
+        })
+    }
+
+    fn from_raw(r: &Raw) -> Self {
+        let mut seq = [0u8; 8];
+        seq[..6].copy_from_slice(&r.body[2..8]);
+        Anchor {
+            format_gen: u16::from_le_bytes([r.body[0], r.body[1]]),
+            head_seq: u64::from_le_bytes(seq),
+            head_slot: u16::from_le_bytes([r.body[8], r.body[9]]),
+        }
+    }
+}
+
+/// Insert a record read back from flash (scan, migration): the last one
+/// per key wins, except monotonic values, which keep the largest seen.
+/// Returns false if the table is full.
+fn absorb(table: &mut RawTable, r: Raw) -> bool {
+    let monotonic = r.tag == LAMPORT_TAG && ValueId::from_id(r.id).is_some_and(|v| v.monotonic());
+    match table.iter_mut().find(|e| e.tag == r.tag && e.id == r.id) {
+        Some(e) => {
+            if !(monotonic && r.value() < e.value()) {
+                *e = r;
+            }
+            true
+        }
+        None => table.push(r).is_ok(),
+    }
+}
+
+/// A region scan: the newest sector, its header `seq`, its next free slot,
+/// its records, and the highest header `seq` seen anywhere.
+type RegionScan = (u32, u32, u16, RawTable, u32);
+
+/// Find the newest sector with a valid `version` header in a region and
+/// read its records.  `Ok(None)`: no valid header (unformatted).
+fn scan_region<F: CounterFlash>(
+    flash: &mut F,
+    sectors: u32,
+    version: u8,
+) -> Result<Option<RegionScan>, StorageError> {
+    let read_slot =
+        |flash: &mut F, sector: u32, slot: u16| -> Result<[u8; SLOT_SIZE], StorageError> {
+            let mut b = [0u8; SLOT_SIZE];
+            flash.read(CounterLog::<F>::slot_offset(sector, slot), &mut b)?;
+            Ok(b)
+        };
+    let mut best: Option<(u32, u32)> = None;
+    let mut max_seq = 0u32;
+    for sector in 0..sectors {
+        if let Some(seq) = decode_header(&read_slot(flash, sector, 0)?, version) {
+            max_seq = max_seq.max(seq);
+            if best.map_or(true, |(_, s)| seq > s) {
+                best = Some((sector, seq));
+            }
+        }
+    }
+    let Some((sector, seq)) = best else {
+        return Ok(None);
+    };
+    let mut table = RawTable::new();
+    let mut head = 1;
+    for slot in 1..SLOTS_PER_SECTOR {
+        let b = read_slot(flash, sector, slot)?;
+        if is_erased(&b) {
+            continue;
+        }
+        head = slot + 1;
+        if let Some(r) = Raw::decode(seq, &b) {
+            if !absorb(&mut table, r) {
+                // More keys than this firmware can carry: never drop one.
+                return Err(StorageError::KeystoreFull);
+            }
+        }
+    }
+    Ok(Some((sector, seq, head, table, max_seq)))
 }
 
 // ─── CounterLog ──────────────────────────────────────────────────────────────
@@ -479,20 +658,20 @@ enum LogState {
     Failed,
 }
 
-/// The append-only retry-counter log over a [`CounterFlash`] region.
+/// The append-only counter log over a [`CounterFlash`] region.
 ///
-/// The index of current states is kept in RAM (a few dozen bytes); no
-/// sector buffer is ever held, all flash access is slot-sized.
+/// The current records are kept in RAM, keyed by (tag, id) — at most
+/// [`MAX_RAW`] of them, about 0.5 KB; no sector buffer is ever held, all
+/// flash access is slot-sized.
 pub struct CounterLog<F: CounterFlash> {
     flash: F,
     sectors: u32,
     state: LogState,
     /// Next header `seq` to commit (above every one ever seen or tried).
     next_seq: u32,
-    entries: [Option<CounterState>; MAX_CREDENTIALS],
-    /// Device values by `ValueId::index` (`None`: never written); index 0
-    /// is the domain Lamport counter.
-    values: Values,
+    raw: RawTable,
+    /// Set when this boot moved a version-1 log into this region.
+    migrated_v1: bool,
 }
 
 impl<F: CounterFlash> CounterLog<F> {
@@ -503,11 +682,55 @@ impl<F: CounterFlash> CounterLog<F> {
             sectors,
             state: LogState::Failed,
             next_seq: 1,
-            entries: [None; MAX_CREDENTIALS],
-            values: [None; MAX_VALUES],
+            raw: RawTable::new(),
+            migrated_v1: false,
         };
         log.state = log.scan().unwrap_or(LogState::Failed);
         log
+    }
+
+    /// [`Self::open`], then, if this region holds no log yet, move a
+    /// version-1 log from `legacy` into it: its records become this log's
+    /// first sector (sequence numbers continuing above the old ones), then
+    /// the legacy sectors are erased.  A cut before the new header is
+    /// programmed leaves the legacy log intact and the move restarts at
+    /// the next boot; a cut after it only leaves the legacy sectors to
+    /// erase, which nothing reads again.  A version-1 log is never
+    /// treated as unformatted: that would reseed the counters from the PIN
+    /// records.
+    pub fn open_migrating<L: CounterFlash>(
+        flash: F,
+        sectors: u32,
+        legacy: &mut L,
+        legacy_sectors: u32,
+    ) -> Self {
+        let mut log = Self::open(flash, sectors);
+        if log.state != LogState::Unformatted {
+            return log;
+        }
+        match scan_region(legacy, legacy_sectors, 1) {
+            Ok(None) => {}
+            Ok(Some((_, _, _, table, max_seq))) => {
+                log.next_seq = log.next_seq.max(max_seq.saturating_add(1));
+                if log.commit(None, &table).is_ok() {
+                    log.migrated_v1 = true;
+                    for sector in 0..legacy_sectors {
+                        let _ = legacy.erase_sector(sector);
+                    }
+                } else {
+                    log.state = LogState::Failed;
+                }
+            }
+            // The old log exists but cannot be read or carried: fail
+            // closed rather than start from nothing.
+            Err(_) => log.state = LogState::Failed,
+        }
+        log
+    }
+
+    /// This boot moved a version-1 log into this region.
+    pub fn migrated_v1(&self) -> bool {
+        self.migrated_v1
     }
 
     /// The underlying flash (tests inspect it).
@@ -526,39 +749,36 @@ impl<F: CounterFlash> CounterLog<F> {
     }
 
     fn scan(&mut self) -> Result<LogState, StorageError> {
-        let mut best: Option<(u32, u32)> = None;
-        for sector in 0..self.sectors {
-            if let Some(seq) = decode_header(&self.read_slot(sector, 0)?) {
-                self.next_seq = self.next_seq.max(seq.saturating_add(1));
-                if best.map_or(true, |(_, s)| seq > s) {
-                    best = Some((sector, seq));
-                }
-            }
-        }
-        let Some((sector, seq)) = best else {
+        let Some((sector, seq, head, table, max_seq)) =
+            scan_region(&mut self.flash, self.sectors, FORMAT_VERSION)?
+        else {
             return Ok(LogState::Unformatted);
         };
-        let mut head = 1;
-        for slot in 1..SLOTS_PER_SECTOR {
-            let b = self.read_slot(sector, slot)?;
-            if is_erased(&b) {
-                continue;
-            }
-            head = slot + 1;
-            if let Some((cred, state)) = decode_record(seq, &b) {
-                self.entries[cred.index()] = Some(state);
-            } else if let Some((id, v)) = decode_value(seq, &b) {
-                // Monotonic values: a torn-then-rewritten history can only
-                // hold them in increasing order, but never trust that.
-                // Others: the last record wins.
-                let slot = &mut self.values[id.index()];
-                *slot = Some(match *slot {
-                    Some(old) if id.monotonic() => old.max(v),
-                    _ => v,
-                });
-            }
-        }
+        self.next_seq = self.next_seq.max(max_seq.saturating_add(1));
+        self.raw = table;
         Ok(LogState::Active { sector, seq, head })
+    }
+
+    fn find(&self, tag: u8, id: u8) -> Option<&Raw> {
+        self.raw.iter().find(|r| r.tag == tag && r.id == id)
+    }
+
+    /// `table` with `r` in place of its key (or added).
+    fn with(&self, r: Raw) -> Result<RawTable, StorageError> {
+        let mut table = self.raw.clone();
+        match table.iter_mut().find(|e| e.tag == r.tag && e.id == r.id) {
+            Some(e) => *e = r,
+            None => table.push(r).map_err(|_| StorageError::KeystoreFull)?,
+        }
+        Ok(table)
+    }
+
+    fn check_active(&self) -> Result<(), StorageError> {
+        match self.state {
+            LogState::Active { .. } => Ok(()),
+            LogState::Unformatted => Err(StorageError::NotFormatted),
+            LogState::Failed => Err(StorageError::ReadError),
+        }
     }
 
     /// Program `data` into one slot and read it back.
@@ -576,14 +796,13 @@ impl<F: CounterFlash> CounterLog<F> {
         }
     }
 
-    /// Write `entries` into a freshly erased `sector` and commit it with a
+    /// Write `table` into a freshly erased `sector` and commit it with a
     /// header carrying `seq`.  Returns the next free slot.
     fn write_sector(
         &mut self,
         sector: u32,
         seq: u32,
-        entries: &[Option<CounterState>; MAX_CREDENTIALS],
-        values: &Values,
+        table: &RawTable,
     ) -> Result<u16, StorageError> {
         self.flash.erase_sector(sector)?;
         for slot in 0..SLOTS_PER_SECTOR {
@@ -592,17 +811,9 @@ impl<F: CounterFlash> CounterLog<F> {
             }
         }
         let mut slot = 1;
-        for cred in Credential::ALL {
-            if let Some(state) = entries[cred.index()] {
-                self.program_slot(sector, slot, &encode_record(seq, cred, &state))?;
-                slot += 1;
-            }
-        }
-        for id in ValueId::ALL {
-            if let Some(v) = values[id.index()] {
-                self.program_slot(sector, slot, &encode_value(seq, id, v))?;
-                slot += 1;
-            }
+        for r in table {
+            self.program_slot(sector, slot, &r.encode(seq))?;
+            slot += 1;
         }
         // The commit point: until this header reads back valid, the sector
         // is ignored and the previous one stays authoritative.
@@ -610,13 +821,8 @@ impl<F: CounterFlash> CounterLog<F> {
         Ok(slot)
     }
 
-    /// Commit `entries` to a sector other than `avoid`, trying each in turn.
-    fn commit(
-        &mut self,
-        avoid: Option<u32>,
-        entries: &[Option<CounterState>; MAX_CREDENTIALS],
-        values: &Values,
-    ) -> Result<(), StorageError> {
+    /// Commit `table` to a sector other than `avoid`, trying each in turn.
+    fn commit(&mut self, avoid: Option<u32>, table: &RawTable) -> Result<(), StorageError> {
         let start = avoid.map_or(0, |a| a + 1);
         let mut last = Err(StorageError::WriteError);
         for k in 0..self.sectors {
@@ -628,10 +834,9 @@ impl<F: CounterFlash> CounterLog<F> {
             // header behind: never reuse its seq.
             let seq = self.next_seq;
             self.next_seq = seq.checked_add(1).ok_or(StorageError::WriteError)?;
-            match self.write_sector(sector, seq, entries, values) {
+            match self.write_sector(sector, seq, table) {
                 Ok(head) => {
-                    self.entries = *entries;
-                    self.values = *values;
+                    self.raw = table.clone();
                     self.state = LogState::Active { sector, seq, head };
                     return Ok(());
                 }
@@ -640,42 +845,21 @@ impl<F: CounterFlash> CounterLog<F> {
         }
         last
     }
-}
 
-impl<F: CounterFlash> RetryCounterBackend for CounterLog<F> {
-    fn get(&mut self, cred: Credential) -> Result<Option<CounterState>, StorageError> {
-        match self.state {
-            LogState::Active { .. } => Ok(self.entries[cred.index()]),
-            LogState::Unformatted => Err(StorageError::NotFormatted),
-            LogState::Failed => Err(StorageError::ReadError),
-        }
-    }
-
-    fn put(&mut self, cred: Credential, new: CounterState) -> Result<(), StorageError> {
-        let i = cred.index();
-        if let Some(old) = self.entries[i] {
-            if new.failures_total < old.failures_total {
-                return Err(StorageError::IntegrityFailure);
-            }
-            if new == old && matches!(self.state, LogState::Active { .. }) {
-                return Ok(());
-            }
-        }
+    /// Durably record `r` (append, or rotate a full sector).  Returns only
+    /// once the record is on flash.
+    fn write(&mut self, r: Raw) -> Result<(), StorageError> {
+        // Refuse a new key past the cap before touching flash.
+        let rotated = self.with(r)?;
         let mut attempts = 0;
         loop {
             let LogState::Active { sector, seq, head } = self.state else {
-                return Err(match self.state {
-                    LogState::Unformatted => StorageError::NotFormatted,
-                    _ => StorageError::ReadError,
-                });
+                return Err(self.check_active().unwrap_err());
             };
             if head >= SLOTS_PER_SECTOR {
-                // Full: carry every state, the new one included, over to
+                // Full: carry every record, the new one included, over to
                 // the next sector.
-                let mut entries = self.entries;
-                entries[i] = Some(new);
-                let values = self.values;
-                return self.commit(Some(sector), &entries, &values);
+                return self.commit(Some(sector), &rotated);
             }
             // Whatever happens, this slot is used up (a torn write leaves
             // it neither erased nor valid).
@@ -684,9 +868,9 @@ impl<F: CounterFlash> RetryCounterBackend for CounterLog<F> {
                 seq,
                 head: head + 1,
             };
-            match self.program_slot(sector, head, &encode_record(seq, cred, &new)) {
+            match self.program_slot(sector, head, &r.encode(seq)) {
                 Ok(()) => {
-                    self.entries[i] = Some(new);
+                    self.raw = rotated;
                     return Ok(());
                 }
                 Err(e) => {
@@ -699,6 +883,61 @@ impl<F: CounterFlash> RetryCounterBackend for CounterLog<F> {
         }
     }
 
+    /// The keystore anchor (`Ok(None)`: never written).
+    pub fn anchor(&mut self) -> Result<Option<Anchor>, StorageError> {
+        self.check_active()?;
+        Ok(self.find(ANCHOR_TAG, 0).map(Anchor::from_raw))
+    }
+
+    /// Durably set the keystore anchor.  Within one `format_gen` the head
+    /// only moves forward (`IntegrityFailure` otherwise); writing the
+    /// current anchor is a no-op.  A new `format_gen` (format, re-index)
+    /// may start anywhere.
+    pub fn put_anchor(&mut self, a: Anchor) -> Result<(), StorageError> {
+        self.check_active()?;
+        if let Some(old) = self.anchor()? {
+            if old == a {
+                return Ok(());
+            }
+            if old.format_gen == a.format_gen && a.head_seq < old.head_seq {
+                return Err(StorageError::IntegrityFailure);
+            }
+        }
+        self.write(a.to_raw().ok_or(StorageError::WriteError)?)
+    }
+}
+
+impl<F: CounterFlash> RetryCounterBackend for CounterLog<F> {
+    fn get(&mut self, cred: Credential) -> Result<Option<CounterState>, StorageError> {
+        self.check_active()?;
+        Ok(self.find(RECORD_TAG, cred as u8).map(|r| {
+            let mut b = [0u8; SLOT_SIZE];
+            b[0] = r.tag;
+            b[1] = r.id;
+            b[2..12].copy_from_slice(&r.body);
+            let word = |i: usize| u32::from_le_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]]);
+            CounterState {
+                failures_total: word(4),
+                failures_at_reset: word(8),
+                allowance: b[2],
+            }
+        }))
+    }
+
+    fn put(&mut self, cred: Credential, new: CounterState) -> Result<(), StorageError> {
+        if let Some(old) = self.get(cred).ok().flatten() {
+            if new.failures_total < old.failures_total {
+                return Err(StorageError::IntegrityFailure);
+            }
+            if new == old {
+                return Ok(());
+            }
+        }
+        // The slot encoding is the version-1 record's; seq 0 is a dummy,
+        // only bytes 0..12 are kept.
+        self.write(Raw::from_slot(&encode_record(0, cred, &new)))
+    }
+
     fn needs_migration(&mut self) -> bool {
         self.state == LogState::Unformatted
     }
@@ -707,11 +946,14 @@ impl<F: CounterFlash> RetryCounterBackend for CounterLog<F> {
         if self.state != LogState::Unformatted {
             return Err(StorageError::WriteError);
         }
-        let mut entries = [None; MAX_CREDENTIALS];
+        let mut table = RawTable::new();
         for (cred, state) in seeds {
-            entries[cred.index()] = Some(*state);
+            let r = Raw::from_slot(&encode_record(0, *cred, state));
+            if !absorb(&mut table, r) {
+                return Err(StorageError::KeystoreFull);
+            }
         }
-        self.commit(None, &entries, &[None; MAX_VALUES])
+        self.commit(None, &table)
     }
 
     fn lamport(&mut self) -> Result<u64, StorageError> {
@@ -723,54 +965,28 @@ impl<F: CounterFlash> RetryCounterBackend for CounterLog<F> {
     }
 
     fn value(&mut self, id: ValueId) -> Result<Option<u64>, StorageError> {
-        match self.state {
-            LogState::Active { .. } => Ok(self.values[id.index()]),
-            LogState::Unformatted => Err(StorageError::NotFormatted),
-            LogState::Failed => Err(StorageError::ReadError),
-        }
+        self.check_active()?;
+        Ok(self.find(LAMPORT_TAG, id as u8).map(Raw::value))
     }
 
     fn put_value(&mut self, id: ValueId, value: u64) -> Result<(), StorageError> {
-        if let Some(old) = self.values[id.index()] {
+        if let Some(old) = self.value(id)? {
             if id.monotonic() && value < old {
                 return Err(StorageError::IntegrityFailure);
             }
-            if value == old && matches!(self.state, LogState::Active { .. }) {
+            if value == old {
                 return Ok(());
             }
         }
-        let mut attempts = 0;
-        loop {
-            let LogState::Active { sector, seq, head } = self.state else {
-                return Err(match self.state {
-                    LogState::Unformatted => StorageError::NotFormatted,
-                    _ => StorageError::ReadError,
-                });
-            };
-            if head >= SLOTS_PER_SECTOR {
-                let entries = self.entries;
-                let mut values = self.values;
-                values[id.index()] = Some(value);
-                return self.commit(Some(sector), &entries, &values);
-            }
-            self.state = LogState::Active {
-                sector,
-                seq,
-                head: head + 1,
-            };
-            match self.program_slot(sector, head, &encode_value(seq, id, value)) {
-                Ok(()) => {
-                    self.values[id.index()] = Some(value);
-                    return Ok(());
-                }
-                Err(e) => {
-                    attempts += 1;
-                    if attempts >= WRITE_ATTEMPTS {
-                        return Err(e);
-                    }
-                }
-            }
-        }
+        self.write(Raw::from_slot(&encode_value(0, id, value)))
+    }
+
+    fn anchor(&mut self) -> Result<Option<Anchor>, StorageError> {
+        CounterLog::anchor(self)
+    }
+
+    fn put_anchor(&mut self, a: Anchor) -> Result<(), StorageError> {
+        CounterLog::put_anchor(self, a)
     }
 }
 
@@ -1144,7 +1360,7 @@ mod tests {
     }
 
     #[test]
-    fn unknown_value_ids_are_skipped() {
+    fn unknown_value_ids_are_ignored_and_carried() {
         let mut log = formatted();
         let LogState::Active { sector, seq, head } = log.state else {
             panic!()
@@ -1157,6 +1373,242 @@ mod tests {
         let mut again = reopen(&mut log);
         assert_eq!(again.value(ValueId::PoolClock), Ok(None));
         assert_eq!(again.lamport(), Ok(0));
+        // Version 2: rotation carries it, for the firmware that knows it.
+        for v in 1..=u64::from(SLOTS_PER_SECTOR) {
+            again.put_lamport(v).unwrap();
+        }
+        let again = reopen(&mut again);
+        assert!(again
+            .raw
+            .iter()
+            .any(|r| r.tag == LAMPORT_TAG && r.id == 0x7F && r.value() == 5));
+    }
+
+    /// Program a record of any (tag, id) into the active sector.
+    fn plant(log: &mut CounterLog<SimFlash>, tag: u8, id: u8, fill: u8) {
+        let LogState::Active { sector, seq, head } = log.state else {
+            panic!()
+        };
+        let r = Raw {
+            tag,
+            id,
+            body: [fill; 10],
+        };
+        log.program_slot(sector, head, &r.encode(seq)).unwrap();
+        log.state = LogState::Active {
+            sector,
+            seq,
+            head: head + 1,
+        };
+    }
+
+    #[test]
+    fn unknown_kinds_survive_rotation_byte_for_byte() {
+        let mut log = formatted();
+        plant(&mut log, 0x58, 0x01, 0xA5);
+        plant(&mut log, 0x58, 0x02, 0x5A);
+        let mut log = reopen(&mut log);
+        for v in 1..=(2 * u64::from(SLOTS_PER_SECTOR)) {
+            log.put_lamport(v).unwrap();
+        }
+        let log = reopen(&mut log);
+        let x = |id| {
+            log.raw
+                .iter()
+                .find(|r| r.tag == 0x58 && r.id == id)
+                .copied()
+        };
+        assert_eq!(x(1).map(|r| r.body), Some([0xA5; 10]));
+        assert_eq!(x(2).map(|r| r.body), Some([0x5A; 10]));
+    }
+
+    #[test]
+    fn a_new_key_past_the_cap_is_refused_never_dropped() {
+        let mut log = formatted();
+        log.put_lamport(1).unwrap();
+        // Fill the table with unknown kinds up to the cap.
+        let mut id = 0;
+        while log.raw.len() < MAX_RAW {
+            plant(&mut log, 0x58, id, id);
+            log = reopen(&mut log);
+            id += 1;
+        }
+        let programs = log.flash_mut().programs;
+        assert_eq!(
+            log.put(PIN, CounterState::fresh(3)),
+            Err(StorageError::KeystoreFull)
+        );
+        assert_eq!(log.flash_mut().programs, programs, "nothing written");
+        // Existing keys still update, across rotations.
+        for v in 2..=(2 * u64::from(SLOTS_PER_SECTOR)) {
+            log.put_lamport(v).unwrap();
+        }
+        let mut log = reopen(&mut log);
+        assert_eq!(log.raw.len(), MAX_RAW);
+        assert_eq!(log.lamport(), Ok(2 * u64::from(SLOTS_PER_SECTOR)));
+    }
+
+    #[test]
+    fn signature_counter_persists_and_may_reset() {
+        let mut log = formatted();
+        log.put_value(ValueId::SignatureCounter, 41).unwrap();
+        log.put_value(ValueId::SignatureCounter, 42).unwrap();
+        assert_eq!(
+            reopen(&mut log).value(ValueId::SignatureCounter),
+            Ok(Some(42))
+        );
+        // Key generation resets it: not monotonic.
+        log.put_value(ValueId::SignatureCounter, 0).unwrap();
+        assert_eq!(
+            reopen(&mut log).value(ValueId::SignatureCounter),
+            Ok(Some(0))
+        );
+    }
+
+    // ── Anchor ──────────────────────────────────────────────────────────
+
+    fn anchor(g: u16, seq: u64, slot: u16) -> Anchor {
+        Anchor {
+            format_gen: g,
+            head_seq: seq,
+            head_slot: slot,
+        }
+    }
+
+    #[test]
+    fn anchor_round_trips_and_only_moves_forward() {
+        let mut log = formatted();
+        assert_eq!(log.anchor(), Ok(None));
+        log.put_anchor(anchor(1, 0, 1)).unwrap();
+        log.put_anchor(anchor(1, 7, 8)).unwrap();
+        assert_eq!(reopen(&mut log).anchor(), Ok(Some(anchor(1, 7, 8))));
+        assert_eq!(
+            log.put_anchor(anchor(1, 6, 9)),
+            Err(StorageError::IntegrityFailure)
+        );
+        // Same seq, another slot: allowed only by the caller's rules (a
+        // retried commit in the next slot, R3); the log keeps the newest.
+        log.put_anchor(anchor(1, 7, 9)).unwrap();
+        // A new format_gen may start low.
+        log.put_anchor(anchor(2, 0, 1)).unwrap();
+        assert_eq!(reopen(&mut log).anchor(), Ok(Some(anchor(2, 0, 1))));
+        // 48-bit seq limit.
+        assert_eq!(
+            log.put_anchor(anchor(2, ANCHOR_SEQ_MAX + 1, 1)),
+            Err(StorageError::WriteError)
+        );
+        log.put_anchor(anchor(2, ANCHOR_SEQ_MAX, 3)).unwrap();
+        assert_eq!(
+            reopen(&mut log).anchor(),
+            Ok(Some(anchor(2, ANCHOR_SEQ_MAX, 3)))
+        );
+    }
+
+    #[test]
+    fn anchor_survives_rotation_and_torn_writes() {
+        let mut log = formatted();
+        log.put(PIN, CounterState::fresh(3)).unwrap();
+        for seq in 1..=(3 * u64::from(SLOTS_PER_SECTOR)) {
+            log.put_anchor(anchor(1, seq, (seq % 2000) as u16)).unwrap();
+        }
+        let n = 3 * u64::from(SLOTS_PER_SECTOR);
+        let mut log = reopen(&mut log);
+        assert_eq!(log.anchor().unwrap().unwrap().head_seq, n);
+        // A cut at every byte of the next anchor: the anchor is the old
+        // one or the new one, never anything else.
+        for budget in 0..SLOT_SIZE {
+            let mut flash = log.flash_mut().reboot();
+            flash.program_budget = Some(budget);
+            let mut l = open(flash);
+            let _ = l.put_anchor(anchor(1, n + 1, 5));
+            let a = reopen(&mut l).anchor().unwrap().unwrap();
+            assert!(
+                a == anchor(1, n, (n % 2000) as u16) || a == anchor(1, n + 1, 5),
+                "{a:?}"
+            );
+        }
+    }
+
+    // ── Version-1 migration ─────────────────────────────────────────────
+
+    /// A version-1 log in `flash`: header seq 5, a PIN state and two values.
+    fn v1_log() -> SimFlash {
+        let mut f = SimFlash::new();
+        let seq = 5;
+        let mut h = encode_header(seq);
+        h[8] = 1;
+        let c = crc(None, &h[0..12]);
+        h[12..16].copy_from_slice(&c.to_le_bytes());
+        let pin = CounterState {
+            failures_total: 9,
+            failures_at_reset: 8,
+            allowance: 3,
+        };
+        let slot = |n: u32| 2 * SECTOR_SIZE as u32 + n * SLOT_SIZE as u32;
+        f.program(slot(1), &encode_record(seq, PIN, &pin)).unwrap();
+        f.program(slot(2), &encode_value(seq, ValueId::Lamport, 77))
+            .unwrap();
+        f.program(slot(3), &encode_value(seq, ValueId::PoolClock, 1234))
+            .unwrap();
+        f.program(slot(0), &h).unwrap();
+        f
+    }
+
+    #[test]
+    fn version_1_log_is_migrated_once() {
+        let mut legacy = v1_log();
+        let mut log = CounterLog::open_migrating(SimFlash::new(), SECTORS, &mut legacy, SECTORS);
+        assert!(log.migrated_v1());
+        assert!(
+            !log.needs_migration(),
+            "never reseeded from the PIN records"
+        );
+        assert_eq!(log.get(PIN).unwrap().unwrap().remaining(), 2);
+        assert_eq!(log.lamport(), Ok(77));
+        assert_eq!(log.value(ValueId::PoolClock), Ok(Some(1234)));
+        assert!(log.next_seq > 5, "sequence continues above version 1");
+        assert!(legacy.mem.iter().all(|&b| b == 0xFF), "legacy erased");
+        // Next boot: already migrated, nothing to do.
+        let mut again =
+            CounterLog::open_migrating(log.flash_mut().reboot(), SECTORS, &mut legacy, SECTORS);
+        assert!(!again.migrated_v1());
+        assert_eq!(again.lamport(), Ok(77));
+    }
+
+    #[test]
+    fn a_cut_during_migration_restarts_it() {
+        // Cut after every program of the new sector: until its header is
+        // valid the legacy log is untouched and the next boot starts over.
+        for budget in (0..200).step_by(7) {
+            let mut legacy = v1_log();
+            let mut flash = SimFlash::new();
+            flash.program_budget = Some(budget);
+            let mut log = CounterLog::open_migrating(flash, SECTORS, &mut legacy, SECTORS);
+            let migrated = log.migrated_v1();
+            let mut log =
+                CounterLog::open_migrating(log.flash_mut().reboot(), SECTORS, &mut legacy, SECTORS);
+            assert!(!log.needs_migration(), "budget {budget}");
+            assert_eq!(
+                log.lamport(),
+                Ok(77),
+                "budget {budget} migrated first time: {migrated}"
+            );
+            assert_eq!(log.get(PIN).unwrap().unwrap().remaining(), 2);
+        }
+    }
+
+    #[test]
+    fn a_v1_header_in_the_new_region_is_not_a_v2_log() {
+        let mut log = open(v1_log());
+        assert!(log.needs_migration());
+    }
+
+    #[test]
+    fn blank_legacy_region_leaves_the_log_unformatted() {
+        let mut legacy = SimFlash::new();
+        let mut log = CounterLog::open_migrating(SimFlash::new(), SECTORS, &mut legacy, SECTORS);
+        assert!(log.needs_migration());
+        assert!(!log.migrated_v1());
     }
 
     #[test]
@@ -1178,7 +1630,7 @@ mod tests {
         let r = encode_record(9, Credential::PivPuk, &s);
         assert_eq!(decode_record(9, &r), Some((Credential::PivPuk, s)));
         assert_eq!(decode_record(10, &r), None, "bound to the sector seq");
-        assert_eq!(decode_header(&encode_header(42)), Some(42));
+        assert_eq!(decode_header(&encode_header(42), FORMAT_VERSION), Some(42));
     }
 
     #[test]
@@ -1475,7 +1927,7 @@ mod tests {
         log.put(PIN, n).unwrap();
         // Both the full old sector and the new one have valid headers.
         let headers = (0..SECTORS)
-            .filter(|&k| decode_header(&log.read_slot(k, 0).unwrap()).is_some())
+            .filter(|&k| decode_header(&log.read_slot(k, 0).unwrap(), FORMAT_VERSION).is_some())
             .count();
         assert_eq!(headers, 2);
         assert_eq!(reopen(&mut log).get(PIN), Ok(Some(n)));
