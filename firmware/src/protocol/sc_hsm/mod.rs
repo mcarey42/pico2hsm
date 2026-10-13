@@ -271,13 +271,11 @@ pub enum OpBufState {
     Dirty(u32),
 }
 
-/// Capacity of the SC-HSM key/EF index.  At least the flash directory's,
-/// so an object that fits on flash always fits here: with 32 entries the
-/// 33rd key or file was saved (9000) yet unreachable until a reset.
-/// 8 bytes per entry.
+/// Capacity of the SC-HSM key/EF index (8 bytes per entry).  The store
+/// refuses a new SC-HSM object past it (`keystore_v2`, 6A84): with a
+/// smaller index than the store, an object was saved (9000) yet
+/// unreachable until a reset.
 pub const MAX_KEY_INDEX: usize = 340;
-#[cfg(target_arch = "arm")]
-const _: () = assert!(MAX_KEY_INDEX >= crate::storage::filesystem::MAX_DIRECTORY_ENTRIES);
 
 /// Lightweight metadata for a key or EF file stored in flash.
 /// Kept in RAM so LIST KEYS, SELECT, MSE SET, and PRKD generation

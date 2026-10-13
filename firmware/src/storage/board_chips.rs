@@ -1,33 +1,20 @@
-//! Board-specific `BoardChip` type aliases for `StaticCell` monomorphization.
+//! The keystore medium per board, for `StaticCell` monomorphization.
 //!
-//! Exactly one `BoardChip` alias is active at compile time, selected by
-//! the active board feature flag.
-//!
-//! # pico2_4m
-//! Uses `QmiFlash` — the RP2350 internal QMI flash (upper 2 MB partition).
-//! No external SPI flash is required; the on-board 4 MB chip is shared between
-//! firmware XIP (lower 2 MB) and keystore (upper 2 MB).
-//!
-//! # rp2350_one_* / rp2350_geek_*
-//! Uses `AnyChip<Spi0Flash, Spi1Flash, QmiFlash>` where Spi0Flash is the
-//! primary flash on SPI0 and Spi1Flash is the RAID-1 mirror on SPI1.
-//! `QmiFlash` is the unused SD-slot placeholder for the type parameter.
-//!
-//! # waveshare_rp2350_lcd_sdcard
-//! Uses `SdCardFlash` — single SD card on SPI1.
-//!
-//! NOTE: The AnyChip variants for SPI boards require that the SpiFlash instances
-//! are built from the respective SPI buses before the board struct is constructed.
-//! See `main.rs` `run_one_board` / `run_geek_board` for the wiring.
+//! Every board without an SD card keeps its keystore in the upper part of
+//! the internal QMI flash (`QmiFlash`); the SD-card boards on the card
+//! (`SdCardFlash`).  No board has external SPI flash (STORAGE_V2 §2).
 
-#[cfg(target_arch = "arm")]
+#[cfg(all(
+    target_arch = "arm",
+    any(
+        feature = "waveshare_rp2350_lcd_sdcard",
+        feature = "rp2350_geek_sdcard"
+    )
+))]
 use embassy_rp::gpio::Output;
 
 #[cfg(target_arch = "arm")]
-use crate::storage::{
-    flash_chip::{QmiFlash, SpiFlash},
-    AnyChip,
-};
+use crate::storage::flash_chip::QmiFlash;
 
 #[cfg(all(
     target_arch = "arm",
@@ -46,20 +33,10 @@ pub type BoardChip = QmiFlash;
 
 // ── rp2350_one_* ─────────────────────────────────────────────────────────────
 
-/// RAID-1 pair: SPI0 primary (W25Qxx) + SPI1 mirror (W25Qxx).
-/// The third type parameter (`QmiFlash`) is the unused SD-slot placeholder.
+/// Internal QMI flash (the RAID-1 SPI chips of the 1.x design were never
+/// fitted).
 #[cfg(all(target_arch = "arm", feature = "rp2350_one_4m"))]
-pub type BoardChip = AnyChip<
-    SpiFlash<
-        embassy_rp::spi::Spi<'static, embassy_rp::peripherals::SPI0, embassy_rp::spi::Blocking>,
-        Output<'static>,
-    >,
-    SpiFlash<
-        embassy_rp::spi::Spi<'static, embassy_rp::peripherals::SPI1, embassy_rp::spi::Blocking>,
-        Output<'static>,
-    >,
-    QmiFlash,
->;
+pub type BoardChip = QmiFlash;
 
 // ── rp2350_geek_16m ──────────────────────────────────────────────────────────
 

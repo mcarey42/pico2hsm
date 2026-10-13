@@ -376,8 +376,10 @@ impl<F: StoreFlash, B: CounterFlash, L: RetryCounterBackend> FlashKeyStoreV2<F, 
     /// (Until the SO-PIN verifier moves into the binding, phase 4, such a
     /// store fails closed.)
     pub fn format_needs_no_pin(&self) -> bool {
-        matches!(self.status, StoreStatus::NeedsFormat | StoreStatus::BindingUnverifiable)
-            && self.binding.is_none()
+        matches!(
+            self.status,
+            StoreStatus::NeedsFormat | StoreStatus::BindingUnverifiable
+        ) && self.binding.is_none()
     }
 
     /// Wipe one group: one record, the binding with its new epoch, the
@@ -449,6 +451,26 @@ fn applet_group(owner: AppletId) -> usize {
 
 impl<F: StoreFlash, B: CounterFlash, L: RetryCounterBackend> KeyStore for FlashKeyStoreV2<F, B, L> {
     fn save_key(&mut self, obj: &KeyObject) -> Result<(), HsmError> {
+        // A new SC-HSM object past the SC-HSM index's capacity would be
+        // stored yet unreachable (the index is in RAM, 340 entries): refuse
+        // it, as the 1.x directory did.  Updates always go through.
+        if (obj.key_id >> 16) & 0xFF == 0
+            && self
+                .store
+                .lookup(obj.key_id)
+                .map_err(HsmError::Storage)?
+                .is_none()
+        {
+            let mut sc_hsm = 0usize;
+            let _ = self.store.for_each(&mut |e| {
+                if (e.key_id >> 16) & 0xFF == 0 {
+                    sc_hsm += 1;
+                }
+            });
+            if sc_hsm >= crate::protocol::sc_hsm::MAX_KEY_INDEX {
+                return Err(HsmError::Storage(StorageError::KeystoreFull));
+            }
+        }
         let smk = self.smk()?;
         let b = self
             .binding
