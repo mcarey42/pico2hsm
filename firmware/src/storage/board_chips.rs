@@ -112,6 +112,6 @@ pub type BoardStoreChip = BoardChip;
 #[cfg(target_arch = "arm")]
 pub type BoardKeyStore = crate::storage::keystore_v2::FlashKeyStoreV2<
     BoardStoreChip,
-    crate::storage::flash_chip::QmiBindingFlash,
+    crate::storage::flash_chip::RoutedBindingFlash,
     crate::storage::BoardCounterLog,
 >;

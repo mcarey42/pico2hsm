@@ -194,9 +194,18 @@ enum FlashOp {
     /// Bring the Storage V2 anchor forward in the same log (SD boards: the
     /// key write ran on core1).
     PutAnchor(pico2hsm_firmware::storage::retry_counter::Anchor),
-    /// FORMAT STORE (writes the binding block: core0 only); the flag is
+    /// FORMAT STORE (QMI boards; SD boards format on core1); the flag is
     /// "the SO-PIN was verified".
     FormatStore(bool),
+    /// One erase or program of the binding ring for core1 (SD boards'
+    /// formats and wipes).  The data points into core1's buffer, which
+    /// outlives the op for the same reason as `SaveKey`'s.
+    BindingWrite {
+        erase: bool,
+        offset: u32,
+        data: *const u8,
+        len: usize,
+    },
     /// Encrypt a generated key and write it to an RSA pool slot (internal
     /// flash, every board).  Points at core1's `KeyObject`, which outlives
     /// the op for the same reason as `SaveKey`'s.
@@ -305,8 +314,11 @@ impl pico2hsm_firmware::storage::KeyStore for Core1KeyStore {
     }
 
     fn wipe_all(&mut self) -> Result<(), pico2hsm_core::error::HsmError> {
-        // Every board: a wipe rotates an epoch in the binding block, on
-        // internal flash (core0 only).
+        if Self::is_direct_write() {
+            // SD: here on core1, so core0 keeps the time extensions going
+            // through seconds of SD writes; the binding writes go to core0.
+            return self.direct().wipe_all();
+        }
         Self::on_core0(FlashOp::WipeAll)
     }
 
@@ -348,7 +360,17 @@ impl pico2hsm_firmware::storage::KeyStore for Core1KeyStore {
         &mut self,
         so_pin_verified: bool,
     ) -> Result<(), pico2hsm_core::error::HsmError> {
-        Self::on_core0(FlashOp::FormatStore(so_pin_verified))?;
+        if Self::is_direct_write() {
+            // As `wipe_all`: the ring erase is 512 SD block writes.
+            let r = self.direct().format_store(so_pin_verified);
+            pico2hsm_firmware::cdc_log!(
+                "FORMAT STORE {}",
+                if r.is_ok() { "done" } else { "refused" }
+            );
+            r?;
+        } else {
+            Self::on_core0(FlashOp::FormatStore(so_pin_verified))?;
+        }
         // Every applet's RAM state describes the old store.
         pico2hsm_firmware::RELOAD_AFTER_APDU.store(true, core::sync::atomic::Ordering::SeqCst);
         Ok(())
@@ -526,7 +548,10 @@ fn new_keystore(
     Result<(), pico2hsm_core::error::StorageError>,
 ) {
     use pico2hsm_firmware::storage::{
-        flash_chip::{QmiBindingFlash, QmiCounterFlash, QmiLegacyCounterFlash, QMI_FLASH_SIZE},
+        flash_chip::{
+            QmiBindingFlash, QmiCounterFlash, QmiLegacyCounterFlash, RoutedBindingFlash,
+            QMI_FLASH_SIZE,
+        },
         flash_layout::{BINDING_SECTORS, LEGACY_COUNTER_SECTORS, RETRY_COUNTER_SECTORS},
         keystore_v2::{Hooks, StoreStatus},
         retry_counter::CounterLog,
@@ -552,7 +577,10 @@ fn new_keystore(
     }
     ks.attach_retry_counters(log);
     if ks
-        .attach_binding(QmiBindingFlash::new(handle()), BINDING_SECTORS)
+        .attach_binding(
+            RoutedBindingFlash::new(QmiBindingFlash::new(handle()), binding_write_from_core1),
+            BINDING_SECTORS,
+        )
         .is_err()
     {
         defmt::error!("storage: binding block unreadable");
@@ -578,6 +606,33 @@ fn put_anchor_from_core1(
     a: pico2hsm_firmware::storage::retry_counter::Anchor,
 ) -> Result<(), pico2hsm_core::error::StorageError> {
     Core1KeyStore::on_core0(FlashOp::PutAnchor(a)).map_err(|e| match e {
+        pico2hsm_core::error::HsmError::Storage(s) => s,
+        _ => pico2hsm_core::error::StorageError::WriteError,
+    })
+}
+
+/// `RoutedBindingFlash`'s route for core1 (SD boards): the binding ring is
+/// on internal flash, which only core0 can write.
+#[cfg(target_arch = "arm")]
+fn binding_write_from_core1(
+    w: pico2hsm_firmware::storage::flash_chip::BindingWrite<'_>,
+) -> Result<(), pico2hsm_core::error::StorageError> {
+    use pico2hsm_firmware::storage::flash_chip::BindingWrite;
+    let op = match w {
+        BindingWrite::Erase(sector) => FlashOp::BindingWrite {
+            erase: true,
+            offset: sector,
+            data: core::ptr::null(),
+            len: 0,
+        },
+        BindingWrite::Program(offset, data) => FlashOp::BindingWrite {
+            erase: false,
+            offset,
+            data: data.as_ptr(),
+            len: data.len(),
+        },
+    };
+    Core1KeyStore::on_core0(op).map_err(|e| match e {
         pico2hsm_core::error::HsmError::Storage(s) => s,
         _ => pico2hsm_core::error::StorageError::WriteError,
     })
@@ -1196,6 +1251,34 @@ fn handle_flash_op(
                 if r.is_ok() { "done" } else { "refused" }
             );
             r
+        }
+        FlashOp::BindingWrite {
+            erase,
+            offset,
+            data,
+            len,
+        } => {
+            use pico2hsm_firmware::storage::flash_chip::{
+                BindingWrite, QmiBindingFlash, QMI_FLASH_SIZE,
+            };
+            // SAFETY: the blocking driver holds no state (see
+            // `new_keystore`); core1 is parked in `on_core0`.
+            let mut flash = QmiBindingFlash::new(embassy_rp::flash::Flash::<
+                _,
+                embassy_rp::flash::Blocking,
+                QMI_FLASH_SIZE,
+            >::new_blocking(unsafe {
+                embassy_rp::peripherals::FLASH::steal()
+            }));
+            let w = if erase {
+                BindingWrite::Erase(offset)
+            } else {
+                // SAFETY: see `FlashOp::BindingWrite` — core1 is blocked
+                // until we reply, so its buffer is live and unchanged.
+                BindingWrite::Program(offset, unsafe { core::slice::from_raw_parts(data, len) })
+            };
+            w.apply(&mut flash)
+                .map_err(pico2hsm_core::error::HsmError::Storage)
         }
         FlashOp::PutAnchor(a) => match store.counter_log() {
             Some(log) => log

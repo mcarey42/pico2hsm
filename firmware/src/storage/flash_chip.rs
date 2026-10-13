@@ -258,6 +258,71 @@ impl<const OFFSET: u32, const SIZE: u32> super::retry_counter::CounterFlash
     }
 }
 
+// ─── RoutedBindingFlash — binding writes from core1 ─────────────────────────
+
+/// A binding-ring write that core1 hands to core0 (offsets relative to the
+/// binding region).
+pub enum BindingWrite<'a> {
+    /// Erase this sector of the ring.
+    Erase(u32),
+    /// Program `data` at this offset.
+    Program(u32, &'a [u8]),
+}
+
+impl BindingWrite<'_> {
+    /// Run the write here; core0 only.
+    pub fn apply(self, flash: &mut QmiBindingFlash) -> Result<(), StorageError> {
+        use super::retry_counter::CounterFlash as _;
+        match self {
+            BindingWrite::Erase(sector) => flash.erase_sector(sector),
+            BindingWrite::Program(offset, data) => flash.program(offset, data),
+        }
+    }
+}
+
+/// The binding ring's flash.  On the SD boards FORMAT STORE and the wipes
+/// run on core1 (their SD writes take seconds, and core0 must keep sending
+/// CCID time extensions meanwhile), but the ring is on internal flash,
+/// which only core0 can write: from core1 each erase or program goes to
+/// core0 through `route`, a short flash op.  Reads work from either core.
+pub struct RoutedBindingFlash {
+    inner: QmiBindingFlash,
+    route: fn(BindingWrite<'_>) -> Result<(), StorageError>,
+}
+
+impl RoutedBindingFlash {
+    pub fn new(
+        inner: QmiBindingFlash,
+        route: fn(BindingWrite<'_>) -> Result<(), StorageError>,
+    ) -> Self {
+        RoutedBindingFlash { inner, route }
+    }
+
+    fn on_core1() -> bool {
+        embassy_rp::pac::SIO.cpuid().read() == 1
+    }
+}
+
+impl super::retry_counter::CounterFlash for RoutedBindingFlash {
+    fn read(&mut self, offset: u32, buf: &mut [u8]) -> Result<(), StorageError> {
+        self.inner.read(offset, buf)
+    }
+
+    fn program(&mut self, offset: u32, data: &[u8]) -> Result<(), StorageError> {
+        if Self::on_core1() {
+            return (self.route)(BindingWrite::Program(offset, data));
+        }
+        self.inner.program(offset, data)
+    }
+
+    fn erase_sector(&mut self, sector: u32) -> Result<(), StorageError> {
+        if Self::on_core1() {
+            return (self.route)(BindingWrite::Erase(sector));
+        }
+        self.inner.erase_sector(sector)
+    }
+}
+
 // ─── Storage V2: the QMI keystore region as a `StoreFlash` ───────────────────
 
 impl super::store_v2::StoreFlash for QmiFlash {

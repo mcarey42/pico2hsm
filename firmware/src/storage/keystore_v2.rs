@@ -10,9 +10,10 @@
 //! The binding block and the counter log are on internal flash, which only
 //! core0 can write.  On QMI boards every write runs on core0 already
 //! (`FlashOp`).  On SD-card boards key writes run on core1: their anchor
-//! update goes to core0 through the [`Hooks::put_anchor`] hook, and the
-//! operations that write the binding (group wipes, formats) are sent to
-//! core0 whole.
+//! update goes to core0 through the [`Hooks::put_anchor`] hook.  Group
+//! wipes and formats run there too (their SD writes take seconds, and
+//! core0 must keep the CCID time extensions going); each binding-ring
+//! erase or program they make goes to core0 (`RoutedBindingFlash`).
 
 use heapless::Vec;
 use pico2hsm_core::error::{CryptoError, HsmError, StorageError};
@@ -256,7 +257,7 @@ impl<F: StoreFlash, B: CounterFlash, L: RetryCounterBackend> FlashKeyStoreV2<F, 
             let info = self.mount_info(b)?;
             let mut env = AnchorEnv {
                 log: self.counters.as_mut(),
-                hooks: None,
+                hooks: self.hooks,
             };
             match self.store.mount(info, &mut env) {
                 Ok(()) => {
@@ -342,7 +343,7 @@ impl<F: StoreFlash, B: CounterFlash, L: RetryCounterBackend> FlashKeyStoreV2<F, 
         {
             let mut env = AnchorEnv {
                 log: self.counters.as_mut(),
-                hooks: None,
+                hooks: self.hooks,
             };
             self.store.format(info, &mut env, auth)?;
         }
@@ -355,7 +356,9 @@ impl<F: StoreFlash, B: CounterFlash, L: RetryCounterBackend> FlashKeyStoreV2<F, 
 
     /// FORMAT STORE (§8.3, R9): a new, empty store; every key of every
     /// applet is gone.  The caller has checked the SO-PIN, or that the
-    /// store is refused or has no verifiable binding.  Core0 only.
+    /// store is refused or has no verifiable binding.  Either core: on
+    /// core1 (SD boards) the binding and anchor writes go to core0
+    /// (`RoutedBindingFlash`, [`Hooks`]).
     pub fn format_store_now(&mut self, so_pin_verified: bool) -> Result<(), HsmError> {
         self.smk()?;
         let auth = FormatAuth::format_store(so_pin_verified || self.format_needs_no_pin())
@@ -383,7 +386,7 @@ impl<F: StoreFlash, B: CounterFlash, L: RetryCounterBackend> FlashKeyStoreV2<F, 
     }
 
     /// Wipe one group: one record, the binding with its new epoch, the
-    /// group's sectors.  Core0 only (writes the binding).
+    /// group's sectors.  Either core (see `format_store_now`).
     fn wipe_group(&mut self, group: usize) -> Result<(), HsmError> {
         let mut nb = self
             .binding
