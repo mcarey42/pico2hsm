@@ -153,6 +153,7 @@ footer 122–134.
 |---|---|---|---|
 | E10 | NO SD CARD | Insert microSD card. / Retrying (try N). | SD card init fails at boot; drawn before the device waits for the watchdog (N = watchdog resets in a row + 1) |
 | E11 | STORAGE UNREADABLE | Keys not loaded. / Run pico2hsm-tool diag. | keystore init failed; until the host runs an operation, then an ERROR band |
+| E12 | FORMAT STORE NEEDED | No 2.0 keystore found. / See README, 2.0.0 notes. | the keystore region holds no 2.0 store (a 1.x keystore after the upgrade); until FORMAT STORE succeeds |
 | E20 | NOT PROVISIONED | Keys cannot be stored. / See PROVISIONING.md. | no storage master key (release build, unprovisioned OTP) |
 | E31 | RNG FAILURE | Hardware RNG failed self-test. / Device halted. | rendered by the harness; not yet wired (the TRNG failure path resets without the display) |
 

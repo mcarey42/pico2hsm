@@ -155,9 +155,22 @@ bits  7–0:  proto_ref     (u8)  — protocol-level key reference
 ```
 
 Constructors: `KeyId::sc_hsm(partition, key_ref)`, `KeyId::piv(key_ref)`,
-`KeyId::openpgp(slot)`.  Flash magic `"P2K4"` is the current format (with `key_flags` byte); `"P2K2"` and
-`"P2K3"` are recognized as legacy and surfaced as incompatible (re-INITIALIZE
-required after firmware update from older builds).
+`KeyId::openpgp(slot)`.
+
+**Storage V2 (2.0) — the keystore engine** (`docs/STORAGE_V2.md`):
+`storage/store_v2.rs` (journal ring, snapshots, lookup, allocation; host
+fault-injection tests in `store_v2_tests.rs`), `storage/keystore_v2.rs`
+(`KeyStore` over it; `BoardKeyStore` is `FlashKeyStoreV2`),
+`storage/binding.rs` (binding block ring, internal flash),
+`storage/retry_counter.rs` (counter log v2: retry counters, device values,
+the keystore anchor, the OpenPGP signature counter).  Objects are
+`KeyObject` blobs sealed under `K_obj(store, group epoch, full key ID)`
+with the V2 object header as AAD.  SC-HSM INITIALIZE, PIV reset and
+OpenPGP TERMINATE wipe their *group* (one journal record, epoch rotated in
+the binding: core0 only).  A 1.x keystore is refused until FORMAT STORE
+(`80 54 4E`, data `FORMAT-STORE-V2`; PIN-less only without a valid
+binding).  The 1.x filesystem (`filesystem.rs`, `raid.rs`, `wal.rs`,
+`StorageManager`) is still compiled but unused until phase 5 removes it.
 
 **Still required before PIV/OpenPGP command handlers:**
 Per-applet PIN slots in flash.  SC-HSM already has a PIN slot; PIV needs its own;
@@ -320,6 +333,27 @@ write/erase and key load, for blocking storage work on core0.
   board instead of it hanging.
 - `debug`-feature test hooks (SC-HSM selected): `80 FE 10 00` wedges core1,
   `80 FE 11 00` wedges core0 after replying, `80 FE 12 00` resets now.
+- Boards without SWD (the Waveshare LCD): each core leaves breadcrumbs
+  (`watchdog::crumb`, code table in `watchdog.rs`) in watchdog scratch
+  registers and a 16-entry ring in `.uninit`; HardFaults and panics record
+  their PC / location there too (never a panic's message: it can carry
+  runtime values, and the serial port is unauthenticated).  After a reset
+  a debug build's boot log (CDC serial, after the first APDU) prints
+  `reset: crumbs …` and `crumbs0` / `crumbs1`; release builds record but
+  never print them.  Resolve a fault PC with
+  `arm-none-eabi-addr2line -f -C -i -e <elf> <pc>`.
+
+### defmt only on core0
+
+defmt's logger lock is a critical section, and the firmware uses
+`cortex-m`'s `critical-section-single-core`: it masks interrupts on one
+core only.  A core1 log that overlaps a core0 log panics ("defmt logger
+taken reentrantly") and the watchdog resets the chip.  Nothing that core1
+runs may log through defmt, **including embassy-rp internals**:
+`embassy_rp::flash::Flash::blocking_read` logs a `trace!` in debug builds,
+so internal-flash reads go through `flash_chip::xip_read` instead.  For
+core1 diagnostics use `watchdog::crumb`.  (`cdc_log!` from core1 is not
+safe yet either: its channel's critical section is the single-core one.)
 
 ### CCID timeout on long operations (P-384 / P-521 / K-256 sign)
 

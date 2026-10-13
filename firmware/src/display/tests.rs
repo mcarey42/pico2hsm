@@ -465,6 +465,18 @@ fn fixtures(l: &Layout) -> Vec<(&'static str, Screen)> {
             },
         ),
     ));
+    // E12: a 1.x keystore after the upgrade, waiting for FORMAT STORE.
+    v.push((
+        "error_e12",
+        err(
+            ErrorCode::E12FormatStoreNeeded,
+            FooterView::Normal {
+                uptime: 12,
+                storage: StorageLine::SdFail,
+                reset: None,
+            },
+        ),
+    ));
     // E20: no storage key; the keystore itself opened fine.
     v.push((
         "error_e20",
@@ -566,6 +578,7 @@ const GOLDEN: &[(&str, &str, u64)] = &[
     ("320x172", "home_reset_warning", 0xeba036cebfff83a3),
     ("320x172", "error_e10", 0xf322e5b7134dfaa8),
     ("320x172", "error_e11", 0xa3cbb5fec2db2a07),
+    ("320x172", "error_e12", 0xe27ae4e4a5fa1cfb),
     ("320x172", "error_e20", 0x0e83bedec9f700e7),
     ("320x172", "error_e31", 0x8257a608ca9e6470),
     ("320x172", "sas", 0x9d50546a1ae4fd33),
@@ -589,6 +602,7 @@ const GOLDEN: &[(&str, &str, u64)] = &[
     ("240x135", "home_reset_warning", 0x91c52674eb1cb205),
     ("240x135", "error_e10", 0x7933e5c2f1dc4da6),
     ("240x135", "error_e11", 0xf0eb8948ebead2b9),
+    ("240x135", "error_e12", 0x6546948334a77f1e),
     ("240x135", "error_e20", 0x76907a08f42afe0b),
     ("240x135", "error_e31", 0xcb89cdf1c07a17f1),
     ("240x135", "sas", 0x23a77eb2546c997f),

@@ -28,6 +28,12 @@ pub mod crypto;
 pub mod display_snapshot;
 pub mod domain;
 pub mod mailbox;
+
+/// Set by a command that replaced the store under the applets (FORMAT
+/// STORE): after its response the dispatcher drops every applet's RAM
+/// state and reloads it, as after a USB reset.
+pub static RELOAD_AFTER_APDU: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
 pub mod protocol;
 /// RSA key pool: idle-time pre-generation, rotation and issue (`rsa`).
 #[cfg(feature = "rsa")]

@@ -230,7 +230,9 @@ of a notice.
   as above.  "Idle" only before the first operation since boot.
 - **Footer**: every variant (normal, reset warning, dev board) carries the
   storage health, drawn at the right of the strip.
-- **Full-screen errors**: E20 while `SMK_MISSING`; E11 while
+- **Full-screen errors**: E20 while `SMK_MISSING`; E12 while
+  `NEEDS_FORMAT` (a 1.x keystore after the 2.0 upgrade; cleared when
+  FORMAT STORE succeeds); E11 while
   `KS_INIT_FAILED` and the host has not yet run an operation (afterwards an
   ERROR band).  E10 is drawn by the boot code (no SD card) before it waits
   for the watchdog.

@@ -1,19 +1,13 @@
-//! SDCard `FlashChip` implementation using `embedded-sdmmc`.
-//!
-//! Wraps an SDCard accessed via `embedded-sdmmc` as a `FlashChip` instance,
-//! allowing the RAID manager to treat an SDCard identically to a SPI flash
-//! chip.
+//! The SD card as the Storage V2 keystore medium (`embedded-sdmmc`).
 //!
 //! # Addressing
-//! SDCards use 512-byte sectors internally.  This wrapper maps the 4096-byte
-//! `FlashChip` sector interface to 8 consecutive 512-byte SDCard sectors.
-//! `write_page` (256 bytes) performs a read-modify-write on the containing
-//! 512-byte SDCard sector.
+//! The store sees 4096-byte sectors of 8 × 512-byte card blocks, starting
+//! `SD_BYTE_OFFSET` into the card.  Writes are whole blocks, written as
+//! they are: no read-modify-write (STORAGE_V2 §6.4).
 //!
 //! # Erase
-//! SDCards have an internal FTL that handles wear levelling and bad block
-//! management.  "Erasing" a 4096-byte logical sector is implemented as
-//! writing 0xFF to all 8 corresponding 512-byte sectors.
+//! The card's FTL does wear levelling and bad-block management.  "Erasing"
+//! a 4096-byte sector writes 0xFF to its 8 blocks.
 //!
 //! # API notes (`embedded-sdmmc` 0.9)
 //! - `SdCard::new(spi_device, delay)` — `spi_device` must implement
@@ -23,7 +17,7 @@
 //! - `SdCard::num_bytes()` returns the total byte capacity.
 
 use embedded_sdmmc::{Block, BlockDevice, BlockIdx, SdCard};
-use pico2hsm_core::{error::StorageError, flash::FlashChip};
+use pico2hsm_core::error::StorageError;
 
 /// Number of consecutive write failures before the SDCard is marked degraded.
 const BAD_WRITE_THRESHOLD: u32 = 8;
@@ -31,28 +25,25 @@ const BAD_WRITE_THRESHOLD: u32 = 8;
 /// SD card physical sector size (512 bytes).
 const SD_SECTOR_BYTES: u32 = 512;
 
-/// Number of SD card sectors per one logical 4096-byte `FlashChip` sector.
+/// Card blocks per 4096-byte store sector.
 const SD_SECTORS_PER_LOGICAL: u32 = 4096 / SD_SECTOR_BYTES; // 8
 
 // ─── SdCardFlash<SPI, DELAY> ─────────────────────────────────────────────────
 
 /// Number of SD sectors (512 bytes each) reserved at the start of the card for
-/// the P2HSDCARD signature block. The KeyFilesystem's sector 0 maps to SD
-/// physical sector `SD_RESERVED_SECTORS`, never touching sector 0 (signature).
+/// the 1.x pairing signature (no longer written or read).  The store's
+/// sector 0 maps to card block `SD_RESERVED_SECTORS`.
 const SD_RESERVED_SECTORS: u32 = 8; // 8 × 512 = 4 096 bytes = one 4 KiB logical sector
-/// Byte offset added to every FlashChip address before issuing SD card I/O.
+/// Byte offset added to every store address before issuing SD card I/O.
 const SD_BYTE_OFFSET: u32 = SD_RESERVED_SECTORS * SD_SECTOR_BYTES;
 
 /// Keystore region on the card (16 MiB = 4096 sectors of 4 KiB).
 const SD_KEYSTORE_MAX_BYTES: u64 = 16 * 1024 * 1024;
 
-/// SDCard wrapped as a `FlashChip`.
+/// The SD card keystore region.
 ///
 /// `SPI` must implement `embedded_hal::spi::SpiDevice<u8>`.
 /// `DELAY` must implement `embedded_hal::delay::DelayNs`.
-///
-/// The first `SD_RESERVED_SECTORS` physical sectors are reserved for the
-/// P2HSDCARD pairing signature and are never touched by the FlashChip API.
 pub struct SdCardFlash<SPI, DELAY>
 where
     SPI: embedded_hal::spi::SpiDevice<u8>,
@@ -127,15 +118,11 @@ where
     }
 }
 
-impl<SPI, DELAY> FlashChip for SdCardFlash<SPI, DELAY>
+impl<SPI, DELAY> SdCardFlash<SPI, DELAY>
 where
     SPI: embedded_hal::spi::SpiDevice<u8>,
     DELAY: embedded_hal::delay::DelayNs,
 {
-    fn capacity(&self) -> u64 {
-        self.capacity_bytes
-    }
-
     /// Read `buf.len()` bytes starting at byte address `addr`.
     ///
     /// Reads one 512-byte SD sector at a time, handling any byte offset
@@ -144,7 +131,7 @@ where
     ///
     /// `SD_BYTE_OFFSET` is added so that the filesystem never touches the
     /// reserved signature region at the start of the card.
-    fn read(&mut self, addr: u32, buf: &mut [u8]) -> Result<(), StorageError> {
+    pub fn read_at(&mut self, addr: u32, buf: &mut [u8]) -> Result<(), StorageError> {
         let physical_addr = addr + SD_BYTE_OFFSET;
         let first_sd_sector = physical_addr / SD_SECTOR_BYTES;
         let byte_offset = (physical_addr % SD_SECTOR_BYTES) as usize;
@@ -161,7 +148,10 @@ where
                 contents: [0u8; 512],
             }];
             let block = unsafe { &mut *core::ptr::addr_of_mut!(SD_BLOCK) };
-            if self.card.read(block, BlockIdx(sd_sector_idx)).is_err() {
+            crate::watchdog::crumb(0x0230_0000 | (sd_sector_idx & 0xFFFF));
+            let r = self.card.read(block, BlockIdx(sd_sector_idx));
+            crate::watchdog::crumb(0x0233_0000);
+            if r.is_err() {
                 crate::display_snapshot::note_sd_io(false);
                 return Err(StorageError::ReadError);
             }
@@ -179,71 +169,12 @@ where
         Ok(())
     }
 
-    /// Write up to 256 bytes (`PAGE_SIZE`) at a page-aligned address.
-    ///
-    /// Performs a read-modify-write on the containing 512-byte SD sector:
-    /// 1. Read the 512-byte sector that contains `addr`.
-    /// 2. Overwrite the 256-byte window with `data`.
-    /// 3. Write the modified 512-byte sector back.
-    fn write_page(&mut self, addr: u32, data: &[u8]) -> Result<(), StorageError> {
-        let physical_addr = addr + SD_BYTE_OFFSET;
-        let sd_sector_idx = physical_addr / SD_SECTOR_BYTES;
-        let byte_offset = (physical_addr % SD_SECTOR_BYTES) as usize;
-
-        // Feeds the hardware watchdog on core0 / bumps core1's heartbeat.
-        crate::watchdog::progress();
-        // Step 1: read existing 512-byte sector.
-        let mut block = [Block::new()];
-        if self.card.read(&mut block, BlockIdx(sd_sector_idx)).is_err() {
-            crate::display_snapshot::note_sd_io(false);
-            return Err(StorageError::ReadError);
-        }
-
-        // Step 2: patch the window.
-        let len = data.len().min(Block::LEN - byte_offset);
-        block[0].contents[byte_offset..byte_offset + len].copy_from_slice(&data[..len]);
-
-        // Step 3: write back.
-        self.card
-            .write(&block, BlockIdx(sd_sector_idx))
-            .map_err(|_| {
-                crate::display_snapshot::note_sd_io(false);
-                self.write_errors += 1;
-                if self.write_errors >= BAD_WRITE_THRESHOLD {
-                    defmt::error!(
-                        "SdCardFlash: {} consecutive write errors — marking degraded",
-                        self.write_errors,
-                    );
-                    #[cfg(target_arch = "arm")]
-                    crate::cdc_error!(
-                        "SD write err {} consec, sector {} — degraded",
-                        self.write_errors,
-                        sd_sector_idx
-                    );
-                    self.degraded = true;
-                } else {
-                    #[cfg(target_arch = "arm")]
-                    crate::cdc_warn!(
-                        "SD write err on sector {} ({}/{})",
-                        sd_sector_idx,
-                        self.write_errors,
-                        BAD_WRITE_THRESHOLD
-                    );
-                }
-                StorageError::WriteError
-            })?;
-
-        self.write_errors = 0;
-        crate::display_snapshot::note_sd_io(true);
-        Ok(())
-    }
-
     /// Erase a 4096-byte logical sector by overwriting 8 × 512-byte SD
     /// sectors with 0xFF.
     ///
     /// SDCards handle physical erase internally via FTL.  We write 0xFF to
     /// match the FlashChip erased-sector contract (blank = all-ones).
-    fn erase_sector(&mut self, addr: u32) -> Result<(), StorageError> {
+    pub fn erase_at(&mut self, addr: u32) -> Result<(), StorageError> {
         let first_sd_sector = (addr + SD_BYTE_OFFSET) / SD_SECTOR_BYTES;
         let mut blank_block = Block::new();
         blank_block.contents.fill(0xFF);
@@ -252,11 +183,10 @@ where
         for i in 0..SD_SECTORS_PER_LOGICAL {
             // A slow card can take up to 250 ms per block write.
             crate::watchdog::progress();
-            if self
-                .card
-                .write(&blocks, BlockIdx(first_sd_sector + i))
-                .is_err()
-            {
+            crate::watchdog::crumb(0x0232_0000 | ((first_sd_sector + i) & 0xFFFF));
+            let r = self.card.write(&blocks, BlockIdx(first_sd_sector + i));
+            crate::watchdog::crumb(0x0233_0000);
+            if r.is_err() {
                 crate::display_snapshot::note_sd_io(false);
                 return Err(StorageError::EraseError);
             }
@@ -264,140 +194,56 @@ where
         crate::display_snapshot::note_sd_io(true);
         Ok(())
     }
+}
 
-    /// SDCards don't expose a JEDEC ID; returns `None`.
-    fn jedec_id(&mut self) -> Option<[u8; 3]> {
-        None
+// ─── Storage V2: the card as a `StoreFlash` ──────────────────────────────────
+
+impl<SPI, DELAY> super::store_v2::StoreFlash for SdCardFlash<SPI, DELAY>
+where
+    SPI: embedded_hal::spi::SpiDevice<u8>,
+    DELAY: embedded_hal::delay::DelayNs,
+{
+    fn media(&self) -> super::store_v2::Media {
+        super::store_v2::Media::Sd
     }
 
-    fn is_degraded(&self) -> bool {
-        self.degraded
+    fn sectors(&self) -> u32 {
+        (self.capacity_bytes / u64::from(super::store_v2::SECTOR)) as u32
     }
 
-    /// Increment the write-error counter; mark degraded if threshold exceeded.
-    ///
-    /// SDCards have internal FTL bad-block management; we just track a simple
-    /// error count and eventually mark the whole card degraded.
-    fn mark_bad_sector(&mut self, _sector: u32) -> Result<(), StorageError> {
-        self.write_errors += 1;
-        if self.write_errors >= BAD_WRITE_THRESHOLD {
-            self.degraded = true;
+    fn read(&mut self, offset: u32, buf: &mut [u8]) -> Result<(), StorageError> {
+        self.read_at(offset, buf)
+    }
+
+    /// Whole 512-byte blocks, written as they are: no read-modify-write
+    /// (STORAGE_V2 §6.4).  `write` returns once the card has accepted the
+    /// block and left busy.
+    fn program(&mut self, offset: u32, data: &[u8]) -> Result<(), StorageError> {
+        if offset % SD_SECTOR_BYTES != 0 || data.len() % SD_SECTOR_BYTES as usize != 0 {
+            return Err(StorageError::WriteError);
         }
+        let first = (offset + SD_BYTE_OFFSET) / SD_SECTOR_BYTES;
+        for (i, chunk) in data.chunks(SD_SECTOR_BYTES as usize).enumerate() {
+            crate::watchdog::progress();
+            let mut block = Block::new();
+            block.contents.copy_from_slice(chunk);
+            crate::watchdog::crumb(0x0231_0000 | ((first + i as u32) & 0xFFFF));
+            let r = self
+                .card
+                .write(core::slice::from_ref(&block), BlockIdx(first + i as u32));
+            crate::watchdog::crumb(0x0233_0000);
+            if r.is_err() {
+                crate::display_snapshot::note_sd_io(false);
+                return Err(StorageError::WriteError);
+            }
+        }
+        crate::display_snapshot::note_sd_io(true);
         Ok(())
     }
-}
 
-// ─── SD card signature block (block 0 pairing) ─────────────────────────────────
-
-/// Check/adoption result returned by `check_sd_signature`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SdCardCheckResult {
-    /// Raw block 0 has our magic + fingerprint matches this device. Proceed with RAID-1.
-    Matched,
-    /// Raw block 0 is blank (all 0x00 or 0xFF) or has no P2HSDCARD magic. Auto-adopt.
-    Blank,
-    /// Raw block 0 has valid magic but fingerprint is from a different device. Boot degraded.
-    Foreign,
-    /// Magic present but CRC invalid. Treat as Blank (overwrite safe).
-    Corrupt,
-}
-
-/// Signature stored in raw SD card block 0 (512 bytes, first 64 bytes used).
-#[allow(dead_code)]
-pub struct SdCardSignature {
-    pub device_fingerprint: [u8; 32],
-    pub pairing_timestamp: u64,
-}
-
-const SD_SIG_MAGIC: [u8; 9] = *b"P2HSDCARD";
-const SD_SIG_VERSION: u8 = 0x01;
-
-/// Compute device fingerprint: SHA-256 of the 8-byte flash chip unique ID.
-/// This is stable, hardware-unique, and works before OTP provisioning.
-pub fn compute_device_fingerprint(flash_uid: &[u8; 8]) -> [u8; 32] {
-    use sha2::{Digest, Sha256};
-    let mut h = Sha256::new();
-    h.update(flash_uid);
-    h.finalize().into()
-}
-
-/// Read raw block 0 from the SD card and classify the signature.
-/// `card` must be initialized (num_bytes() already called).
-pub fn check_sd_signature<SPI, DELAY>(
-    card: &SdCard<SPI, DELAY>,
-    our_fingerprint: &[u8; 32],
-) -> SdCardCheckResult
-where
-    SPI: embedded_hal::spi::SpiDevice<u8>,
-    DELAY: embedded_hal::delay::DelayNs,
-{
-    let mut block = [Block::new()];
-    if card.read(&mut block, BlockIdx(0)).is_err() {
-        return SdCardCheckResult::Blank;
+    fn erase_sector(&mut self, sector: u32) -> Result<(), StorageError> {
+        self.erase_at(sector * super::store_v2::SECTOR)
     }
-    let data = &block[0].contents;
-
-    // Check if block is blank (all 0x00 or all 0xFF).
-    let all_zero = data.iter().all(|&b| b == 0x00);
-    let all_ff = data.iter().all(|&b| b == 0xFF);
-    if all_zero || all_ff {
-        return SdCardCheckResult::Blank;
-    }
-
-    // Check magic.
-    if data[0..9] != SD_SIG_MAGIC {
-        return SdCardCheckResult::Blank;
-    }
-
-    // Check version.
-    if data[9] != SD_SIG_VERSION {
-        return SdCardCheckResult::Blank;
-    }
-
-    // Verify CRC32 over bytes [0..54].
-    let stored_crc = u32::from_le_bytes([data[54], data[55], data[56], data[57]]);
-    let computed_crc = crc32fast::hash(&data[0..54]);
-    if stored_crc != computed_crc {
-        return SdCardCheckResult::Corrupt;
-    }
-
-    // Compare fingerprint.
-    if data[10..42] == our_fingerprint[..] {
-        SdCardCheckResult::Matched
-    } else {
-        SdCardCheckResult::Foreign
-    }
-}
-
-/// Write our pairing signature to raw block 0.
-pub fn write_sd_signature<SPI, DELAY>(
-    card: &SdCard<SPI, DELAY>,
-    fingerprint: &[u8; 32],
-) -> Result<(), ()>
-where
-    SPI: embedded_hal::spi::SpiDevice<u8>,
-    DELAY: embedded_hal::delay::DelayNs,
-{
-    let mut block = Block::new();
-    // Fill padding with 0xFF.
-    block.contents.fill(0xFF);
-
-    // [0..9] magic
-    block.contents[0..9].copy_from_slice(&SD_SIG_MAGIC);
-    // [9] version
-    block.contents[9] = SD_SIG_VERSION;
-    // [10..42] device fingerprint
-    block.contents[10..42].copy_from_slice(fingerprint);
-    // [42..50] pairing timestamp (u64 LE) — use 0 for now (no RTC)
-    block.contents[42..50].copy_from_slice(&0u64.to_le_bytes());
-    // [50..54] reserved
-    block.contents[50..54].fill(0x00);
-    // [54..58] CRC32 over [0..54]
-    let crc = crc32fast::hash(&block.contents[0..54]);
-    block.contents[54..58].copy_from_slice(&crc.to_le_bytes());
-
-    let blocks = [block];
-    card.write(&blocks, BlockIdx(0)).map_err(|_| ())
 }
 
 impl<SPI, DELAY> SdCardFlash<SPI, DELAY>
@@ -428,51 +274,5 @@ where
             degraded: false,
             write_errors: 0,
         }
-    }
-}
-
-// ─── Non-generic legacy stub (kept for source compatibility) ──────────────────
-
-/// Non-generic SDCard stub.
-///
-/// This is the original stub kept for source compatibility. All operations
-/// return errors. New code should use `SdCardFlash<SPI, DELAY>`.
-pub struct SdCardFlashLegacy {
-    capacity: u64,
-    degraded: bool,
-}
-
-impl SdCardFlashLegacy {
-    #[allow(dead_code)]
-    pub fn new_stub(capacity: u64) -> Self {
-        SdCardFlashLegacy {
-            capacity,
-            degraded: false,
-        }
-    }
-}
-
-impl FlashChip for SdCardFlashLegacy {
-    fn capacity(&self) -> u64 {
-        self.capacity
-    }
-    fn read(&mut self, _addr: u32, _buf: &mut [u8]) -> Result<(), StorageError> {
-        Err(StorageError::ReadError)
-    }
-    fn write_page(&mut self, _addr: u32, _data: &[u8]) -> Result<(), StorageError> {
-        Err(StorageError::WriteError)
-    }
-    fn erase_sector(&mut self, _addr: u32) -> Result<(), StorageError> {
-        Err(StorageError::EraseError)
-    }
-    fn jedec_id(&mut self) -> Option<[u8; 3]> {
-        None
-    }
-    fn is_degraded(&self) -> bool {
-        self.degraded
-    }
-    fn mark_bad_sector(&mut self, _sector: u32) -> Result<(), StorageError> {
-        self.degraded = true;
-        Ok(())
     }
 }

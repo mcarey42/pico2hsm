@@ -60,6 +60,9 @@ pub fn handle(
         0x49 => handle_import_member_cert(state, store, cmd),
         0x4A => handle_import_revocation(state, store, cmd),
         0x50 => handle_pool_status(store),
+        // FORMAT STORE (STORAGE_V2 §8.3): the store decides whether the
+        // SO-PIN is needed (it is, unless the store is not up, R9).
+        0x4E => handle_format_store(state, store, cmd),
 
         // RSA key pool settings: a device policy, SO-PIN only.
         0x51 => {
@@ -2805,5 +2808,33 @@ mod tests {
         let resp = extras(&mut tgt, &mut ts, 0x35, &static_pub(&ss));
         assert_eq!(resp.sw, SW_CONDITIONS_NOT_SATISFIED);
         assert_eq!(tgt.dkek.get_dkek(), Some(&[0x11u8; 32]));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// P1=0x4E  FORMAT STORE
+// ---------------------------------------------------------------------------
+
+/// Confirmation value FORMAT STORE must carry, so no stray APDU formats.
+pub const FORMAT_STORE_CONFIRM: &[u8] = b"FORMAT-STORE-V2";
+
+/// Replace the keystore with a new, empty one: every key of every applet
+/// is gone (STORAGE_V2 §8.3).  The SO-PIN is required while the store is
+/// up; a refused store (a 1.x keystore, a foreign card, no verifiable
+/// binding) formats without it (R9).
+fn handle_format_store(
+    state: &mut ScHsmState,
+    store: &mut dyn KeyStore,
+    cmd: &ApduCommand<'_>,
+) -> ApduResponse {
+    if cmd.data != FORMAT_STORE_CONFIRM {
+        return ApduResponse::err(SW_WRONG_DATA);
+    }
+    match store.format_store(state.so_pin_verified) {
+        Ok(()) => ApduResponse::ok(&[]),
+        Err(pico2hsm_core::error::HsmError::Storage(
+            pico2hsm_core::error::StorageError::IntegrityFailure,
+        )) => ApduResponse::err(SW_SECURITY_STATUS),
+        Err(_) => ApduResponse::err(pico2hsm_core::apdu::SW_MEMORY_FAILURE),
     }
 }

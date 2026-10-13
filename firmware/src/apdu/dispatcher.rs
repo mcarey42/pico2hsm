@@ -692,6 +692,12 @@ impl Dispatcher {
         self.display.health = flags & !STORE_WRITE_FAILED;
     }
 
+    /// FORMAT STORE succeeded: the store is up, empty and new.
+    pub fn note_store_formatted(&mut self) {
+        use crate::display_snapshot::health::{KS_INIT_FAILED, NEEDS_FORMAT};
+        self.display.health &= !(NEEDS_FORMAT | KS_INIT_FAILED);
+    }
+
     /// Record the host session core1 now serves (after
     /// [`Self::clear_session`], and at boot).
     pub fn note_session(&mut self, epoch: u32) {

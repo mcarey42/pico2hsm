@@ -133,7 +133,6 @@ defmt-rtt = { version = "0.4", features = ["disable-blocking-mode"] }
 # ARM Cortex-M runtime
 cortex-m = { version = "0.7", features = ["critical-section-single-core"] }
 cortex-m-rt = { version = "0.7" }
-panic-probe = { version = "0.3", features = ["print-defmt"] }
 
 # ChaCha20 stream cipher — used as CSPRNG state in crypto::rng (reseed hook)
 chacha20 = { version = "0.9", default-features = false }

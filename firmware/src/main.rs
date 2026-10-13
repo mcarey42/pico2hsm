@@ -40,8 +40,6 @@ use defmt_rtt as _;
 use embassy_executor::Spawner;
 #[cfg(target_arch = "arm")]
 use embassy_time::Timer;
-#[cfg(target_arch = "arm")]
-use panic_probe as _;
 #[allow(unused_imports)]
 use pico2hsm_firmware::{serial_fmt, serial_print, serial_println};
 
@@ -191,6 +189,21 @@ enum FlashOp {
     /// Append a device value (RSA pool clock / config / sequence) to the
     /// same log.
     PutValue(pico2hsm_firmware::storage::retry_counter::ValueId, u64),
+    /// Bring the Storage V2 anchor forward in the same log (SD boards: the
+    /// key write ran on core1).
+    PutAnchor(pico2hsm_firmware::storage::retry_counter::Anchor),
+    /// FORMAT STORE (QMI boards; SD boards format on core1); the flag is
+    /// "the SO-PIN was verified".
+    FormatStore(bool),
+    /// One erase or program of the binding ring for core1 (SD boards'
+    /// formats and wipes).  The data points into core1's buffer, which
+    /// outlives the op for the same reason as `SaveKey`'s.
+    BindingWrite {
+        erase: bool,
+        offset: u32,
+        data: *const u8,
+        len: usize,
+    },
     /// Encrypt a generated key and write it to an RSA pool slot (internal
     /// flash, every board).  Points at core1's `KeyObject`, which outlives
     /// the op for the same reason as `SaveKey`'s.
@@ -253,8 +266,11 @@ impl Core1KeyStore {
 
     /// Run `op` on core0 and block until it reports the result.
     fn on_core0(op: FlashOp) -> Result<(), pico2hsm_core::error::HsmError> {
+        pico2hsm_firmware::watchdog::crumb(0x0220_0000 | flash_op_code(&op));
         blocking_send(&FLASH_REQ, op);
-        blocking_receive(&FLASH_RESP)
+        let r = blocking_receive(&FLASH_RESP);
+        pico2hsm_firmware::watchdog::crumb(0x0221_0000);
+        r
     }
 
     fn direct(&mut self) -> &mut pico2hsm_firmware::storage::BoardKeyStore {
@@ -300,6 +316,8 @@ impl pico2hsm_firmware::storage::KeyStore for Core1KeyStore {
 
     fn wipe_all(&mut self) -> Result<(), pico2hsm_core::error::HsmError> {
         if Self::is_direct_write() {
+            // SD: here on core1, so core0 keeps the time extensions going
+            // through seconds of SD writes; the binding writes go to core0.
             return self.direct().wipe_all();
         }
         Self::on_core0(FlashOp::WipeAll)
@@ -337,6 +355,26 @@ impl pico2hsm_firmware::storage::KeyStore for Core1KeyStore {
         &mut self,
     ) -> Option<&mut dyn pico2hsm_firmware::storage::retry_counter::RetryCounterBackend> {
         Some(self)
+    }
+
+    fn format_store(
+        &mut self,
+        so_pin_verified: bool,
+    ) -> Result<(), pico2hsm_core::error::HsmError> {
+        if Self::is_direct_write() {
+            // As `wipe_all`: the ring erase is 512 SD block writes.
+            let r = self.direct().format_store(so_pin_verified);
+            pico2hsm_firmware::cdc_log!(
+                "FORMAT STORE {}",
+                if r.is_ok() { "done" } else { "refused" }
+            );
+            r?;
+        } else {
+            Self::on_core0(FlashOp::FormatStore(so_pin_verified))?;
+        }
+        // Every applet's RAM state describes the old store.
+        pico2hsm_firmware::RELOAD_AFTER_APDU.store(true, core::sync::atomic::Ordering::SeqCst);
+        Ok(())
     }
 
     #[cfg(feature = "rsa")]
@@ -498,13 +536,25 @@ impl pico2hsm_firmware::storage::retry_counter::RetryCounterBackend for Core1Key
     }
 }
 
-/// Attach the retry-counter log on internal flash to the keystore and run
-/// the one-time migration.  Boot only, on core0, before the first key load.
+/// Build the Storage V2 key store over `chip` (boot, core0): attach the
+/// counter log (moving a version-1 log into the version-2 region once) and
+/// the binding ring on internal flash, then mount — formatting only a
+/// first-boot device (STORAGE_V2 §8.3).
 #[cfg(target_arch = "arm")]
-fn init_retry_counters(store: &mut pico2hsm_firmware::storage::BoardKeyStore) {
+fn new_keystore(
+    chip: pico2hsm_firmware::storage::BoardStoreChip,
+    smk: Option<zeroize::Zeroizing<[u8; 32]>>,
+) -> (
+    pico2hsm_firmware::storage::BoardKeyStore,
+    Result<(), pico2hsm_core::error::StorageError>,
+) {
     use pico2hsm_firmware::storage::{
-        flash_chip::{QmiCounterFlash, QmiLegacyCounterFlash, QMI_FLASH_SIZE},
-        flash_layout::{LEGACY_COUNTER_SECTORS, RETRY_COUNTER_SECTORS},
+        flash_chip::{
+            QmiBindingFlash, QmiCounterFlash, QmiLegacyCounterFlash, RoutedBindingFlash,
+            QMI_FLASH_SIZE,
+        },
+        flash_layout::{BINDING_SECTORS, LEGACY_COUNTER_SECTORS, RETRY_COUNTER_SECTORS},
+        keystore_v2::{Hooks, StoreStatus},
         retry_counter::CounterLog,
     };
     // SAFETY: on the QMI boards the keystore's `QmiFlash` owns `p.FLASH`.
@@ -515,6 +565,7 @@ fn init_retry_counters(store: &mut pico2hsm_firmware::storage::BoardKeyStore) {
             unsafe { embassy_rp::peripherals::FLASH::steal() },
         )
     };
+    let mut ks = pico2hsm_firmware::storage::BoardKeyStore::new(chip, smk);
     let mut legacy = QmiLegacyCounterFlash::new(handle());
     let log = CounterLog::open_migrating(
         QmiCounterFlash::new(handle()),
@@ -525,7 +576,73 @@ fn init_retry_counters(store: &mut pico2hsm_firmware::storage::BoardKeyStore) {
     if log.migrated_v1() {
         defmt::info!("retry counters: version-1 log moved to the version-2 region");
     }
-    store.attach_retry_counters(log);
+    ks.attach_retry_counters(log);
+    if ks
+        .attach_binding(
+            RoutedBindingFlash::new(QmiBindingFlash::new(handle()), binding_write_from_core1),
+            BINDING_SECTORS,
+        )
+        .is_err()
+    {
+        defmt::error!("storage: binding block unreadable");
+    }
+    ks.set_hooks(Hooks {
+        put_anchor: put_anchor_from_core1,
+    });
+    let r = ks.init();
+    match ks.status() {
+        StoreStatus::Up => defmt::info!("storage: Storage V2 store mounted"),
+        StoreStatus::NeedsFormat => defmt::warn!(
+            "storage: the keystore region holds no 2.0 store (a 1.x keystore?) — FORMAT STORE needed"
+        ),
+        s => defmt::error!("storage: store refused: {}", defmt::Debug2Format(&s)),
+    }
+    (ks, r)
+}
+
+/// `Hooks::put_anchor` for core1 (SD boards): the counter log is on
+/// internal flash, which only core0 can write.
+#[cfg(target_arch = "arm")]
+fn put_anchor_from_core1(
+    a: pico2hsm_firmware::storage::retry_counter::Anchor,
+) -> Result<(), pico2hsm_core::error::StorageError> {
+    Core1KeyStore::on_core0(FlashOp::PutAnchor(a)).map_err(|e| match e {
+        pico2hsm_core::error::HsmError::Storage(s) => s,
+        _ => pico2hsm_core::error::StorageError::WriteError,
+    })
+}
+
+/// `RoutedBindingFlash`'s route for core1 (SD boards): the binding ring is
+/// on internal flash, which only core0 can write.
+#[cfg(target_arch = "arm")]
+fn binding_write_from_core1(
+    w: pico2hsm_firmware::storage::flash_chip::BindingWrite<'_>,
+) -> Result<(), pico2hsm_core::error::StorageError> {
+    use pico2hsm_firmware::storage::flash_chip::BindingWrite;
+    let op = match w {
+        BindingWrite::Erase(sector) => FlashOp::BindingWrite {
+            erase: true,
+            offset: sector,
+            data: core::ptr::null(),
+            len: 0,
+        },
+        BindingWrite::Program(offset, data) => FlashOp::BindingWrite {
+            erase: false,
+            offset,
+            data: data.as_ptr(),
+            len: data.len(),
+        },
+    };
+    Core1KeyStore::on_core0(op).map_err(|e| match e {
+        pico2hsm_core::error::HsmError::Storage(s) => s,
+        _ => pico2hsm_core::error::StorageError::WriteError,
+    })
+}
+
+/// Seed the counter log from the PIN records if it is new (one-time
+/// migration).  Boot only, on core0, before the first key load.
+#[cfg(target_arch = "arm")]
+fn init_retry_counters(store: &mut pico2hsm_firmware::storage::BoardKeyStore) {
     match pico2hsm_firmware::apdu::dispatcher::Dispatcher::migrate_retry_counters(store) {
         Ok(true) => defmt::info!("retry counters: migrated from the PIN records"),
         Ok(false) => {}
@@ -575,10 +692,18 @@ static KEYSTORE_CELL: StaticCell<pico2hsm_firmware::storage::BoardKeyStore> = St
 
 /// Health facts known at boot (`display_snapshot::health` bits).
 #[cfg(target_arch = "arm")]
-fn boot_health(ks_ok: bool, smk_present: bool) -> u8 {
+fn boot_health(
+    ks_ok: bool,
+    smk_present: bool,
+    store: &pico2hsm_firmware::storage::BoardKeyStore,
+) -> u8 {
     use pico2hsm_firmware::display_snapshot::health;
+    use pico2hsm_firmware::storage::keystore_v2::StoreStatus;
     let mut f = 0;
-    if !ks_ok {
+    if store.status() == StoreStatus::NeedsFormat {
+        // Not damage: the routine 1.x → 2.0 upgrade step.
+        f |= health::NEEDS_FORMAT;
+    } else if !ks_ok {
         f |= health::KS_INIT_FAILED;
     }
     if !smk_present {
@@ -790,7 +915,11 @@ fn dispatcher_loop(ptr_wrapper: DispatcherPtr) -> ! {
 
     let mut session = pico2hsm_firmware::SESSION_EPOCH.load(core::sync::atomic::Ordering::SeqCst);
     loop {
+        pico2hsm_firmware::watchdog::crumb(0x0210_0000);
         let apdu_bytes = next_apdu(store_ptr);
+        pico2hsm_firmware::watchdog::crumb(
+            0x0211_0000 | u32::from(apdu_bytes.get(1).copied().unwrap_or(0)),
+        );
         // A new host session (USB reset/deconfigure or card power cycle)
         // must not inherit PIN/key authentication from the previous one.
         // Key off the session the APDU was *sent in*, not the current one:
@@ -818,6 +947,7 @@ fn dispatcher_loop(ptr_wrapper: DispatcherPtr) -> ! {
             // it into BSS, risking silent stack overflow on the second USB
             // reconnect in a test session.  reset_in_place also zeroizes the
             // old session's secrets (DKEK, PIN state, cached keys).
+            pico2hsm_firmware::watchdog::crumb(0x0214_0000);
             dispatcher.reset_in_place();
             if Core1KeyStore::is_direct_write() {
                 // SD card: reload directly on core1.
@@ -846,10 +976,12 @@ fn dispatcher_loop(ptr_wrapper: DispatcherPtr) -> ! {
                 publish(&dispatcher.display_snapshot());
             }
             let mut ks = Core1KeyStore::new(store_ptr);
+            pico2hsm_firmware::watchdog::crumb(0x0215_0000);
             fill_response(|out| {
                 dispatcher.dispatch_into(&apdu_bytes, &mut ks, out);
                 dispatcher.display_end(out, &mut ks);
             });
+            pico2hsm_firmware::watchdog::crumb(0x0216_0000);
             // The command may carry PINs or key material: dropping it wipes it.
             drop(apdu_bytes);
             // A reset during the command: whatever it authenticated belonged
@@ -864,6 +996,17 @@ fn dispatcher_loop(ptr_wrapper: DispatcherPtr) -> ! {
             publish(&dispatcher.display_snapshot());
             CORE1_PROGRESS.store(60, core::sync::atomic::Ordering::Relaxed);
             post_response();
+            // The store was replaced (FORMAT STORE): drop every applet's
+            // state and reload it, as after a USB reset — after the
+            // response, never under the running command.
+            if pico2hsm_firmware::RELOAD_AFTER_APDU
+                .swap(false, core::sync::atomic::Ordering::SeqCst)
+            {
+                dispatcher.reset_in_place();
+                dispatcher.note_store_formatted();
+                let _ = Core1KeyStore::on_core0(FlashOp::ReloadKeys);
+                publish(&dispatcher.display_snapshot());
+            }
             CORE1_PROGRESS.store(0, core::sync::atomic::Ordering::Relaxed);
         }
     }
@@ -871,15 +1014,45 @@ fn dispatcher_loop(ptr_wrapper: DispatcherPtr) -> ! {
 
 // ─── defmt support (ARM only) ─────────────────────────────────────────────────
 // defmt requires _defmt_timestamp and _defmt_panic to be defined by the crate.
-// defmt-rtt provides the RTT transport; panic_probe provides #[panic_handler]
-// but NOT #[defmt::panic_handler] — that must be defined by the application.
+// defmt-rtt provides the RTT transport; the application defines both the
+// #[panic_handler] (`panic`) and the #[defmt::panic_handler].
 #[cfg(target_arch = "arm")]
 defmt::timestamp!("{=u64:us}", embassy_time::Instant::now().as_micros());
 
 #[cfg(target_arch = "arm")]
 #[defmt::panic_handler]
 fn defmt_panic() -> ! {
-    panic_probe::hard_fault()
+    pico2hsm_firmware::watchdog::crumb(0xFA1D_0000);
+    cortex_m::asm::udf()
+}
+
+/// Panic handler (in place of panic-probe): record the location as
+/// breadcrumbs — marker `0xFA19_0000 | line`, then the file name's
+/// address — so the next boot shows it even without a probe; then print
+/// the message over defmt as panic-probe did.  The message itself is never
+/// recorded: it is formatted from runtime values (an `assert_eq!` on two
+/// buffers prints their bytes), and the breadcrumbs outlive the reset and
+/// are printed on the unauthenticated CDC serial port.
+#[cfg(target_arch = "arm")]
+#[panic_handler]
+fn panic(info: &core::panic::PanicInfo<'_>) -> ! {
+    use core::sync::atomic::{AtomicBool, Ordering};
+    use pico2hsm_firmware::watchdog::crumb;
+    // A panic inside this handler (defmt's own "taken reentrantly", say)
+    // stops here: the first one's breadcrumbs are already recorded.
+    static PANICKING: AtomicBool = AtomicBool::new(false);
+    cortex_m::interrupt::disable();
+    if PANICKING.swap(true, Ordering::Relaxed) {
+        cortex_m::asm::udf()
+    }
+    let (line, file) = info
+        .location()
+        .map_or((0, 0), |l| (l.line(), l.file().as_ptr() as u32));
+    crumb(0xFA19_0000 | (line & 0xFFFF));
+    crumb(file);
+    // As panic-probe's `print-defmt`, for a board with a probe attached.
+    defmt::error!("{}", defmt::Display2Format(info));
+    cortex_m::asm::udf()
 }
 
 // ─── Embassy interrupt binding (ARM only) ─────────────────────────────────────
@@ -1117,6 +1290,51 @@ fn handle_flash_op(
             dispatcher.load_keys_from_store(store);
             Ok(())
         }
+        FlashOp::FormatStore(so_pin_verified) => {
+            defmt::warn!("FLASH_SVC: FORMAT STORE");
+            let r = store.format_store_now(so_pin_verified);
+            pico2hsm_firmware::cdc_log!(
+                "FORMAT STORE {}",
+                if r.is_ok() { "done" } else { "refused" }
+            );
+            r
+        }
+        FlashOp::BindingWrite {
+            erase,
+            offset,
+            data,
+            len,
+        } => {
+            use pico2hsm_firmware::storage::flash_chip::{
+                BindingWrite, QmiBindingFlash, QMI_FLASH_SIZE,
+            };
+            // SAFETY: the blocking driver holds no state (see
+            // `new_keystore`); core1 is parked in `on_core0`.
+            let mut flash = QmiBindingFlash::new(embassy_rp::flash::Flash::<
+                _,
+                embassy_rp::flash::Blocking,
+                QMI_FLASH_SIZE,
+            >::new_blocking(unsafe {
+                embassy_rp::peripherals::FLASH::steal()
+            }));
+            let w = if erase {
+                BindingWrite::Erase(offset)
+            } else {
+                // SAFETY: see `FlashOp::BindingWrite` — core1 is blocked
+                // until we reply, so its buffer is live and unchanged.
+                BindingWrite::Program(offset, unsafe { core::slice::from_raw_parts(data, len) })
+            };
+            w.apply(&mut flash)
+                .map_err(pico2hsm_core::error::HsmError::Storage)
+        }
+        FlashOp::PutAnchor(a) => match store.counter_log() {
+            Some(log) => log
+                .put_anchor(a)
+                .map_err(pico2hsm_core::error::HsmError::Storage),
+            None => Err(pico2hsm_core::error::HsmError::Storage(
+                pico2hsm_core::error::StorageError::NotFormatted,
+            )),
+        },
         FlashOp::PutCounter(cred, state) => match store.retry_counters() {
             Some(log) => log
                 .put(cred, state)
@@ -1186,10 +1404,38 @@ async fn flash_service(
     dispatcher_ptr: *mut pico2hsm_firmware::apdu::dispatcher::Dispatcher,
 ) {
     loop {
+        pico2hsm_firmware::watchdog::crumb(0x0130_0000);
         let op = FLASH_REQ.receive().await;
+        pico2hsm_firmware::watchdog::crumb(0x0131_0000 | flash_op_code(&op));
         let result = handle_flash_op(op, store, dispatcher_ptr);
+        pico2hsm_firmware::watchdog::crumb(0x0132_0000);
         FLASH_RESP.send(result).await;
         cortex_m::asm::sev(); // wake core1 from WFE
+    }
+}
+
+/// Breadcrumb code of a flash op (diagnostics).
+#[cfg(target_arch = "arm")]
+fn flash_op_code(op: &FlashOp) -> u32 {
+    match op {
+        FlashOp::SaveKey(_) => 1,
+        FlashOp::EraseKey(_) => 2,
+        FlashOp::WipeAll => 3,
+        FlashOp::WipeByOwner(_) => 4,
+        FlashOp::WipeByOwnerStep(_) => 5,
+        FlashOp::ReloadKeys => 6,
+        FlashOp::PutCounter(..) => 7,
+        FlashOp::PutLamport(_) => 8,
+        FlashOp::PutValue(..) => 9,
+        FlashOp::PutAnchor(_) => 10,
+        FlashOp::FormatStore(_) => 11,
+        FlashOp::BindingWrite { erase, .. } => 12 + u32::from(*erase),
+        #[cfg(feature = "rsa")]
+        FlashOp::PoolPut { .. } => 14,
+        #[cfg(feature = "rsa")]
+        FlashOp::PoolTake(_) => 15,
+        #[cfg(feature = "rsa")]
+        FlashOp::PoolErase(_) => 16,
     }
 }
 
@@ -1244,6 +1490,7 @@ async fn await_core1_response<'d, D: embassy_usb::driver::Driver<'d>>(
     // heartbeat or reply); here it gets a 6F00 out before the reset.
     let mut monitor = Core1Monitor::new(Instant::now().as_millis(), Core1Activity::sample());
     loop {
+        pico2hsm_firmware::watchdog::crumb(0x0113_0000);
         match select(RESP_READY.receive(), Timer::at(deadline)).await {
             Either::First(()) => {
                 pico2hsm_firmware::watchdog::note_core1_response();
@@ -1263,9 +1510,10 @@ async fn await_core1_response<'d, D: embassy_usb::driver::Driver<'d>>(
                 if health == Core1Health::Stalled {
                     return None;
                 }
-                if let Err(pico2hsm_firmware::transport::ccid::CcidError::UsbDisconnected) =
-                    ccid.send_time_extension().await
-                {
+                pico2hsm_firmware::watchdog::crumb(0x0120_0000);
+                let wtx = ccid.send_time_extension().await;
+                pico2hsm_firmware::watchdog::crumb(0x0121_0000);
+                if let Err(pico2hsm_firmware::transport::ccid::CcidError::UsbDisconnected) = wtx {
                     // Sending it fails the same way (and a new session's
                     // epoch would drop it): the caller takes its disconnect path.
                     return Some(recv_core1_response().await);
@@ -1408,6 +1656,7 @@ async fn watchdog_feeder() {
     let mut monitor = Core1Monitor::new(Instant::now().as_millis(), Core1Activity::sample());
     let mut stack_peak = 0;
     loop {
+        pico2hsm_firmware::watchdog::crumb(0x0150_0000);
         let peak = core1_stack_high_water();
         if peak > stack_peak + 1024 {
             stack_peak = peak;
@@ -1458,6 +1707,71 @@ fn log_boot_report(r: &pico2hsm_firmware::watchdog::BootReport) {
             r.chip_reset
         );
     }
+    log_crumbs(r);
+}
+
+/// The breadcrumbs the previous run left (see `watchdog::crumb`).  Debug
+/// builds only: the CDC serial port needs no authentication, and the
+/// crumbs show recent APDU instruction bytes and code addresses.  Release
+/// builds still record them (a debugger can read them) but never print.
+#[cfg(target_arch = "arm")]
+fn log_crumbs(r: &pico2hsm_firmware::watchdog::BootReport) {
+    let history = pico2hsm_firmware::watchdog::take_crumb_history();
+    if !cfg!(debug_assertions) {
+        return;
+    }
+    defmt::info!(
+        "reset: crumbs core0=0x{:08X} core1=0x{:08X}",
+        r.crumbs.0,
+        r.crumbs.1
+    );
+    pico2hsm_firmware::cdc_log!(
+        "reset: crumbs core0=0x{:08X} core1=0x{:08X}",
+        r.crumbs.0,
+        r.crumbs.1
+    );
+    if let Some(h) = history {
+        for (core, row) in h.iter().enumerate() {
+            for half in row.chunks(8) {
+                pico2hsm_firmware::cdc_log!(
+                    "crumbs{} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X}",
+                    core,
+                    half[0],
+                    half[1],
+                    half[2],
+                    half[3],
+                    half[4],
+                    half[5],
+                    half[6],
+                    half[7]
+                );
+            }
+        }
+    }
+}
+
+/// HardFault (diagnostics): record the faulting PC as breadcrumbs (marker
+/// `0xFA17_0000`, then the PC, then LR), so the next boot shows it.
+#[cfg(target_arch = "arm")]
+#[cortex_m_rt::exception]
+unsafe fn HardFault(ef: &cortex_m_rt::ExceptionFrame) -> ! {
+    pico2hsm_firmware::watchdog::crumb(0xFA17_0000);
+    pico2hsm_firmware::watchdog::crumb(ef.pc());
+    pico2hsm_firmware::watchdog::crumb(ef.lr());
+    loop {
+        cortex_m::asm::nop();
+    }
+}
+
+/// Any other unhandled exception or interrupt (UsageFault, BusFault, …):
+/// record its number (marker `0xFA18_xxxx`).
+#[cfg(target_arch = "arm")]
+#[cortex_m_rt::exception]
+unsafe fn DefaultHandler(irqn: i16) {
+    pico2hsm_firmware::watchdog::crumb(0xFA18_0000 | (irqn as u16 as u32));
+    loop {
+        cortex_m::asm::nop();
+    }
 }
 
 // ─── RP2350-One main function ─────────────────────────────────────────────────
@@ -1504,11 +1818,7 @@ async fn run_one_board(p: embassy_rp::Peripherals) {
     >::new_blocking(p.FLASH);
     let qmi = pico2hsm_firmware::storage::flash_chip::QmiFlash::new(qmi_flash);
 
-    let mut fs = pico2hsm_firmware::storage::filesystem::KeyFilesystem::new();
-    let _ = fs.add_chip(pico2hsm_firmware::storage::AnyChip::SdCard(qmi));
-    let sm = pico2hsm_firmware::storage::StorageManager::new(fs);
-    let mut ks = pico2hsm_firmware::storage::FlashKeyStore::new(sm, smk);
-    let ks_init = ks.init();
+    let (ks, ks_init) = new_keystore(qmi, smk);
     let ks_ok = ks_init.is_ok();
     match ks_init {
         Ok(()) => defmt::info!("KeyStore: initialized (rp2350_one internal flash)"),
@@ -1576,7 +1886,7 @@ async fn run_one_board(p: embassy_rp::Peripherals) {
         dispatcher_ref.load_keys_from_store(store);
         dispatcher_ref.migrate_domain(store);
     }
-    publish_boot_snapshot(dispatcher_ref, boot_health(ks_ok, smk_present));
+    publish_boot_snapshot(dispatcher_ref, boot_health(ks_ok, smk_present, store));
     let dispatcher_ptr = dispatcher_ref as *mut pico2hsm_firmware::apdu::dispatcher::Dispatcher;
     let dispatcher_send = DispatcherPtr(dispatcher_ptr, store as *mut _);
 
@@ -1753,12 +2063,17 @@ async fn display_board_ccid_loop<'d, D: embassy_usb::driver::Driver<'d>>(
         ccid.wait_connected().await;
         defmt::info!("USB connected");
         loop {
+            pico2hsm_firmware::watchdog::crumb(0x0110_0000);
             match ccid.recv_apdu().await {
                 Ok(mut apdu_bytes) => {
+                    pico2hsm_firmware::watchdog::crumb(
+                        0x0111_0000 | u32::from(apdu_bytes.get(1).copied().unwrap_or(0)),
+                    );
                     let epoch = ccid.apdu_epoch();
                     pico2hsm_firmware::APDU_EPOCH
                         .store(epoch, core::sync::atomic::Ordering::SeqCst);
                     send_to_core1(&mut apdu_bytes).await;
+                    pico2hsm_firmware::watchdog::crumb(0x0112_0000);
                     set_apdu_started(Some(embassy_time::Instant::now().as_millis() as u32));
                     kick();
                     let response = match await_core1_response(ccid).await {
@@ -1767,7 +2082,10 @@ async fn display_board_ccid_loop<'d, D: embassy_usb::driver::Driver<'d>>(
                     };
                     set_apdu_started(None);
                     kick();
-                    match send_and_wipe(ccid, response, epoch).await {
+                    pico2hsm_firmware::watchdog::crumb(0x0114_0000);
+                    let sent = send_and_wipe(ccid, response, epoch).await;
+                    pico2hsm_firmware::watchdog::crumb(0x0115_0000);
+                    match sent {
                         Ok(()) => {
                             for _ in 0..16 {
                                 if !pico2hsm_firmware::transport::cdc_serial::drain_one(cdc_sender)
@@ -1778,6 +2096,7 @@ async fn display_board_ccid_loop<'d, D: embassy_usb::driver::Driver<'d>>(
                             }
                         }
                         Err(CcidError::UsbDisconnected) => {
+                            pico2hsm_firmware::watchdog::crumb(0x0116_0000);
                             send_reset_to_core1().await;
                             let _ = recv_core1_response().await;
                             break;
@@ -1939,11 +2258,8 @@ async fn run_geek_board(
             bus.borrow_mut().set_config(&fast_cfg);
         });
 
-        let mut fs = pico2hsm_firmware::storage::filesystem::KeyFilesystem::new();
-        fs.add_chip(sd_chip).expect("add SD chip");
-        let sm = pico2hsm_firmware::storage::StorageManager::new(fs);
-        let mut ks = pico2hsm_firmware::storage::FlashKeyStore::new(sm, smk);
-        let ks_ok = ks.init().is_ok();
+        let (ks, ks_init) = new_keystore(sd_chip, smk);
+        let ks_ok = ks_init.is_ok();
         if ks_ok {
             serial_println!("KeyStore ok (SD card)");
         } else {
@@ -1961,11 +2277,8 @@ async fn run_geek_board(
             { pico2hsm_firmware::storage::flash_chip::QMI_FLASH_SIZE },
         >::new_blocking(p.FLASH);
         let qmi = pico2hsm_firmware::storage::flash_chip::QmiFlash::new(qmi_flash);
-        let mut fs = pico2hsm_firmware::storage::filesystem::KeyFilesystem::new();
-        let _ = fs.add_chip(qmi);
-        let sm = pico2hsm_firmware::storage::StorageManager::new(fs);
-        let mut ks = pico2hsm_firmware::storage::FlashKeyStore::new(sm, smk);
-        let ks_ok = ks.init().is_ok();
+        let (ks, ks_init) = new_keystore(qmi, smk);
+        let ks_ok = ks_init.is_ok();
         if ks_ok {
             serial_println!("KeyStore ok (QMI flash)");
         } else {
@@ -1985,7 +2298,7 @@ async fn run_geek_board(
         dispatcher_ref.load_keys_from_store(store);
         dispatcher_ref.migrate_domain(store);
     }
-    publish_boot_snapshot(dispatcher_ref, boot_health(ks_ok, smk_present));
+    publish_boot_snapshot(dispatcher_ref, boot_health(ks_ok, smk_present, store));
     {
         let inv = dispatcher_ref.display_snapshot().inventory;
         let keys = u16::from(inv.keys_hsm) + u16::from(inv.keys_piv) + u16::from(inv.keys_pgp);
@@ -2112,11 +2425,7 @@ async fn run_pico2_board(p: embassy_rp::Peripherals) {
     >::new_blocking(p.FLASH);
     let qmi = pico2hsm_firmware::storage::flash_chip::QmiFlash::new(qmi_flash);
 
-    let mut fs = pico2hsm_firmware::storage::filesystem::KeyFilesystem::new();
-    let _ = fs.add_chip(qmi);
-    let sm = pico2hsm_firmware::storage::StorageManager::new(fs);
-    let mut ks = pico2hsm_firmware::storage::FlashKeyStore::new(sm, smk);
-    let ks_init = ks.init();
+    let (ks, ks_init) = new_keystore(qmi, smk);
     let ks_ok = ks_init.is_ok();
     match ks_init {
         Ok(()) => defmt::info!("KeyStore: initialized (pico2_4m internal flash)"),
@@ -2177,7 +2486,7 @@ async fn run_pico2_board(p: embassy_rp::Peripherals) {
         dispatcher_ref.load_keys_from_store(store);
         dispatcher_ref.migrate_domain(store);
     }
-    publish_boot_snapshot(dispatcher_ref, boot_health(ks_ok, smk_present));
+    publish_boot_snapshot(dispatcher_ref, boot_health(ks_ok, smk_present, store));
     let dispatcher_ptr = dispatcher_ref as *mut pico2hsm_firmware::apdu::dispatcher::Dispatcher;
     let dispatcher_send = DispatcherPtr(dispatcher_ptr, store as *mut _);
 
@@ -2354,11 +2663,8 @@ fn init_sd_keystore(
     let sd_chip =
         pico2hsm_firmware::storage::sdcard::SdCardFlash::from_initialized(card, capacity_bytes);
 
-    let mut fs = pico2hsm_firmware::storage::filesystem::KeyFilesystem::new();
-    fs.add_chip(sd_chip).expect("add SD chip");
-    let sm = pico2hsm_firmware::storage::StorageManager::new(fs);
-    let mut ks = pico2hsm_firmware::storage::FlashKeyStore::new(sm, smk);
-    let ks_ok = ks.init().is_ok();
+    let (ks, ks_init) = new_keystore(sd_chip, smk);
+    let ks_ok = ks_init.is_ok();
     if ks_ok {
         defmt::info!("KeyStore: initialized (SD card)");
     } else {
@@ -2480,11 +2786,8 @@ async fn run_waveshare_lcd_board(
             { pico2hsm_firmware::storage::flash_chip::QMI_FLASH_SIZE },
         >::new_blocking(p.FLASH);
         let qmi = pico2hsm_firmware::storage::flash_chip::QmiFlash::new(qmi_flash);
-        let mut fs = pico2hsm_firmware::storage::filesystem::KeyFilesystem::new();
-        let _ = fs.add_chip(qmi);
-        let sm = pico2hsm_firmware::storage::StorageManager::new(fs);
-        let mut ks = pico2hsm_firmware::storage::FlashKeyStore::new(sm, smk);
-        let ks_ok = ks.init().is_ok();
+        let (ks, ks_init) = new_keystore(qmi, smk);
+        let ks_ok = ks_init.is_ok();
         if ks_ok {
             defmt::info!("KeyStore: initialized (waveshare_rp2350_lcd_16m internal flash)");
         } else {
@@ -2504,7 +2807,7 @@ async fn run_waveshare_lcd_board(
         dispatcher_ref.load_keys_from_store(store);
         dispatcher_ref.migrate_domain(store);
     }
-    publish_boot_snapshot(dispatcher_ref, boot_health(ks_ok, smk_present));
+    publish_boot_snapshot(dispatcher_ref, boot_health(ks_ok, smk_present, store));
     {
         let inv = dispatcher_ref.display_snapshot().inventory;
         let keys = u16::from(inv.keys_hsm) + u16::from(inv.keys_piv) + u16::from(inv.keys_pgp);
