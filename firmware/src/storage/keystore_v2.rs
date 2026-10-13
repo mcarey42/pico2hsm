@@ -356,7 +356,7 @@ impl<F: StoreFlash, B: CounterFlash, L: RetryCounterBackend> FlashKeyStoreV2<F, 
     /// FORMAT STORE (§8.3, R9): a new, empty store; every key of every
     /// applet is gone.  The caller has checked the SO-PIN, or that the
     /// store is refused or has no verifiable binding.  Core0 only.
-    pub fn format_store(&mut self, so_pin_verified: bool) -> Result<(), HsmError> {
+    pub fn format_store_now(&mut self, so_pin_verified: bool) -> Result<(), HsmError> {
         self.smk()?;
         let auth = FormatAuth::format_store(so_pin_verified || self.format_needs_no_pin())
             .ok_or(HsmError::Storage(StorageError::IntegrityFailure))?;
@@ -546,6 +546,10 @@ impl<F: StoreFlash, B: CounterFlash, L: RetryCounterBackend> KeyStore for FlashK
         self.counters
             .as_mut()
             .map(|c| c as &mut dyn RetryCounterBackend)
+    }
+
+    fn format_store(&mut self, so_pin_verified: bool) -> Result<(), HsmError> {
+        self.format_store_now(so_pin_verified)
     }
 
     #[cfg(feature = "rsa")]

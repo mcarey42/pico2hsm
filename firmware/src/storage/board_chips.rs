@@ -110,6 +110,31 @@ pub type BoardChip = SdCardFlash<
 
 // ── BoardKeyStore type alias ──────────────────────────────────────────────────
 
-/// `BoardKeyStore`: a single `FlashKeyStore` over `BoardChip`.
+/// The keystore medium of the Storage V2 store: internal QMI flash on every
+/// board without an SD card (the RP2350-One included: its RAID `BoardChip`
+/// was never populated), the card on the SD boards.
+#[cfg(all(
+    target_arch = "arm",
+    not(any(
+        feature = "rp2350_geek_sdcard",
+        feature = "waveshare_rp2350_lcd_sdcard"
+    ))
+))]
+pub type BoardStoreChip = QmiFlash;
+#[cfg(all(
+    target_arch = "arm",
+    any(
+        feature = "rp2350_geek_sdcard",
+        feature = "waveshare_rp2350_lcd_sdcard"
+    )
+))]
+pub type BoardStoreChip = BoardChip;
+
+/// `BoardKeyStore`: the Storage V2 key store over `BoardStoreChip`, with
+/// the binding ring and the counter log on internal flash.
 #[cfg(target_arch = "arm")]
-pub type BoardKeyStore = crate::storage::FlashKeyStore<BoardChip>;
+pub type BoardKeyStore = crate::storage::keystore_v2::FlashKeyStoreV2<
+    BoardStoreChip,
+    crate::storage::flash_chip::QmiBindingFlash,
+    crate::storage::BoardCounterLog,
+>;

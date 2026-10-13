@@ -78,7 +78,7 @@ pub mod wal;
 #[cfg(target_arch = "arm")]
 pub use board_chips::BoardChip;
 #[cfg(target_arch = "arm")]
-pub use board_chips::BoardKeyStore;
+pub use board_chips::{BoardKeyStore, BoardStoreChip};
 #[cfg(target_arch = "arm")]
 pub use keystore::FlashKeyStore;
 

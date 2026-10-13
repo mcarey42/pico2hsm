@@ -585,6 +585,10 @@ pub type QmiLegacyCounterFlash = QmiRegionFlash<
     { super::flash_layout::LEGACY_COUNTER_SIZE },
 >;
 
+/// The Storage V2 binding block ring (`flash_layout::BINDING_OFFSET`).
+pub type QmiBindingFlash =
+    QmiRegionFlash<{ super::flash_layout::BINDING_OFFSET }, { super::flash_layout::BINDING_SIZE }>;
+
 /// The RSA key pool region (`flash_layout::RSA_POOL_OFFSET`).
 pub type QmiPoolFlash = QmiRegionFlash<
     { super::flash_layout::RSA_POOL_OFFSET },

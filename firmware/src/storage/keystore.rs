@@ -81,6 +81,15 @@ pub trait KeyStore {
         None
     }
 
+    /// FORMAT STORE (STORAGE_V2 §8.3): replace the store with a new, empty
+    /// one — every key of every applet is gone.  `so_pin_verified`: the
+    /// SC-HSM SO-PIN was verified this session; without it the store only
+    /// formats if it is not up (refused, no verifiable binding, R9).
+    fn format_store(&mut self, so_pin_verified: bool) -> Result<(), HsmError> {
+        let _ = so_pin_verified;
+        Err(HsmError::Storage(StorageError::WriteError))
+    }
+
     /// The RSA key pool region (see `storage::rsa_pool`), or `None` if this
     /// store has none: GENERATE then always generates live.
     #[cfg(feature = "rsa")]
