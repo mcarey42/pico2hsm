@@ -180,7 +180,7 @@ heartbeat moving instead of suppressing it.
 ## APDU Robustness
 
 ### Dispatch chain
-- All APDUs received on Core0 (USB/CCID), forwarded to Core1 via `APDU_CHANNEL`
+- All APDUs received on Core0 (USB/CCID), forwarded to Core1 via the `APDU_BOX` mailbox (wiped after use)
 - Dispatcher validates CLA, INS, P1, P2 before routing to command handlers
 - Unknown INS returns `SW_INS_NOT_SUPPORTED` (0x6D00)
 - Wrong CLA returns `SW_CLA_NOT_SUPPORTED` (0x6E00)
