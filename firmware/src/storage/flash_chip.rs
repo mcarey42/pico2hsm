@@ -13,6 +13,23 @@
 use heapless::Vec;
 use pico2hsm_core::{error::StorageError, flash::FlashChip};
 
+/// Read internal flash at `offset` (from the start of flash) through the
+/// XIP window — what `embassy_rp::flash::Flash::blocking_read` does, minus
+/// its defmt `trace!`.  Reads run on both cores, and defmt's logger is not
+/// safe to enter from two cores at once (the critical section is the
+/// single-core one): a core1 read logging while core0 logs panics with
+/// "defmt logger taken reentrantly".  The caller has bounds-checked.
+fn xip_read(offset: u32, buf: &mut [u8]) {
+    const XIP_BASE: usize = 0x1000_0000;
+    // SAFETY: the range lies inside the mapped flash (callers check it
+    // against `QMI_FLASH_SIZE`-bounded regions); flash writes run on core0
+    // with core1 paused, so no read overlaps one.
+    let src = unsafe {
+        core::slice::from_raw_parts((XIP_BASE + offset as usize) as *const u8, buf.len())
+    };
+    buf.copy_from_slice(src);
+}
+
 // ─── QmiFlash ─────────────────────────────────────────────────────────────────
 
 /// Byte offset from flash start where the keystore partition begins.
@@ -78,9 +95,9 @@ impl FlashChip for QmiFlash {
         if addr as u64 + buf.len() as u64 > self.capacity {
             return Err(StorageError::ReadError);
         }
-        self.flash
-            .blocking_read(QMI_KEYSTORE_OFFSET + addr, buf)
-            .map_err(|_| StorageError::ReadError)
+        // Both cores read the store (`fetch_key` on core1): no defmt.
+        xip_read(QMI_KEYSTORE_OFFSET + addr, buf);
+        Ok(())
     }
 
     fn write_page(&mut self, addr: u32, data: &[u8]) -> Result<(), StorageError> {
@@ -235,9 +252,9 @@ impl<const OFFSET: u32, const SIZE: u32> super::retry_counter::CounterFlash
 {
     fn read(&mut self, offset: u32, buf: &mut [u8]) -> Result<(), StorageError> {
         let at = Self::absolute(offset, buf.len()).map_err(|_| StorageError::ReadError)?;
-        self.flash
-            .blocking_read(at, buf)
-            .map_err(|_| StorageError::ReadError)
+        // Core1 reads these regions too (anchor, binding readback, pool).
+        xip_read(at, buf);
+        Ok(())
     }
 
     fn program(&mut self, offset: u32, data: &[u8]) -> Result<(), StorageError> {
