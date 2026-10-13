@@ -324,6 +324,100 @@ pub struct BootReport {
     pub wdt_resets: u32,
     /// Raw `POWMAN.CHIP_RESET` (which reset domain fired).
     pub chip_reset: u32,
+    /// The last [`crumb`] each core left before the reset (core0, core1).
+    pub crumbs: (u32, u32),
+}
+
+/// Diagnostic breadcrumb: where this core is (`SCRATCH2` for core0,
+/// `SCRATCH3` for core1, and the last [`CRUMB_DEPTH`] in [`CRUMB_RING`]).
+/// They survive a watchdog reset and the next boot logs them (`reset:
+/// crumbs`, `crumbs0` / `crumbs1`, oldest first), so a hang or a fault on
+/// a board without a debugger still shows its place.
+///
+/// Codes (`0xAABB_xxxx`; `xxxx` is a detail):
+///
+/// | Code | Where |
+/// |---|---|
+/// | `0110` / `0111`+INS / `0112` | core0 CCID loop: wait for an APDU / got one / handed to core1 |
+/// | `0113`, `0120` / `0121` | core0 waiting for core1; time extension sent / done |
+/// | `0114` / `0115` / `0116` | core0 sending the response / sent / USB disconnect |
+/// | `0130` / `0131`+op / `0132` | core0 flash service: idle / running op (`flash_op_code`) / done |
+/// | `0140`–`0144` | core0 display task: show / shown / loop / LED / LED done |
+/// | `0150` | core0 watchdog feeder |
+/// | `0210` / `0211`+INS / `0214` / `0215` / `0216` | core1: wait / got APDU / USB reset reload / dispatch / done |
+/// | `0220`+op / `0221` | core1 waiting for core0 on a flash op / answered |
+/// | `0230`+block / `0231`+block / `0232`+block / `0233` | SD read / write / erase-write / done |
+/// | `FA17`, then PC, LR | HardFault |
+/// | `FA18`+IRQ | unhandled exception or interrupt |
+/// | `FA19`+line, then the file name's address | panic (never its message) |
+/// | `FA1D` | defmt panic |
+#[inline(always)]
+pub fn crumb(code: u32) {
+    #[cfg(target_arch = "arm")]
+    {
+        use embassy_rp::pac;
+        let core = pac::SIO.cpuid().read() as usize & 1;
+        if core == 0 {
+            pac::WATCHDOG.scratch2().write_value(code);
+        } else {
+            pac::WATCHDOG.scratch3().write_value(code);
+        }
+        // SAFETY: each core writes only its own row; RAM in .uninit
+        // survives the watchdog reset and is read once at boot.
+        unsafe {
+            let ring = &mut *core::ptr::addr_of_mut!(CRUMB_RING);
+            let i = ring.next[core] as usize % CRUMB_DEPTH;
+            ring.codes[core][i] = code;
+            ring.next[core] = ring.next[core].wrapping_add(1);
+        }
+    }
+    #[cfg(not(target_arch = "arm"))]
+    let _ = code;
+}
+
+/// Breadcrumbs kept per core in [`CRUMB_RING`].
+pub const CRUMB_DEPTH: usize = 16;
+
+/// The last [`CRUMB_DEPTH`] breadcrumbs of each core, in RAM the reset
+/// does not clear (`.uninit`); `magic` tells a filled ring from garbage.
+#[repr(C)]
+pub struct CrumbRing {
+    magic: u32,
+    next: [u32; 2],
+    codes: [[u32; CRUMB_DEPTH]; 2],
+}
+
+const CRUMB_MAGIC: u32 = 0xC0DE_C0DE;
+
+#[cfg(target_arch = "arm")]
+#[link_section = ".uninit.crumbs"]
+static mut CRUMB_RING: CrumbRing = CrumbRing {
+    magic: 0,
+    next: [0; 2],
+    codes: [[0; CRUMB_DEPTH]; 2],
+};
+
+/// The previous run's breadcrumb history, oldest first, per core (`None`
+/// after a power-on, when the RAM held garbage), then start a new one.
+/// Core0, at boot, before core1 runs.
+#[cfg(target_arch = "arm")]
+pub fn take_crumb_history() -> Option<[[u32; CRUMB_DEPTH]; 2]> {
+    // SAFETY: core1 is not running yet.
+    let ring = unsafe { &mut *core::ptr::addr_of_mut!(CRUMB_RING) };
+    let out = (ring.magic == CRUMB_MAGIC).then(|| {
+        let mut h = [[0u32; CRUMB_DEPTH]; 2];
+        for (core, row) in h.iter_mut().enumerate() {
+            let next = ring.next[core] as usize;
+            for (k, slot) in row.iter_mut().enumerate() {
+                *slot = ring.codes[core][(next + k) % CRUMB_DEPTH];
+            }
+        }
+        h
+    });
+    ring.magic = CRUMB_MAGIC;
+    ring.next = [0; 2];
+    ring.codes = [[0; CRUMB_DEPTH]; 2];
+    out
 }
 
 // ─── Hardware access (ARM only) ──────────────────────────────────────────────
@@ -375,6 +469,9 @@ pub fn boot_init() -> BootReport {
     let reason = wd.reason().read();
     let last = classify(reason.timer(), reason.force(), wd.scratch0().read());
     let wdt_resets = next_reset_count(wd.scratch1().read(), last);
+    let crumbs = (wd.scratch2().read(), wd.scratch3().read());
+    wd.scratch2().write_value(0);
+    wd.scratch3().write_value(0);
     wd.scratch0().write_value(0);
     wd.scratch1().write_value(wdt_resets);
     let chip_reset = pac::POWMAN.chip_reset().read().0;
@@ -383,6 +480,7 @@ pub fn boot_init() -> BootReport {
         last,
         wdt_resets,
         chip_reset,
+        crumbs,
     }
 }
 

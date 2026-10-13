@@ -1012,6 +1012,7 @@ mod tests {
             last,
             wdt_resets: n,
             chip_reset: 0,
+            crumbs: (0, 0),
         };
         assert_eq!(reset_info(&r(LastReset::Other, 0)), None);
         assert_eq!(

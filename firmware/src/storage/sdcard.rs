@@ -148,7 +148,10 @@ where
                 contents: [0u8; 512],
             }];
             let block = unsafe { &mut *core::ptr::addr_of_mut!(SD_BLOCK) };
-            if self.card.read(block, BlockIdx(sd_sector_idx)).is_err() {
+            crate::watchdog::crumb(0x0230_0000 | (sd_sector_idx & 0xFFFF));
+            let r = self.card.read(block, BlockIdx(sd_sector_idx));
+            crate::watchdog::crumb(0x0233_0000);
+            if r.is_err() {
                 crate::display_snapshot::note_sd_io(false);
                 return Err(StorageError::ReadError);
             }
@@ -180,11 +183,10 @@ where
         for i in 0..SD_SECTORS_PER_LOGICAL {
             // A slow card can take up to 250 ms per block write.
             crate::watchdog::progress();
-            if self
-                .card
-                .write(&blocks, BlockIdx(first_sd_sector + i))
-                .is_err()
-            {
+            crate::watchdog::crumb(0x0232_0000 | ((first_sd_sector + i) & 0xFFFF));
+            let r = self.card.write(&blocks, BlockIdx(first_sd_sector + i));
+            crate::watchdog::crumb(0x0233_0000);
+            if r.is_err() {
                 crate::display_snapshot::note_sd_io(false);
                 return Err(StorageError::EraseError);
             }
@@ -225,11 +227,12 @@ where
             crate::watchdog::progress();
             let mut block = Block::new();
             block.contents.copy_from_slice(chunk);
-            if self
+            crate::watchdog::crumb(0x0231_0000 | ((first + i as u32) & 0xFFFF));
+            let r = self
                 .card
-                .write(core::slice::from_ref(&block), BlockIdx(first + i as u32))
-                .is_err()
-            {
+                .write(core::slice::from_ref(&block), BlockIdx(first + i as u32));
+            crate::watchdog::crumb(0x0233_0000);
+            if r.is_err() {
                 crate::display_snapshot::note_sd_io(false);
                 return Err(StorageError::WriteError);
             }

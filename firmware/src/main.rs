@@ -40,8 +40,6 @@ use defmt_rtt as _;
 use embassy_executor::Spawner;
 #[cfg(target_arch = "arm")]
 use embassy_time::Timer;
-#[cfg(target_arch = "arm")]
-use panic_probe as _;
 #[allow(unused_imports)]
 use pico2hsm_firmware::{serial_fmt, serial_print, serial_println};
 
@@ -268,8 +266,11 @@ impl Core1KeyStore {
 
     /// Run `op` on core0 and block until it reports the result.
     fn on_core0(op: FlashOp) -> Result<(), pico2hsm_core::error::HsmError> {
+        pico2hsm_firmware::watchdog::crumb(0x0220_0000 | flash_op_code(&op));
         blocking_send(&FLASH_REQ, op);
-        blocking_receive(&FLASH_RESP)
+        let r = blocking_receive(&FLASH_RESP);
+        pico2hsm_firmware::watchdog::crumb(0x0221_0000);
+        r
     }
 
     fn direct(&mut self) -> &mut pico2hsm_firmware::storage::BoardKeyStore {
@@ -914,7 +915,11 @@ fn dispatcher_loop(ptr_wrapper: DispatcherPtr) -> ! {
 
     let mut session = pico2hsm_firmware::SESSION_EPOCH.load(core::sync::atomic::Ordering::SeqCst);
     loop {
+        pico2hsm_firmware::watchdog::crumb(0x0210_0000);
         let apdu_bytes = next_apdu(store_ptr);
+        pico2hsm_firmware::watchdog::crumb(
+            0x0211_0000 | u32::from(apdu_bytes.get(1).copied().unwrap_or(0)),
+        );
         // A new host session (USB reset/deconfigure or card power cycle)
         // must not inherit PIN/key authentication from the previous one.
         // Key off the session the APDU was *sent in*, not the current one:
@@ -942,6 +947,7 @@ fn dispatcher_loop(ptr_wrapper: DispatcherPtr) -> ! {
             // it into BSS, risking silent stack overflow on the second USB
             // reconnect in a test session.  reset_in_place also zeroizes the
             // old session's secrets (DKEK, PIN state, cached keys).
+            pico2hsm_firmware::watchdog::crumb(0x0214_0000);
             dispatcher.reset_in_place();
             if Core1KeyStore::is_direct_write() {
                 // SD card: reload directly on core1.
@@ -970,10 +976,12 @@ fn dispatcher_loop(ptr_wrapper: DispatcherPtr) -> ! {
                 publish(&dispatcher.display_snapshot());
             }
             let mut ks = Core1KeyStore::new(store_ptr);
+            pico2hsm_firmware::watchdog::crumb(0x0215_0000);
             fill_response(|out| {
                 dispatcher.dispatch_into(&apdu_bytes, &mut ks, out);
                 dispatcher.display_end(out, &mut ks);
             });
+            pico2hsm_firmware::watchdog::crumb(0x0216_0000);
             // The command may carry PINs or key material: dropping it wipes it.
             drop(apdu_bytes);
             // A reset during the command: whatever it authenticated belonged
@@ -1006,15 +1014,45 @@ fn dispatcher_loop(ptr_wrapper: DispatcherPtr) -> ! {
 
 // ─── defmt support (ARM only) ─────────────────────────────────────────────────
 // defmt requires _defmt_timestamp and _defmt_panic to be defined by the crate.
-// defmt-rtt provides the RTT transport; panic_probe provides #[panic_handler]
-// but NOT #[defmt::panic_handler] — that must be defined by the application.
+// defmt-rtt provides the RTT transport; the application defines both the
+// #[panic_handler] (`panic`) and the #[defmt::panic_handler].
 #[cfg(target_arch = "arm")]
 defmt::timestamp!("{=u64:us}", embassy_time::Instant::now().as_micros());
 
 #[cfg(target_arch = "arm")]
 #[defmt::panic_handler]
 fn defmt_panic() -> ! {
-    panic_probe::hard_fault()
+    pico2hsm_firmware::watchdog::crumb(0xFA1D_0000);
+    cortex_m::asm::udf()
+}
+
+/// Panic handler (in place of panic-probe): record the location as
+/// breadcrumbs — marker `0xFA19_0000 | line`, then the file name's
+/// address — so the next boot shows it even without a probe; then print
+/// the message over defmt as panic-probe did.  The message itself is never
+/// recorded: it is formatted from runtime values (an `assert_eq!` on two
+/// buffers prints their bytes), and the breadcrumbs outlive the reset and
+/// are printed on the unauthenticated CDC serial port.
+#[cfg(target_arch = "arm")]
+#[panic_handler]
+fn panic(info: &core::panic::PanicInfo<'_>) -> ! {
+    use core::sync::atomic::{AtomicBool, Ordering};
+    use pico2hsm_firmware::watchdog::crumb;
+    // A panic inside this handler (defmt's own "taken reentrantly", say)
+    // stops here: the first one's breadcrumbs are already recorded.
+    static PANICKING: AtomicBool = AtomicBool::new(false);
+    cortex_m::interrupt::disable();
+    if PANICKING.swap(true, Ordering::Relaxed) {
+        cortex_m::asm::udf()
+    }
+    let (line, file) = info
+        .location()
+        .map_or((0, 0), |l| (l.line(), l.file().as_ptr() as u32));
+    crumb(0xFA19_0000 | (line & 0xFFFF));
+    crumb(file);
+    // As panic-probe's `print-defmt`, for a board with a probe attached.
+    defmt::error!("{}", defmt::Display2Format(info));
+    cortex_m::asm::udf()
 }
 
 // ─── Embassy interrupt binding (ARM only) ─────────────────────────────────────
@@ -1366,10 +1404,38 @@ async fn flash_service(
     dispatcher_ptr: *mut pico2hsm_firmware::apdu::dispatcher::Dispatcher,
 ) {
     loop {
+        pico2hsm_firmware::watchdog::crumb(0x0130_0000);
         let op = FLASH_REQ.receive().await;
+        pico2hsm_firmware::watchdog::crumb(0x0131_0000 | flash_op_code(&op));
         let result = handle_flash_op(op, store, dispatcher_ptr);
+        pico2hsm_firmware::watchdog::crumb(0x0132_0000);
         FLASH_RESP.send(result).await;
         cortex_m::asm::sev(); // wake core1 from WFE
+    }
+}
+
+/// Breadcrumb code of a flash op (diagnostics).
+#[cfg(target_arch = "arm")]
+fn flash_op_code(op: &FlashOp) -> u32 {
+    match op {
+        FlashOp::SaveKey(_) => 1,
+        FlashOp::EraseKey(_) => 2,
+        FlashOp::WipeAll => 3,
+        FlashOp::WipeByOwner(_) => 4,
+        FlashOp::WipeByOwnerStep(_) => 5,
+        FlashOp::ReloadKeys => 6,
+        FlashOp::PutCounter(..) => 7,
+        FlashOp::PutLamport(_) => 8,
+        FlashOp::PutValue(..) => 9,
+        FlashOp::PutAnchor(_) => 10,
+        FlashOp::FormatStore(_) => 11,
+        FlashOp::BindingWrite { erase, .. } => 12 + u32::from(*erase),
+        #[cfg(feature = "rsa")]
+        FlashOp::PoolPut { .. } => 14,
+        #[cfg(feature = "rsa")]
+        FlashOp::PoolTake(_) => 15,
+        #[cfg(feature = "rsa")]
+        FlashOp::PoolErase(_) => 16,
     }
 }
 
@@ -1424,6 +1490,7 @@ async fn await_core1_response<'d, D: embassy_usb::driver::Driver<'d>>(
     // heartbeat or reply); here it gets a 6F00 out before the reset.
     let mut monitor = Core1Monitor::new(Instant::now().as_millis(), Core1Activity::sample());
     loop {
+        pico2hsm_firmware::watchdog::crumb(0x0113_0000);
         match select(RESP_READY.receive(), Timer::at(deadline)).await {
             Either::First(()) => {
                 pico2hsm_firmware::watchdog::note_core1_response();
@@ -1443,9 +1510,10 @@ async fn await_core1_response<'d, D: embassy_usb::driver::Driver<'d>>(
                 if health == Core1Health::Stalled {
                     return None;
                 }
-                if let Err(pico2hsm_firmware::transport::ccid::CcidError::UsbDisconnected) =
-                    ccid.send_time_extension().await
-                {
+                pico2hsm_firmware::watchdog::crumb(0x0120_0000);
+                let wtx = ccid.send_time_extension().await;
+                pico2hsm_firmware::watchdog::crumb(0x0121_0000);
+                if let Err(pico2hsm_firmware::transport::ccid::CcidError::UsbDisconnected) = wtx {
                     // Sending it fails the same way (and a new session's
                     // epoch would drop it): the caller takes its disconnect path.
                     return Some(recv_core1_response().await);
@@ -1588,6 +1656,7 @@ async fn watchdog_feeder() {
     let mut monitor = Core1Monitor::new(Instant::now().as_millis(), Core1Activity::sample());
     let mut stack_peak = 0;
     loop {
+        pico2hsm_firmware::watchdog::crumb(0x0150_0000);
         let peak = core1_stack_high_water();
         if peak > stack_peak + 1024 {
             stack_peak = peak;
@@ -1637,6 +1706,71 @@ fn log_boot_report(r: &pico2hsm_firmware::watchdog::BootReport) {
             r.wdt_resets,
             r.chip_reset
         );
+    }
+    log_crumbs(r);
+}
+
+/// The breadcrumbs the previous run left (see `watchdog::crumb`).  Debug
+/// builds only: the CDC serial port needs no authentication, and the
+/// crumbs show recent APDU instruction bytes and code addresses.  Release
+/// builds still record them (a debugger can read them) but never print.
+#[cfg(target_arch = "arm")]
+fn log_crumbs(r: &pico2hsm_firmware::watchdog::BootReport) {
+    let history = pico2hsm_firmware::watchdog::take_crumb_history();
+    if !cfg!(debug_assertions) {
+        return;
+    }
+    defmt::info!(
+        "reset: crumbs core0=0x{:08X} core1=0x{:08X}",
+        r.crumbs.0,
+        r.crumbs.1
+    );
+    pico2hsm_firmware::cdc_log!(
+        "reset: crumbs core0=0x{:08X} core1=0x{:08X}",
+        r.crumbs.0,
+        r.crumbs.1
+    );
+    if let Some(h) = history {
+        for (core, row) in h.iter().enumerate() {
+            for half in row.chunks(8) {
+                pico2hsm_firmware::cdc_log!(
+                    "crumbs{} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X}",
+                    core,
+                    half[0],
+                    half[1],
+                    half[2],
+                    half[3],
+                    half[4],
+                    half[5],
+                    half[6],
+                    half[7]
+                );
+            }
+        }
+    }
+}
+
+/// HardFault (diagnostics): record the faulting PC as breadcrumbs (marker
+/// `0xFA17_0000`, then the PC, then LR), so the next boot shows it.
+#[cfg(target_arch = "arm")]
+#[cortex_m_rt::exception]
+unsafe fn HardFault(ef: &cortex_m_rt::ExceptionFrame) -> ! {
+    pico2hsm_firmware::watchdog::crumb(0xFA17_0000);
+    pico2hsm_firmware::watchdog::crumb(ef.pc());
+    pico2hsm_firmware::watchdog::crumb(ef.lr());
+    loop {
+        cortex_m::asm::nop();
+    }
+}
+
+/// Any other unhandled exception or interrupt (UsageFault, BusFault, …):
+/// record its number (marker `0xFA18_xxxx`).
+#[cfg(target_arch = "arm")]
+#[cortex_m_rt::exception]
+unsafe fn DefaultHandler(irqn: i16) {
+    pico2hsm_firmware::watchdog::crumb(0xFA18_0000 | (irqn as u16 as u32));
+    loop {
+        cortex_m::asm::nop();
     }
 }
 
@@ -1929,12 +2063,17 @@ async fn display_board_ccid_loop<'d, D: embassy_usb::driver::Driver<'d>>(
         ccid.wait_connected().await;
         defmt::info!("USB connected");
         loop {
+            pico2hsm_firmware::watchdog::crumb(0x0110_0000);
             match ccid.recv_apdu().await {
                 Ok(mut apdu_bytes) => {
+                    pico2hsm_firmware::watchdog::crumb(
+                        0x0111_0000 | u32::from(apdu_bytes.get(1).copied().unwrap_or(0)),
+                    );
                     let epoch = ccid.apdu_epoch();
                     pico2hsm_firmware::APDU_EPOCH
                         .store(epoch, core::sync::atomic::Ordering::SeqCst);
                     send_to_core1(&mut apdu_bytes).await;
+                    pico2hsm_firmware::watchdog::crumb(0x0112_0000);
                     set_apdu_started(Some(embassy_time::Instant::now().as_millis() as u32));
                     kick();
                     let response = match await_core1_response(ccid).await {
@@ -1943,7 +2082,10 @@ async fn display_board_ccid_loop<'d, D: embassy_usb::driver::Driver<'d>>(
                     };
                     set_apdu_started(None);
                     kick();
-                    match send_and_wipe(ccid, response, epoch).await {
+                    pico2hsm_firmware::watchdog::crumb(0x0114_0000);
+                    let sent = send_and_wipe(ccid, response, epoch).await;
+                    pico2hsm_firmware::watchdog::crumb(0x0115_0000);
+                    match sent {
                         Ok(()) => {
                             for _ in 0..16 {
                                 if !pico2hsm_firmware::transport::cdc_serial::drain_one(cdc_sender)
@@ -1954,6 +2096,7 @@ async fn display_board_ccid_loop<'d, D: embassy_usb::driver::Driver<'d>>(
                             }
                         }
                         Err(CcidError::UsbDisconnected) => {
+                            pico2hsm_firmware::watchdog::crumb(0x0116_0000);
                             send_reset_to_core1().await;
                             let _ = recv_core1_response().await;
                             break;

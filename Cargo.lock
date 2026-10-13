@@ -1550,16 +1550,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "panic-probe"
-version = "0.3.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4047d9235d1423d66cc97da7d07eddb54d4f154d6c13805c6d0793956f4f25b0"
-dependencies = [
- "cortex-m",
- "defmt 0.3.100",
-]
-
-[[package]]
 name = "parking_lot"
 version = "0.12.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1674,7 +1664,6 @@ dependencies = [
  "p256",
  "p384",
  "p521",
- "panic-probe",
  "pbkdf2",
  "pico2hsm-core",
  "png",

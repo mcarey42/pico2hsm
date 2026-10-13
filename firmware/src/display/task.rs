@@ -57,15 +57,20 @@ pub async fn run<P: Panel>(mut drv: ScreenDriver<'_, P>, info: StaticInfo) -> ! 
     let mut ticker = Ticker::every(Duration::from_secs(1));
     let mut last = None;
     loop {
+        crate::watchdog::crumb(0x0142_0000);
         let inputs = sample(&mut last);
         let frame = ctl.step(&inputs);
         if frame.sleep {
             drv.sleep().await;
         } else {
             drv.wake().await;
+            crate::watchdog::crumb(0x0140_0000);
             drv.show(&frame.screen).await;
+            crate::watchdog::crumb(0x0141_0000);
         }
+        crate::watchdog::crumb(0x0143_0000);
         drv.led(frame.led, frame.sleep).await;
+        crate::watchdog::crumb(0x0144_0000);
         let deadline = frame.deadline_ms.map_or(
             Instant::now() + Duration::from_secs(3600),
             Instant::from_millis,
