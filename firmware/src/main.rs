@@ -66,7 +66,8 @@ use static_cell::StaticCell;
 
 /// Stack for core1.  Measured on hardware (2026-10-12, full hardware suite,
 /// debug build, painted stack, see `core1_stack_high_water`): 60.5 KB peak
-/// on pico2_4m after the core0/core1 mailboxes (81 KB before them).  The
+/// on pico2_4m after the core0/core1 mailboxes (81 KB before them), 62.9 KB
+/// on waveshare_rp2350_lcd_sdcard, where storage I/O runs on core1.  The
 /// older static estimate of the deepest path (PIV PUT DATA on an SD-card
 /// board) was ~89 KB before the mailboxes removed ~20 KB of it.  96 KB
 /// keeps well over the 15 KB margin; MSPLIM turns an overflow into a fault
