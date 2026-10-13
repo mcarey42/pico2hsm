@@ -64,17 +64,19 @@ use static_cell::StaticCell;
 
 // ─── Core1 stack (ARM only) ──────────────────────────────────────────────────
 
-/// Stack for core1.  Measured worst path (2026-10, pico2_4m debug, from the
-/// `sub sp` prologues): dispatcher_loop 16 KB → dispatch_with_store 8 KB →
-/// process_apdu_with_store 8 KB → route_with_store 4 KB → bip_slip 13 KB →
-/// fetch_key 12 KB → read_key 7 KB ≈ 70 KB, so 128 KB leaves ~58 KB.
-/// Do not reduce below 96 KB.
+/// Stack for core1.  Measured on hardware (2026-10-12, full hardware suite,
+/// debug build, painted stack, see `core1_stack_high_water`): 60.5 KB peak
+/// on pico2_4m after the core0/core1 mailboxes (81 KB before them).  The
+/// older static estimate of the deepest path (PIV PUT DATA on an SD-card
+/// board) was ~89 KB before the mailboxes removed ~20 KB of it.  96 KB
+/// keeps well over the 15 KB margin; MSPLIM turns an overflow into a fault
+/// (core1 stops, the watchdog resets the chip) rather than corruption.
+/// Re-measure (the boot log prints the high water) before going lower.
 ///
 /// Core1 runs a synchronous dispatch loop (no Embassy executor) — the
-/// full 128 KB is available as call-stack, with no async state machine
-/// overhead.
+/// whole stack is call-stack, with no async state machine overhead.
 #[cfg(target_arch = "arm")]
-const CORE1_STACK_SIZE: usize = 131072;
+const CORE1_STACK_SIZE: usize = 96 * 1024;
 #[cfg(target_arch = "arm")]
 static mut CORE1_STACK: Stack<CORE1_STACK_SIZE> = Stack::new();
 
@@ -82,8 +84,10 @@ static mut CORE1_STACK: Stack<CORE1_STACK_SIZE> = Stack::new();
 #[cfg(target_arch = "arm")]
 const CORE1_STACK_PAINT: u32 = 0xC1C1_C1C1;
 
-/// Paint the whole core1 stack before core1 starts, so
-/// `core1_stack_high_water` can measure the deepest use.
+/// Paint the whole core1 stack, so `core1_stack_high_water` can measure the
+/// deepest use.  Called first thing in `main`, before the watchdog feeder
+/// (which reads the high water) runs: on SD-card boards the keystore mount
+/// takes long enough that the feeder used to read an unpainted stack.
 #[cfg(target_arch = "arm")]
 fn paint_core1_stack() {
     let base = addr_of_mut!(CORE1_STACK) as *mut u32;
@@ -902,6 +906,9 @@ const USB_PID: u16 = 0x27C0;
 #[cfg(target_arch = "arm")]
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
+    // Before any task can read it (see `paint_core1_stack`).
+    paint_core1_stack();
+
     // ── 1. Initialise RP2350 clocks and peripherals ─────────────────────────
     let p = embassy_rp::init(Default::default());
 
@@ -1564,7 +1571,6 @@ async fn run_one_board(p: embassy_rp::Peripherals) {
     let dispatcher_ptr = dispatcher_ref as *mut pico2hsm_firmware::apdu::dispatcher::Dispatcher;
     let dispatcher_send = DispatcherPtr(dispatcher_ptr, store as *mut _);
 
-    paint_core1_stack();
     spawn_core1(
         p.CORE1,
         unsafe { &mut *addr_of_mut!(CORE1_STACK) },
@@ -1981,7 +1987,6 @@ async fn run_geek_board(
     let dispatcher_ptr = dispatcher_ref as *mut pico2hsm_firmware::apdu::dispatcher::Dispatcher;
     let dispatcher_send = DispatcherPtr(dispatcher_ptr, store as *mut _);
 
-    paint_core1_stack();
     spawn_core1(
         p.CORE1,
         unsafe { &mut *addr_of_mut!(CORE1_STACK) },
@@ -2168,7 +2173,6 @@ async fn run_pico2_board(p: embassy_rp::Peripherals) {
     let dispatcher_send = DispatcherPtr(dispatcher_ptr, store as *mut _);
 
     defmt::info!("core0: spawning core1");
-    paint_core1_stack();
     spawn_core1(
         p.CORE1,
         unsafe { &mut *addr_of_mut!(CORE1_STACK) },
@@ -2501,7 +2505,6 @@ async fn run_waveshare_lcd_board(
     let dispatcher_ptr = dispatcher_ref as *mut pico2hsm_firmware::apdu::dispatcher::Dispatcher;
     let dispatcher_send = DispatcherPtr(dispatcher_ptr, store as *mut _);
 
-    paint_core1_stack();
     spawn_core1(
         p.CORE1,
         unsafe { &mut *addr_of_mut!(CORE1_STACK) },
