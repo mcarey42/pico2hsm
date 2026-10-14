@@ -408,9 +408,17 @@ def _kcv(runner: CLIRunner, reader: int) -> Optional[str]:
     return m.group(1).upper() if m else None
 
 
-def _pkcs11_slots(runner: CLIRunner) -> list[str]:
+def _pkcs11_slot(runner: CLIRunner, reader: int) -> Optional[str]:
+    """The PKCS#11 slot ID of PC/SC reader ``reader`` (matched by reader name:
+    slot order need not follow the device-under-test / peer roles)."""
+    from smartcard.System import readers
+
+    name = str(readers()[reader])
     out = runner.pkcs11_tool("-L").stdout
-    return re.findall(r"^Slot \d+ \((0x[0-9a-fA-F]+)\)", out, re.MULTILINE)
+    for slot, desc in re.findall(r"^Slot \d+ \((0x[0-9a-fA-F]+)\): (.*)$", out, re.MULTILINE):
+        if desc.strip() == name.strip():
+            return slot
+    return None
 
 
 def _key_ref_for_id(reader: int, key_id: int) -> Optional[int]:
@@ -442,8 +450,8 @@ def test_wrapped_key_moves_between_devices(enrolled_peers, runner: CLIRunner, co
     k0, k1 = _kcv(runner, 0), _kcv(runner, 1)
     if not k0 or k0 != k1:
         pytest.skip(f"devices do not share a DKEK (KCV {k0} / {k1})")
-    slots = _pkcs11_slots(runner)
-    assert len(slots) >= 2, slots
+    slots = [_pkcs11_slot(runner, R0()), _pkcs11_slot(runner, R1())]
+    assert all(slots), slots
 
     key_id = 0x7A
     gen = runner.pkcs11_tool(

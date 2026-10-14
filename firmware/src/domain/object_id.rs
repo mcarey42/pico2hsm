@@ -87,14 +87,14 @@ impl ObjectId {
     }
 }
 
-fn strip_zeros(b: &[u8]) -> &[u8] {
+pub(crate) fn strip_zeros(b: &[u8]) -> &[u8] {
     let n = b.iter().take_while(|&&x| x == 0).count();
     &b[n..]
 }
 
 /// The modulus inside a PKCS#1 `RSAPrivateKey` DER (`SEQUENCE { INTEGER
 /// version, INTEGER n, ... }`), for RSA keys stored without a public part.
-fn pkcs1_modulus(der: &[u8]) -> Option<&[u8]> {
+pub(crate) fn pkcs1_modulus(der: &[u8]) -> Option<&[u8]> {
     // Read one DER TLV header at `at`: (tag, content start, content len).
     fn tlv(b: &[u8], at: usize) -> Option<(u8, usize, usize)> {
         let tag = *b.get(at)?;

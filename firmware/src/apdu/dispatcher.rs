@@ -1090,6 +1090,32 @@ fn km_algo_to_core_key_type(
     }
 }
 
+/// An RSA key's SC-HSM algorithm byte (0x05 / 0x06 / 0x07) and key type,
+/// by modulus size, as GENERATE KEY PAIR puts them in the index.  The
+/// object itself only records `AlgorithmId::RsaDecrypt`, which is no
+/// SC-HSM algorithm byte (the PrKDF would describe the key as EC).
+fn rsa_size_algo(
+    obj: &crate::security::key_management::KeyObject,
+) -> Option<(u8, pico2hsm_core::key::KeyType)> {
+    use crate::domain::object_id::{pkcs1_modulus, strip_zeros};
+    use crate::security::key_management::KeyType as KmType;
+    use pico2hsm_core::key::KeyType as CoreKeyType;
+    if obj.key_type != KmType::Rsa {
+        return None;
+    }
+    let p = obj.public_key.as_slice();
+    let n = if p.len() > 2 {
+        p.get(2..2 + usize::from(u16::from_be_bytes([p[0], p[1]])))
+    } else {
+        pkcs1_modulus(&obj.private_key)
+    };
+    Some(match n.map_or(0, |n| strip_zeros(n).len()) {
+        0..=256 => (0x05, CoreKeyType::RsaPrivate2048),
+        257..=384 => (0x06, CoreKeyType::RsaPrivate3072),
+        _ => (0x07, CoreKeyType::RsaPrivate4096),
+    })
+}
+
 /// Convert a `KeyObject` (security layer) to a `KeyMeta` entry and push it
 /// into `ScHsmState.key_index`. Key material stays in flash; only lightweight
 /// metadata is kept in RAM.
@@ -1099,8 +1125,10 @@ fn push_key_object_to_state(
 ) {
     use crate::protocol::sc_hsm::KeyMeta;
 
-    let algo = obj.algorithm as u8;
-    let core_key_type = km_algo_to_core_key_type(obj.algorithm);
+    let (algo, core_key_type) = match rsa_size_algo(&obj) {
+        Some(sized) => sized,
+        None => (obj.algorithm as u8, km_algo_to_core_key_type(obj.algorithm)),
+    };
 
     // Avoid duplicate entries — replace any existing entry with the same key_id.
     state.key_index.retain(|m| m.key_id != obj.key_id);
@@ -1273,6 +1301,47 @@ mod tests {
             )
         };
         assert!(!bytes.windows(32).any(|w| w == pattern));
+    }
+
+    /// A reloaded RSA key gets the SC-HSM algorithm byte GENERATE KEY PAIR
+    /// gave it (by modulus size), not `AlgorithmId::RsaDecrypt` (0x41):
+    /// the PrKDF and the manifest must not change across a reboot.
+    #[test]
+    fn reloaded_rsa_key_keeps_its_sc_hsm_algo() {
+        use crate::security::key_management::{AlgorithmId, KeyObject, KeyType as KmType};
+        use pico2hsm_core::key::{AppletId, KeyType as CoreKeyType};
+        let mut slot = core::mem::MaybeUninit::<Dispatcher>::uninit();
+        let d = Dispatcher::init_in_place(&mut slot);
+        for (bytes, algo, ty) in [
+            (256usize, 0x05u8, CoreKeyType::RsaPrivate2048),
+            (384, 0x06, CoreKeyType::RsaPrivate3072),
+            (512, 0x07, CoreKeyType::RsaPrivate4096),
+        ] {
+            let kid = pico2hsm_core::key::KeyId::sc_hsm(0, 0x31).0;
+            let mut obj =
+                KeyObject::new(KmType::Rsa, kid, AppletId::ScHsm, AlgorithmId::RsaDecrypt);
+            let _ = obj
+                .public_key
+                .extend_from_slice(&(bytes as u16).to_be_bytes());
+            for _ in 0..bytes {
+                let _ = obj.public_key.push(0xC3);
+            }
+            let _ = obj.public_key.extend_from_slice(&[0x01, 0x00, 0x01]);
+            push_key_object_to_state(&mut d.sc_hsm.state, obj);
+            let m = d
+                .sc_hsm
+                .state
+                .key_index
+                .iter()
+                .find(|m| m.key_id == kid)
+                .copied()
+                .unwrap();
+            assert_eq!(
+                (m.algo, m.key_type),
+                (algo, ty as u8),
+                "{bytes}-byte modulus"
+            );
+        }
     }
 
     #[test]
