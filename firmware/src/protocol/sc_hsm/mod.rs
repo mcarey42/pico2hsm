@@ -512,6 +512,11 @@ pub struct ScHsmState {
     pub so_pin_hash: Option<[u8; 32]>,
     /// 16-byte random salt for the SO-PIN PBKDF2 hash.
     pub so_pin_salt: [u8; 16],
+    /// The PIN record could not be loaded ([`ScHsm::lock_out`]): the user
+    /// PIN and PUK are blocked in RAM only, their real counters stay in the
+    /// log.  Only the SO-PIN (from the binding) is ever persisted in this
+    /// state, until INITIALIZE replaces every credential.
+    pub creds_locked: bool,
 
     /// Stored PUK hash (PBKDF2-HMAC-SHA256). None if no PUK is configured.
     pub puk_hash: Option<[u8; 32]>,
@@ -617,6 +622,7 @@ impl ScHsmState {
             user_pin_salt: [0u8; 16],
             so_pin_hash: None,
             so_pin_salt: [0u8; 16],
+            creds_locked: false,
             puk_hash: None,
             puk_salt: [0u8; 16],
             puk_retry_count: 10,
@@ -668,6 +674,7 @@ impl ScHsmState {
             addr_of_mut!((*dest).user_pin_salt).write([0u8; 16]);
             addr_of_mut!((*dest).so_pin_hash).write(None);
             addr_of_mut!((*dest).so_pin_salt).write([0u8; 16]);
+            addr_of_mut!((*dest).creds_locked).write(false);
             addr_of_mut!((*dest).puk_hash).write(None);
             addr_of_mut!((*dest).puk_salt).write([0u8; 16]);
             addr_of_mut!((*dest).puk_retry_count).write(10);
@@ -1263,6 +1270,11 @@ impl ScHsm {
             }
         };
 
+        if state.creds_locked && in_binding {
+            // The record on flash stays as it is (see `creds_locked`).
+            return Ok(());
+        }
+
         crate::CORE1_PROGRESS.store(35, core::sync::atomic::Ordering::Relaxed);
         let kid = Self::sc_hsm_pin_key_id();
         let mut obj = KeyObject::new(
@@ -1282,6 +1294,8 @@ impl ScHsm {
     }
 
     /// Write every SC-HSM counter whose RAM value differs from the log.
+    /// With the credentials locked out, only the SO-PIN's: the others are
+    /// zero in RAM only (see `creds_locked`).
     fn sync_counters(
         state: &ScHsmState,
         store: &mut dyn crate::storage::KeyStore,
@@ -1291,6 +1305,9 @@ impl ScHsm {
             (Credential::ScHsmSoPin, state.so_pin_retry_count),
             (Credential::ScHsmPuk, state.puk_retry_count),
         ] {
+            if state.creds_locked && cred != Credential::ScHsmSoPin {
+                continue;
+            }
             retry_counter::set(store, cred, n)?;
         }
         Ok(())
@@ -1417,6 +1434,7 @@ impl ScHsm {
     /// Every credential blocked, SO-PIN included, so INITIALIZE refuses too.
     /// Recovery is a full flash erase (physical access), as on a real card.
     fn lock_out(state: &mut ScHsmState) {
+        state.creds_locked = true;
         state.initialized = true;
         state.so_pin_hash = Some([0xA5; 32]);
         state.so_pin_retry_count = 0;
@@ -1442,6 +1460,7 @@ impl ScHsm {
         state.puk_hash = nonzero(b[98..130].try_into().unwrap_or([0u8; 32]));
         state.puk_salt = b[130..146].try_into().unwrap_or([0u8; 16]);
         state.initialized = b[147] != 0;
+        state.creds_locked = false;
         true
     }
 
@@ -2454,4 +2473,4 @@ pub(crate) mod policy_tests;
 mod domain_tests;
 
 #[cfg(test)]
-mod so_pin_binding_tests;
+mod store_recovery_tests;

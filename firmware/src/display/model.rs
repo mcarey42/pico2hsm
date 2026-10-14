@@ -404,6 +404,8 @@ impl Controller {
             Some(Note::SdMissing)
         } else if flags & health::KS_INIT_FAILED != 0 {
             Some(Note::StorageUnreadable)
+        } else if flags & health::STORE_DEGRADED != 0 {
+            Some(Note::StoreReadOnly)
         } else if is_blocked {
             Some(Note::Unblock(applet))
         } else {
@@ -957,6 +959,16 @@ mod tests {
         };
         let h = home(&c.step(&inputs(3, s)));
         assert_eq!(h.status, Status::Error);
+        // OPEN DEGRADED: no full-screen error, a READ-ONLY note.
+        s.health.flags = health::STORE_DEGRADED | health::PROVISIONED;
+        let h = home(&c.step(&inputs(4, s)));
+        assert!(matches!(
+            h.activity,
+            ActivityView::Done {
+                note: Some(Note::StoreReadOnly),
+                ..
+            }
+        ));
         s.health.flags = 0;
         assert!(matches!(
             c.footer(&s, 0),

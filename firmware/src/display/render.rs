@@ -376,6 +376,7 @@ fn note_text(n: Note, l: &Layout) -> &'static str {
     match n {
         Note::NotSaved => "Last change NOT saved",
         Note::StorageUnreadable => "Keystore unreadable",
+        Note::StoreReadOnly => "Keystore READ-ONLY",
         Note::SdMissing => "SD card missing",
         Note::Unblock(Applet::Hsm) => "Unblock: PUK or SO-PIN",
         Note::Unblock(Applet::Piv) => "Unblock: PIV PUK",

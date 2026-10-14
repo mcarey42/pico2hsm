@@ -1,5 +1,6 @@
-//! Host tests: the SC-HSM SO-PIN in the Storage V2 binding block
-//! (STORAGE_V2 §8.1, R9, R10), APDU in, the real V2 key store underneath.
+//! Host tests: the SC-HSM SO-PIN in the Storage V2 binding block (§8.1,
+//! R9, R10) and store recovery (§9.3: STORE STATUS, OPEN DEGRADED, ACCEPT
+//! STORE), APDU in, the real V2 key store underneath.
 
 use super::*;
 use crate::security::key_management::{AlgorithmId, KeyObject, KeyType as KmKeyType};
@@ -159,4 +160,98 @@ fn an_old_record_moves_its_so_pin_into_the_binding() {
     let (mut hsm, mut ks) = boot(&Dev::of(&mut ks));
     assert!(matches!(ks.so_pin_home(), SoPinHome::Binding(Some(_))));
     assert_eq!(verify_so(&mut hsm, &mut ks, SO_PIN), SW_OK);
+}
+
+fn status(hsm: &mut ScHsm, ks: &mut Ks) -> (u8, u8, u64, u32, u32) {
+    let r = hsm.process_apdu_with_store(&apdu(0x80, 0x54, 0x52, 0, &[]), ks);
+    assert_eq!(sw(&r), SW_OK);
+    let b = &r[..r.len() - 2];
+    (
+        b[0],
+        b[1],
+        u64::from_be_bytes(b[2..10].try_into().unwrap()),
+        u32::from_be_bytes(b[10..14].try_into().unwrap()),
+        u32::from_be_bytes(b[14..18].try_into().unwrap()),
+    )
+}
+
+/// An initialised device whose store was rolled back by `n` commits (a
+/// lost SD tail, a restored image): refused at boot.
+fn rolled_back(n: usize) -> (ScHsm, Ks) {
+    let (mut hsm, mut ks) = initialized();
+    ks.save_key(&crate::storage::keystore_v2::tests::key(0x0000_0007, 7))
+        .unwrap();
+    let old = Dev::of(&mut ks).store;
+    for i in 0..n {
+        ks.save_key(&crate::storage::keystore_v2::tests::key(
+            0x0000_0010 + i as u32,
+            9,
+        ))
+        .unwrap();
+    }
+    let mut d = Dev::of(&mut ks);
+    d.store = old;
+    let _ = hsm;
+    boot(&d)
+}
+
+fn open_degraded(hsm: &mut ScHsm, ks: &mut Ks) -> u16 {
+    run(hsm, ks, 0x54, 0x4F, 0, b"OPEN-DEGRADED")
+}
+
+#[test]
+fn store_status_of_an_up_store() {
+    let (mut hsm, mut ks) = initialized();
+    assert_eq!(status(&mut hsm, &mut ks), (0, 0, 0, 0, 0));
+}
+
+#[test]
+fn a_refused_store_reports_what_it_lost() {
+    let (mut hsm, mut ks) = rolled_back(3);
+    assert_eq!(status(&mut hsm, &mut ks), (2, 4, 3, 0, 0));
+}
+
+#[test]
+fn open_degraded_needs_the_so_pin_and_a_refused_store() {
+    let (mut hsm, mut ks) = initialized();
+    assert_eq!(verify_so(&mut hsm, &mut ks, SO_PIN), SW_OK);
+    assert_eq!(
+        open_degraded(&mut hsm, &mut ks),
+        pico2hsm_core::apdu::SW_CONDITIONS_NOT_SATISFIED,
+        "the store is up"
+    );
+    let (mut hsm, mut ks) = rolled_back(1);
+    assert_eq!(
+        open_degraded(&mut hsm, &mut ks),
+        pico2hsm_core::apdu::SW_SECURITY_STATUS
+    );
+    assert_eq!(verify_so(&mut hsm, &mut ks, SO_PIN), SW_OK);
+    assert_eq!(
+        run(&mut hsm, &mut ks, 0x54, 0x4F, 0, b"OPEN"),
+        pico2hsm_core::apdu::SW_WRONG_DATA
+    );
+    assert_eq!(status(&mut hsm, &mut ks).3, 0, "nothing counted yet");
+}
+
+/// OPEN DEGRADED: the verifiable state, read-only, until reboot.
+#[test]
+fn open_degraded_mounts_read_only_until_reboot() {
+    let (mut hsm, mut ks) = rolled_back(2);
+    assert_eq!(verify_so(&mut hsm, &mut ks, SO_PIN), SW_OK);
+    assert_eq!(open_degraded(&mut hsm, &mut ks), SW_OK);
+    assert_eq!(status(&mut hsm, &mut ks), (1, 4, 2, 1, 0));
+    // The keys of the accepted state are there; the lost ones are not.
+    assert_eq!(crate::storage::keystore_v2::tests::tag(&mut ks, 7), Some(7));
+    assert_eq!(crate::storage::keystore_v2::tests::tag(&mut ks, 0x10), None);
+    // The applets reload: the user PIN works again (verifying the SO-PIN
+    // while it was locked out left its counter alone); nothing can change.
+    let mut hsm = ScHsm::new();
+    ScHsm::load_pin_state_from_store(&mut hsm.state, &mut ks);
+    assert_eq!(run(&mut hsm, &mut ks, 0x20, 0, 0x81, USER_PIN), SW_OK);
+    assert!(ks
+        .save_key(&crate::storage::keystore_v2::tests::key(0x20, 1))
+        .is_err());
+    // A reboot refuses the store again; the count stays.
+    let (mut hsm, mut ks) = boot(&Dev::of(&mut ks));
+    assert_eq!(status(&mut hsm, &mut ks), (2, 4, 2, 1, 0));
 }

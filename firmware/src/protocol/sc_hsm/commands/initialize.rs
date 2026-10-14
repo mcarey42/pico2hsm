@@ -257,6 +257,7 @@ pub fn handle(
     state.challenge = None;
 
     state.initialized = true;
+    state.creds_locked = false;
     state.key_index.clear();
     state.ef_cache.clear();
     state.op_buf.invalidate();

@@ -63,6 +63,15 @@ pub fn handle(
         // FORMAT STORE (STORAGE_V2 §8.3): the store decides whether the
         // SO-PIN is needed (it is, unless the store is not up, R9).
         0x4E => handle_format_store(state, store, cmd),
+        // STORE STATUS (§9.3): what recovery needs to know, no PIN.
+        0x52 => handle_store_status(store),
+        // OPEN DEGRADED (§9.3): SO-PIN.
+        0x4F => {
+            if !state.so_pin_verified {
+                return ApduResponse::err(SW_SECURITY_STATUS);
+            }
+            handle_open_degraded(state, store, cmd)
+        }
 
         // RSA key pool settings: a device policy, SO-PIN only.
         0x51 => {
@@ -2835,6 +2844,83 @@ fn handle_format_store(
         Err(pico2hsm_core::error::HsmError::Storage(
             pico2hsm_core::error::StorageError::IntegrityFailure,
         )) => ApduResponse::err(SW_SECURITY_STATUS),
+        Err(_) => ApduResponse::err(pico2hsm_core::apdu::SW_MEMORY_FAILURE),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// P1=0x52  STORE STATUS,  P1=0x4F  OPEN DEGRADED
+// ---------------------------------------------------------------------------
+
+/// Confirmation value OPEN DEGRADED must carry.
+pub const OPEN_DEGRADED_CONFIRM: &[u8] = b"OPEN-DEGRADED";
+
+/// The store's state for recovery (STORAGE_V2 §9.3):
+/// `state u8 | reason u8 | lost u64 | degraded opens u32 | re-anchors u32`
+/// (big-endian).  `state`: 0 up, 1 read-only (OPEN DEGRADED), 2 refused,
+/// 3 FORMAT STORE needed, 4 down.  `reason`: why a refused store was
+/// refused (1 blank, 2 another store, 3 no anchor, 4 behind the anchor,
+/// 5 damaged, 6 rotation pending, 7 I/O).  `lost`: the records the anchor
+/// counts that the store does not hold.
+fn handle_store_status(store: &mut dyn KeyStore) -> ApduResponse {
+    use crate::storage::retry_counter::ValueId;
+    let Some(r) = store.store_report() else {
+        return ApduResponse::err(pico2hsm_core::apdu::SW_INS_NOT_SUPPORTED);
+    };
+    let (opens, reanchors) = match store.retry_counters() {
+        Some(log) => (
+            log.value(ValueId::StoreDegradedOpens).ok().flatten(),
+            log.value(ValueId::StoreReanchors).ok().flatten(),
+        ),
+        None => (None, None),
+    };
+    let mut out = [0u8; 18];
+    out[0] = r.state as u8;
+    out[1] = r.reason;
+    out[2..10].copy_from_slice(&r.lost.to_be_bytes());
+    out[10..14].copy_from_slice(&(opens.unwrap_or(0) as u32).to_be_bytes());
+    out[14..18].copy_from_slice(&(reanchors.unwrap_or(0) as u32).to_be_bytes());
+    ApduResponse::ok(&out)
+}
+
+/// Bump a monotonic recovery count in the counter log, before the event
+/// it counts (fail closed: no record, no event).
+fn count_event(
+    store: &mut dyn KeyStore,
+    id: crate::storage::retry_counter::ValueId,
+) -> Result<(), ()> {
+    let log = store.retry_counters().ok_or(())?;
+    let n = log.value(id).map_err(|_| ())?.unwrap_or(0);
+    log.put_value(id, n.saturating_add(1)).map_err(|_| ())
+}
+
+/// Mount a refused store read-only, as far as it verifies (STORAGE_V2
+/// §9.3): keys work and can be exported, nothing can be changed, until
+/// ACCEPT STORE, FORMAT STORE or a reboot.  Every applet's state is
+/// reloaded after the response.
+fn handle_open_degraded(
+    state: &mut ScHsmState,
+    store: &mut dyn KeyStore,
+    cmd: &ApduCommand<'_>,
+) -> ApduResponse {
+    use crate::storage::StoreState;
+    if cmd.data != OPEN_DEGRADED_CONFIRM {
+        return ApduResponse::err(SW_WRONG_DATA);
+    }
+    if store.store_report().map(|r| r.state) != Some(StoreState::Refused) {
+        return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED);
+    }
+    if count_event(
+        store,
+        crate::storage::retry_counter::ValueId::StoreDegradedOpens,
+    )
+    .is_err()
+    {
+        return ApduResponse::err(pico2hsm_core::apdu::SW_MEMORY_FAILURE);
+    }
+    match store.open_degraded(state.so_pin_verified) {
+        Ok(()) => ApduResponse::ok(&[]),
+        // Nothing verifiable to mount.
         Err(_) => ApduResponse::err(pico2hsm_core::apdu::SW_MEMORY_FAILURE),
     }
 }

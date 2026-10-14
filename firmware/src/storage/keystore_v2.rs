@@ -23,11 +23,11 @@ use zeroize::Zeroizing;
 use super::binding::{
     derive_k_bind, open_so_pin, seal_so_pin, BindState, Binding, BindingRing, Scan,
 };
-use super::keystore::{SoPin, SoPinHome};
+use super::keystore::{SoPin, SoPinHome, StoreReport, StoreState};
 use super::retry_counter::{Anchor, CounterFlash, RetryCounterBackend};
 use super::store_v2::{
-    derive_k_idx, derive_k_obj, group_of, object_header, Env, Fetched, FormatAuth, Meta, MountInfo,
-    Refusal, Store, StoreFlash, MAX_OBJECT_BLOB,
+    derive_k_idx, derive_k_obj, group_of, object_header, DegradedAuth, Env, Fetched, FormatAuth,
+    Meta, MountInfo, Refusal, Store, StoreFlash, MAX_OBJECT_BLOB,
 };
 use super::KeyStore;
 use crate::security::key_management::{KeyObject, MAX_BLOB_SIZE};
@@ -40,8 +40,9 @@ pub enum StoreStatus {
     Down,
     /// Mounted read-write.
     Up,
-    /// Mounted read-only (OPEN DEGRADED).
-    Degraded,
+    /// Mounted read-only by OPEN DEGRADED: why it had been refused, and
+    /// how many records the anchor counts beyond the state mounted.
+    Degraded { was: Refusal, lost: u64 },
     /// Refused: why (§9).
     Refused(Refusal),
     /// The binding block exists but does not verify (another SMK, e.g. after
@@ -441,6 +442,43 @@ impl<F: StoreFlash, B: CounterFlash, L: RetryCounterBackend> FlashKeyStoreV2<F, 
         Ok(false)
     }
 
+    /// OPEN DEGRADED (§9.3): mount a refused store read-only, as far as it
+    /// verifies.  Only a store refused next to a valid binding; nothing is
+    /// written (the caller records the event in the counter log first).
+    /// Either core: reads only.
+    pub fn open_degraded_now(&mut self, so_pin_verified: bool) -> Result<(), HsmError> {
+        let StoreStatus::Refused(was) = self.status else {
+            return Err(HsmError::Storage(StorageError::IntegrityFailure));
+        };
+        let auth = DegradedAuth::so_pin_verified(so_pin_verified)
+            .ok_or(HsmError::Storage(StorageError::IntegrityFailure))?;
+        let b = self
+            .binding
+            .as_ref()
+            .ok_or(HsmError::Storage(StorageError::NotFormatted))?;
+        let info = self.mount_info(b).map_err(HsmError::Storage)?;
+        let format_gen = b.format_gen as u16;
+        let mut env = AnchorEnv {
+            log: self.counters.as_mut(),
+            hooks: self.hooks,
+        };
+        let anchored = env
+            .anchor()
+            .ok()
+            .flatten()
+            .filter(|a| a.format_gen == format_gen)
+            .map(|a| a.head_seq);
+        if self.store.mount_degraded(info, &mut env, auth).is_err() {
+            return Err(HsmError::Storage(StorageError::IntegrityFailure));
+        }
+        let head = self.store.next_seq().unwrap_or(1) - 1;
+        self.status = StoreStatus::Degraded {
+            was,
+            lost: anchored.map_or(0, |a| a.saturating_sub(head)),
+        };
+        Ok(())
+    }
+
     /// Live objects and free data sectors (display).
     pub fn key_count(&self) -> usize {
         self.store.len()
@@ -459,6 +497,19 @@ fn auth_kind(a: &FormatAuth) -> AuthKind {
         AuthKind::FirstBoot
     } else {
         AuthKind::Other
+    }
+}
+
+/// A [`Refusal`] as STORE STATUS reports it.
+pub fn refusal_code(r: Refusal) -> u8 {
+    match r {
+        Refusal::Blank => 1,
+        Refusal::WrongStore => 2,
+        Refusal::NoAnchor => 3,
+        Refusal::BehindAnchor(_) => 4,
+        Refusal::Corrupt(_) => 5,
+        Refusal::PendingRotation { .. } => 6,
+        Refusal::Io => 7,
     }
 }
 
@@ -615,6 +666,33 @@ impl<F: StoreFlash, B: CounterFlash, L: RetryCounterBackend> KeyStore for FlashK
 
     fn reset_sc_hsm(&mut self, so: &SoPin) -> Result<(), HsmError> {
         self.wipe_group(applet_group(AppletId::ScHsm), Some(so))
+    }
+
+    fn store_report(&self) -> Option<StoreReport> {
+        let (state, why, lost) = match self.status {
+            StoreStatus::Up => (StoreState::Up, None, 0),
+            StoreStatus::Degraded { was, lost } => (StoreState::Degraded, Some(was), lost),
+            StoreStatus::Refused(r) => {
+                let lost = match r {
+                    Refusal::BehindAnchor(n) => n,
+                    _ => 0,
+                };
+                (StoreState::Refused, Some(r), lost)
+            }
+            StoreStatus::BindingUnverifiable | StoreStatus::NeedsFormat => {
+                (StoreState::NeedsFormat, None, 0)
+            }
+            StoreStatus::Down | StoreStatus::NoKey => (StoreState::Down, None, 0),
+        };
+        Some(StoreReport {
+            state,
+            reason: why.map_or(0, refusal_code),
+            lost,
+        })
+    }
+
+    fn open_degraded(&mut self, so_pin_verified: bool) -> Result<(), HsmError> {
+        self.open_degraded_now(so_pin_verified)
     }
 
     fn enumerate_keys(&self) -> Vec<KeyId, 64> {

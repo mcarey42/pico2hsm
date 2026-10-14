@@ -414,6 +414,25 @@ impl pico2hsm_firmware::storage::KeyStore for Core1KeyStore {
         Self::on_core0(FlashOp::ResetScHsm(so))
     }
 
+    fn store_report(&self) -> Option<pico2hsm_firmware::storage::StoreReport> {
+        use pico2hsm_firmware::storage::KeyStore as _;
+        // SAFETY: as `so_pin_home`.
+        unsafe { &*self.store_ptr }.store_report()
+    }
+
+    fn open_degraded(
+        &mut self,
+        so_pin_verified: bool,
+    ) -> Result<(), pico2hsm_core::error::HsmError> {
+        // Reads only (XIP or SD) and the anchor from the log's RAM table:
+        // here on core1 on every board.
+        self.direct().open_degraded_now(so_pin_verified)?;
+        pico2hsm_firmware::cdc_log!("OPEN DEGRADED: store mounted read-only");
+        // Every applet's RAM state comes from the store as now mounted.
+        pico2hsm_firmware::RELOAD_AFTER_APDU.store(true, core::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+
     #[cfg(feature = "rsa")]
     fn rsa_pool(&mut self) -> Option<&mut dyn pico2hsm_firmware::storage::rsa_pool::PoolBackend> {
         use pico2hsm_firmware::storage::KeyStore as _;
@@ -1033,14 +1052,19 @@ fn dispatcher_loop(ptr_wrapper: DispatcherPtr) -> ! {
             publish(&dispatcher.display_snapshot());
             CORE1_PROGRESS.store(60, core::sync::atomic::Ordering::Relaxed);
             post_response();
-            // The store was replaced (FORMAT STORE): drop every applet's
-            // state and reload it, as after a USB reset — after the
-            // response, never under the running command.
+            // The store changed under the applets (FORMAT STORE, OPEN
+            // DEGRADED, ACCEPT STORE): drop every applet's state and reload
+            // it, as after a USB reset — after the response, never under
+            // the running command.
             if pico2hsm_firmware::RELOAD_AFTER_APDU
                 .swap(false, core::sync::atomic::Ordering::SeqCst)
             {
                 dispatcher.reset_in_place();
-                dispatcher.note_store_formatted();
+                {
+                    use pico2hsm_firmware::storage::KeyStore as _;
+                    // SAFETY: as `Core1KeyStore::direct`; a RAM read.
+                    dispatcher.note_store(unsafe { &*store_ptr }.store_report());
+                }
                 let _ = Core1KeyStore::on_core0(FlashOp::ReloadKeys);
                 publish(&dispatcher.display_snapshot());
             }

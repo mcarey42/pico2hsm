@@ -692,10 +692,18 @@ impl Dispatcher {
         self.display.health = flags & !STORE_WRITE_FAILED;
     }
 
-    /// FORMAT STORE succeeded: the store is up, empty and new.
-    pub fn note_store_formatted(&mut self) {
-        use crate::display_snapshot::health::{KS_INIT_FAILED, NEEDS_FORMAT};
-        self.display.health &= !(NEEDS_FORMAT | KS_INIT_FAILED);
+    /// The store changed under the applets (FORMAT STORE, OPEN DEGRADED,
+    /// ACCEPT STORE): its health flags follow its new state.
+    pub fn note_store(&mut self, report: Option<crate::storage::StoreReport>) {
+        use crate::display_snapshot::health::{KS_INIT_FAILED, NEEDS_FORMAT, STORE_DEGRADED};
+        use crate::storage::StoreState;
+        self.display.health &= !(NEEDS_FORMAT | KS_INIT_FAILED | STORE_DEGRADED);
+        self.display.health |= match report.map(|r| r.state) {
+            None | Some(StoreState::Up) => 0,
+            Some(StoreState::Degraded) => STORE_DEGRADED,
+            Some(StoreState::NeedsFormat) => NEEDS_FORMAT,
+            Some(StoreState::Refused | StoreState::Down) => KS_INIT_FAILED,
+        };
     }
 
     /// Record the host session core1 now serves (after

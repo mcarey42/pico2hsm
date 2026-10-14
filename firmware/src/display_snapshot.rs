@@ -129,8 +129,10 @@ pub mod health {
     /// The SD card keystore stopped answering (the last card access
     /// failed: pulled or dead card).  Set by core1 from [`super::SD_FAULT`].
     pub const SD_MISSING: u8 = 1 << 3;
-    // Bit 4 is reserved (was MIRROR_DEGRADED: no display board has a
-    // mirrored store, so it could never be set).
+    /// The store is mounted read-only (OPEN DEGRADED, STORAGE_V2 §9.3):
+    /// keys work, changes fail.  Until ACCEPT STORE, FORMAT STORE or a
+    /// reboot.  (Bit 4 was MIRROR_DEGRADED, never set by any board.)
+    pub const STORE_DEGRADED: u8 = 1 << 4;
     /// OTP holds a storage key (the device is provisioned).
     pub const PROVISIONED: u8 = 1 << 5;
     /// The keystore region holds no 2.0 store (a 1.x keystore after the
