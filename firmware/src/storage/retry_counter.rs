@@ -913,13 +913,14 @@ impl<F: CounterFlash> CounterLog<F> {
     /// current anchor is a no-op.  A new `format_gen` (format, re-index)
     /// may start anywhere.
     ///
-    /// On a log never written, the first anchor seeds it empty.  Only a
-    /// format reaches that (any mounted store has an anchor), and a format
-    /// wipes every credential, so there are no counters to carry; the
-    /// PIN-record migration, which needs a mounted store, never can.  A
-    /// log that fails its scan stays `Failed`.
+    /// On a log never written, a format's anchor (head 0, slot 0) seeds it
+    /// empty: a format wipes every credential, so there are no counters to
+    /// carry, and the PIN-record migration, which needs a mounted store,
+    /// never could.  Any other anchor (a re-index) on such a log is
+    /// refused (`NotFormatted`), and a log that fails its scan stays
+    /// `Failed`.
     pub fn put_anchor(&mut self, a: Anchor) -> Result<(), StorageError> {
-        if self.state == LogState::Unformatted {
+        if self.state == LogState::Unformatted && a.head_seq == 0 && a.head_slot == 0 {
             self.format(&[])?;
         }
         self.check_active()?;
@@ -1678,6 +1679,13 @@ mod tests {
         let mut log = reopen(&mut log);
         assert_eq!(log.anchor(), Ok(Some(anchor(1, 0, 0))));
         assert_eq!(log.get(PIN), Ok(None), "seeded empty");
+    }
+
+    #[test]
+    fn blank_region_refuses_a_reindex_anchor() {
+        let mut log = open(SimFlash::new());
+        assert_eq!(log.put_anchor(anchor(2, 9, 0)), Err(StorageError::NotFormatted));
+        assert!(log.needs_migration(), "nothing seeded");
     }
 
     #[test]
