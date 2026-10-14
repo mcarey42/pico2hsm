@@ -2,7 +2,7 @@
 //!
 //! The binding block ties a keystore to this device: the store's identity,
 //! the epoch secrets its keys are derived from, the format generation the
-//! counter-log anchor refers to, and (from phase 4) the SO-PIN verifier.
+//! counter-log anchor refers to, and the SC-HSM SO-PIN.
 //! It lives on internal flash on every board, never on the removable card.
 //!
 //! # On flash
@@ -23,10 +23,14 @@
 //! Eight sectors, because applet resets write the binding and some can be
 //! driven by the host without a secret (R8): ~800 000 writes.
 //!
-//! # Status
-//! Phase 1: the module and its tests.  Nothing writes the binding yet; the
-//! format path (phases 3–4) will, and the mount will refuse a store whose
-//! binding is missing (STORAGE_V2 §8.3).
+//! # SO-PIN
+//! The SC-HSM SO-PIN lives here, not in the keystore, so it works while the
+//! store is refused (recovery and FORMAT STORE need it, §9.3).  The verifier
+//! is the SO-PIN's PBKDF2 hash encrypted under a key derived from `K_bind`
+//! and the salt ([`seal_so_pin`]); the copy's HMAC protects it.  Reading it
+//! takes `K_bind`, which also lets an attacker test guesses against a
+//! `HMAC(K_bind, salt ‖ SO-PIN)` verifier: the two are equally strong, and
+//! this one keeps the applet's double-checked comparison as it is.
 
 use pico2hsm_core::error::StorageError;
 use subtle::ConstantTimeEq;
@@ -94,9 +98,10 @@ pub struct Binding {
     pub e_group: [[u8; 32]; 3],
     /// Epoch generation per [`Group`] (a WIPE_OWNER above it is pending).
     pub group_gen: [u32; 3],
-    /// SO-PIN salt (phase 4).
+    /// SO-PIN salt.
     pub so_salt: [u8; 16],
-    /// `HMAC(K_bind, salt ‖ SO-PIN)`; all zero: no SO-PIN set (phase 4).
+    /// The SO-PIN's PBKDF2 hash, sealed by [`seal_so_pin`]; all zero: no
+    /// SO-PIN set.
     pub so_verifier: [u8; 32],
     /// Fingerprint of the card being formatted (R14); zero on QMI boards.
     pub card_fingerprint: [u8; 8],
@@ -198,6 +203,31 @@ pub fn derive_k_bind(smk: &[u8; 32]) -> Zeroizing<[u8; 32]> {
     // HKDF-SHA256 with a 32-byte output cannot fail.
     let _ = hkdf_sha256(&[], smk, b"pico2hsm-bind-v2", &mut k[..]);
     k
+}
+
+/// The keystream that seals an SO-PIN hash: `HKDF(K_bind, salt,
+/// "pico2hsm-sopin-v2")`.  A new salt with every SO-PIN, so never reused.
+fn so_pin_pad(k_bind: &[u8; 32], salt: &[u8; 16]) -> Zeroizing<[u8; 32]> {
+    let mut pad = Zeroizing::new([0u8; 32]);
+    let _ = hkdf_sha256(salt, k_bind, b"pico2hsm-sopin-v2", &mut pad[..]);
+    pad
+}
+
+/// The binding's SO-PIN verifier for a PBKDF2 `hash` with `salt`.
+pub fn seal_so_pin(k_bind: &[u8; 32], salt: &[u8; 16], hash: &[u8; 32]) -> [u8; 32] {
+    let pad = so_pin_pad(k_bind, salt);
+    core::array::from_fn(|i| hash[i] ^ pad[i])
+}
+
+/// The PBKDF2 hash a binding's verifier holds; `None` when none is set.
+pub fn open_so_pin(k_bind: &[u8; 32], b: &Binding) -> Option<Zeroizing<[u8; 32]>> {
+    if b.so_verifier == [0u8; 32] {
+        return None;
+    }
+    let pad = so_pin_pad(k_bind, &b.so_salt);
+    Some(Zeroizing::new(core::array::from_fn(|i| {
+        b.so_verifier[i] ^ pad[i]
+    })))
 }
 
 /// What the ring holds (R9 needs "absent" and "unverifiable" apart).
@@ -556,6 +586,19 @@ mod tests {
             ring.write(&mut binding(2), &K),
             Err(StorageError::WriteError)
         );
+    }
+
+    #[test]
+    fn the_so_pin_round_trips_and_is_bound_to_k_bind() {
+        let mut b = binding(1);
+        assert_eq!(open_so_pin(&K, &b), None, "none set");
+        b.so_salt = [3; 16];
+        b.so_verifier = seal_so_pin(&K, &b.so_salt, &[9; 32]);
+        assert_ne!(b.so_verifier, [9; 32], "not stored in the clear");
+        assert_eq!(*open_so_pin(&K, &b).unwrap(), [9; 32]);
+        assert_ne!(*open_so_pin(&[8; 32], &b).unwrap(), [9; 32]);
+        // Another salt, another pad.
+        assert_ne!(seal_so_pin(&K, &[4; 16], &[9; 32]), b.so_verifier);
     }
 
     #[test]

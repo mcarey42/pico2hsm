@@ -164,30 +164,37 @@ pub fn handle(
         .and_then(|v| v.first().copied())
         .unwrap_or(0);
 
-    // Re-initialization: the provided init code must match the stored hash
-    // (checked last, after every field — see `well_formed`).
-    // The real SmartCard-HSM authenticates re-init via the init code in the
+    // An SO-PIN is set (re-initialization, or a store FORMAT STORE emptied
+    // with the SO-PIN carried forward, R9/R10): the provided init code must
+    // match it (checked last, after every field — see `well_formed`).  The
+    // real SmartCard-HSM authenticates re-init via the init code in the
     // command itself — no prior VERIFY is required.
-    if state.initialized {
-        // The retry itself is spent on flash by ScHsm::with_persisted_attempt.
-        if state.so_pin_hash.is_some() && state.so_pin_retry_count == 0 {
-            return ApduResponse::err(pico2hsm_core::apdu::SW_AUTH_BLOCKED);
-        }
-        if let Some(stored_hash) = state.so_pin_hash {
-            let provided_hash = hash_pin_pbkdf2(init_code, &state.so_pin_salt);
-            if !bool::from(provided_hash.ct_eq(&stored_hash)) {
-                return ApduResponse::err(SW_SECURITY_STATUS);
-            }
+    // The retry itself is spent on flash by ScHsm::with_persisted_attempt.
+    if state.so_pin_hash.is_some() && state.so_pin_retry_count == 0 {
+        return ApduResponse::err(pico2hsm_core::apdu::SW_AUTH_BLOCKED);
+    }
+    if let Some(stored_hash) = state.so_pin_hash {
+        let provided_hash = hash_pin_pbkdf2(init_code, &state.so_pin_salt);
+        if !bool::from(provided_hash.ct_eq(&stored_hash)) {
+            return ApduResponse::err(SW_SECURITY_STATUS);
         }
     }
+
+    // The new SO-PIN, so the wipe can write it with SC-HSM's new epoch.
+    let so_salt = gen_salt();
+    let so = crate::storage::SoPin {
+        salt: so_salt,
+        hash: hash_pin_pbkdf2(init_code, &so_salt),
+    };
 
     // Wipe SC-HSM's keys from flash first, before any credential in RAM
     // changes.  Old keys must really be gone, or they would reappear after
     // a reset under the new PINs; and if the wipe fails, RAM still holds
     // the old credentials — a later VERIFY must not persist new ones next
-    // to keys the wipe left behind.
+    // to keys the wipe left behind.  Where the store keeps the SO-PIN in
+    // its binding, the new one goes in the same write (R10).
     crate::CORE1_PROGRESS.store(31, core::sync::atomic::Ordering::Relaxed);
-    if store.wipe_by_owner(AppletId::ScHsm).is_err() {
+    if store.reset_sc_hsm(&so).is_err() {
         return ApduResponse::err(pico2hsm_core::apdu::SW_MEMORY_FAILURE);
     }
     // The domain records (member list, object sidecars, pinned peer) go
@@ -205,14 +212,13 @@ pub fn handle(
         return ApduResponse::err(pico2hsm_core::apdu::SW_MEMORY_FAILURE);
     }
 
-    // Generate fresh random salts for all credentials.
-    let so_salt = gen_salt();
+    // Generate fresh random salts for the other credentials.
     let user_salt = gen_salt();
     let puk_salt_bytes = gen_salt();
 
     // Store SO-PIN (init code) hash using PBKDF2.
-    state.so_pin_salt = so_salt;
-    state.so_pin_hash = Some(hash_pin_pbkdf2(init_code, &so_salt));
+    state.so_pin_salt = so.salt;
+    state.so_pin_hash = Some(so.hash);
 
     // Store User PIN hash if provided, using PBKDF2.
     // Without one, the previous owner's PIN must not survive re-INITIALIZE.

@@ -20,7 +20,10 @@ use pico2hsm_core::error::{CryptoError, HsmError, StorageError};
 use pico2hsm_core::key::{AppletId, KeyId};
 use zeroize::Zeroizing;
 
-use super::binding::{derive_k_bind, BindState, Binding, BindingRing, Scan};
+use super::binding::{
+    derive_k_bind, open_so_pin, seal_so_pin, BindState, Binding, BindingRing, Scan,
+};
+use super::keystore::{SoPin, SoPinHome};
 use super::retry_counter::{Anchor, CounterFlash, RetryCounterBackend};
 use super::store_v2::{
     derive_k_idx, derive_k_obj, group_of, object_header, Env, Fetched, FormatAuth, Meta, MountInfo,
@@ -114,7 +117,13 @@ fn fill_random(b: &mut [u8]) -> Result<(), StorageError> {
     {
         crate::crypto::rng::fill_random(b).map_err(|_| StorageError::WriteError)
     }
-    #[cfg(not(target_arch = "arm"))]
+    #[cfg(all(not(target_arch = "arm"), test))]
+    {
+        // Host tests: a counter-driven stand-in (distinct, never secret).
+        tests::fill(b);
+        Ok(())
+    }
+    #[cfg(all(not(target_arch = "arm"), not(test)))]
     {
         // No TRNG on the host: fail closed (nothing is written).
         let _ = b;
@@ -370,24 +379,29 @@ impl<F: StoreFlash, B: CounterFlash, L: RetryCounterBackend> FlashKeyStoreV2<F, 
             .map_err(HsmError::Storage)
     }
 
-    /// Whether a PIN-less FORMAT STORE is allowed (R9): only when there is
-    /// no valid binding — a 1.x keystore or a store formatted elsewhere
-    /// (`NeedsFormat`), or a binding that does not verify under this SMK.
-    /// A store that is merely refused next to a valid binding (a missing
-    /// or rolled-back card, damage) keeps its binding: formatting it would
-    /// destroy the epochs the real card needs, so it takes the SO-PIN.
-    /// (Until the SO-PIN verifier moves into the binding, phase 4, such a
-    /// store fails closed.)
+    /// Whether a PIN-less FORMAT STORE is allowed (R9): when there is no
+    /// valid binding — a 1.x keystore or a store formatted elsewhere
+    /// (`NeedsFormat`), or a binding that does not verify under this SMK —
+    /// or when the store is refused and its binding holds no SO-PIN (there
+    /// is none to ask for, and nothing else would ever get the device
+    /// going again).  A refused store with an SO-PIN (a missing or
+    /// rolled-back card, damage) keeps its binding without it: formatting
+    /// would destroy the epochs the real card needs.
     pub fn format_needs_no_pin(&self) -> bool {
-        matches!(
-            self.status,
-            StoreStatus::NeedsFormat | StoreStatus::BindingUnverifiable
-        ) && self.binding.is_none()
+        match self.status {
+            StoreStatus::NeedsFormat | StoreStatus::BindingUnverifiable => self.binding.is_none(),
+            StoreStatus::Refused(_) => self
+                .binding
+                .as_ref()
+                .is_some_and(|b| b.so_verifier == [0; 32]),
+            _ => false,
+        }
     }
 
-    /// Wipe one group: one record, the binding with its new epoch, the
-    /// group's sectors.  Either core (see `format_store_now`).
-    fn wipe_group(&mut self, group: usize) -> Result<(), HsmError> {
+    /// Wipe one group: one record, the binding with its new epoch (and,
+    /// for SC-HSM INITIALIZE, its new SO-PIN: R10), the group's sectors.
+    /// Either core (see `format_store_now`).
+    fn wipe_group(&mut self, group: usize, so: Option<&SoPin>) -> Result<(), HsmError> {
         let mut nb = self
             .binding
             .clone()
@@ -402,6 +416,10 @@ impl<F: StoreFlash, B: CounterFlash, L: RetryCounterBackend> FlashKeyStoreV2<F, 
             log: self.counters.as_mut(),
             hooks: self.hooks,
         };
+        if let Some(so) = so {
+            nb.so_salt = so.salt;
+            nb.so_verifier = seal_so_pin(&k_bind, &so.salt, &so.hash);
+        }
         let mut rotated = false;
         let r = self.store.wipe_group(&mut env, group, &mut |gen| {
             nb.e_group[group] = random()?;
@@ -553,13 +571,50 @@ impl<F: StoreFlash, B: CounterFlash, L: RetryCounterBackend> KeyStore for FlashK
 
     fn wipe_all(&mut self) -> Result<(), HsmError> {
         for g in 0..3 {
-            self.wipe_group(g)?;
+            self.wipe_group(g, None)?;
         }
         Ok(())
     }
 
     fn wipe_by_owner(&mut self, owner: AppletId) -> Result<(), HsmError> {
-        self.wipe_group(applet_group(owner))
+        self.wipe_group(applet_group(owner), None)
+    }
+
+    fn so_pin_home(&self) -> SoPinHome {
+        let (Some(smk), Some(b)) = (self.smk.as_deref(), self.binding.as_ref()) else {
+            return SoPinHome::Binding(None);
+        };
+        let k_bind = derive_k_bind(smk);
+        SoPinHome::Binding(open_so_pin(&k_bind, b).map(|hash| SoPin {
+            salt: b.so_salt,
+            hash: *hash,
+        }))
+    }
+
+    fn set_binding_so_pin(&mut self, so: Option<&SoPin>) -> Result<(), HsmError> {
+        let smk = self.smk()?;
+        let k_bind = derive_k_bind(smk);
+        let mut nb = self
+            .binding
+            .clone()
+            .ok_or(HsmError::Storage(StorageError::NotFormatted))?;
+        match so {
+            Some(so) => {
+                nb.so_salt = so.salt;
+                nb.so_verifier = seal_so_pin(&k_bind, &so.salt, &so.hash);
+            }
+            None => {
+                nb.so_salt = [0; 16];
+                nb.so_verifier = [0; 32];
+            }
+        }
+        self.write_binding(&mut nb).map_err(HsmError::Storage)?;
+        self.binding = Some(nb);
+        Ok(())
+    }
+
+    fn reset_sc_hsm(&mut self, so: &SoPin) -> Result<(), HsmError> {
+        self.wipe_group(applet_group(AppletId::ScHsm), Some(so))
     }
 
     fn enumerate_keys(&self) -> Vec<KeyId, 64> {
@@ -664,5 +719,256 @@ impl<F: StoreFlash, B: CounterFlash, L: RetryCounterBackend> crate::storage::rsa
             .as_mut()
             .ok_or(HsmError::Storage(StorageError::NotFormatted))?;
         pool.erase(slot).map_err(HsmError::Storage)
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    extern crate std;
+    use super::*;
+    use crate::security::key_management::{AlgorithmId, KeyType};
+    use crate::storage::retry_counter::CounterLog;
+    use crate::storage::store_v2::Media;
+    use core::sync::atomic::{AtomicU64, Ordering};
+    use std::vec;
+    use std::vec::Vec;
+
+    static CTR: AtomicU64 = AtomicU64::new(1);
+
+    /// Host stand-in for the TRNG: distinct values, nothing secret.
+    pub(crate) fn fill(b: &mut [u8]) {
+        for chunk in b.chunks_mut(8) {
+            let v = CTR
+                .fetch_add(1, Ordering::Relaxed)
+                .wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            chunk.copy_from_slice(&v.to_le_bytes()[..chunk.len()]);
+        }
+    }
+
+    const SS: usize = 4096;
+
+    /// NOR flash for every region (keystore, binding ring, counter log).
+    #[derive(Clone)]
+    pub(crate) struct Nor {
+        pub mem: Vec<u8>,
+    }
+
+    impl Nor {
+        fn new(sectors: usize) -> Self {
+            Nor {
+                mem: vec![0xFF; sectors * SS],
+            }
+        }
+        fn rd(&self, offset: u32, buf: &mut [u8]) {
+            let o = offset as usize;
+            buf.copy_from_slice(&self.mem[o..o + buf.len()]);
+        }
+        fn pr(&mut self, offset: u32, data: &[u8]) {
+            for (i, &d) in data.iter().enumerate() {
+                self.mem[offset as usize + i] &= d;
+            }
+        }
+        fn er(&mut self, sector: u32) {
+            let s = sector as usize * SS;
+            self.mem[s..s + SS].fill(0xFF);
+        }
+    }
+
+    impl StoreFlash for Nor {
+        fn media(&self) -> Media {
+            Media::Nor
+        }
+        fn sectors(&self) -> u32 {
+            (self.mem.len() / SS) as u32
+        }
+        fn read(&mut self, offset: u32, buf: &mut [u8]) -> Result<(), StorageError> {
+            self.rd(offset, buf);
+            Ok(())
+        }
+        fn program(&mut self, offset: u32, data: &[u8]) -> Result<(), StorageError> {
+            self.pr(offset, data);
+            Ok(())
+        }
+        fn erase_sector(&mut self, sector: u32) -> Result<(), StorageError> {
+            self.er(sector);
+            Ok(())
+        }
+    }
+
+    impl CounterFlash for Nor {
+        fn read(&mut self, offset: u32, buf: &mut [u8]) -> Result<(), StorageError> {
+            self.rd(offset, buf);
+            Ok(())
+        }
+        fn program(&mut self, offset: u32, data: &[u8]) -> Result<(), StorageError> {
+            self.pr(offset, data);
+            Ok(())
+        }
+        fn erase_sector(&mut self, sector: u32) -> Result<(), StorageError> {
+            self.er(sector);
+            Ok(())
+        }
+    }
+
+    pub(crate) type Ks = FlashKeyStoreV2<Nor, Nor, CounterLog<Nor>>;
+
+    /// A device's three internal regions, between boots.
+    #[derive(Clone)]
+    pub(crate) struct Dev {
+        pub store: Nor,
+        pub bind: Nor,
+        pub log: Nor,
+    }
+
+    const SMK: [u8; 32] = [5; 32];
+
+    impl Dev {
+        pub(crate) fn new() -> Self {
+            Dev {
+                store: Nor::new(96),
+                bind: Nor::new(8),
+                log: Nor::new(16),
+            }
+        }
+
+        /// Boot: open the log (formatting a blank one), the binding, init.
+        pub(crate) fn boot(&self) -> (Ks, Result<(), StorageError>) {
+            let mut log = CounterLog::open(self.log.clone(), 16);
+            if self.log.mem.iter().all(|&b| b == 0xFF) {
+                log.format(&[]).unwrap();
+            }
+            let mut ks = Ks::new(self.store.clone(), Some(Zeroizing::new(SMK)));
+            ks.attach_retry_counters(log);
+            ks.attach_binding(self.bind.clone(), 8).unwrap();
+            let r = ks.init();
+            (ks, r)
+        }
+
+        /// The regions as `ks` left them.
+        pub(crate) fn of(ks: &mut Ks) -> Self {
+            Dev {
+                store: ks.store.flash_mut().clone(),
+                bind: ks.binding_ring.as_mut().unwrap().flash_mut().clone(),
+                log: ks.counters.as_mut().unwrap().flash_mut().clone(),
+            }
+        }
+    }
+
+    pub(crate) fn key(id: u32, tag: u8) -> KeyObject {
+        let owner = match (id >> 16) & 0xFF {
+            1 => AppletId::Piv,
+            2 => AppletId::OpenPgp,
+            _ => AppletId::ScHsm,
+        };
+        let mut k = KeyObject::new(KeyType::Generic, id, owner, AlgorithmId::AesGcm);
+        let _ = k.private_key.extend_from_slice(&[tag; 16]);
+        k
+    }
+
+    pub(crate) fn tag(ks: &mut Ks, id: u32) -> Option<u8> {
+        ks.fetch_key(KeyId(id)).unwrap().map(|k| k.private_key[0])
+    }
+
+    pub(crate) fn so(n: u8) -> SoPin {
+        SoPin {
+            salt: [n; 16],
+            hash: [n ^ 0x5A; 32],
+        }
+    }
+
+    fn so_of(ks: &Ks) -> Option<SoPin> {
+        match ks.so_pin_home() {
+            SoPinHome::Binding(s) => s,
+            SoPinHome::Record => panic!("V2 keeps the SO-PIN in the binding"),
+        }
+    }
+
+    #[test]
+    fn first_boot_formats_with_no_so_pin() {
+        let (ks, r) = Dev::new().boot();
+        r.unwrap();
+        assert_eq!(ks.status(), StoreStatus::Up);
+        assert_eq!(so_of(&ks), None);
+    }
+
+    #[test]
+    fn reset_sc_hsm_sets_the_so_pin_and_wipes_only_sc_hsm() {
+        let (mut ks, r) = Dev::new().boot();
+        r.unwrap();
+        ks.save_key(&key(0x0000_0001, 1)).unwrap();
+        ks.save_key(&key(0x0001_009A, 2)).unwrap();
+        ks.reset_sc_hsm(&so(7)).unwrap();
+        assert_eq!(tag(&mut ks, 0x0000_0001), None);
+        assert_eq!(tag(&mut ks, 0x0001_009A), Some(2));
+        assert_eq!(so_of(&ks), Some(so(7)));
+        // It survives a reboot.
+        let (mut ks2, r) = Dev::of(&mut ks).boot();
+        r.unwrap();
+        assert_eq!(so_of(&ks2), Some(so(7)));
+        assert_eq!(tag(&mut ks2, 0x0001_009A), Some(2));
+    }
+
+    #[test]
+    fn the_so_pin_is_not_on_flash_in_the_clear() {
+        let (mut ks, r) = Dev::new().boot();
+        r.unwrap();
+        ks.reset_sc_hsm(&so(7)).unwrap();
+        let d = Dev::of(&mut ks);
+        let hash = so(7).hash;
+        for region in [&d.store.mem, &d.bind.mem, &d.log.mem] {
+            assert!(!region.windows(32).any(|w| w == hash));
+        }
+    }
+
+    #[test]
+    fn set_binding_so_pin_replaces_and_clears() {
+        let (mut ks, r) = Dev::new().boot();
+        r.unwrap();
+        ks.set_binding_so_pin(Some(&so(1))).unwrap();
+        assert_eq!(so_of(&ks), Some(so(1)));
+        ks.set_binding_so_pin(Some(&so(2))).unwrap();
+        let (mut ks, _) = Dev::of(&mut ks).boot();
+        assert_eq!(so_of(&ks), Some(so(2)));
+        ks.set_binding_so_pin(None).unwrap();
+        assert_eq!(so_of(&ks), None);
+    }
+
+    /// A store rolled back to an older image: refused, the SO-PIN still
+    /// readable, a PIN-less FORMAT STORE refused while one is set.
+    #[test]
+    fn a_refused_store_keeps_its_so_pin() {
+        let (mut ks, r) = Dev::new().boot();
+        r.unwrap();
+        ks.reset_sc_hsm(&so(3)).unwrap();
+        ks.save_key(&key(0x0000_0001, 1)).unwrap();
+        let old = Dev::of(&mut ks).store;
+        ks.save_key(&key(0x0000_0002, 2)).unwrap();
+        let mut d = Dev::of(&mut ks);
+        d.store = old;
+        let (mut ks, r) = d.boot();
+        assert!(r.is_err());
+        assert!(matches!(
+            ks.status(),
+            StoreStatus::Refused(Refusal::BehindAnchor(1))
+        ));
+        assert_eq!(so_of(&ks), Some(so(3)));
+        assert!(!ks.format_needs_no_pin());
+        assert!(ks.format_store(false).is_err());
+        // Without an SO-PIN there is nothing to ask for.
+        ks.set_binding_so_pin(None).unwrap();
+        assert!(ks.format_needs_no_pin());
+    }
+
+    #[test]
+    fn format_store_carries_the_so_pin_forward() {
+        let (mut ks, r) = Dev::new().boot();
+        r.unwrap();
+        ks.reset_sc_hsm(&so(4)).unwrap();
+        ks.save_key(&key(0x0002_0001, 9)).unwrap();
+        ks.format_store(true).unwrap();
+        assert_eq!(tag(&mut ks, 0x0002_0001), None);
+        let (ks, r) = Dev::of(&mut ks).boot();
+        r.unwrap();
+        assert_eq!(so_of(&ks), Some(so(4)));
     }
 }

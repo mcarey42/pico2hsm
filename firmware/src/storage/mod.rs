@@ -23,7 +23,7 @@ pub mod rsa_pool;
 pub mod store_v2;
 #[cfg(test)]
 mod store_v2_tests;
-pub use keystore::KeyStore;
+pub use keystore::{KeyStore, SoPin, SoPinHome, StoreReport, StoreState};
 
 pub use keystore::NullKeyStore;
 

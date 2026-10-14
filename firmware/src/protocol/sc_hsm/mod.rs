@@ -33,6 +33,7 @@ use zeroize::Zeroizing;
 
 use crate::security::dkek::DkekManager;
 use crate::storage::retry_counter::{self, CounterState, Credential, RetryCounterBackend};
+use crate::storage::{SoPin, SoPinHome};
 
 use commands::*;
 
@@ -74,11 +75,11 @@ impl RetryCounter {
             puk_auth::INS_PUK_AUTH if (8..=16).contains(&n) && state.puk_hash.is_some() => {
                 Some(Self::Puk)
             }
-            // Re-INITIALIZE is authorised by the SO-PIN carried in the command.
+            // INITIALIZE is authorised by the SO-PIN carried in the command
+            // whenever one is set (re-INITIALIZE, or a store FORMAT STORE
+            // emptied with the SO-PIN carried forward).
             initialize::INS_INITIALIZE
-                if state.initialized
-                    && state.so_pin_hash.is_some()
-                    && initialize::well_formed(cmd) =>
+                if state.so_pin_hash.is_some() && initialize::well_formed(cmd) =>
             {
                 Some(Self::SoPin)
             }
@@ -1196,12 +1197,22 @@ impl ScHsm {
     /// zeroes them, so a record never again carries a usable count — if
     /// the log is ever lost, these credentials load blocked.
     fn pin_record(state: &ScHsmState) -> Zeroizing<Vec<u8, 160>> {
+        Self::pin_record_with(state, true)
+    }
+
+    /// [`Self::pin_record`]; without the SO-PIN (zeros) where the store
+    /// keeps it in its binding block instead.
+    fn pin_record_with(state: &ScHsmState, with_so_pin: bool) -> Zeroizing<Vec<u8, 160>> {
         let mut buf: Zeroizing<Vec<u8, 160>> = Zeroizing::new(Vec::new());
         let _ = buf.extend_from_slice(state.user_pin_hash.as_ref().unwrap_or(&[0u8; 32]));
         let _ = buf.extend_from_slice(&state.user_pin_salt);
         let _ = buf.push(0);
-        let _ = buf.extend_from_slice(state.so_pin_hash.as_ref().unwrap_or(&[0u8; 32]));
-        let _ = buf.extend_from_slice(&state.so_pin_salt);
+        let (so_hash, so_salt) = match state.so_pin_hash {
+            Some(h) if with_so_pin => (h, state.so_pin_salt),
+            _ => ([0u8; 32], [0u8; 16]),
+        };
+        let _ = buf.extend_from_slice(&so_hash);
+        let _ = buf.extend_from_slice(&so_salt);
         let _ = buf.push(0);
         let _ = buf.extend_from_slice(state.puk_hash.as_ref().unwrap_or(&[0u8; 32]));
         let _ = buf.extend_from_slice(&state.puk_salt);
@@ -1236,6 +1247,22 @@ impl ScHsm {
         crate::CORE1_PROGRESS.store(34, core::sync::atomic::Ordering::Relaxed);
         Self::sync_counters(state, store)?;
 
+        // The SO-PIN, where the store keeps it in its binding (STORAGE_V2
+        // §8.1): written there before the record, which then holds none.
+        let in_binding = match store.so_pin_home() {
+            SoPinHome::Record => false,
+            SoPinHome::Binding(cur) => {
+                let want = state.so_pin_hash.map(|hash| SoPin {
+                    salt: state.so_pin_salt,
+                    hash,
+                });
+                if cur != want {
+                    store.set_binding_so_pin(want.as_ref())?;
+                }
+                true
+            }
+        };
+
         crate::CORE1_PROGRESS.store(35, core::sync::atomic::Ordering::Relaxed);
         let kid = Self::sc_hsm_pin_key_id();
         let mut obj = KeyObject::new(
@@ -1245,7 +1272,9 @@ impl ScHsm {
             AlgorithmId::AesGcm,
         );
         crate::CORE1_PROGRESS.store(36, core::sync::atomic::Ordering::Relaxed);
-        let _ = obj.private_key.extend_from_slice(&Self::pin_record(state));
+        let _ = obj
+            .private_key
+            .extend_from_slice(&Self::pin_record_with(state, !in_binding));
         crate::CORE1_PROGRESS.store(37, core::sync::atomic::Ordering::Relaxed);
         let result = store.save_key(&obj);
         crate::CORE1_PROGRESS.store(38, core::sync::atomic::Ordering::Relaxed);
@@ -1310,25 +1339,79 @@ impl ScHsm {
                 has_content = true;
             }
         });
-        match store.fetch_key(pin_kid) {
+        let locked = match store.fetch_key(pin_kid) {
             Ok(Some(obj)) if Self::apply_pin_record(state, &obj.private_key) => {
                 Self::load_counters(state, store, true);
+                false
             }
-            Ok(None) if !has_content => Self::load_counters(state, store, false),
-            _ => Self::lock_out(state),
+            Ok(None) if !has_content => {
+                Self::load_counters(state, store, false);
+                false
+            }
+            _ => {
+                Self::lock_out(state);
+                true
+            }
+        };
+        Self::apply_binding_so_pin(state, store, locked);
+    }
+
+    /// The SO-PIN from the binding block, where the store keeps it there
+    /// (STORAGE_V2 §8.1).  It overrides the record, and stays usable when
+    /// the record cannot be read (`locked`: a refused store, damage), so
+    /// the SO-PIN can authenticate recovery and re-INITIALIZE; its retry
+    /// counter is the log's (a missing entry is blocked).  A record from
+    /// before 2.0's binding still carrying an SO-PIN moves it into the
+    /// binding.
+    fn apply_binding_so_pin(
+        state: &mut ScHsmState,
+        store: &mut dyn crate::storage::KeyStore,
+        locked: bool,
+    ) {
+        let SoPinHome::Binding(so) = store.so_pin_home() else {
+            return;
+        };
+        match so {
+            Some(so) => {
+                state.so_pin_salt = so.salt;
+                state.so_pin_hash = Some(so.hash);
+                if locked {
+                    state.so_pin_retry_count =
+                        retry_counter::load(store, Credential::ScHsmSoPin, true, 0);
+                }
+            }
+            None if locked => {}
+            None => {
+                if let Some(hash) = state.so_pin_hash {
+                    let so = SoPin {
+                        salt: state.so_pin_salt,
+                        hash,
+                    };
+                    // On failure the record keeps it until the next boot.
+                    let _ = store.set_binding_so_pin(Some(&so));
+                }
+            }
         }
     }
 
     /// Runtime rollback after a failed save: put RAM back to the record and
     /// counters on flash, or lock out if the record can't be read.
     fn restore_pin_record(state: &mut ScHsmState, store: &mut dyn crate::storage::KeyStore) {
-        match store.fetch_key(Self::sc_hsm_pin_key_id()) {
+        let locked = match store.fetch_key(Self::sc_hsm_pin_key_id()) {
             Ok(Some(obj)) if Self::apply_pin_record(state, &obj.private_key) => {
                 Self::load_counters(state, store, false);
+                false
             }
-            Ok(None) if !state.initialized => Self::load_counters(state, store, false),
-            _ => Self::lock_out(state),
-        }
+            Ok(None) if !state.initialized => {
+                Self::load_counters(state, store, false);
+                false
+            }
+            _ => {
+                Self::lock_out(state);
+                true
+            }
+        };
+        Self::apply_binding_so_pin(state, store, locked);
     }
 
     /// Every credential blocked, SO-PIN included, so INITIALIZE refuses too.
@@ -2369,3 +2452,6 @@ pub(crate) mod policy_tests;
 
 #[cfg(test)]
 mod domain_tests;
+
+#[cfg(test)]
+mod so_pin_binding_tests;

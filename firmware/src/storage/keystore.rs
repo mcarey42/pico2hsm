@@ -18,6 +18,61 @@ use pico2hsm_core::{
 use crate::security::key_management::KeyObject;
 use crate::storage::retry_counter::{CounterState, Credential, RetryCounterBackend};
 
+// ─── SO-PIN and recovery types ────────────────────────────────────────────────
+
+/// The SC-HSM SO-PIN as stored: its salt and PBKDF2 hash.
+#[derive(Clone, PartialEq, Eq, zeroize::Zeroize, zeroize::ZeroizeOnDrop)]
+pub struct SoPin {
+    pub salt: [u8; 16],
+    pub hash: [u8; 32],
+}
+
+impl core::fmt::Debug for SoPin {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("SoPin(..)")
+    }
+}
+
+/// Where a store keeps the SC-HSM SO-PIN (see [`KeyStore::so_pin_home`]).
+#[derive(Debug, PartialEq, Eq)]
+pub enum SoPinHome {
+    /// In the SC-HSM PIN record.
+    Record,
+    /// In the binding block: the SO-PIN, or `None` if none is set (or the
+    /// store has no valid binding).
+    Binding(Option<SoPin>),
+}
+
+/// The store's state as STORE STATUS reports it (STORAGE_V2 §9.3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StoreReport {
+    /// [`StoreState`] as a byte.
+    pub state: StoreState,
+    /// Why a refused store was refused (`Refusal` code, 0 otherwise).
+    pub reason: u8,
+    /// Journal records the anchor counts that the store does not hold
+    /// (refused or degraded); what ACCEPT STORE would give up.
+    pub lost: u64,
+}
+
+/// Coarse store state (STORE STATUS byte).
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StoreState {
+    /// Mounted read-write.
+    Up = 0,
+    /// Mounted read-only by OPEN DEGRADED.
+    Degraded = 1,
+    /// Refused next to a valid binding: OPEN DEGRADED, ACCEPT STORE or
+    /// FORMAT STORE.
+    Refused = 2,
+    /// No 2.0 store (a 1.x keystore, a card formatted elsewhere) or a
+    /// binding that does not verify: FORMAT STORE only.
+    NeedsFormat = 3,
+    /// No storage key, or not initialised.
+    Down = 4,
+}
+
 // ─── KeyStore trait ───────────────────────────────────────────────────────────
 
 /// Persistent key storage interface for APDU command handlers.
@@ -67,6 +122,54 @@ pub trait KeyStore {
     /// formats if it is not up (refused, no verifiable binding, R9).
     fn format_store(&mut self, so_pin_verified: bool) -> Result<(), HsmError> {
         let _ = so_pin_verified;
+        Err(HsmError::Storage(StorageError::WriteError))
+    }
+
+    /// Where the SC-HSM SO-PIN lives (STORAGE_V2 §8.1).  Stores with a
+    /// binding block keep it there, so it works while the store itself is
+    /// refused (recovery needs it); stores without one keep it in the
+    /// SC-HSM PIN record.
+    fn so_pin_home(&self) -> SoPinHome {
+        SoPinHome::Record
+    }
+
+    /// Replace the SO-PIN in the binding (`None`: none set).  Only for
+    /// stores whose [`Self::so_pin_home`] is the binding.
+    fn set_binding_so_pin(&mut self, so: Option<&SoPin>) -> Result<(), HsmError> {
+        let _ = so;
+        Err(HsmError::Storage(StorageError::WriteError))
+    }
+
+    /// SC-HSM INITIALIZE's wipe: SC-HSM's keys and domain records go, and
+    /// the new SO-PIN goes into the same binding write as SC-HSM's new
+    /// epoch, so the old keys never stand next to the new SO-PIN (R10).  A
+    /// cut leaves the old keys and SO-PIN, or no keys and either SO-PIN
+    /// (before the binding write, the next mount finishes the rotation
+    /// with the old one); re-INITIALIZE with that SO-PIN recovers.  Stores
+    /// without a binding: only the wipe.
+    fn reset_sc_hsm(&mut self, so: &SoPin) -> Result<(), HsmError> {
+        let _ = so;
+        self.wipe_by_owner(AppletId::ScHsm)
+    }
+
+    /// Where the store stands, for STORE STATUS and the recovery commands
+    /// (STORAGE_V2 §9.3).  `None`: this store has no such state.
+    fn store_report(&self) -> Option<StoreReport> {
+        None
+    }
+
+    /// OPEN DEGRADED (§9.3): mount a refused store read-only, as far as it
+    /// verifies.  Needs the SO-PIN.
+    fn open_degraded(&mut self, so_pin_verified: bool) -> Result<(), HsmError> {
+        let _ = so_pin_verified;
+        Err(HsmError::Storage(StorageError::WriteError))
+    }
+
+    /// ACCEPT STORE (§16 OD-1, R2): make the state OPEN DEGRADED mounted
+    /// the store's new, read-write state.  `lost` must be the number of
+    /// records STORE STATUS reported missing.  Needs the SO-PIN.
+    fn accept_store(&mut self, so_pin_verified: bool, lost: u64) -> Result<(), HsmError> {
+        let _ = (so_pin_verified, lost);
         Err(HsmError::Storage(StorageError::WriteError))
     }
 

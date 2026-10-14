@@ -195,6 +195,12 @@ enum FlashOp {
     /// FORMAT STORE (QMI boards; SD boards format on core1); the flag is
     /// "the SO-PIN was verified".
     FormatStore(bool),
+    /// Replace the SO-PIN in the binding block (QMI boards; null: clear
+    /// it).  Points at core1's value, live until the reply (as `SaveKey`).
+    SetSoPin(*const pico2hsm_firmware::storage::SoPin),
+    /// SC-HSM INITIALIZE's wipe with its new SO-PIN (QMI boards).  Points
+    /// at core1's value, as `SetSoPin`.
+    ResetScHsm(*const pico2hsm_firmware::storage::SoPin),
     /// One erase or program of the binding ring for core1 (SD boards'
     /// formats and wipes).  The data points into core1's buffer, which
     /// outlives the op for the same reason as `SaveKey`'s.
@@ -375,6 +381,37 @@ impl pico2hsm_firmware::storage::KeyStore for Core1KeyStore {
         // Every applet's RAM state describes the old store.
         pico2hsm_firmware::RELOAD_AFTER_APDU.store(true, core::sync::atomic::Ordering::SeqCst);
         Ok(())
+    }
+
+    fn so_pin_home(&self) -> pico2hsm_firmware::storage::SoPinHome {
+        use pico2hsm_firmware::storage::KeyStore as _;
+        // RAM only (the binding as mounted): safe from core1.
+        // SAFETY: as `direct`; core0 never writes the store meanwhile.
+        unsafe { &*self.store_ptr }.so_pin_home()
+    }
+
+    fn set_binding_so_pin(
+        &mut self,
+        so: Option<&pico2hsm_firmware::storage::SoPin>,
+    ) -> Result<(), pico2hsm_core::error::HsmError> {
+        if Self::is_direct_write() {
+            // The binding-ring writes go to core0 (`RoutedBindingFlash`).
+            return self.direct().set_binding_so_pin(so);
+        }
+        Self::on_core0(FlashOp::SetSoPin(
+            so.map_or(core::ptr::null(), |s| s as *const _),
+        ))
+    }
+
+    fn reset_sc_hsm(
+        &mut self,
+        so: &pico2hsm_firmware::storage::SoPin,
+    ) -> Result<(), pico2hsm_core::error::HsmError> {
+        if Self::is_direct_write() {
+            // As `wipe_by_owner`: SD writes here, binding writes on core0.
+            return self.direct().reset_sc_hsm(so);
+        }
+        Self::on_core0(FlashOp::ResetScHsm(so))
     }
 
     #[cfg(feature = "rsa")]
@@ -1299,6 +1336,22 @@ fn handle_flash_op(
             );
             r
         }
+        FlashOp::SetSoPin(so) => {
+            // SAFETY: see `FlashOp::SetSoPin` — core1 is blocked until we
+            // reply, so the pointee is live and unchanged.
+            let so = unsafe { so.as_ref() };
+            store.set_binding_so_pin(so)
+        }
+        FlashOp::ResetScHsm(so) => {
+            defmt::info!("FLASH_SVC: reset SC-HSM");
+            // SAFETY: as `SetSoPin`.
+            match unsafe { so.as_ref() } {
+                Some(so) => store.reset_sc_hsm(so),
+                None => Err(pico2hsm_core::error::HsmError::Storage(
+                    pico2hsm_core::error::StorageError::WriteError,
+                )),
+            }
+        }
         FlashOp::BindingWrite {
             erase,
             offset,
@@ -1430,6 +1483,8 @@ fn flash_op_code(op: &FlashOp) -> u32 {
         FlashOp::PutAnchor(_) => 10,
         FlashOp::FormatStore(_) => 11,
         FlashOp::BindingWrite { erase, .. } => 12 + u32::from(*erase),
+        FlashOp::SetSoPin(_) => 17,
+        FlashOp::ResetScHsm(_) => 18,
         #[cfg(feature = "rsa")]
         FlashOp::PoolPut { .. } => 14,
         #[cfg(feature = "rsa")]
