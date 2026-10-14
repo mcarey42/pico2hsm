@@ -17,12 +17,25 @@
 
     2e8a:10fd boards (C pico-keys firmware) are never attached.
 
-    A device that has not been shared yet needs `usbipd bind --force`, which
-    needs an elevated shell.  Run the script elevated once; later runs work
+    Sharing a device needs administrator rights.  The script binds
+    (`usbipd bind --force`) every connected target device that is not
+    force-shared yet, and registers a usbipd AutoBind policy for each of the
+    IDs above.  When either is needed and the shell is not elevated, the
+    script runs that part elevated (one UAC prompt) and carries on
     unelevated.
+
+    The UsbDk filter driver on this host makes a share that is not forced
+    fail to attach ("Device in error state"), and an AutoBind policy shares
+    without forcing.  So a new device (a board with a new serial number,
+    or one in BOOTSEL for the first time) still needs a run of this script
+    to be attached.  The policies help on hosts without UsbDk.
 
 .PARAMETER Distribution
     WSL distribution to attach to.  Defaults to the default distribution.
+
+.PARAMETER Bind
+    Only register the AutoBind policies and bind the unshared devices, then
+    exit.  Needs an elevated shell; the script uses it for its elevated pass.
 
 .PARAMETER Stop
     Stop the auto-attach processes this script starts and their helpers
@@ -34,6 +47,7 @@
 [CmdletBinding()]
 param(
     [string]$Distribution = '',
+    [switch]$Bind,
     [switch]$Stop
 )
 
@@ -65,6 +79,48 @@ function Get-AttachProcesses {
     $found
 }
 
+# Hardware IDs ('VID:PID', upper case) with an AutoBind policy.
+function Get-AutoBindIds {
+    $ids = @{}
+    & $Usbipd policy list | ForEach-Object {
+        if ($_ -match '\bAllow\s+AutoBind\b.*\b([0-9A-Fa-f]{4}:[0-9A-Fa-f]{4})\s*$') {
+            $ids[$Matches[1].ToUpper()] = $true
+        }
+    }
+    $ids
+}
+
+# Connected devices with one of the target IDs.
+function Get-TargetDevices {
+    (& $Usbipd state | ConvertFrom-Json).Devices |
+        Where-Object { $_.BusId } |
+        ForEach-Object {
+            if ($_.InstanceId -match 'VID_([0-9A-F]{4})&PID_([0-9A-F]{4})') {
+                $_ | Add-Member -NotePropertyName HwId -NotePropertyValue "$($Matches[1]):$($Matches[2])" -PassThru
+            }
+        } |
+        Where-Object { $Targets.ContainsKey($_.HwId) }
+}
+
+# The administrator part: AutoBind policies for the target IDs, and a forced
+# bind for each target device connected now that is not force-shared.
+function Invoke-Sharing {
+    $policies = Get-AutoBindIds
+    foreach ($hwId in $Targets.Keys) {
+        if (-not $policies.ContainsKey($hwId)) {
+            & $Usbipd policy add --effect Allow --operation AutoBind --hardware-id $hwId
+            if ($LASTEXITCODE -eq 0) { Write-Host "$hwId  $($Targets[$hwId])  AutoBind policy added" }
+            else { Write-Warning "$hwId AutoBind policy failed." }
+        }
+    }
+    foreach ($dev in @(Get-TargetDevices | Where-Object { -not $_.IsForced })) {
+        # --force: the UsbDk filter driver on this host blocks a plain bind.
+        & $Usbipd bind --force --busid $dev.BusId
+        if ($LASTEXITCODE -eq 0) { Write-Host "$($dev.BusId)  $($dev.HwId)  $($Targets[$dev.HwId])  bound" }
+        else { Write-Warning "$($dev.BusId)  $($dev.HwId) bind failed." }
+    }
+}
+
 if ($Stop) {
     $running = Get-AttachProcesses
     foreach ($busId in $running.Keys) {
@@ -88,14 +144,34 @@ if ($Stop) {
 $isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).
     IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 
-$devices = (& $Usbipd state | ConvertFrom-Json).Devices |
-    Where-Object { $_.BusId } |
-    ForEach-Object {
-        if ($_.InstanceId -match 'VID_([0-9A-F]{4})&PID_([0-9A-F]{4})') {
-            $_ | Add-Member -NotePropertyName HwId -NotePropertyValue "$($Matches[1]):$($Matches[2])" -PassThru
+if ($Bind) {
+    if (-not $isAdmin) { throw '-Bind needs an elevated shell.' }
+    Invoke-Sharing
+    return
+}
+
+$policies = Get-AutoBindIds
+$missing = @($Targets.Keys | Where-Object { -not $policies.ContainsKey($_) })
+$unshared = @(Get-TargetDevices | Where-Object { -not $_.IsForced })
+if ($missing -or $unshared) {
+    if ($isAdmin) {
+        Invoke-Sharing
+    } else {
+        # Elevate only the sharing; the attach processes stay unelevated, so
+        # later unelevated runs can see their command lines.
+        Write-Host 'Sharing needs administrator rights; approve the UAC prompt.'
+        try {
+            $elevated = Start-Process -FilePath 'powershell.exe' -Verb RunAs -Wait -PassThru -ArgumentList @(
+                '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$PSCommandPath`"", '-Bind')
+            if ($elevated.ExitCode -ne 0) { Write-Warning "elevated pass exited with $($elevated.ExitCode)" }
+        } catch {
+            Write-Warning "elevated pass not run: $($_.Exception.Message)"
         }
-    } |
-    Where-Object { $Targets.ContainsKey($_.HwId) }
+    }
+    $policies = Get-AutoBindIds
+}
+
+$devices = Get-TargetDevices
 
 if (-not $devices) {
     Write-Host 'No pico2hsm boards or debug probes connected.'
@@ -110,18 +186,9 @@ foreach ($dev in $devices) {
     $busId = $dev.BusId
     $label = "$busId  $($dev.HwId)  $($Targets[$dev.HwId])"
 
-    if (-not $dev.PersistedGuid) {
-        if (-not $isAdmin) {
-            Write-Warning "$label is not shared; rerun this script elevated to bind it."
-            continue
-        }
-        # --force: the UsbDk filter driver on this host blocks a plain bind.
-        & $Usbipd bind --force --busid $busId
-        if ($LASTEXITCODE -ne 0) {
-            Write-Warning "$label bind failed."
-            continue
-        }
-        Write-Host "$label bound"
+    if (-not $dev.IsForced) {
+        Write-Warning "$label is not force-shared; rerun this script elevated to bind it."
+        continue
     }
 
     if ($running.ContainsKey($busId)) {
