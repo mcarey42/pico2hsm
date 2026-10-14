@@ -72,7 +72,7 @@ review of its write path (2026-10-12) found:
 ## 3. Flash layout (2.0)
 
 Internal (QMI) flash.  The bootrom partition table and the A/B firmware
-slots are part of the 2.0 layout work (`docs/` plan to follow); they are
+slots are part of the 2.0 layout work ([FLASH_LAYOUT_2_0.md](FLASH_LAYOUT_2_0.md)); they are
 listed here so the store's place is fixed.
 
 | Region | 4 MB boards (Pico 2, RP2350-One) | 16 MB boards (Geek, Waveshare LCD) |
@@ -687,7 +687,8 @@ party **with the card sent separately**:
 4. Anchor checks, formatting rules, fail-closed boot, `OPEN DEGRADED`
    and `ACCEPT STORE` (OD-1).
 5. Remove RAID / WAL / multi-chip / legacy formats / SD pairing block.
-6. 2.0 flash layout with the partition table (separate plan).
+6. 2.0 flash layout with the partition table (plan:
+   [FLASH_LAYOUT_2_0.md](FLASH_LAYOUT_2_0.md)).
 7. Docs; full hardware runs; SD power-pull campaign; `v2.0.0-rc1`.
 
 A re-review of this revision comes first; then each phase lands with its
