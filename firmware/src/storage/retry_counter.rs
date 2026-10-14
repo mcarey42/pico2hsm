@@ -1684,7 +1684,10 @@ mod tests {
     #[test]
     fn blank_region_refuses_a_reindex_anchor() {
         let mut log = open(SimFlash::new());
-        assert_eq!(log.put_anchor(anchor(2, 9, 0)), Err(StorageError::NotFormatted));
+        assert_eq!(
+            log.put_anchor(anchor(2, 9, 0)),
+            Err(StorageError::NotFormatted)
+        );
         assert!(log.needs_migration(), "nothing seeded");
     }
 
