@@ -51,6 +51,8 @@ pub const P1_WATCHDOG_RESET: u8 = 0x12;
 pub const P1_ANCHOR_AHEAD: u8 = 0x13;
 /// P1: reboot into BOOTSEL (boards without a probe or a reachable button).
 pub const P1_REBOOT_BOOTSEL: u8 = 0x14;
+/// P1: image version and the bootrom's boot info (which slot booted).
+pub const P1_IMAGE_INFO: u8 = 0x15;
 /// P1: Montgomery multiplication benchmark.
 pub const P1_BENCH_MONT: u8 = 0x20;
 /// P1: self-test the UMAAL kernel against the portable one.
@@ -70,6 +72,8 @@ pub fn handle(cmd: &ApduCommand<'_>, store: &mut dyn crate::storage::KeyStore) -
         #[cfg(target_arch = "arm")]
         P1_WATCHDOG_RESET => crate::watchdog::reset_now(crate::watchdog::ResetCause::DebugTest),
         #[cfg(target_arch = "arm")]
+        P1_IMAGE_INFO => return image_info(),
+        #[cfg(target_arch = "arm")]
         P1_REBOOT_BOOTSEL => {
             // Both USB interfaces (PICOBOOT for picotool, the UF2 drive).
             embassy_rp::rom_data::reset_to_usb_boot(0, 0);
@@ -86,6 +90,29 @@ pub fn handle(cmd: &ApduCommand<'_>, store: &mut dyn crate::storage::KeyStore) -
     // TODO: implement — read memory region and return raw bytes.
     // NOTE: This is a debug-only stub. Production builds never compile this.
     ApduResponse::err(SW_WRONG_DATA)
+}
+
+/// See `P1_IMAGE_INFO`: `major u16 | minor u16` (big-endian), then the
+/// `get_sys_info(BOOT_INFO)` words as the ROM returns them (little-endian;
+/// the first is the mask of flags it filled).
+fn image_info() -> ApduResponse {
+    let mut out = heapless::Vec::<u8, 32>::new();
+    #[cfg(target_arch = "arm")]
+    {
+        let _ = out.extend_from_slice(&crate::image_def::IMAGE_MAJOR.to_be_bytes());
+        let _ = out.extend_from_slice(&crate::image_def::IMAGE_MINOR.to_be_bytes());
+        /// `SYS_INFO_BOOT_INFO` (datasheet §5.5.11.1).
+        const BOOT_INFO: u32 = 0x0040;
+        let mut words = [0u32; 5];
+        // SAFETY: the buffer is `words.len()` words long.
+        let n = unsafe {
+            embassy_rp::rom_data::get_sys_info(words.as_mut_ptr(), words.len(), BOOT_INFO)
+        };
+        for w in words.iter().take(n.clamp(0, 5) as usize) {
+            let _ = out.extend_from_slice(&w.to_le_bytes());
+        }
+    }
+    ApduResponse::ok(&out)
 }
 
 /// See `P1_ANCHOR_AHEAD`.
