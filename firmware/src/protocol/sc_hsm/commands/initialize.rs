@@ -109,7 +109,6 @@ pub fn handle(
     cmd: &ApduCommand<'_>,
 ) -> ApduResponse {
     crate::CORE1_PROGRESS.store(30, core::sync::atomic::Ordering::Relaxed);
-    // cdc_log removed — CriticalSectionRawMutex is single-core only, unsafe on core1
     if cmd.p1 != 0x00 || cmd.p2 != 0x00 {
         return ApduResponse::err(SW_WRONG_DATA);
     }
@@ -356,7 +355,6 @@ pub fn handle(
     }
     crate::CORE1_PROGRESS.store(39, core::sync::atomic::Ordering::Relaxed);
 
-    // cdc_log removed — CriticalSectionRawMutex is single-core only, unsafe on core1
     ApduResponse::ok(&[])
 }
 

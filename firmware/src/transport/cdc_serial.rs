@@ -22,7 +22,9 @@
 //!    flush one buffered line per loop iteration.
 
 #[cfg(target_arch = "arm")]
-use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, channel::Channel};
+use embassy_rp::spinlock_mutex::SpinlockRawMutex;
+#[cfg(target_arch = "arm")]
+use embassy_sync::channel::Channel;
 #[cfg(target_arch = "arm")]
 use heapless::Vec;
 
@@ -34,13 +36,12 @@ const LOG_QUEUE_DEPTH: usize = 16;
 /// Cross-core, non-blocking log channel.
 ///
 /// `try_send` is called by the [`cdc_log!`] family of macros (safe from any
-/// core or interrupt context).  Core0 drains it via [`drain_one`].
+/// core or interrupt context).  Core0 drains it via [`drain_one`].  Locked
+/// with RP2350 hardware spinlock 25: the critical section is the
+/// single-core one, which would not keep core1 out.
 #[cfg(target_arch = "arm")]
-pub static CDC_LOG_CHANNEL: Channel<
-    CriticalSectionRawMutex,
-    Vec<u8, LOG_LINE_MAX>,
-    LOG_QUEUE_DEPTH,
-> = Channel::new();
+pub static CDC_LOG_CHANNEL: Channel<SpinlockRawMutex<25>, Vec<u8, LOG_LINE_MAX>, LOG_QUEUE_DEPTH> =
+    Channel::new();
 
 // ─── Public logging macros ───────────────────────────────────────────────────
 
