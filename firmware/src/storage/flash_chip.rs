@@ -13,19 +13,31 @@
 use heapless::Vec;
 use pico2hsm_core::{error::StorageError, flash::FlashChip};
 
-/// Read internal flash at `offset` (from the start of flash) through the
-/// XIP window — what `embassy_rp::flash::Flash::blocking_read` does, minus
-/// its defmt `trace!`.  Reads run on both cores, and defmt's logger is not
-/// safe to enter from two cores at once (the critical section is the
-/// single-core one): a core1 read logging while core0 logs panics with
-/// "defmt logger taken reentrantly".  The caller has bounds-checked.
+/// The XIP window that maps physical flash with no address translation
+/// and no cache (`XIP_NOCACHE_NOALLOC_NOTRANSLATE_BASE`).
+///
+/// The usual window, `0x1000_0000`, is translated: booted from a partition
+/// (FLASH_LAYOUT_2_0.md), the bootrom maps the boot slot there, so
+/// `0x1000_0000 + offset` would read the firmware slot, not `offset`, and
+/// fault past its end.  This one always reads physical flash; uncached, it
+/// also never returns stale lines after a program or erase.
+const XIP_PHYSICAL_BASE: usize = 0x1C00_0000;
+
+/// Read internal flash at physical `offset` (from the start of flash).
+/// Unlike `embassy_rp::flash::Flash::blocking_read`: no defmt `trace!`
+/// (reads run on both cores, and defmt's logger is not safe to enter from
+/// two cores at once: a core1 read logging while core0 logs panics with
+/// "defmt logger taken reentrantly"), and no address translation (see
+/// [`XIP_PHYSICAL_BASE`]).  The caller has bounds-checked.
 fn xip_read(offset: u32, buf: &mut [u8]) {
-    const XIP_BASE: usize = 0x1000_0000;
-    // SAFETY: the range lies inside the mapped flash (callers check it
-    // against `QMI_FLASH_SIZE`-bounded regions); flash writes run on core0
-    // with core1 paused, so no read overlaps one.
+    // SAFETY: the range lies inside the flash (callers check it against
+    // `QMI_FLASH_SIZE`-bounded regions); flash writes run on core0 with
+    // core1 paused, so no read overlaps one.
     let src = unsafe {
-        core::slice::from_raw_parts((XIP_BASE + offset as usize) as *const u8, buf.len())
+        core::slice::from_raw_parts(
+            (XIP_PHYSICAL_BASE + offset as usize) as *const u8,
+            buf.len(),
+        )
     };
     buf.copy_from_slice(src);
 }
@@ -116,9 +128,7 @@ impl FlashChip for QmiFlash {
         // Write-back verification.
         let mut verify_buf = [0u8; 256];
         let verify_slice = &mut verify_buf[..data.len()];
-        self.flash
-            .blocking_read(QMI_KEYSTORE_OFFSET + addr, verify_slice)
-            .map_err(|_| StorageError::ReadError)?;
+        xip_read(QMI_KEYSTORE_OFFSET + addr, verify_slice);
 
         if verify_slice != data {
             let sector = addr / 4096;
