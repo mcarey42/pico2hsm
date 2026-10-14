@@ -56,7 +56,7 @@ or `pico2hsm-tool store status`.  The response's first bytes are `state`,
 | `02` | `03` no anchor | The counter log lost the anchor (e.g. after a downgrade to 1.x and back). | 6 |
 | `02` | `07` read error | The store could not be read.  Reseat the card, reboot. | 2 |
 | `03` | — | No 2.0 store, or the binding does not verify (a 1.x keystore; a store from before OTP provisioning, see 7). | 6 |
-| `04` | — | No storage key (an unprovisioned release build). | [PROVISIONING.md](PROVISIONING.md) |
+| `04` | — | A format that did not finish (it finishes at the next boot: reboot), or no storage key (an unprovisioned release build). | Reboot; if still `04`, [PROVISIONING.md](PROVISIONING.md) |
 
 ## 2. First: is the right card in?
 
