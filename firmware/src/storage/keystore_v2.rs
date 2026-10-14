@@ -249,11 +249,7 @@ impl<F: StoreFlash, B: CounterFlash, L: RetryCounterBackend> FlashKeyStoreV2<F, 
             }
             Some(BindState::Formatting) => self.finish_format(FormatAuth::resume_formatting(true)),
             Some(BindState::Active) => self.mount(),
-            Some(BindState::Reindexing) => {
-                // ACCEPT STORE is not implemented yet: fail closed.
-                self.status = StoreStatus::Refused(Refusal::Corrupt("re-index pending"));
-                Err(StorageError::IntegrityFailure)
-            }
+            Some(BindState::Reindexing) => self.finish_reindex(),
         };
         if let Some(ring) = self.binding_ring.as_mut() {
             let _ = ring.tidy();
@@ -479,6 +475,86 @@ impl<F: StoreFlash, B: CounterFlash, L: RetryCounterBackend> FlashKeyStoreV2<F, 
         Ok(())
     }
 
+    /// ACCEPT STORE (§16 OD-1, R2): make the state OPEN DEGRADED mounted
+    /// the store's new, read-write state.  Only after OPEN DEGRADED of a
+    /// store refused as behind its anchor or damaged (never another store,
+    /// a lost anchor or binding), with `lost` the count STORE STATUS
+    /// reported.  A re-index, not a lowered anchor: a new `E_store` and
+    /// `format_gen + 1` (same store and group epochs), a fresh ring whose
+    /// CHECKPOINT is above both the old anchor and the accepted head, so no
+    /// seq is ever reused under one store and epoch.  Resumable from the
+    /// binding's REINDEXING state.  Either core (as `format_store_now`).
+    pub fn accept_store_now(&mut self, so_pin_verified: bool, lost: u64) -> Result<(), HsmError> {
+        let refuse = || HsmError::Storage(StorageError::IntegrityFailure);
+        if !so_pin_verified {
+            return Err(refuse());
+        }
+        let StoreStatus::Degraded { was, lost: l } = self.status else {
+            return Err(refuse());
+        };
+        if !matches!(was, Refusal::BehindAnchor(_) | Refusal::Corrupt(_)) || lost != l {
+            return Err(refuse());
+        }
+        let smk = *self.smk()?;
+        let b = self.binding.clone().ok_or_else(refuse)?;
+        let mut env = AnchorEnv {
+            log: self.counters.as_mut(),
+            hooks: self.hooks,
+        };
+        let anchored = env
+            .anchor()
+            .map_err(HsmError::Storage)?
+            .filter(|a| a.format_gen == b.format_gen as u16)
+            .map(|a| a.head_seq)
+            .ok_or_else(refuse)?;
+        let head = self.store.next_seq().ok_or_else(refuse)? - 1;
+        let seq = anchored.max(head) + 2;
+        if seq > crate::storage::retry_counter::ANCHOR_SEQ_MAX {
+            return Err(refuse());
+        }
+        // Step 1: the accepted index, under the new key.
+        let e_store: [u8; 32] = random().map_err(HsmError::Storage)?;
+        let k_idx = derive_k_idx(&smk, &b.store_id, &e_store);
+        self.store
+            .reindex_snapshot(&k_idx, seq)
+            .map_err(HsmError::Storage)?;
+        // Step 2: the binding names the new key; the old one (and with it
+        // the old journal) is gone from here on.
+        let mut nb = b.clone();
+        nb.state = BindState::Reindexing;
+        nb.e_store = e_store;
+        nb.format_gen = b.format_gen.wrapping_add(1).max(1);
+        self.write_binding(&mut nb).map_err(HsmError::Storage)?;
+        self.binding = Some(nb);
+        self.store.unmount();
+        self.finish_reindex().map_err(HsmError::Storage)
+    }
+
+    /// Steps 3–5 of ACCEPT STORE, resumable from a REINDEXING binding: the
+    /// ring, the anchor, the binding ACTIVE, mount.
+    fn finish_reindex(&mut self) -> Result<(), StorageError> {
+        let b = self.binding.as_ref().ok_or(StorageError::NotFormatted)?;
+        if b.state != BindState::Reindexing {
+            return Err(StorageError::IntegrityFailure);
+        }
+        let info = self.mount_info(b)?;
+        {
+            let mut env = AnchorEnv {
+                log: self.counters.as_mut(),
+                hooks: self.hooks,
+            };
+            if let Err(e) = self.store.finish_reindex(info, &mut env) {
+                self.status = StoreStatus::Refused(Refusal::Corrupt("re-index"));
+                return Err(e);
+            }
+        }
+        let mut nb = self.binding.clone().ok_or(StorageError::NotFormatted)?;
+        nb.state = BindState::Active;
+        self.write_binding(&mut nb)?;
+        self.binding = Some(nb);
+        self.mount()
+    }
+
     /// Live objects and free data sectors (display).
     pub fn key_count(&self) -> usize {
         self.store.len()
@@ -688,11 +764,16 @@ impl<F: StoreFlash, B: CounterFlash, L: RetryCounterBackend> KeyStore for FlashK
             state,
             reason: why.map_or(0, refusal_code),
             lost,
+            head: self.store.next_seq().map_or(0, |n| n - 1),
         })
     }
 
     fn open_degraded(&mut self, so_pin_verified: bool) -> Result<(), HsmError> {
         self.open_degraded_now(so_pin_verified)
+    }
+
+    fn accept_store(&mut self, so_pin_verified: bool, lost: u64) -> Result<(), HsmError> {
+        self.accept_store_now(so_pin_verified, lost)
     }
 
     fn enumerate_keys(&self) -> Vec<KeyId, 64> {
@@ -825,36 +906,90 @@ pub(crate) mod tests {
 
     const SS: usize = 4096;
 
+    std::thread_local! {
+        /// Flash operations left before a power cut (`None`: no cut), over
+        /// every region; `DEAD` once it struck.
+        static BUDGET: core::cell::Cell<Option<usize>> = const { core::cell::Cell::new(None) };
+        static DEAD: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+        pub(crate) static OPS: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+    }
+
+    /// Spend one operation; `false`: the power is gone (a program then
+    /// leaves half its bytes).
+    fn op() -> bool {
+        if DEAD.get() {
+            return false;
+        }
+        OPS.set(OPS.get() + 1);
+        match BUDGET.get() {
+            Some(0) => {
+                DEAD.set(true);
+                false
+            }
+            Some(n) => {
+                BUDGET.set(Some(n - 1));
+                true
+            }
+            None => true,
+        }
+    }
+
+    pub(crate) fn cut_after(n: Option<usize>) {
+        BUDGET.set(n);
+        DEAD.set(false);
+        OPS.set(0);
+    }
+
     /// NOR flash for every region (keystore, binding ring, counter log).
     #[derive(Clone)]
     pub(crate) struct Nor {
         pub mem: Vec<u8>,
+        /// An SD card: whole 512-byte blocks, written over (not ANDed).
+        sd: bool,
     }
 
     impl Nor {
         fn new(sectors: usize) -> Self {
             Nor {
                 mem: vec![0xFF; sectors * SS],
+                sd: false,
             }
         }
         fn rd(&self, offset: u32, buf: &mut [u8]) {
             let o = offset as usize;
             buf.copy_from_slice(&self.mem[o..o + buf.len()]);
         }
-        fn pr(&mut self, offset: u32, data: &[u8]) {
-            for (i, &d) in data.iter().enumerate() {
-                self.mem[offset as usize + i] &= d;
+        fn pr(&mut self, offset: u32, data: &[u8]) -> Result<(), StorageError> {
+            let live = op();
+            let n = if live { data.len() } else { data.len() / 2 };
+            if self.sd {
+                assert!(offset % 512 == 0 && data.len() % 512 == 0);
+                let n = n / 512 * 512;
+                self.mem[offset as usize..offset as usize + n].copy_from_slice(&data[..n]);
+            } else {
+                for (i, &d) in data[..n].iter().enumerate() {
+                    self.mem[offset as usize + i] &= d;
+                }
             }
+            live.then_some(()).ok_or(StorageError::WriteError)
         }
-        fn er(&mut self, sector: u32) {
+        fn er(&mut self, sector: u32) -> Result<(), StorageError> {
+            if !op() {
+                return Err(StorageError::EraseError);
+            }
             let s = sector as usize * SS;
             self.mem[s..s + SS].fill(0xFF);
+            Ok(())
         }
     }
 
     impl StoreFlash for Nor {
         fn media(&self) -> Media {
-            Media::Nor
+            if self.sd {
+                Media::Sd
+            } else {
+                Media::Nor
+            }
         }
         fn sectors(&self) -> u32 {
             (self.mem.len() / SS) as u32
@@ -864,12 +999,10 @@ pub(crate) mod tests {
             Ok(())
         }
         fn program(&mut self, offset: u32, data: &[u8]) -> Result<(), StorageError> {
-            self.pr(offset, data);
-            Ok(())
+            self.pr(offset, data)
         }
         fn erase_sector(&mut self, sector: u32) -> Result<(), StorageError> {
-            self.er(sector);
-            Ok(())
+            self.er(sector)
         }
     }
 
@@ -879,12 +1012,10 @@ pub(crate) mod tests {
             Ok(())
         }
         fn program(&mut self, offset: u32, data: &[u8]) -> Result<(), StorageError> {
-            self.pr(offset, data);
-            Ok(())
+            self.pr(offset, data)
         }
         fn erase_sector(&mut self, sector: u32) -> Result<(), StorageError> {
-            self.er(sector);
-            Ok(())
+            self.er(sector)
         }
     }
 
@@ -907,6 +1038,14 @@ pub(crate) mod tests {
                 bind: Nor::new(8),
                 log: Nor::new(16),
             }
+        }
+
+        /// The same with the keystore on an SD card.
+        pub(crate) fn new_sd() -> Self {
+            let mut d = Dev::new();
+            d.store = Nor::new(160);
+            d.store.sd = true;
+            d
         }
 
         /// Boot: open the log (formatting a blank one), the binding, init.
@@ -1048,5 +1187,157 @@ pub(crate) mod tests {
         let (ks, r) = Dev::of(&mut ks).boot();
         r.unwrap();
         assert_eq!(so_of(&ks), Some(so(4)));
+    }
+}
+
+#[cfg(test)]
+mod accept_tests {
+    use super::tests::*;
+    use super::*;
+
+    /// A device whose store lost its last `n` commits (one key, 7, stays).
+    fn rolled_back(n: u32) -> Dev {
+        rolled_back_on(Dev::new(), n)
+    }
+
+    fn rolled_back_on(dev: Dev, n: u32) -> Dev {
+        let (mut ks, r) = dev.boot();
+        r.unwrap();
+        ks.reset_sc_hsm(&so(1)).unwrap();
+        ks.save_key(&key(7, 7)).unwrap();
+        ks.save_key(&key(0x0001_0005, 5)).unwrap();
+        let old = Dev::of(&mut ks).store;
+        for i in 0..n {
+            ks.save_key(&key(0x10 + i, 9)).unwrap();
+        }
+        let mut d = Dev::of(&mut ks);
+        d.store = old;
+        d
+    }
+
+    fn degraded(d: &Dev) -> Ks {
+        let (mut ks, r) = d.boot();
+        assert!(r.is_err());
+        ks.open_degraded_now(true).unwrap();
+        ks
+    }
+
+    fn accepted_state(ks: &mut Ks) {
+        assert_eq!(ks.status(), StoreStatus::Up);
+        assert_eq!(tag(ks, 7), Some(7));
+        assert_eq!(tag(ks, 0x0001_0005), Some(5));
+        assert_eq!(tag(ks, 0x10), None);
+    }
+
+    #[test]
+    fn accept_store_makes_the_degraded_state_the_store() {
+        let mut ks = degraded(&rolled_back(3));
+        assert!(matches!(
+            ks.status(),
+            StoreStatus::Degraded {
+                lost: 3,
+                was: Refusal::BehindAnchor(3)
+            }
+        ));
+        let head = ks.store_report().unwrap().head;
+        ks.accept_store_now(true, 3).unwrap();
+        accepted_state(&mut ks);
+        // New seqs run above the old anchor (head + 3): never reused (R2).
+        assert!(ks.store_report().unwrap().head > head + 3);
+        // Read-write again, and it survives a reboot.
+        ks.save_key(&key(8, 8)).unwrap();
+        let (mut ks, r) = Dev::of(&mut ks).boot();
+        r.unwrap();
+        accepted_state(&mut ks);
+        assert_eq!(tag(&mut ks, 8), Some(8));
+        assert_eq!(so_pin_of(&ks), Some(so(1)), "the binding keeps the SO-PIN");
+    }
+
+    fn so_pin_of(ks: &Ks) -> Option<SoPin> {
+        match ks.so_pin_home() {
+            SoPinHome::Binding(s) => s,
+            SoPinHome::Record => None,
+        }
+    }
+
+    #[test]
+    fn accept_store_is_guarded() {
+        let d = rolled_back(2);
+        // Not before OPEN DEGRADED.
+        let (mut ks, _) = d.boot();
+        assert!(ks.accept_store_now(true, 2).is_err());
+        let mut ks = degraded(&d);
+        assert!(ks.accept_store_now(false, 2).is_err(), "SO-PIN");
+        assert!(ks.accept_store_now(true, 1).is_err(), "the count shown");
+        assert!(matches!(ks.status(), StoreStatus::Degraded { .. }));
+        // Not for a store whose anchor is gone.
+        let mut d2 = d.clone();
+        d2.log = Dev::new().log;
+        let (mut ks2, _) = d2.boot();
+        assert!(matches!(
+            ks2.status(),
+            StoreStatus::Refused(Refusal::NoAnchor)
+        ));
+        ks2.open_degraded_now(true).unwrap();
+        assert!(ks2.accept_store_now(true, 0).is_err());
+    }
+
+    /// A power cut at every flash operation of ACCEPT STORE: the next boot
+    /// finds the store refused as before (and the re-index can be run
+    /// again) or up with exactly the accepted state.
+    #[test]
+    fn accept_store_survives_a_cut_anywhere() {
+        cut_sweep(rolled_back(2));
+    }
+
+    #[test]
+    fn accept_store_survives_a_cut_anywhere_on_sd() {
+        cut_sweep(rolled_back_on(Dev::new_sd(), 2));
+    }
+
+    fn cut_sweep(d: Dev) {
+        let mut ks = degraded(&d);
+        cut_after(None);
+        ks.accept_store_now(true, 2).unwrap();
+        let total = OPS.get();
+        assert!(total > 10, "{total} operations");
+        let (mut retried, mut resumed) = (0, 0);
+        for budget in 0..total {
+            let mut ks = degraded(&d);
+            cut_after(Some(budget));
+            // A cut in the last step (erasing the binding ring's old copy,
+            // best effort: boot tidies it) still reports success.
+            let _ = ks.accept_store_now(true, 2);
+            cut_after(None);
+            let after = Dev::of(&mut ks);
+            let reindexing = ks.binding.as_ref().map(|b| b.state) == Some(BindState::Reindexing);
+            let (mut ks, r) = after.boot();
+            if reindexing && r.is_ok() {
+                resumed += 1;
+            }
+            if r.is_err() {
+                retried += 1;
+                assert!(
+                    matches!(ks.status(), StoreStatus::Refused(_)),
+                    "cut at {budget}: {:?}",
+                    ks.status()
+                );
+                ks.open_degraded_now(true).unwrap();
+                let lost = ks.store_report().unwrap().lost;
+                ks.accept_store_now(true, lost)
+                    .unwrap_or_else(|e| panic!("cut at {budget}: retry {e:?}"));
+            }
+            accepted_state(&mut ks);
+            ks.save_key(&key(9, 9)).unwrap();
+            let (mut ks, r) = Dev::of(&mut ks).boot();
+            r.unwrap_or_else(|e| panic!("cut at {budget}: {e:?}"));
+            assert_eq!(tag(&mut ks, 9), Some(9));
+        }
+        // Both ways back were taken: refused (cut before the binding named
+        // the new key) and resumed at boot from REINDEXING.
+        assert!(
+            retried > 0 && resumed > 0,
+            "{retried} retried, {resumed} resumed"
+        );
     }
 }

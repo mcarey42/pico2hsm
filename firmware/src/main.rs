@@ -201,6 +201,9 @@ enum FlashOp {
     /// SC-HSM INITIALIZE's wipe with its new SO-PIN (QMI boards).  Points
     /// at core1's value, as `SetSoPin`.
     ResetScHsm(*const pico2hsm_firmware::storage::SoPin),
+    /// ACCEPT STORE (QMI boards; SD boards re-index on core1): "the SO-PIN
+    /// was verified" and the lost-record count the host confirmed.
+    AcceptStore(bool, u64),
     /// One erase or program of the binding ring for core1 (SD boards'
     /// formats and wipes).  The data points into core1's buffer, which
     /// outlives the op for the same reason as `SaveKey`'s.
@@ -431,6 +434,27 @@ impl pico2hsm_firmware::storage::KeyStore for Core1KeyStore {
         // Every applet's RAM state comes from the store as now mounted.
         pico2hsm_firmware::RELOAD_AFTER_APDU.store(true, core::sync::atomic::Ordering::SeqCst);
         Ok(())
+    }
+
+    fn accept_store(
+        &mut self,
+        so_pin_verified: bool,
+        lost: u64,
+    ) -> Result<(), pico2hsm_core::error::HsmError> {
+        let r = if Self::is_direct_write() {
+            // As `format_store`: the ring rewrite is SD writes.
+            self.direct().accept_store_now(so_pin_verified, lost)
+        } else {
+            Self::on_core0(FlashOp::AcceptStore(so_pin_verified, lost))
+        };
+        pico2hsm_firmware::cdc_log!(
+            "ACCEPT STORE {} ({} records given up)",
+            if r.is_ok() { "done" } else { "refused" },
+            lost
+        );
+        // A failed re-index may have changed the store's state too.
+        pico2hsm_firmware::RELOAD_AFTER_APDU.store(true, core::sync::atomic::Ordering::SeqCst);
+        r
     }
 
     #[cfg(feature = "rsa")]
@@ -1366,6 +1390,10 @@ fn handle_flash_op(
             let so = unsafe { so.as_ref() };
             store.set_binding_so_pin(so)
         }
+        FlashOp::AcceptStore(so_pin_verified, lost) => {
+            defmt::warn!("FLASH_SVC: ACCEPT STORE");
+            store.accept_store_now(so_pin_verified, lost)
+        }
         FlashOp::ResetScHsm(so) => {
             defmt::info!("FLASH_SVC: reset SC-HSM");
             // SAFETY: as `SetSoPin`.
@@ -1509,6 +1537,7 @@ fn flash_op_code(op: &FlashOp) -> u32 {
         FlashOp::BindingWrite { erase, .. } => 12 + u32::from(*erase),
         FlashOp::SetSoPin(_) => 17,
         FlashOp::ResetScHsm(_) => 18,
+        FlashOp::AcceptStore(..) => 19,
         #[cfg(feature = "rsa")]
         FlashOp::PoolPut { .. } => 14,
         #[cfg(feature = "rsa")]

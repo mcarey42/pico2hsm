@@ -847,6 +847,107 @@ impl<F: StoreFlash> Store<F> {
         Ok(())
     }
 
+    // ── Re-index (ACCEPT STORE) ─────────────────────────────────────────
+
+    /// ACCEPT STORE, step 1 (§16 OD-1, R2): write the mounted (degraded)
+    /// state's index as a snapshot under the re-index's new `k_idx`, as of
+    /// `seq − 1`, into free data sectors.  Nothing the mounted state uses
+    /// is touched, so a cut here leaves the store as it was.
+    pub fn reindex_snapshot(&mut self, k_idx: &[u8; 32], seq: u64) -> Result<(), StorageError> {
+        let Some(m) = self.m.take() else {
+            return Err(StorageError::NotFormatted);
+        };
+        let r = self.checkpoint_with(&m, k_idx, seq - 1);
+        self.m = Some(m);
+        r.map(|_| ())
+    }
+
+    /// ACCEPT STORE, step 2 (resumable; the binding is in REINDEXING with
+    /// the new `E_store`): find the snapshot step 1 wrote under the new
+    /// key (only one chain verifies under it), erase the ring, write ring
+    /// sector 0's header and a CHECKPOINT naming that snapshot, then the
+    /// anchor `(format_gen, seq, slot 0)`.  Every later record's seq is
+    /// above it, so no seq is reused under one store and epoch (R2).
+    pub fn finish_reindex(
+        &mut self,
+        info: MountInfo,
+        env: &mut dyn Env,
+    ) -> Result<(), StorageError> {
+        self.m = None;
+        let (seq, first, count, hash) = self.find_snapshot(&info)?;
+        for pos in 0..self.geo.ring {
+            self.flash.get_mut().erase_sector(pos)?;
+        }
+        self.write_ring_header(0, 0, &info.k_idx, &info.store_id)?;
+        let rec = Rec {
+            kind: Kind::Checkpoint,
+            count,
+            key_id: u32::from_le_bytes([hash[0], hash[1], hash[2], hash[3]]),
+            sector: first,
+            seq,
+            aux: u32::from_le_bytes([hash[4], hash[5], hash[6], hash[7]]),
+        };
+        let slot = self.encode_slot(&rec, &info.k_idx, &info.store_id, 0, 0);
+        let len = self.slot_len();
+        self.flash
+            .get_mut()
+            .program(self.geo.slot_offset(0, 0), &slot[..len])?;
+        self.flash.get_mut().sync()?;
+        env.put_anchor(Anchor {
+            format_gen: info.format_gen as u16,
+            head_seq: seq,
+            head_slot: 0,
+        })
+    }
+
+    /// The snapshot chain that verifies under `info`'s key: `(checkpoint
+    /// seq, first sector, sectors, hash)`.  Its sector 0 is found by its
+    /// header (as-of seq, index and count are in the clear, the MAC binds
+    /// them); the chain is then checked sector by sector.
+    fn find_snapshot(&mut self, info: &MountInfo) -> Result<(u64, u32, u8, [u8; 8]), StorageError> {
+        let range = self.data_range();
+        let mut head = [0u8; SNAP_HEADER];
+        for first in range.clone() {
+            self.flash.get_mut().read(first * SECTOR, &mut head)?;
+            if head[0..4] != *b"P2S2"
+                || head[4..20] != info.store_id
+                || u16::from_le_bytes([head[28], head[29]]) != 0
+            {
+                continue;
+            }
+            let as_of = u64::from_le_bytes(head[20..28].try_into().unwrap_or([0; 8]));
+            let count = u16::from_le_bytes([head[30], head[31]]);
+            if count == 0 || count as usize > MAX_SNAPSHOT_SECTORS {
+                continue;
+            }
+            let mut macs: heapless::Vec<[u8; 16], MAX_SNAPSHOT_SECTORS> = heapless::Vec::new();
+            let mut sector = first;
+            let mut ok = true;
+            for idx in 0..count {
+                if !range.contains(&sector) {
+                    ok = false;
+                    break;
+                }
+                let buf = self.buf.get_mut();
+                self.flash.get_mut().read(sector * SECTOR, &mut buf[..])?;
+                match parse_snapshot(buf, &info.k_idx, &info.store_id, as_of, idx, count) {
+                    Some((next, _, mac, _)) => {
+                        let _ = macs.push(mac);
+                        sector = next;
+                    }
+                    None => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if ok {
+                return Ok((as_of + 1, first, count as u8, snapshot_hash(&macs)));
+            }
+        }
+        Err(StorageError::IntegrityFailure)
+    }
+
     // ── Mount ───────────────────────────────────────────────────────────
 
     /// Mount the store read-write (§9.1 steps 3–6): ring headers, newest
@@ -1785,7 +1886,9 @@ impl<F: StoreFlash> Store<F> {
         let Some(m) = self.m.take() else {
             return Err(StorageError::NotFormatted);
         };
-        let r = self.checkpoint_with(&m, env);
+        let as_of = m.head_seq;
+        let k = m.k_idx.clone();
+        let r = self.checkpoint_with(&m, &k, as_of);
         self.m = Some(m);
         let (sectors, count, all, hash, total) = r?;
         // The new snapshot's sectors are in use from now on (a failed
@@ -1855,13 +1958,16 @@ impl<F: StoreFlash> Store<F> {
         Ok(())
     }
 
-    /// Write the merged snapshot to fresh sectors (marked used).  Returns
-    /// the sectors, their count, the new fence table and the hash.
+    /// Write the merged snapshot to fresh sectors, MACed under `wk` as of
+    /// `as_of` (the mounted key and head for a checkpoint; a re-index's new
+    /// key and base for ACCEPT STORE).  Returns the sectors, their count,
+    /// the new fence table and the hash.
     #[allow(clippy::type_complexity)]
     fn checkpoint_with(
         &mut self,
         m: &Mounted,
-        _env: &mut dyn Env,
+        wk: &[u8; 32],
+        as_of: u64,
     ) -> Result<
         (
             heapless::Vec<u32, MAX_SNAPSHOT_SECTORS>,
@@ -1906,7 +2012,6 @@ impl<F: StoreFlash> Store<F> {
         if count > MAX_SNAPSHOT_SECTORS {
             return Err(StorageError::KeystoreFull);
         }
-        let as_of = m.head_seq;
         // Allocate every sector first (the chain needs the next pointer);
         // mark them so the next allocation skips them.
         let mut sectors: heapless::Vec<u32, MAX_SNAPSHOT_SECTORS> = heapless::Vec::new();
@@ -1939,7 +2044,9 @@ impl<F: StoreFlash> Store<F> {
             *out_n += 1;
             *written += 1;
             if *out_n == SNAP_PER_SECTOR || *written == total {
-                me.flush_snapshot_sector(m, &sectors, *out_idx, count, *out_n, as_of, &mut macs)?;
+                me.flush_snapshot_sector(
+                    m, wk, &sectors, *out_idx, count, *out_n, as_of, &mut macs,
+                )?;
                 *out_idx += 1;
                 *out_n = 0;
                 me.buf.get_mut().fill(0xFF);
@@ -1993,7 +2100,7 @@ impl<F: StoreFlash> Store<F> {
         }
         if total == 0 {
             // An empty store still has one (empty) snapshot sector.
-            self.flush_snapshot_sector(m, &sectors, 0, count, 0, as_of, &mut macs)?;
+            self.flush_snapshot_sector(m, wk, &sectors, 0, count, 0, as_of, &mut macs)?;
             let _ = fence.push(u32::MAX);
         }
         Ok((sectors, count, fence, snapshot_hash(&macs), total))
@@ -2018,6 +2125,7 @@ impl<F: StoreFlash> Store<F> {
     fn flush_snapshot_sector(
         &mut self,
         m: &Mounted,
+        wk: &[u8; 32],
         sectors: &[u32],
         idx: usize,
         count: usize,
@@ -2028,7 +2136,7 @@ impl<F: StoreFlash> Store<F> {
         let next = if idx + 1 < count { sectors[idx + 1] } else { 0 };
         let mac = finish_snapshot(
             self.buf.get_mut(),
-            &m.k_idx,
+            wk,
             &m.store_id,
             as_of,
             idx as u16,

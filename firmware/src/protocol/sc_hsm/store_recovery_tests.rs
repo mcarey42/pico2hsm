@@ -255,3 +255,56 @@ fn open_degraded_mounts_read_only_until_reboot() {
     let (mut hsm, mut ks) = boot(&Dev::of(&mut ks));
     assert_eq!(status(&mut hsm, &mut ks), (2, 4, 2, 1, 0));
 }
+
+fn accept(hsm: &mut ScHsm, ks: &mut Ks, lost: u64) -> u16 {
+    let mut d: heapless::Vec<u8, 32> = heapless::Vec::new();
+    d.extend_from_slice(b"ACCEPT-STORE-V2").unwrap();
+    d.extend_from_slice(&lost.to_be_bytes()).unwrap();
+    run(hsm, ks, 0x54, 0x53, 0, &d)
+}
+
+/// The recovery of §9.3 end to end: refused → OPEN DEGRADED → ACCEPT
+/// STORE with the count shown → a read-write store, counted.
+#[test]
+fn accept_store_recovers_a_rolled_back_store() {
+    let (mut hsm, mut ks) = rolled_back(2);
+    assert_eq!(verify_so(&mut hsm, &mut ks, SO_PIN), SW_OK);
+    assert_eq!(
+        accept(&mut hsm, &mut ks, 2),
+        pico2hsm_core::apdu::SW_CONDITIONS_NOT_SATISFIED,
+        "OPEN DEGRADED first"
+    );
+    assert_eq!(open_degraded(&mut hsm, &mut ks), SW_OK);
+    assert_eq!(
+        accept(&mut hsm, &mut ks, 1),
+        pico2hsm_core::apdu::SW_WRONG_DATA,
+        "not the count STORE STATUS showed"
+    );
+    assert_eq!(accept(&mut hsm, &mut ks, 2), SW_OK);
+    assert_eq!(status(&mut hsm, &mut ks), (0, 0, 0, 1, 1));
+    // A reboot finds it up; the applet works and writes again.
+    let (mut hsm, mut ks) = boot(&Dev::of(&mut ks));
+    assert_eq!(status(&mut hsm, &mut ks), (0, 0, 0, 1, 1));
+    assert_eq!(run(&mut hsm, &mut ks, 0x20, 0, 0x81, USER_PIN), SW_OK);
+    let mut d: heapless::Vec<u8, 32> = heapless::Vec::new();
+    d.extend_from_slice(USER_PIN).unwrap();
+    d.extend_from_slice(b"135790").unwrap();
+    assert_eq!(run(&mut hsm, &mut ks, 0x24, 0, 0x81, &d), SW_OK);
+    assert_eq!(crate::storage::keystore_v2::tests::tag(&mut ks, 7), Some(7));
+}
+
+#[test]
+fn accept_store_needs_the_so_pin() {
+    let (mut hsm, mut ks) = rolled_back(1);
+    assert_eq!(verify_so(&mut hsm, &mut ks, SO_PIN), SW_OK);
+    assert_eq!(open_degraded(&mut hsm, &mut ks), SW_OK);
+    // The reload after OPEN DEGRADED starts a fresh applet state.
+    let mut hsm = ScHsm::new();
+    ScHsm::load_pin_state_from_store(&mut hsm.state, &mut ks);
+    assert_eq!(
+        accept(&mut hsm, &mut ks, 1),
+        pico2hsm_core::apdu::SW_SECURITY_STATUS
+    );
+    assert_eq!(verify_so(&mut hsm, &mut ks, SO_PIN), SW_OK);
+    assert_eq!(accept(&mut hsm, &mut ks, 1), SW_OK);
+}

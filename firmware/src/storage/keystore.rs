@@ -53,6 +53,8 @@ pub struct StoreReport {
     /// Journal records the anchor counts that the store does not hold
     /// (refused or degraded); what ACCEPT STORE would give up.
     pub lost: u64,
+    /// The mounted state's newest journal seq (0 when not mounted).
+    pub head: u64,
 }
 
 /// Coarse store state (STORE STATUS byte).
