@@ -1061,6 +1061,18 @@ pub(crate) mod tests {
             (ks, r)
         }
 
+        /// Boot as the firmware does: the counter log as found (a blank
+        /// one stays unformatted; only the PIN-record migration, which
+        /// needs a mounted store, seeds it).
+        pub(crate) fn boot_unseeded(&self) -> (Ks, Result<(), StorageError>) {
+            let log = CounterLog::open(self.log.clone(), 16);
+            let mut ks = Ks::new(self.store.clone(), Some(Zeroizing::new(SMK)));
+            ks.attach_retry_counters(log);
+            ks.attach_binding(self.bind.clone(), 8).unwrap();
+            let r = ks.init();
+            (ks, r)
+        }
+
         /// The regions as `ks` left them.
         pub(crate) fn of(ks: &mut Ks) -> Self {
             Dev {
@@ -1106,6 +1118,36 @@ pub(crate) mod tests {
         r.unwrap();
         assert_eq!(ks.status(), StoreStatus::Up);
         assert_eq!(so_of(&ks), None);
+    }
+
+    /// A factory-fresh device: nothing on flash, the counter log included.
+    #[test]
+    fn first_boot_formats_with_a_blank_counter_log() {
+        let (mut ks, r) = Dev::new().boot_unseeded();
+        r.unwrap();
+        assert_eq!(ks.status(), StoreStatus::Up);
+        ks.save_key(&key(7, 7)).unwrap();
+        let (mut ks, r) = Dev::of(&mut ks).boot_unseeded();
+        r.unwrap();
+        assert_eq!(tag(&mut ks, 7), Some(7));
+    }
+
+    /// A 1.x keystore on a board whose counter log was never written (no
+    /// version-1 log to migrate either): FORMAT STORE still works.
+    #[test]
+    fn format_store_over_a_1x_keystore_with_a_blank_counter_log() {
+        let mut d = Dev::new();
+        d.store.mem[..64].fill(0x12);
+        let (mut ks, r) = d.boot_unseeded();
+        assert!(r.is_err());
+        assert_eq!(ks.status(), StoreStatus::NeedsFormat);
+        assert!(ks.format_needs_no_pin());
+        ks.format_store(false).unwrap();
+        assert_eq!(ks.status(), StoreStatus::Up);
+        ks.save_key(&key(7, 7)).unwrap();
+        let (mut ks, r) = Dev::of(&mut ks).boot_unseeded();
+        r.unwrap();
+        assert_eq!(tag(&mut ks, 7), Some(7));
     }
 
     #[test]

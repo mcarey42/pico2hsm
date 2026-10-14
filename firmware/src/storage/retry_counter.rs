@@ -898,6 +898,12 @@ impl<F: CounterFlash> CounterLog<F> {
 
     /// The keystore anchor (`Ok(None)`: never written).
     pub fn anchor(&mut self) -> Result<Option<Anchor>, StorageError> {
+        // A log never written (a blank region, no version-1 log to move)
+        // has no anchor: a factory-fresh device, or a 1.x board that never
+        // logged a counter.  Its first boot must still format (§8.3).
+        if self.state == LogState::Unformatted {
+            return Ok(None);
+        }
         self.check_active()?;
         Ok(self.find(ANCHOR_TAG, 0).map(Anchor::from_raw))
     }
@@ -906,7 +912,16 @@ impl<F: CounterFlash> CounterLog<F> {
     /// only moves forward (`IntegrityFailure` otherwise); writing the
     /// current anchor is a no-op.  A new `format_gen` (format, re-index)
     /// may start anywhere.
+    ///
+    /// On a log never written, the first anchor seeds it empty.  Only a
+    /// format reaches that (any mounted store has an anchor), and a format
+    /// wipes every credential, so there are no counters to carry; the
+    /// PIN-record migration, which needs a mounted store, never can.  A
+    /// log that fails its scan stays `Failed`.
     pub fn put_anchor(&mut self, a: Anchor) -> Result<(), StorageError> {
+        if self.state == LogState::Unformatted {
+            self.format(&[])?;
+        }
         self.check_active()?;
         if let Some(old) = self.anchor()? {
             if old == a {
@@ -1652,6 +1667,17 @@ mod tests {
         assert!(log.needs_migration());
         assert_eq!(log.get(PIN), Err(StorageError::NotFormatted));
         assert!(log.put(PIN, CounterState::fresh(3)).is_err());
+    }
+
+    #[test]
+    fn blank_region_has_no_anchor_and_the_first_anchor_seeds_it() {
+        let mut log = open(SimFlash::new());
+        assert_eq!(log.anchor(), Ok(None));
+        log.put_anchor(anchor(1, 0, 0)).unwrap();
+        assert!(!log.needs_migration());
+        let mut log = reopen(&mut log);
+        assert_eq!(log.anchor(), Ok(Some(anchor(1, 0, 0))));
+        assert_eq!(log.get(PIN), Ok(None), "seeded empty");
     }
 
     #[test]
