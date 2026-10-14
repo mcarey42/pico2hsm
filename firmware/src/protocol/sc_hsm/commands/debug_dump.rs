@@ -49,6 +49,8 @@ pub const P1_WEDGE_CORE0: u8 = 0x11;
 pub const P1_WATCHDOG_RESET: u8 = 0x12;
 /// P1: move the keystore anchor ahead (recovery test).
 pub const P1_ANCHOR_AHEAD: u8 = 0x13;
+/// P1: reboot into BOOTSEL (boards without a probe or a reachable button).
+pub const P1_REBOOT_BOOTSEL: u8 = 0x14;
 /// P1: Montgomery multiplication benchmark.
 pub const P1_BENCH_MONT: u8 = 0x20;
 /// P1: self-test the UMAAL kernel against the portable one.
@@ -67,6 +69,14 @@ pub fn handle(cmd: &ApduCommand<'_>, store: &mut dyn crate::storage::KeyStore) -
         }
         #[cfg(target_arch = "arm")]
         P1_WATCHDOG_RESET => crate::watchdog::reset_now(crate::watchdog::ResetCause::DebugTest),
+        #[cfg(target_arch = "arm")]
+        P1_REBOOT_BOOTSEL => {
+            // Both USB interfaces (PICOBOOT for picotool, the UF2 drive).
+            embassy_rp::rom_data::reset_to_usb_boot(0, 0);
+            loop {
+                cortex_m::asm::wfi();
+            }
+        }
         #[cfg(all(target_arch = "arm", feature = "rsa"))]
         P1_BENCH_MONT => return bench_mont(cmd.p2 as usize),
         #[cfg(all(target_arch = "arm", feature = "rsa"))]

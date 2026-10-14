@@ -49,8 +49,8 @@ fn xip_read(offset: u32, buf: &mut [u8]) {
 /// Never touch below this.  See `flash_layout`.
 pub const QMI_KEYSTORE_OFFSET: u32 = super::flash_layout::QMI_KEYSTORE_OFFSET;
 
-/// Flash size the QMI driver is instantiated with (4 MB; the 16 MB boards
-/// use only the same lower 4 MB).
+/// Flash size the QMI driver is instantiated with (the board's chip: 4 MB
+/// or 16 MB, `flash_layout::MAP`).
 pub const QMI_FLASH_SIZE: usize = super::flash_layout::QMI_FLASH_SIZE as usize;
 
 /// The RP2350 built-in QMI flash chip, restricted to the keystore partition.
@@ -80,7 +80,7 @@ impl QmiFlash {
     /// Create a new `QmiFlash` wrapping an embassy-rp blocking flash driver.
     ///
     /// `flash` must be created with `Flash::new_blocking(p.FLASH)` and the
-    /// `FLASH_SIZE` const generic must equal `QMI_FLASH_SIZE` (4 MB).
+    /// `FLASH_SIZE` const generic must equal `QMI_FLASH_SIZE`.
     pub fn new(
         flash: embassy_rp::flash::Flash<
             'static,
