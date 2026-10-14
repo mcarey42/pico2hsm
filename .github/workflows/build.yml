@@ -17,6 +17,7 @@ jobs:
         feature:
           - pico2_4m
           - rp2350_one_4m
+          - rp2350_one_16m
           - rp2350_geek_16m
           - rp2350_geek_sdcard
           - waveshare_rp2350_lcd_16m
@@ -220,6 +221,7 @@ jobs:
       matrix:
         board:
           - rp2350_one_4m
+          - rp2350_one_16m
           - rp2350_geek_16m
           - rp2350_geek_sdcard
           - pico2_4m

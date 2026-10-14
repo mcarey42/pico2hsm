@@ -62,7 +62,8 @@ pub const MAP_4M: Map = Map {
     flash_size: 0x0040_0000,
 };
 
-/// The 16 MB boards (Geek, Waveshare LCD; QMI and SD variants): a
+/// The 16 MB boards (Geek, Waveshare LCD, RP2350-One with a 16 MB chip;
+/// QMI and SD variants): a
 /// partition table with A/B firmware slots of 4 MB each
 /// (FLASH_LAYOUT_2_0.md), the store regions from 8 MB.  An image runs
 /// from either slot at 0x1000_0000 (bootrom address translation), so it
@@ -86,6 +87,7 @@ pub const SLOT_B_16M: u32 = 0x0040_0000;
 
 /// Whether this build is for a 16 MB board.
 pub const FLASH_16M: bool = cfg!(any(
+    feature = "rp2350_one_16m",
     feature = "rp2350_geek_16m",
     feature = "rp2350_geek_sdcard",
     feature = "waveshare_rp2350_lcd_16m",
@@ -199,7 +201,7 @@ mod tests {
 
     #[test]
     fn boards_reserve_the_storage_regions() {
-        let boards: [(&str, &str, Map); 5] = [
+        let boards: [(&str, &str, Map); 6] = [
             (
                 "pico2_4m",
                 include_str!("../../../boards/pico2_4m.x"),
@@ -209,6 +211,11 @@ mod tests {
                 "rp2350_one_4m",
                 include_str!("../../../boards/rp2350_one_4m.x"),
                 MAP_4M,
+            ),
+            (
+                "rp2350_one_16m",
+                include_str!("../../../boards/rp2350_one_16m.x"),
+                MAP_16M,
             ),
             (
                 "rp2350_geek_16m",

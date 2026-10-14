@@ -28,6 +28,9 @@ default = ["rp2350_one_4m", "rsa", "applet-piv", "applet-openpgp-curve25519"]
 # unprovisioned device.  Debug builds always allow it.  NEVER for deployment.
 insecure-dev-keystore = []
 rp2350_one_4m = ["uart-debug"]
+# RP2350-One with a 16 MB flash chip fitted: the One board code (it turns on
+# rp2350_one_4m) with the 16 MB flash map (A/B slots, store from 8 MB).
+rp2350_one_16m = ["rp2350_one_4m"]
 rp2350_geek_16m = ["uart-debug"]
 rp2350_geek_sdcard = ["uart-debug"]
 pico2_4m = []

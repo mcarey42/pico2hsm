@@ -16,6 +16,7 @@
 # Valid board features:
 #   pico2_4m               Raspberry Pi Pico 2 4MB
 #   rp2350_one_4m          Waveshare RP2350-One  4MB
+#   rp2350_one_16m         Waveshare RP2350-One with a 16MB chip fitted
 #   rp2350_geek_16m        Waveshare RP2350-Geek 16MB
 #   rp2350_geek_sdcard     Waveshare RP2350-Geek SDCard
 #   waveshare_rp2350_lcd_16m           Waveshare RP2350-LCD-1.47-B 16MB
@@ -44,6 +45,7 @@ fi
 VALID_FEATURES=(
     pico2_4m
     rp2350_one_4m
+    rp2350_one_16m
     rp2350_geek_16m
     rp2350_geek_sdcard
     waveshare_rp2350_lcd_16m

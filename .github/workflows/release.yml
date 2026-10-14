@@ -43,6 +43,7 @@ jobs:
         board:
           - pico2_4m
           - rp2350_one_4m
+          - rp2350_one_16m
           - rp2350_geek_16m
           - rp2350_geek_sdcard
           - waveshare_rp2350_lcd_16m
@@ -234,7 +235,7 @@ jobs:
           cat release/SHA256SUMS
 
           # Verify every expected board is represented — fail loudly otherwise.
-          EXPECTED_BOARDS=(pico2_4m rp2350_one_4m rp2350_geek_16m rp2350_geek_sdcard waveshare_rp2350_lcd_16m waveshare_rp2350_lcd_sdcard)
+          EXPECTED_BOARDS=(pico2_4m rp2350_one_4m rp2350_one_16m rp2350_geek_16m rp2350_geek_sdcard waveshare_rp2350_lcd_16m waveshare_rp2350_lcd_sdcard)
           MISSING=()
           for b in "${EXPECTED_BOARDS[@]}"; do
             if ! ls "release/pico2hsm-${b}-unsigned.uf2" >/dev/null 2>&1; then
