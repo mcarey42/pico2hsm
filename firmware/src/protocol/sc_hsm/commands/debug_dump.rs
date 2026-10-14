@@ -20,6 +20,12 @@
 //!   stopped feeding".
 //! - P1=0x12: reset the chip now through the watchdog trigger (from core1).
 //!
+//! Storage V2 recovery test hook (hardware test plan, STORAGE_V2 §9.3):
+//! - P1=0x13: move the keystore anchor P2 records (1–255) ahead of the
+//!   journal, as if that many acknowledged writes were lost.  The store
+//!   keeps working until the next boot, which refuses it as behind its
+//!   anchor by P2.
+//!
 //! Benchmark (`rsa` builds):
 //! - P1=0x20: P2 = modulus size in 32-bit words (64 = 2048-bit, 128 =
 //!   4096-bit).  Runs 256 Montgomery squarings plus 256 multiplications
@@ -41,14 +47,17 @@ pub const P1_WEDGE_CORE1: u8 = 0x10;
 pub const P1_WEDGE_CORE0: u8 = 0x11;
 /// P1: immediate watchdog reset (watchdog test).
 pub const P1_WATCHDOG_RESET: u8 = 0x12;
+/// P1: move the keystore anchor ahead (recovery test).
+pub const P1_ANCHOR_AHEAD: u8 = 0x13;
 /// P1: Montgomery multiplication benchmark.
 pub const P1_BENCH_MONT: u8 = 0x20;
 /// P1: self-test the UMAAL kernel against the portable one.
 pub const P1_SELFTEST_MAC2: u8 = 0x21;
 
 /// Handle a DEBUG MEMORY DUMP APDU command.
-pub fn handle(cmd: &ApduCommand<'_>) -> ApduResponse {
+pub fn handle(cmd: &ApduCommand<'_>, store: &mut dyn crate::storage::KeyStore) -> ApduResponse {
     match cmd.p1 {
+        P1_ANCHOR_AHEAD => return anchor_ahead(store, cmd.p2),
         P1_WEDGE_CORE1 => loop {
             core::hint::spin_loop();
         },
@@ -67,6 +76,29 @@ pub fn handle(cmd: &ApduCommand<'_>) -> ApduResponse {
     // TODO: implement — read memory region and return raw bytes.
     // NOTE: This is a debug-only stub. Production builds never compile this.
     ApduResponse::err(SW_WRONG_DATA)
+}
+
+/// See `P1_ANCHOR_AHEAD`.
+fn anchor_ahead(store: &mut dyn crate::storage::KeyStore, n: u8) -> ApduResponse {
+    use crate::storage::retry_counter::Anchor;
+    use pico2hsm_core::apdu::SW_MEMORY_FAILURE;
+    if n == 0 {
+        return ApduResponse::err(SW_WRONG_DATA);
+    }
+    let Some(log) = store.retry_counters() else {
+        return ApduResponse::err(SW_MEMORY_FAILURE);
+    };
+    let Ok(Some(a)) = log.anchor() else {
+        return ApduResponse::err(SW_MEMORY_FAILURE);
+    };
+    let ahead = Anchor {
+        head_seq: a.head_seq + u64::from(n),
+        ..a
+    };
+    match log.put_anchor(ahead) {
+        Ok(()) => ApduResponse::ok(&[]),
+        Err(_) => ApduResponse::err(SW_MEMORY_FAILURE),
+    }
 }
 
 /// See `P1_BENCH_MONT`.

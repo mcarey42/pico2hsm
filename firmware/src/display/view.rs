@@ -169,6 +169,8 @@ pub enum Note {
     NotSaved,
     /// The keystore failed to initialise.
     StorageUnreadable,
+    /// The keystore is mounted read-only (OPEN DEGRADED).
+    StoreReadOnly,
     /// The SD card stopped answering.
     SdMissing,
     /// How to unblock the active applet's PIN (E40).

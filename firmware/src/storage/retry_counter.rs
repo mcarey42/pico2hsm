@@ -269,10 +269,17 @@ pub enum ValueId {
     /// OpenPGP digital-signature counter (DO 93).  Not monotonic: key
     /// generation and import reset it.
     SignatureCounter = 0x05,
+    /// Storage V2: OPEN DEGRADED mounts so far (§9.3, monotonic).
+    StoreDegradedOpens = 0x06,
+    /// Storage V2: ACCEPT STORE re-anchors so far (§16 OD-1, monotonic).
+    StoreReanchors = 0x07,
+    /// Storage V2: the last re-anchor, `anchor head_seq << 32 | accepted
+    /// head_seq` (low 32 bits of each; not monotonic).
+    StoreLastReanchor = 0x08,
 }
 
 /// Number of [`ValueId`]s (the in-RAM value table).
-pub const MAX_VALUES: usize = 5;
+pub const MAX_VALUES: usize = 8;
 
 impl ValueId {
     /// Every value, in table order (`id − 1`).
@@ -282,6 +289,9 @@ impl ValueId {
         ValueId::PoolConfig,
         ValueId::PoolSeq,
         ValueId::SignatureCounter,
+        ValueId::StoreDegradedOpens,
+        ValueId::StoreReanchors,
+        ValueId::StoreLastReanchor,
     ];
 
     /// The value with record id `id`.
@@ -296,7 +306,10 @@ impl ValueId {
 
     /// Whether the value may only grow.
     pub fn monotonic(self) -> bool {
-        !matches!(self, ValueId::PoolConfig | ValueId::SignatureCounter)
+        !matches!(
+            self,
+            ValueId::PoolConfig | ValueId::SignatureCounter | ValueId::StoreLastReanchor
+        )
     }
 }
 

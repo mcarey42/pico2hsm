@@ -7,9 +7,10 @@ layout, #14); the engine, its wiring and the removal of the 1.x code
 (phases 2–5: object format, journal, snapshots, lookup, allocation,
 anchor checks, formatting rules, fail-closed boot, FORMAT STORE, E12;
 #15, hardware-verified on the Pico 2 and the Waveshare LCD SD board).
-Still to do: OPEN DEGRADED and ACCEPT STORE commands (the engine has the
-read-only mount), the SO-PIN verifier in the binding, removing the
-SC-HSM key index and EF cache from RAM, the partition-table layout
+Phase 4's recovery is in too: the SO-PIN in the binding, STORE STATUS,
+OPEN DEGRADED and ACCEPT STORE (§9.3, §16; operator runbook:
+[KEYSTORE_RECOVERY.md](KEYSTORE_RECOVERY.md)).  Still to do: removing
+the SC-HSM key index and EF cache from RAM, the partition-table layout
 (phase 6), the SD power-pull campaign, then `v2.0.0-rc1` (phase 7).**  Ships in the 2.0.0 series.  It is a
 breaking change: 1.x keystores are not migrated (no devices are in use),
 and 2.0 firmware refuses a 1.x keystore with a clear error.
@@ -398,11 +399,17 @@ SO-PIN verifier(32) | HMAC(K_bind)(32)
   erased.  Two valid copies with the same `gen`: identical bytes → keep
   one; different → fail closed.  `gen` at its maximum → refuse further
   writes (R14).
-- **The SO-PIN verifier lives here**, not in the keystore:
-  `HMAC(K_bind, salt ‖ SO-PIN)`, retries spent in the counter log as
-  today.  The SO-PIN therefore works when the store is missing or
-  refused, which recovery (§9.3) and FORMAT STORE (§8.3) need.  The
-  SC-HSM PIN record keeps the user PIN and PUK.
+- **The SO-PIN verifier lives here**, not in the keystore, retries
+  spent in the counter log as today.  The SO-PIN therefore works when the
+  store is missing or refused, which recovery (§9.3) and FORMAT STORE
+  (§8.3) need.  The SC-HSM PIN record keeps the user PIN and PUK.
+  *As built:* the verifier is the SO-PIN's PBKDF2 hash encrypted under
+  `HKDF(K_bind, salt)` rather than `HMAC(K_bind, salt ‖ SO-PIN)`; testing
+  a guess needs `K_bind` either way, and the applet's double-checked
+  comparison stays as it is.  INITIALIZE writes the new SO-PIN in the same
+  binding write as SC-HSM's new epoch (R10), and needs the SO-PIN whenever
+  one is set, also on a store FORMAT STORE emptied.  A PIN-less FORMAT
+  STORE is also allowed on a refused store whose binding holds no SO-PIN.
 - Why a block of its own, not counter-log records (the review proposed a
   multi-field counter-log record): it does not fit a 12-byte slot
   payload; it must be erasable on demand for epoch rotation, while the
@@ -554,7 +561,29 @@ display and recorded in the counter log.
 Recovery from a refused store is then: `OPEN DEGRADED` → DKEK export (or
 domain resync from a peer, cluster plan V3) → FORMAT STORE → restore.
 The SO-PIN may also **accept the current head and re-anchor**
-(`ACCEPT STORE`, §16 OD-1: decided, implement with its guards).
+(`ACCEPT STORE`, §16 OD-1).
+
+*As built* (APDUs in SC_HSM_APDU_REFERENCE §3.29; operator steps in
+[KEYSTORE_RECOVERY.md](KEYSTORE_RECOVERY.md)):
+
+- **STORE STATUS** (no PIN) reports the state, the refusal reason and
+  the records the anchor counts that the store lacks.  The display shows
+  E11 for a refused store and a "Keystore READ-ONLY" note when degraded;
+  the lost-record count is reported by STORE STATUS only.
+- **OPEN DEGRADED** works on any refused store, a lost anchor included
+  (read-only, so nothing is put at risk); it is counted in the counter
+  log before the mount.
+- **ACCEPT STORE** only follows OPEN DEGRADED of a store behind its anchor
+  or damaged, and only with the lost-record count STORE STATUS showed.
+  It is R2's re-index: the accepted index is written as a snapshot under
+  a new `E_store`; the binding goes to REINDEXING (new `E_store`,
+  `format_gen + 1`); the ring is rebuilt with a CHECKPOINT at
+  max(anchor, head) + 2; the anchor; the binding ACTIVE.  A cut after the
+  binding write resumes at boot by finding that snapshot (only one chain
+  verifies under the new key; snapshot headers carry their position), so
+  the binding layout needs no re-index fields.  Counted, with the old and
+  accepted heads, in the counter log.  Reporting re-anchors to domain
+  peers is still to do.
 
 ## 10. Wear
 

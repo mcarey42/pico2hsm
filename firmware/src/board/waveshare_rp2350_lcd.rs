@@ -110,6 +110,9 @@ pub const SDCARD_MOSI_PIN: u8 = 11;
 pub const SDCARD_MISO_PIN: u8 = 12;
 /// SD card chip-select pin.
 pub const SDCARD_CS_PIN: u8 = 15;
+/// SPI1 frequency for SD card data transfers (after identification at
+/// 400 kHz).
+pub const SDCARD_SPI_FREQ_HZ: u32 = 25_000_000;
 
 // ─── GPIO pin assignments — RGB LED ──────────────────────────────────────────
 

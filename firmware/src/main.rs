@@ -195,6 +195,15 @@ enum FlashOp {
     /// FORMAT STORE (QMI boards; SD boards format on core1); the flag is
     /// "the SO-PIN was verified".
     FormatStore(bool),
+    /// Replace the SO-PIN in the binding block (QMI boards; null: clear
+    /// it).  Points at core1's value, live until the reply (as `SaveKey`).
+    SetSoPin(*const pico2hsm_firmware::storage::SoPin),
+    /// SC-HSM INITIALIZE's wipe with its new SO-PIN (QMI boards).  Points
+    /// at core1's value, as `SetSoPin`.
+    ResetScHsm(*const pico2hsm_firmware::storage::SoPin),
+    /// ACCEPT STORE (QMI boards; SD boards re-index on core1): "the SO-PIN
+    /// was verified" and the lost-record count the host confirmed.
+    AcceptStore(bool, u64),
     /// One erase or program of the binding ring for core1 (SD boards'
     /// formats and wipes).  The data points into core1's buffer, which
     /// outlives the op for the same reason as `SaveKey`'s.
@@ -377,6 +386,77 @@ impl pico2hsm_firmware::storage::KeyStore for Core1KeyStore {
         Ok(())
     }
 
+    fn so_pin_home(&self) -> pico2hsm_firmware::storage::SoPinHome {
+        use pico2hsm_firmware::storage::KeyStore as _;
+        // RAM only (the binding as mounted): safe from core1.
+        // SAFETY: as `direct`; core0 never writes the store meanwhile.
+        unsafe { &*self.store_ptr }.so_pin_home()
+    }
+
+    fn set_binding_so_pin(
+        &mut self,
+        so: Option<&pico2hsm_firmware::storage::SoPin>,
+    ) -> Result<(), pico2hsm_core::error::HsmError> {
+        if Self::is_direct_write() {
+            // The binding-ring writes go to core0 (`RoutedBindingFlash`).
+            return self.direct().set_binding_so_pin(so);
+        }
+        Self::on_core0(FlashOp::SetSoPin(
+            so.map_or(core::ptr::null(), |s| s as *const _),
+        ))
+    }
+
+    fn reset_sc_hsm(
+        &mut self,
+        so: &pico2hsm_firmware::storage::SoPin,
+    ) -> Result<(), pico2hsm_core::error::HsmError> {
+        if Self::is_direct_write() {
+            // As `wipe_by_owner`: SD writes here, binding writes on core0.
+            return self.direct().reset_sc_hsm(so);
+        }
+        Self::on_core0(FlashOp::ResetScHsm(so))
+    }
+
+    fn store_report(&self) -> Option<pico2hsm_firmware::storage::StoreReport> {
+        use pico2hsm_firmware::storage::KeyStore as _;
+        // SAFETY: as `so_pin_home`.
+        unsafe { &*self.store_ptr }.store_report()
+    }
+
+    fn open_degraded(
+        &mut self,
+        so_pin_verified: bool,
+    ) -> Result<(), pico2hsm_core::error::HsmError> {
+        // Reads only (XIP or SD) and the anchor from the log's RAM table:
+        // here on core1 on every board.
+        self.direct().open_degraded_now(so_pin_verified)?;
+        pico2hsm_firmware::cdc_log!("OPEN DEGRADED: store mounted read-only");
+        // Every applet's RAM state comes from the store as now mounted.
+        pico2hsm_firmware::RELOAD_AFTER_APDU.store(true, core::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn accept_store(
+        &mut self,
+        so_pin_verified: bool,
+        lost: u64,
+    ) -> Result<(), pico2hsm_core::error::HsmError> {
+        let r = if Self::is_direct_write() {
+            // As `format_store`: the ring rewrite is SD writes.
+            self.direct().accept_store_now(so_pin_verified, lost)
+        } else {
+            Self::on_core0(FlashOp::AcceptStore(so_pin_verified, lost))
+        };
+        pico2hsm_firmware::cdc_log!(
+            "ACCEPT STORE {} ({} records given up)",
+            if r.is_ok() { "done" } else { "refused" },
+            lost
+        );
+        // A failed re-index may have changed the store's state too.
+        pico2hsm_firmware::RELOAD_AFTER_APDU.store(true, core::sync::atomic::Ordering::SeqCst);
+        r
+    }
+
     #[cfg(feature = "rsa")]
     fn rsa_pool(&mut self) -> Option<&mut dyn pico2hsm_firmware::storage::rsa_pool::PoolBackend> {
         use pico2hsm_firmware::storage::KeyStore as _;
@@ -529,6 +609,30 @@ impl pico2hsm_firmware::storage::retry_counter::RetryCounterBackend for Core1Key
         value: u64,
     ) -> Result<(), pico2hsm_core::error::StorageError> {
         match Self::on_core0(FlashOp::PutValue(id, value)) {
+            Ok(()) => Ok(()),
+            Err(pico2hsm_core::error::HsmError::Storage(e)) => Err(e),
+            Err(_) => Err(pico2hsm_core::error::StorageError::WriteError),
+        }
+    }
+
+    fn anchor(
+        &mut self,
+    ) -> Result<
+        Option<pico2hsm_firmware::storage::retry_counter::Anchor>,
+        pico2hsm_core::error::StorageError,
+    > {
+        use pico2hsm_firmware::storage::KeyStore as _;
+        match self.direct().retry_counters() {
+            Some(log) => log.anchor(),
+            None => Err(pico2hsm_core::error::StorageError::NotFormatted),
+        }
+    }
+
+    fn put_anchor(
+        &mut self,
+        a: pico2hsm_firmware::storage::retry_counter::Anchor,
+    ) -> Result<(), pico2hsm_core::error::StorageError> {
+        match Self::on_core0(FlashOp::PutAnchor(a)) {
             Ok(()) => Ok(()),
             Err(pico2hsm_core::error::HsmError::Storage(e)) => Err(e),
             Err(_) => Err(pico2hsm_core::error::StorageError::WriteError),
@@ -996,14 +1100,19 @@ fn dispatcher_loop(ptr_wrapper: DispatcherPtr) -> ! {
             publish(&dispatcher.display_snapshot());
             CORE1_PROGRESS.store(60, core::sync::atomic::Ordering::Relaxed);
             post_response();
-            // The store was replaced (FORMAT STORE): drop every applet's
-            // state and reload it, as after a USB reset — after the
-            // response, never under the running command.
+            // The store changed under the applets (FORMAT STORE, OPEN
+            // DEGRADED, ACCEPT STORE): drop every applet's state and reload
+            // it, as after a USB reset — after the response, never under
+            // the running command.
             if pico2hsm_firmware::RELOAD_AFTER_APDU
                 .swap(false, core::sync::atomic::Ordering::SeqCst)
             {
                 dispatcher.reset_in_place();
-                dispatcher.note_store_formatted();
+                {
+                    use pico2hsm_firmware::storage::KeyStore as _;
+                    // SAFETY: as `Core1KeyStore::direct`; a RAM read.
+                    dispatcher.note_store(unsafe { &*store_ptr }.store_report());
+                }
                 let _ = Core1KeyStore::on_core0(FlashOp::ReloadKeys);
                 publish(&dispatcher.display_snapshot());
             }
@@ -1299,6 +1408,26 @@ fn handle_flash_op(
             );
             r
         }
+        FlashOp::SetSoPin(so) => {
+            // SAFETY: see `FlashOp::SetSoPin` — core1 is blocked until we
+            // reply, so the pointee is live and unchanged.
+            let so = unsafe { so.as_ref() };
+            store.set_binding_so_pin(so)
+        }
+        FlashOp::AcceptStore(so_pin_verified, lost) => {
+            defmt::warn!("FLASH_SVC: ACCEPT STORE");
+            store.accept_store_now(so_pin_verified, lost)
+        }
+        FlashOp::ResetScHsm(so) => {
+            defmt::info!("FLASH_SVC: reset SC-HSM");
+            // SAFETY: as `SetSoPin`.
+            match unsafe { so.as_ref() } {
+                Some(so) => store.reset_sc_hsm(so),
+                None => Err(pico2hsm_core::error::HsmError::Storage(
+                    pico2hsm_core::error::StorageError::WriteError,
+                )),
+            }
+        }
         FlashOp::BindingWrite {
             erase,
             offset,
@@ -1430,6 +1559,9 @@ fn flash_op_code(op: &FlashOp) -> u32 {
         FlashOp::PutAnchor(_) => 10,
         FlashOp::FormatStore(_) => 11,
         FlashOp::BindingWrite { erase, .. } => 12 + u32::from(*erase),
+        FlashOp::SetSoPin(_) => 17,
+        FlashOp::ResetScHsm(_) => 18,
+        FlashOp::AcceptStore(..) => 19,
         #[cfg(feature = "rsa")]
         FlashOp::PoolPut { .. } => 14,
         #[cfg(feature = "rsa")]
@@ -2659,6 +2791,16 @@ fn init_sd_keystore(
 
     let total_bytes = card.num_bytes().ok()?;
     defmt::info!("SD card: {} MiB", total_bytes / (1024 * 1024));
+
+    // Card identified — raise SPI clock from 400 kHz to 25 MHz.  At
+    // 400 kHz a re-index (ACCEPT STORE) outlasts the 30 s APDU limit.
+    spi1_bus_ref.lock(|bus| {
+        let mut fast_cfg = SpiConfig::default();
+        fast_cfg.frequency = pico2hsm_firmware::board::waveshare_rp2350_lcd::SDCARD_SPI_FREQ_HZ;
+        fast_cfg.phase = Phase::CaptureOnFirstTransition;
+        fast_cfg.polarity = Polarity::IdleLow;
+        bus.borrow_mut().set_config(&fast_cfg);
+    });
     let capacity_bytes = total_bytes.saturating_sub(4096);
     let sd_chip =
         pico2hsm_firmware::storage::sdcard::SdCardFlash::from_initialized(card, capacity_bytes);

@@ -239,8 +239,8 @@ Source: Waveshare MicroPython example `MicroPython/02-SD/boot.py`
 ### Keystore on the SD card (`waveshare_rp2350_lcd_sdcard`)
 
 In the SD-card build the card is the keystore.  `init_sd_keystore()` in
-`main.rs` sets up SPI1 at 400 kHz for card identification and leaves it
-there.  `SdCardFlash` (`firmware/src/storage/sdcard.rs`) uses the
+`main.rs` sets up SPI1 at 400 kHz for card identification, then raises it
+to 25 MHz (`SDCARD_SPI_FREQ_HZ`).  `SdCardFlash` (`firmware/src/storage/sdcard.rs`) uses the
 `embedded-sdmmc` block driver only: raw 512-byte block I/O, no FAT
 filesystem.  The PIN/PUK retry-counter log stays on internal flash.
 

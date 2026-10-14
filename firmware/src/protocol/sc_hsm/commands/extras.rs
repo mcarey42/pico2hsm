@@ -63,6 +63,19 @@ pub fn handle(
         // FORMAT STORE (STORAGE_V2 §8.3): the store decides whether the
         // SO-PIN is needed (it is, unless the store is not up, R9).
         0x4E => handle_format_store(state, store, cmd),
+        // STORE STATUS (§9.3): what recovery needs to know, no PIN.
+        0x52 => handle_store_status(store),
+        // OPEN DEGRADED (§9.3) and ACCEPT STORE (§16 OD-1): SO-PIN.
+        0x4F | 0x53 => {
+            if !state.so_pin_verified {
+                return ApduResponse::err(SW_SECURITY_STATUS);
+            }
+            if cmd.p1 == 0x4F {
+                handle_open_degraded(state, store, cmd)
+            } else {
+                handle_accept_store(state, store, cmd)
+            }
+        }
 
         // RSA key pool settings: a device policy, SO-PIN only.
         0x51 => {
@@ -2835,6 +2848,138 @@ fn handle_format_store(
         Err(pico2hsm_core::error::HsmError::Storage(
             pico2hsm_core::error::StorageError::IntegrityFailure,
         )) => ApduResponse::err(SW_SECURITY_STATUS),
+        Err(_) => ApduResponse::err(pico2hsm_core::apdu::SW_MEMORY_FAILURE),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// P1=0x52  STORE STATUS,  P1=0x4F  OPEN DEGRADED
+// ---------------------------------------------------------------------------
+
+/// Confirmation value OPEN DEGRADED must carry.
+pub const OPEN_DEGRADED_CONFIRM: &[u8] = b"OPEN-DEGRADED";
+
+/// The store's state for recovery (STORAGE_V2 §9.3):
+/// `state u8 | reason u8 | lost u64 | degraded opens u32 | re-anchors u32
+/// | head u64` (big-endian).  `state`: 0 up, 1 read-only (OPEN DEGRADED), 2 refused,
+/// 3 FORMAT STORE needed, 4 down.  `reason`: why a refused store was
+/// refused (1 blank, 2 another store, 3 no anchor, 4 behind the anchor,
+/// 5 damaged, 6 rotation pending, 7 I/O).  `lost`: the records the anchor
+/// counts that the store does not hold.
+fn handle_store_status(store: &mut dyn KeyStore) -> ApduResponse {
+    use crate::storage::retry_counter::ValueId;
+    let Some(r) = store.store_report() else {
+        return ApduResponse::err(pico2hsm_core::apdu::SW_INS_NOT_SUPPORTED);
+    };
+    let (opens, reanchors) = match store.retry_counters() {
+        Some(log) => (
+            log.value(ValueId::StoreDegradedOpens).ok().flatten(),
+            log.value(ValueId::StoreReanchors).ok().flatten(),
+        ),
+        None => (None, None),
+    };
+    let mut out = [0u8; 26];
+    out[0] = r.state as u8;
+    out[1] = r.reason;
+    out[2..10].copy_from_slice(&r.lost.to_be_bytes());
+    out[10..14].copy_from_slice(&(opens.unwrap_or(0) as u32).to_be_bytes());
+    out[14..18].copy_from_slice(&(reanchors.unwrap_or(0) as u32).to_be_bytes());
+    out[18..26].copy_from_slice(&r.head.to_be_bytes());
+    ApduResponse::ok(&out)
+}
+
+/// Bump a monotonic recovery count in the counter log, before the event
+/// it counts (fail closed: no record, no event).
+fn count_event(
+    store: &mut dyn KeyStore,
+    id: crate::storage::retry_counter::ValueId,
+) -> Result<(), ()> {
+    let log = store.retry_counters().ok_or(())?;
+    let n = log.value(id).map_err(|_| ())?.unwrap_or(0);
+    log.put_value(id, n.saturating_add(1)).map_err(|_| ())
+}
+
+/// Mount a refused store read-only, as far as it verifies (STORAGE_V2
+/// §9.3): keys work and can be exported, nothing can be changed, until
+/// ACCEPT STORE, FORMAT STORE or a reboot.  Every applet's state is
+/// reloaded after the response.
+fn handle_open_degraded(
+    state: &mut ScHsmState,
+    store: &mut dyn KeyStore,
+    cmd: &ApduCommand<'_>,
+) -> ApduResponse {
+    use crate::storage::StoreState;
+    if cmd.data != OPEN_DEGRADED_CONFIRM {
+        return ApduResponse::err(SW_WRONG_DATA);
+    }
+    if store.store_report().map(|r| r.state) != Some(StoreState::Refused) {
+        return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED);
+    }
+    if count_event(
+        store,
+        crate::storage::retry_counter::ValueId::StoreDegradedOpens,
+    )
+    .is_err()
+    {
+        return ApduResponse::err(pico2hsm_core::apdu::SW_MEMORY_FAILURE);
+    }
+    match store.open_degraded(state.so_pin_verified) {
+        Ok(()) => ApduResponse::ok(&[]),
+        // Nothing verifiable to mount.
+        Err(_) => ApduResponse::err(pico2hsm_core::apdu::SW_MEMORY_FAILURE),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// P1=0x53  ACCEPT STORE
+// ---------------------------------------------------------------------------
+
+/// Confirmation value ACCEPT STORE must carry, followed by the lost-record
+/// count (u64 big-endian) STORE STATUS reported.
+pub const ACCEPT_STORE_CONFIRM: &[u8] = b"ACCEPT-STORE-V2";
+
+/// Make the state OPEN DEGRADED mounted the store's new read-write state
+/// (STORAGE_V2 §16 OD-1, R2), giving up the records it lacks: deleted
+/// keys or older object versions may come back.  Only after OPEN
+/// DEGRADED of a store behind its anchor or damaged; the host repeats the
+/// lost-record count it was shown.  Counted, with the old and accepted
+/// heads, in the counter log first.  Every applet reloads after the
+/// response.
+fn handle_accept_store(
+    state: &mut ScHsmState,
+    store: &mut dyn KeyStore,
+    cmd: &ApduCommand<'_>,
+) -> ApduResponse {
+    use crate::storage::retry_counter::ValueId;
+    use crate::storage::StoreState;
+    let n = ACCEPT_STORE_CONFIRM.len();
+    if cmd.data.len() != n + 8 || &cmd.data[..n] != ACCEPT_STORE_CONFIRM {
+        return ApduResponse::err(SW_WRONG_DATA);
+    }
+    let lost = u64::from_be_bytes(cmd.data[n..].try_into().unwrap_or([0xFF; 8]));
+    let Some(r) = store.store_report() else {
+        return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED);
+    };
+    // Reasons 4 (behind the anchor) and 5 (damaged) only.
+    if r.state != StoreState::Degraded || !matches!(r.reason, 4 | 5) {
+        return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED);
+    }
+    if lost != r.lost {
+        return ApduResponse::err(SW_WRONG_DATA);
+    }
+    let anchored = r.head.saturating_add(r.lost);
+    if count_event(store, ValueId::StoreReanchors).is_err() {
+        return ApduResponse::err(pico2hsm_core::apdu::SW_MEMORY_FAILURE);
+    }
+    let last = (anchored & 0xFFFF_FFFF) << 32 | (r.head & 0xFFFF_FFFF);
+    let recorded = store
+        .retry_counters()
+        .is_some_and(|log| log.put_value(ValueId::StoreLastReanchor, last).is_ok());
+    if !recorded {
+        return ApduResponse::err(pico2hsm_core::apdu::SW_MEMORY_FAILURE);
+    }
+    match store.accept_store(state.so_pin_verified, lost) {
+        Ok(()) => ApduResponse::ok(&[]),
         Err(_) => ApduResponse::err(pico2hsm_core::apdu::SW_MEMORY_FAILURE),
     }
 }

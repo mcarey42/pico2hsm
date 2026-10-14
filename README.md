@@ -80,6 +80,11 @@ What happens on the first boot of 2.0 on a 1.x device:
   it needs no PIN.  Afterwards initialise the applets as on a new device.
 - A device that was never used (blank keystore) formats itself.
 
+If a 2.0 device later refuses its keystore (a swapped or damaged SD card,
+lost writes, OTP provisioning), see
+[docs/KEYSTORE_RECOVERY.md](docs/KEYSTORE_RECOVERY.md): STORE STATUS,
+OPEN DEGRADED, ACCEPT STORE and FORMAT STORE, and what each one costs.
+
 The default feature flag is `rp2350_one_4m` for historical reasons; the primary debug/test target is `pico2_4m` (Raspberry Pi Pico 2 stock board) as documented in `CLAUDE.md`. See `docs/BUILD_CONFIGURATIONS.md` for all flag combinations.
 
 ## Build Requirements
