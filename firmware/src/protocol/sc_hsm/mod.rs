@@ -1082,6 +1082,11 @@ impl ScHsm {
                     decrypt::handle(&mut self.state, store, cmd)
                 }
             }
+            // Debug hooks that need the store (`debug` builds only).
+            #[cfg(feature = "debug")]
+            debug_dump::INS_DEBUG_DUMP if Self::validate_cla(cmd).is_ok() => {
+                debug_dump::handle(cmd, store)
+            }
             // All other commands fall through to the stateless dispatch.
             _ => self.dispatch(cmd),
         }
@@ -1171,7 +1176,7 @@ impl ScHsm {
                 provisioning::handle_write_crit1(&mut self.state, cmd)
             }
             #[cfg(feature = "debug")]
-            debug_dump::INS_DEBUG_DUMP => debug_dump::handle(cmd),
+            debug_dump::INS_DEBUG_DUMP => debug_dump::handle(cmd, &mut LocalNullStore),
             _ => ApduResponse::err(SW_INS_NOT_SUPPORTED),
         }
     }

@@ -555,11 +555,13 @@ Formats the HSM: wipes SC-HSM-owned keys from flash, clears in-memory state, set
 | `0x92` | No | 1 byte | DKEK share count (0 = no DKEK) |
 | `0x93` | No | 8–16 bytes | PUK |
 
-**Re-initialization:** When `state.initialized == true`, the init code in tag `0x82` is compared (SHA-256 hash) against the stored SO-PIN hash. Mismatch returns `SW = 0x6982`.
+**SO-PIN check:** whenever an SO-PIN is set — re-initialization, or a store emptied by FORMAT STORE, which carries the SO-PIN forward — the init code in tag `0x82` is compared (PBKDF2) against it, and each comparison spends an SO-PIN retry first. Mismatch returns `SW = 0x6982`. A device that never had an SO-PIN initializes with any init code.
+
+**Where the SO-PIN lives (2.0):** in the Storage V2 binding block on internal flash, not in the SC-HSM PIN record, so it still verifies while the keystore is refused (see §3.29, "Storage V2 store commands"). INITIALIZE writes the new SO-PIN in the same binding write as SC-HSM's new key epoch.
 
 **Effects:**
 - Clears all in-memory keys (EC, RSA, symmetric, EF files)
-- Wipes SC-HSM-owned keys from flash (`store.wipe_by_owner(AppletId::ScHsm)`)
+- Wipes SC-HSM-owned keys and domain records from flash, and sets the new SO-PIN with them
 - Pre-populates a sentinel entry at key slot 0 (reserved for device auth key)
 - Resets all auth state, MSE state, and challenge
 
@@ -1242,6 +1244,10 @@ RESPONSE (`61xx`); no response exceeds 4084 bytes.
 | `0x4A` | IMPORT_REVOCATION | none | `revocation(121) [‖ certificate(187)]` | `01` added / `00` marked revoked |
 | `0x50` | RSA_POOL_STATUS | none | — | 43 bytes, see "RSA key pool" |
 | `0x51` | RSA_POOL_CONFIG | SO-PIN | 8 bytes, see "RSA key pool" | the new status |
+| `0x4E` | FORMAT_STORE | SO-PIN (see below) | `FORMAT-STORE-V2` | — |
+| `0x4F` | OPEN_DEGRADED | SO-PIN | `OPEN-DEGRADED` | — |
+| `0x52` | STORE_STATUS | none | — | 26 bytes, see "Storage V2 store commands" |
+| `0x53` | ACCEPT_STORE | SO-PIN | `ACCEPT-STORE-V2` ‖ lost(8 BE) | — |
 
 **Lamport counter (`0x34`, `0x3C`, `0x3A`).** Persisted on internal flash
 (retry-counter log, record kind `'L'`) and never decreasing; it replaces
@@ -1314,6 +1320,60 @@ version(1) = 1 | status(1) 0 active / 1 revoked | revoked_lamport(8 BE)
     | sig(64) = ECDSA-P256(d_domain, r‖s) over
                 SHA-256("pico2hsm-member-cert-v1" ‖ the 123 bytes before it)
 ```
+
+#### Storage V2 store commands (`0x4E`, `0x4F`, `0x52`, `0x53`, pico2hsm vendor)
+
+`docs/STORAGE_V2.md` §8.3, §9.3 and §16 describe the design;
+`docs/KEYSTORE_RECOVERY.md` is the operator's runbook.  CLA `0x80`, SC-HSM
+selected.  The SO-PIN (VERIFY P2 = `0x88`) lives in the binding block, so it
+verifies while the store is refused.  After a successful FORMAT STORE, OPEN
+DEGRADED or ACCEPT STORE every applet's state is reloaded from the store,
+which ends the session's authentication: SELECT and VERIFY again.
+
+**STORE_STATUS (`0x52`)** — no PIN, no data.  Response (big-endian):
+
+```
+state(1) | reason(1) | lost(8) | degraded_opens(4) | reanchors(4) | head(8)
+```
+
+| `state` | Meaning |
+|---|---|
+| `0` | up (read-write) |
+| `1` | read-only: OPEN DEGRADED mounted it |
+| `2` | refused; the binding is valid: OPEN DEGRADED, ACCEPT STORE or FORMAT STORE |
+| `3` | no 2.0 store or no verifiable binding: FORMAT STORE only |
+| `4` | down (no storage key) |
+
+`reason` (states 1 and 2): `1` blank, `2` another store's journal, `3` no
+anchor, `4` behind the anchor, `5` damaged, `6` key rotation pending, `7`
+read error.  `lost`: journal records the anchor counts that the store does
+not hold (reason 4 before OPEN DEGRADED; exact once mounted read-only).
+`degraded_opens`, `reanchors`: lifetime counts from the counter log.
+`head`: the mounted state's newest journal record.
+
+**FORMAT_STORE (`0x4E`)** — data `FORMAT-STORE-V2`.  Replaces the store
+with a new, empty one: every key of every applet is gone.  Needs the
+SO-PIN, except when there is no valid binding (state 3) or the store is
+refused and no SO-PIN is set.  Carries the SO-PIN forward, so the next
+INITIALIZE needs it.  SW `6982` without the needed SO-PIN, `6A80` wrong
+data, `6581` write failure.
+
+**OPEN_DEGRADED (`0x4F`)** — SO-PIN, data `OPEN-DEGRADED`.  Mounts a refused
+store (state 2) read-only, as far as it verifies: keys work and can be
+exported, every change fails with `6581`, until ACCEPT STORE, FORMAT STORE
+or a reboot.  The open is counted in the counter log first.  SW `6985` if
+the store is not refused, `6982` without the SO-PIN, `6581` if nothing
+verifiable is left.
+
+**ACCEPT_STORE (`0x53`)** — SO-PIN, data `ACCEPT-STORE-V2` followed by the
+`lost` count STORE_STATUS reported (u64 BE).  Only after OPEN DEGRADED,
+and only for reason 4 (behind the anchor) or 5 (damaged).  Makes the
+read-only state the store's new read-write state, giving up the `lost`
+records: keys deleted or changed in them may come back in their earlier
+form.  A re-index under a new journal key, resumable after a power cut;
+counted, with the old and accepted heads, in the counter log first.  SW
+`6985` in any other state or reason, `6A80` for a different count, `6982`
+without the SO-PIN, `6581` write failure.
 
 #### RSA key pool (`0x50`, `0x51`, pico2hsm vendor, `rsa` firmware)
 
@@ -1426,6 +1486,13 @@ not listed that member yet (308 bytes: extended APDU).
 **Only compiled when the `debug` Cargo feature is enabled.** Never present in production builds.
 
 Dumps a region of RAM, flash, or OTP memory. Currently a stub returning `SW = 0x6A80`.
+
+Test hooks on the same INS (CLA `0x80`): P1 `0x10` wedges core1, `0x11`
+wedges core0 after replying, `0x12` resets through the watchdog (watchdog
+tests); `0x13` moves the keystore anchor P2 records ahead of the journal,
+so the next boot refuses the store as behind its anchor (recovery test,
+`tests/hw/test_21_store_recovery.py`); `0x20`/`0x21` RSA benchmark and
+self-test.
 
 **Command:**
 

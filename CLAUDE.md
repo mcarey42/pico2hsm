@@ -167,10 +167,13 @@ the keystore anchor, the OpenPGP signature counter).  Objects are
 `KeyObject` blobs sealed under `K_obj(store, group epoch, full key ID)`
 with the V2 object header as AAD.  SC-HSM INITIALIZE, PIV reset and
 OpenPGP TERMINATE wipe their *group* (one journal record, epoch rotated in
-the binding: core0 only).  A 1.x keystore is refused until FORMAT STORE
+the binding, whose writes run on core0).  A 1.x keystore is refused until FORMAT STORE
 (`80 54 4E`, data `FORMAT-STORE-V2`; PIN-less only without a valid
-binding).  The 1.x filesystem (`filesystem.rs`, `raid.rs`, `wal.rs`,
-`StorageManager`) is still compiled but unused until phase 5 removes it.
+binding, or refused with no SO-PIN set).  The SC-HSM SO-PIN lives in the
+binding block (`KeyStore::so_pin_home`), so it verifies on a refused
+store; STORE STATUS / OPEN DEGRADED / ACCEPT STORE (`80 54 52/4F/53`)
+recover one (docs/KEYSTORE_RECOVERY.md).  Locked-out SC-HSM credentials
+(`creds_locked`) persist only the SO-PIN.  The 1.x filesystem, RAID, WAL and `StorageManager` are gone (phase 5).
 
 **Still required before PIV/OpenPGP command handlers:**
 Per-applet PIN slots in flash.  SC-HSM already has a PIN slot; PIV needs its own;

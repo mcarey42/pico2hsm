@@ -614,6 +614,30 @@ impl pico2hsm_firmware::storage::retry_counter::RetryCounterBackend for Core1Key
             Err(_) => Err(pico2hsm_core::error::StorageError::WriteError),
         }
     }
+
+    fn anchor(
+        &mut self,
+    ) -> Result<
+        Option<pico2hsm_firmware::storage::retry_counter::Anchor>,
+        pico2hsm_core::error::StorageError,
+    > {
+        use pico2hsm_firmware::storage::KeyStore as _;
+        match self.direct().retry_counters() {
+            Some(log) => log.anchor(),
+            None => Err(pico2hsm_core::error::StorageError::NotFormatted),
+        }
+    }
+
+    fn put_anchor(
+        &mut self,
+        a: pico2hsm_firmware::storage::retry_counter::Anchor,
+    ) -> Result<(), pico2hsm_core::error::StorageError> {
+        match Self::on_core0(FlashOp::PutAnchor(a)) {
+            Ok(()) => Ok(()),
+            Err(pico2hsm_core::error::HsmError::Storage(e)) => Err(e),
+            Err(_) => Err(pico2hsm_core::error::StorageError::WriteError),
+        }
+    }
 }
 
 /// Build the Storage V2 key store over `chip` (boot, core0): attach the
