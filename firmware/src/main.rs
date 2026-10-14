@@ -2791,6 +2791,16 @@ fn init_sd_keystore(
 
     let total_bytes = card.num_bytes().ok()?;
     defmt::info!("SD card: {} MiB", total_bytes / (1024 * 1024));
+
+    // Card identified — raise SPI clock from 400 kHz to 25 MHz.  At
+    // 400 kHz a re-index (ACCEPT STORE) outlasts the 30 s APDU limit.
+    spi1_bus_ref.lock(|bus| {
+        let mut fast_cfg = SpiConfig::default();
+        fast_cfg.frequency = pico2hsm_firmware::board::waveshare_rp2350_lcd::SDCARD_SPI_FREQ_HZ;
+        fast_cfg.phase = Phase::CaptureOnFirstTransition;
+        fast_cfg.polarity = Polarity::IdleLow;
+        bus.borrow_mut().set_config(&fast_cfg);
+    });
     let capacity_bytes = total_bytes.saturating_sub(4096);
     let sd_chip =
         pico2hsm_firmware::storage::sdcard::SdCardFlash::from_initialized(card, capacity_bytes);
