@@ -46,10 +46,16 @@ pub const IMAGE_MAJOR: u16 = parse_u16(env!("PICO2HSM_IMAGE_MAJOR"));
 /// Minor version: `minor * 256 + patch`.
 pub const IMAGE_MINOR: u16 = parse_u16(env!("PICO2HSM_IMAGE_MINOR"));
 
-/// IMAGE_TYPE item: Secure ARM RP2350 EXE; on the A/B (16 MB) boards also
-/// try-before-you-buy, so a new image keeps its slot only once it has
-/// worked (`boot_slot::buy_if_pending`).
-const IMAGE_TYPE: u32 = if crate::storage::flash_layout::FLASH_16M {
+/// Whether this image is try-before-you-buy: release builds for the A/B
+/// (16 MB) boards, so a new image keeps its slot only once it has worked
+/// (`boot_slot::buy_if_pending`).  Debug builds only with PICO2HSM_TBYB:
+/// the bootrom tries a trial image only on an update boot (a UF2 drop,
+/// `picotool load -x`), never after a probe flash and reset.
+const TBYB: bool = crate::storage::flash_layout::FLASH_16M
+    && (!cfg!(debug_assertions) || option_env!("PICO2HSM_TBYB").is_some());
+
+/// IMAGE_TYPE item: Secure ARM RP2350 EXE, try-before-you-buy if [`TBYB`].
+const IMAGE_TYPE: u32 = if TBYB {
     item_image_type_exe(Security::Secure, Architecture::Arm) | ((IMAGE_TYPE_TBYB as u32) << 16)
 } else {
     item_image_type_exe(Security::Secure, Architecture::Arm)

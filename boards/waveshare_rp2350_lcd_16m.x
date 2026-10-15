@@ -15,7 +15,8 @@
  *   RETRY_COUNTERS 0x10808000 + 0x10000 (64KB)      counter log v2
  *   RSA_POOL 0x10818000 + 0xC000 (48KB)             RSA key pool
  *   LEGACY_COUNTERS 0x10824000 + 0x4000 (16KB)      blank placeholder
- *   KEYSTORE 0x10828000 + 0x7D8000 (~7.8 MB; QMI boards)
+ *   KEYSTORE 0x10828000 + 0x7D7000 (~7.8 MB; QMI boards; the last sector
+ *            stays outside every partition: erratum RP2350-E10)
  *   RAM      0x20000000 + 0x82000 (520KB)
  *
  * External flash: Winbond W25Q128JVSIQ (16MB) on QSPI.
@@ -36,7 +37,7 @@ MEMORY {
     RSA_POOL : ORIGIN = 0x10818000, LENGTH = 0xC000
     /* Version-1 counter log (migrated once); see flash_layout.rs */
     LEGACY_COUNTERS : ORIGIN = 0x10824000, LENGTH = 0x4000
-    KEYSTORE : ORIGIN = 0x10828000, LENGTH = 0x7D8000
+    KEYSTORE : ORIGIN = 0x10828000, LENGTH = 0x7D7000
     RAM      : ORIGIN = 0x20000000, LENGTH = 0x82000
 }
 

@@ -91,7 +91,7 @@ impl QmiFlash {
     ) -> Self {
         QmiFlash {
             flash,
-            capacity: (QMI_FLASH_SIZE as u64) - (QMI_KEYSTORE_OFFSET as u64),
+            capacity: (super::flash_layout::QMI_KEYSTORE_END as u64) - (QMI_KEYSTORE_OFFSET as u64),
             degraded: false,
             bad_sectors: Vec::new(),
         }

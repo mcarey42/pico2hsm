@@ -40,50 +40,55 @@
 /// Erase-sector size of the QMI flash.
 pub const SECTOR: u32 = 4096;
 
-/// One flash size's map.  Every store region is a fixed offset from
-/// `store_base`, so the two maps differ only in where the store starts,
-/// where the firmware must end, and the chip size.
+/// One flash size's map.  Every board boots through a bootrom partition
+/// table (FLASH_LAYOUT_2_0.md): the table in the first 8 KB, firmware
+/// slot A after it (and slot B on the 16 MB boards), then the store
+/// regions, each a fixed offset from `store_base`, as closed partitions.
+/// An image runs from its slot at 0x1000_0000 (bootrom address
+/// translation), so it links against the slot's size.
 #[derive(Clone, Copy)]
 pub struct Map {
-    /// Exclusive end of the firmware image (end of the linker FLASH region,
-    /// in the address space the image runs in).
-    pub firmware_end: u32,
+    /// Size of each firmware slot: the end of the linker FLASH region, in
+    /// the address space the image runs in.
+    pub slot_size: u32,
+    /// Physical start of slot B (0: no slot B).
+    pub slot_b: u32,
     /// First byte of the store regions (the binding ring).
     pub store_base: u32,
+    /// Exclusive end of the keystore partition.
+    pub keystore_end: u32,
     /// Flash size.
     pub flash_size: u32,
 }
 
-/// The 4 MB boards (Pico 2, RP2350-One): flat, no partition table.  The
-/// firmware runs from 0; the store regions follow it at 0x1D8000.
+/// The partition table's own space at the start of flash (every board).
+pub const PT_SIZE: u32 = 0x2000;
+/// Physical start of slot A (every board).
+pub const SLOT_A: u32 = PT_SIZE;
+
+/// The 4 MB boards (Pico 2, RP2350-One): one slot of 1.83 MB, the store
+/// regions where the flat 1.x/2.0 interim layout had them (0x1D8000).
+/// No slot B: the room goes to the firmware (post-quantum algorithms).
 pub const MAP_4M: Map = Map {
-    firmware_end: 0x001D_8000,
+    slot_size: 0x001D_8000 - SLOT_A,
+    slot_b: 0,
     store_base: 0x001D_8000,
+    keystore_end: 0x0040_0000,
     flash_size: 0x0040_0000,
 };
 
 /// The 16 MB boards (Geek, Waveshare LCD, RP2350-One with a 16 MB chip;
-/// QMI and SD variants): a
-/// partition table with A/B firmware slots of 4 MB each
-/// (FLASH_LAYOUT_2_0.md), the store regions from 8 MB.  An image runs
-/// from either slot at 0x1000_0000 (bootrom address translation), so it
-/// links against the slot's size; flashed flat (no partition table), it
-/// runs from 0 and stays below the store all the same.
+/// QMI and SD variants): A/B slots of 4 MB less the table, the store
+/// regions from 8 MB.  The keystore stops one sector short of the end:
+/// picotool keeps the last sector out of every partition (erratum
+/// RP2350-E10's absolute block).
 pub const MAP_16M: Map = Map {
-    firmware_end: SLOT_SIZE_16M,
+    slot_size: 0x0040_0000 - SLOT_A,
+    slot_b: 0x0040_0000,
     store_base: 0x0080_0000,
+    keystore_end: 0x0100_0000 - SECTOR,
     flash_size: 0x0100_0000,
 };
-
-/// The partition table's own space at the start of flash (16 MB boards).
-pub const PT_SIZE_16M: u32 = 0x2000;
-/// Each firmware slot on the 16 MB boards: slot A at `PT_SIZE_16M`, slot B
-/// at 4 MB, the same size.
-pub const SLOT_SIZE_16M: u32 = 0x0040_0000 - PT_SIZE_16M;
-/// Physical start of slot A (16 MB boards).
-pub const SLOT_A_16M: u32 = PT_SIZE_16M;
-/// Physical start of slot B (16 MB boards).
-pub const SLOT_B_16M: u32 = 0x0040_0000;
 
 /// Whether this build is for a 16 MB board.
 pub const FLASH_16M: bool = cfg!(any(
@@ -98,7 +103,7 @@ pub const FLASH_16M: bool = cfg!(any(
 pub const MAP: Map = if FLASH_16M { MAP_16M } else { MAP_4M };
 
 /// Exclusive end of the firmware image (end of the linker FLASH region).
-pub const FIRMWARE_END: u32 = MAP.firmware_end;
+pub const FIRMWARE_END: u32 = MAP.slot_size;
 
 /// First byte of the Storage V2 binding block ring (STORAGE_V2 §8.1).
 pub const BINDING_OFFSET: u32 = MAP.store_base;
@@ -144,6 +149,9 @@ pub const LEGACY_COUNTER_SIZE: u32 = LEGACY_COUNTER_SECTORS * SECTOR;
 /// Start of the keystore partition on the QMI boards.
 pub const QMI_KEYSTORE_OFFSET: u32 = MAP.store_base + 0x2_8000;
 
+/// Exclusive end of the keystore partition on the QMI boards.
+pub const QMI_KEYSTORE_END: u32 = MAP.keystore_end;
+
 /// Flash size of this build's board.
 pub const QMI_FLASH_SIZE: u32 = MAP.flash_size;
 
@@ -166,18 +174,25 @@ const _: () = {
     assert!(RSA_POOL_OFFSET + RSA_POOL_SIZE <= LEGACY_COUNTER_OFFSET);
     assert!(LEGACY_COUNTER_OFFSET + LEGACY_COUNTER_SIZE <= QMI_KEYSTORE_OFFSET);
     assert!(QMI_KEYSTORE_OFFSET < QMI_FLASH_SIZE);
-    // The 4 MB map is the one boards already use.
+    // The 4 MB store regions stay where boards already have them.
     assert!(MAP_4M.store_base == 0x001D_8000 && MAP_4M.store_base + 0x2_8000 == 0x0020_0000);
-    // 16 MB: both slots end below the store; slots are sector aligned.
-    assert!(SLOT_A_16M + SLOT_SIZE_16M <= SLOT_B_16M);
-    assert!(SLOT_B_16M + SLOT_SIZE_16M <= MAP_16M.store_base);
-    assert!(SLOT_A_16M % SECTOR == 0 && SLOT_B_16M % SECTOR == 0);
-    assert!(MAP_16M.firmware_end <= MAP_16M.store_base);
+    // Slots: sector aligned, below the store, B after A.
+    assert!(SLOT_A % SECTOR == 0 && PT_SIZE % SECTOR == 0);
+    assert!(SLOT_A + MAP_4M.slot_size <= MAP_4M.store_base);
+    assert!(SLOT_A + MAP_16M.slot_size <= MAP_16M.slot_b);
+    assert!(MAP_16M.slot_b % SECTOR == 0);
+    assert!(MAP_16M.slot_b + MAP_16M.slot_size <= MAP_16M.store_base);
+    assert!(QMI_KEYSTORE_END <= QMI_FLASH_SIZE);
 };
 
 #[cfg(test)]
 mod tests {
+    extern crate std;
     use super::*;
+    use std::format;
+    use std::string::{String, ToString};
+    use std::vec;
+    use std::vec::Vec;
 
     /// `(origin, length)` of a MEMORY region in a linker script.
     fn region(script: &str, name: &str) -> Option<(u32, u32)> {
@@ -236,7 +251,7 @@ mod tests {
         for (name, script, map) in boards {
             let at = |region_name: &str| region(script, region_name).expect(name);
             let (fo, fl) = at("FLASH");
-            assert_eq!(fo + fl, XIP_BASE + map.firmware_end, "{name}: FLASH end");
+            assert_eq!(fo + fl, XIP_BASE + map.slot_size, "{name}: FLASH end");
             // Every reserved region where the constants say, in order.
             let base = map.store_base;
             let regions = [
@@ -256,7 +271,82 @@ mod tests {
             let (ko, kl) = at("KEYSTORE");
             assert_eq!(ko, XIP_BASE + base + 0x2_8000, "{name}: KEYSTORE origin");
             assert!(end <= ko, "{name}: reserved regions overlap the keystore");
-            assert_eq!(ko + kl, XIP_BASE + map.flash_size, "{name}: KEYSTORE end");
+            assert_eq!(ko + kl, XIP_BASE + map.keystore_end, "{name}: KEYSTORE end");
+        }
+    }
+
+    /// `(name, start, size, bootloader permissions)` of every partition in
+    /// a picotool partition-table JSON (`"start"`/`"size"` in KB).
+    fn partitions(json: &str) -> Vec<(String, u32, u32, String)> {
+        let field = |obj: &str, key: &str| -> Option<String> {
+            let at = obj.find(&format!("\"{key}\""))? + key.len() + 2;
+            let rest = obj[at..].trim_start().strip_prefix(':')?.trim_start();
+            let rest = rest.strip_prefix('"')?;
+            Some(rest[..rest.find('"')?].to_string())
+        };
+        let kb = |v: String| v.trim_end_matches(['K', 'k']).parse::<u32>().unwrap() * 1024;
+        let list = &json[json.find("\"partitions\"").unwrap()..];
+        list.split("\"name\"")
+            .skip(1)
+            .map(|obj| {
+                let obj = format!("\"name\"{obj}");
+                let perms = &obj[obj.find("\"permissions\"").unwrap()..];
+                (
+                    field(&obj, "name").unwrap(),
+                    kb(field(&obj, "start").unwrap()),
+                    kb(field(&obj, "size").unwrap()),
+                    field(perms, "bootloader").unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn partition_tables_match_the_maps() {
+        let tables: [(&str, &str, Map); 2] = [
+            ("pt_4m", include_str!("../../../boards/pt_4m.json"), MAP_4M),
+            (
+                "pt_16m",
+                include_str!("../../../boards/pt_16m.json"),
+                MAP_16M,
+            ),
+        ];
+        for (name, json, map) in tables {
+            let parts = partitions(json);
+            let get = |p: &str| {
+                parts
+                    .iter()
+                    .find(|e| e.0 == p)
+                    .unwrap_or_else(|| panic!("{name}: no {p}"))
+                    .clone()
+            };
+            let mut slots = vec![("fw-a", SLOT_A)];
+            if map.slot_b != 0 {
+                slots.push(("fw-b", map.slot_b));
+            } else {
+                assert!(
+                    parts.iter().all(|e| e.0 != "fw-b"),
+                    "{name}: unexpected fw-b"
+                );
+            }
+            for (slot, start) in slots {
+                let (_, s, l, _) = get(slot);
+                assert_eq!((s, l), (start, map.slot_size), "{name}: {slot}");
+            }
+            let b = map.store_base;
+            let store = [
+                ("binding", b, BINDING_SIZE),
+                ("counters", b + 0x8000, RETRY_COUNTER_SIZE),
+                ("rsa-pool", b + 0x1_8000, RSA_POOL_SIZE),
+                ("spare", b + 0x2_4000, LEGACY_COUNTER_SIZE),
+                ("keystore", b + 0x2_8000, map.keystore_end - (b + 0x2_8000)),
+            ];
+            for (p, start, size) in store {
+                let (_, s, l, bl) = get(p);
+                assert_eq!((s, l), (start, size), "{name}: {p}");
+                // Closed to BOOTSEL (picotool, UF2 writes).
+                assert_eq!(bl, "", "{name}: {p} open to the bootloader");
+            }
         }
     }
 }

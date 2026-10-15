@@ -3,8 +3,12 @@
  * Flash layout:
  *   BOOT2    0x10000000 + 0x100 (256 bytes)
  *            RP2350 IMAGE_DEF (.start_block) goes here.
- *   FLASH    0x10000100 + 0x1D7F00 (2MB - 160KB - 256 bytes)
- *            ARM vector table + firmware code.
+ *   FLASH    0x10000100 + 0x1D5F00 (one firmware slot: 1.83 MB - 256 bytes)
+ *            ARM vector table + firmware code.  The image runs from slot A
+ *            (physical 0x002000, after the 8 KB partition table) through
+ *            the bootrom's address translation; see boards/pt_4m.json,
+ *            docs/FLASH_LAYOUT_2_0.md and firmware/src/storage/flash_layout.rs.
+ *   Store regions (physical; closed partitions, not part of the image):
  *   BINDING  0x101D8000 + 0x8000 (32KB, 8 sectors)
  *            Storage V2 binding block ring (STORAGE_V2 §8.1).
  *   RETRY_COUNTERS 0x101E0000 + 0x10000 (64KB, 16 sectors)
@@ -22,7 +26,7 @@
 
 MEMORY {
     BOOT2    : ORIGIN = 0x10000000, LENGTH = 0x100
-    FLASH    : ORIGIN = 0x10000100, LENGTH = 0x1D7F00
+    FLASH    : ORIGIN = 0x10000100, LENGTH = 0x1D5F00
     /* Storage V2 binding block ring; see firmware/src/storage/flash_layout.rs */
     BINDING  : ORIGIN = 0x101D8000, LENGTH = 0x8000
     /* Counter log v2; see firmware/src/storage/flash_layout.rs */
