@@ -109,12 +109,23 @@ pub fn check_layout(words: &[u32]) -> Layout {
     for (name, start, size) in regions {
         let first = start / fl::SECTOR;
         let last = (start + size) / fl::SECTOR - 1;
-        let found = parts
-            .iter()
-            .find(|&&w| w & 0x1FFF == first && (w >> 13) & 0x1FFF == last);
-        match found {
-            Some(&w) if w >> 26 == PERMS_SECURE_ONLY => {}
-            _ => return Layout::Mismatch(name),
+        // Exactly one partition may touch the region: its own, closed one.
+        // Another partition over the same sectors (an open one laid over
+        // the keystore, say) would let the bootloader in through it.
+        let mut own = 0;
+        for &w in &parts {
+            let (f, l) = (w & 0x1FFF, (w >> 13) & 0x1FFF);
+            if f > last || l < first {
+                continue;
+            }
+            if f == first && l == last && w >> 26 == PERMS_SECURE_ONLY {
+                own += 1;
+            } else {
+                return Layout::Mismatch(name);
+            }
+        }
+        if own != 1 {
+            return Layout::Mismatch(name);
         }
     }
     Layout::Matches
@@ -227,6 +238,23 @@ mod tests {
         let mut w = LCD_16M;
         w[8] += 1; // binding moved a sector
         assert_eq!(check_layout(&w), Layout::Mismatch("binding"));
+    }
+
+    #[test]
+    fn another_partition_over_a_store_region_is_a_mismatch() {
+        if !crate::storage::flash_layout::FLASH_16M {
+            return;
+        }
+        // An open partition 0x829000..0xFFF000 added after the closed ones.
+        let mut w: heapless::Vec<u32, 24> = heapless::Vec::from_slice(&LCD_16M).unwrap();
+        w[1] = 0x108;
+        w.extend_from_slice(&[0xfdff_c829, 0x0c01_1601]).unwrap();
+        assert_eq!(check_layout(&w), Layout::Mismatch("keystore"));
+        // One spanning the counter log and the RSA pool.
+        let mut w: heapless::Vec<u32, 24> = heapless::Vec::from_slice(&LCD_16M).unwrap();
+        w[1] = 0x108;
+        w.extend_from_slice(&[0xfd04_8809, 0x0c01_1601]).unwrap();
+        assert_eq!(check_layout(&w), Layout::Mismatch("counters"));
     }
 
     #[test]
