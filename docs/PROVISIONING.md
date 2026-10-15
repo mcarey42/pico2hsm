@@ -4,7 +4,14 @@ Complete step-by-step guide for provisioning a pico2hsm device from bare
 hardware to a production-locked state using **picotool** and standard CLI
 tools. No custom provisioning hardware is required.
 
-Last updated: 2026-04-16 (v1.0.0-rc4)
+Last updated: 2026-04-16 (v1.0.0-rc4); key and OTP-file steps corrected 2026-10-15.
+
+> **Read this with the OTP map.** The staged provisioning order, every OTP
+> row we write with its exact value and risk, and the failure modes are in
+> the pico2hsm OTP map (research on 2026-10-15, to be folded into this guide).
+> Phases 5–8 below are being rewritten to that order: until then, follow it
+> stage by stage, one approved OTP write at a time, and **never load the OTP
+> file `picotool seal` writes** — it enables secure boot.
 
 ---
 
@@ -82,37 +89,48 @@ should be generated on an air-gapped machine and never leave it.
 
 ### Option A: Use the included script
 
+Two keys, one per OTP boot-key slot: slot 0 signs every build, slot 1 is
+an offline backup that lets you revoke slot 0 later without stranding
+devices.
+
 ```bash
-./generate_firmware_signing_keys.sh
+./generate_firmware_signing_keys.sh 0   # BOOTKEY0: signs every build
+./generate_firmware_signing_keys.sh 1   # BOOTKEY1: offline backup
 ```
 
-This generates:
-- `ec_firmware_signing_key.pem` — secp256k1 private key (PKCS#8 PEM)
-- `ec_firmware_signing_key.pub` — corresponding public key
+Each run generates:
+- `ec_firmware_signing_key-bootkey<N>.pem` — secp256k1 private key (PKCS#8 PEM)
+- `ec_firmware_signing_key-bootkey<N>.pub` — corresponding public key
+
+Both names are gitignored (`ec_firmware_signing_key*.pem`, `*.pem`).
 
 ### Option B: Manual generation
 
 ```bash
-# Generate secp256k1 private key
+# Generate a secp256k1 private key (repeat with -bootkey1 for the backup)
 openssl genpkey -algorithm EC \
     -pkeyopt ec_paramgen_curve:secp256k1 \
-    -out ec_firmware_signing_key.pem
-chmod 600 ec_firmware_signing_key.pem
+    -out ec_firmware_signing_key-bootkey0.pem
+chmod 600 ec_firmware_signing_key-bootkey0.pem
 
 # Extract public key
-openssl pkey -in ec_firmware_signing_key.pem \
-    -pubout -out ec_firmware_signing_key.pub
+openssl pkey -in ec_firmware_signing_key-bootkey0.pem \
+    -pubout -out ec_firmware_signing_key-bootkey0.pub
 ```
 
 ### Record the fingerprint
 
+The bootrom stores SHA-256 of the raw public point X‖Y (the last 64 bytes
+of the DER public key), not of the whole DER structure:
+
 ```bash
-openssl pkey -pubin -in ec_firmware_signing_key.pub -outform DER 2>/dev/null \
-    | openssl dgst -sha256 -hex | sed 's/^.* //'
+openssl pkey -in ec_firmware_signing_key-bootkey0.pem -pubout -outform DER 2>/dev/null \
+    | tail -c 64 | sha256sum
 ```
 
-Store this fingerprint in your production records. It identifies the key
-that will be permanently bound to every device you provision.
+This is exactly the value `picotool seal` and `tools/otp-bootkeys.sh` put in
+BOOTKEY<N>. Store each key's fingerprint in your production records: it
+identifies the key permanently bound to every device you provision.
 
 ### Key security
 
@@ -157,19 +175,21 @@ mkdir -p dist
 picotool seal --hash --sign \
     target/thumbv8m.main-none-eabihf/release/pico2hsm -t elf \
     dist/pico2hsm-signed.elf -t elf \
-    ec_firmware_signing_key.pem \
-    dist/pico2hsm-otp.json
+    ec_firmware_signing_key-bootkey0.pem \
+    dist/pico2hsm-seal-otp-ENABLES-SECURE-BOOT.json
 ```
 
-This produces two files:
+`seal` needs a picotool built with mbedtls; set `PICOTOOL=` for the build
+scripts if the one on your PATH lacks it. This produces two files:
 
 | File | Purpose |
 |------|---------|
 | `dist/pico2hsm-signed.elf` | Firmware with embedded signature manifest |
-| `dist/pico2hsm-otp.json` | OTP values for secure boot (public key hash, boot flags) |
+| `dist/pico2hsm-seal-otp-ENABLES-SECURE-BOOT.json` | **Do not load.** Besides the boot-key hash and key-valid flag it sets `crit1.secure_boot_enable`. Use `tools/otp-bootkeys.sh` (Phase 5, Step 4) |
 
-The `build-all-debug.sh` script performs this automatically when
-`ec_firmware_signing_key.pem` is present in the repo root.
+`build-all.sh` and `build-all-debug.sh` do this automatically when
+`ec_firmware_signing_key-bootkey0.pem` is in the repo root
+(`SIGNING_KEY=` selects another key).
 
 ---
 
@@ -284,20 +304,19 @@ xxd -p -c 64 device-001-ikm.bin
 The IKM must be written to OTP rows 0x100–0x11F as ECC-protected words.
 This can be done via:
 
-**Option A: Provisioning APDU** (through the running firmware)
-
-The firmware's `Otp::write_storage_key_material()` function writes the IKM
-to OTP. This is called via a provisioning APDU sequence that requires
-SO-PIN authentication. The exact APDU depends on the provisioning command
-set.
-
-**Option B: picotool OTP write** (in BOOTSEL mode)
+There is no provisioning APDU for this today (`Otp::write_storage_key_material()`
+has no caller). Write it with picotool in BOOTSEL mode, as a raw binary of
+two bytes per ECC row:
 
 ```bash
-# Write IKM bytes to ECC rows 0x100–0x11F
-# picotool otp set requires the device to be in BOOTSEL mode
-picotool otp set 0x100 --ecc --input-file device-001-ikm.bin
+# Write the 64-byte IKM to ECC rows 0x100–0x11F
+picotool otp load --ser <serial> -e -s 0x100 device-001-ikm.bin
 ```
+
+Byte order: picotool stores each row low byte first, while the firmware
+reads each row high byte first. That is consistent on the device, but a
+host-side copy of the IKM (escrow) must swap each byte pair to recompute
+the storage key off-device.
 
 ### Step 3: Verify OTP was written correctly
 
@@ -310,15 +329,23 @@ Compare the output byte-by-byte with your IKM file. OTP fuses can
 
 ### Step 4: Program the boot signing key hash
 
-Load the OTP JSON produced by `picotool seal` in Phase 3:
+**Never load the seal OTP file from Phase 3: it also enables secure boot.**
+Build the boot-key files with `tools/otp-bootkeys.sh` (it writes nothing to
+a device, refuses non-secp256k1 keys, and prints the expected read-back
+rows), then load them as two separate, approved stages:
 
 ```bash
-picotool otp load dist/pico2hsm-otp.json
+tools/otp-bootkeys.sh            # both keys; --primary-only for one
+picotool otp load --ser <serial> dist/otp/stage1-bootkeys.json
+picotool otp get  --ser <serial> OTP_DATA_BOOTKEY0     # compare every row with the script's output
+picotool otp get  --ser <serial> OTP_DATA_BOOTKEY1
+# later, its own approved stage:
+picotool otp load --ser <serial> dist/otp/stage3-key-slots.json
 ```
 
 This burns:
-- **Boot key hash** (BOOTKEY0, rows 0x80–0x8F): SHA-256 of your secp256k1 public key
-- **Boot flags**: key-valid flag
+- **Boot key hashes** (BOOTKEY0 rows 0x80–0x8F, BOOTKEY1 rows 0x90–0x9F): SHA-256 of each secp256k1 public key (X‖Y)
+- **BOOT_FLAGS1** (all three copies): KEY_VALID for the provisioned slots, KEY_INVALID (permanent) for the others
 
 ---
 
@@ -535,7 +562,7 @@ PHASE 1 — KEY GENERATION (air-gapped machine, once)
 PHASE 2–3 — BUILD & SIGN (build machine)
   [ ] Build release firmware for target board
   [ ] Sign with picotool seal
-  [ ] Verify dist/pico2hsm-signed.elf and dist/pico2hsm-otp.json exist
+  [ ] Verify dist/pico2hsm-signed.elf exists, and dist/otp/stage1-bootkeys.json + stage3-key-slots.json from tools/otp-bootkeys.sh (never the seal OTP file)
 
 PHASE 4 — FLASH
   [ ] Flash signed firmware via BOOTSEL or SWD

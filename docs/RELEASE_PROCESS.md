@@ -26,7 +26,7 @@ scope for this workflow — see [SECURE_PROVISIONING_PLAN.md](SECURE_PROVISIONIN
   ```sh
   rustup target add thumbv8m.main-none-eabihf
   ```
-- Optional: `ec_firmware_signing_key.pem` in the repo root if you intend to
+- Optional: `ec_firmware_signing_key-bootkey0.pem` in the repo root if you intend to
   produce a signed build locally for final hardware verification. This key is
   **not** used by CI — CI ships unsigned artifacts.
 

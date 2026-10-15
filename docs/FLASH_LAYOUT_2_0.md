@@ -147,7 +147,7 @@ from BOOTSEL the table can be neither erased nor replaced.
 ## 6. Production
 
 - Install the `-prod` table, signed with the firmware signing key
-  (`ec_firmware_signing_key.pem`, secp256k1).  Secure boot needs that key's
+  (`ec_firmware_signing_key-bootkey0.pem`, secp256k1).  Secure boot needs that key's
   hash in an OTP boot-key slot and the secure-boot enable bit: the same
   OTP burn covers the firmware and the table.  Whether secure boot alone
   makes the bootrom require a signed table, or a further OTP flag does,

@@ -26,11 +26,11 @@ This script:
 - Builds with `DEFMT_LOG=trace` (required for defmt log output to survive optimisation)
 - Uses the debug profile so `#[cfg(debug_assertions)]` sentinels are active
 - Includes `applet-piv` and `applet-openpgp` features (required for PIV/OpenPGP integration tests)
-- **Signs the ELF with `picotool seal --hash --sign` if `ec_firmware_signing_key.pem` is present**
+- **Signs the ELF with `picotool seal --hash --sign` if `ec_firmware_signing_key-bootkey0.pem` is present**
   - Signed output → `dist/pico2hsm-<feat>-debug-signed.elf`
-  - OTP configuration → `dist/pico2hsm-<feat>-debug-otp.json`
+  - The OTP file `seal` writes → `dist/pico2hsm-<feat>-debug-seal-otp-ENABLES-SECURE-BOOT.json`. **Never load it**: it sets `crit1.secure_boot_enable`. Boot keys are provisioned from `tools/otp-bootkeys.sh` (two keys: `-bootkey0` signs builds, `-bootkey1` is the offline backup; `SIGNING_KEY=` overrides, `PICOTOOL=` points at a picotool built with `seal`)
   - If no key is present, flashes unsigned (warns but continues)
-  - **About `ec_firmware_signing_key.pem`**: each user of this project generates
+  - **About `ec_firmware_signing_key-bootkey0.pem`**: each user of this project generates
     and holds their own secp256k1 key. It is the root of trust for that user's
     HSM fleet — **not** a project-wide test key. The filename is gitignored;
     the `dist/` signed artifacts are gitignored; no key material is ever

@@ -114,15 +114,15 @@ both.
 ## Firmware signing
 
 **All firmware outputs should be signed before deployment.** The build scripts
-do this automatically if `ec_firmware_signing_key.pem` exists in the project
+do this automatically if `ec_firmware_signing_key-bootkey0.pem` exists in the project
 root. Generate the key pair once:
 
 ```sh
 ./generate_firmware_signing_keys.sh
 ```
 
-This creates `ec_firmware_signing_key.pem` (private — keep it safe) and
-`ec_firmware_signing_key.pub` (public — safe to share). Both are gitignored.
+This creates `ec_firmware_signing_key-bootkey0.pem` (private — keep it safe) and
+`ec_firmware_signing_key-bootkey0.pub` (public — safe to share). Both are gitignored.
 
 After generating the key, every `./build-all.sh` or `./build-all-debug.sh` run
 will produce signed outputs in `dist/`:

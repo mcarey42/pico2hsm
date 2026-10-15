@@ -8,9 +8,14 @@
 #   3. At boot, the RP2350 bootrom verifies the firmware image signature against the public key
 #      whose hash matches the OTP value. If verification fails, the device refuses to boot.
 #
-# This script generates:
-#   - ec_firmware_signing_key.pem  — EC P-256 private key (PKCS#8 PEM, unencrypted)
-#   - ec_firmware_signing_key.pub  — Corresponding public key (PEM)
+# Usage: ./generate_firmware_signing_keys.sh [0|1]   (default 0)
+#
+# Generates the key for one OTP boot-key slot:
+#   - ec_firmware_signing_key-bootkey<N>.pem — EC secp256k1 private key (PKCS#8 PEM, unencrypted)
+#   - ec_firmware_signing_key-bootkey<N>.pub — corresponding public key (PEM)
+# Slot 0 (BOOTKEY0) signs every build; slot 1 (BOOTKEY1) is the offline backup,
+# used only if key 0 is ever revoked.  tools/otp-bootkeys.sh turns both into the
+# OTP file that provisions them (docs/PROVISIONING.md).
 #
 # These keys are generated once per device family (or per device for higher security).
 # The private key is used by the build/release pipeline to sign firmware images.
@@ -18,8 +23,10 @@
 
 set -euo pipefail
 
-PRIVATE_KEY="ec_firmware_signing_key.pem"
-PUBLIC_KEY="ec_firmware_signing_key.pub"
+SLOT="${1:-0}"
+case "$SLOT" in 0|1) ;; *) echo "usage: $0 [0|1]  (OTP boot-key slot)" >&2; exit 1 ;; esac
+PRIVATE_KEY="ec_firmware_signing_key-bootkey${SLOT}.pem"
+PUBLIC_KEY="ec_firmware_signing_key-bootkey${SLOT}.pub"
 
 # --- Safety check: never overwrite existing keys ---
 if [[ -e "$PRIVATE_KEY" ]]; then
@@ -80,21 +87,13 @@ echo "==========================================================================
 echo
 
 # --- Next steps ---
-echo "Next steps for RP2350 secure boot:"
+FPR=$(openssl pkey -in "$PRIVATE_KEY" -pubout -outform DER 2>/dev/null | tail -c 64 | sha256sum | cut -d' ' -f1)
+echo "Public fingerprint (the OTP BOOTKEY${SLOT} hash): $FPR"
 echo ""
-echo "  1. Back up the private key to a secure offline location immediately."
-echo ""
-echo "  2. Extract the raw public key bytes and burn the SHA-256 hash into"
-echo "     RP2350 OTP. Using picotool:"
-echo ""
-echo "       picotool otp set-key $PUBLIC_KEY"
-echo ""
-echo "     Consult the RP2350 datasheet and picotool documentation for the"
-echo "     exact OTP row addresses and lock bits for your configuration."
-echo ""
-echo "  3. Sign firmware images before flashing. Using picotool:"
-echo ""
-echo "       picotool sign <firmware.elf> <signed-firmware.elf> $PRIVATE_KEY"
-echo ""
-echo "  4. Once OTP is programmed and secure boot is enabled, only firmware"
-echo "     signed with this private key will be accepted by the bootrom."
+echo "Next steps:"
+echo "  1. Back up the private key to a secure offline location now."
+echo "  2. Builds sign with ec_firmware_signing_key-bootkey0.pem automatically"
+echo "     (build-all.sh, build-all-debug.sh; picotool seal --hash --sign)."
+echo "  3. For secure boot, tools/otp-bootkeys.sh turns the slot-0 and slot-1 keys"
+echo "     into the OTP files that provision them.  Every OTP write is"
+echo "     irreversible: follow docs/PROVISIONING.md stage by stage."
