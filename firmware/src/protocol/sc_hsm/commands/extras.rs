@@ -2844,7 +2844,14 @@ fn handle_format_store(
         return ApduResponse::err(SW_WRONG_DATA);
     }
     match store.format_store(state.so_pin_verified) {
-        Ok(()) => ApduResponse::ok(&[]),
+        Ok(()) => {
+            // The RSA pool loaded its config and clock from the counter log
+            // at its first use this boot; a log that was blank then (a new
+            // layout, a 1.x board) left it disabled.  Reload on next use.
+            #[cfg(feature = "rsa")]
+            crate::rsa_pool::with_engine(|e| e.reboot());
+            ApduResponse::ok(&[])
+        }
         Err(pico2hsm_core::error::HsmError::Storage(
             pico2hsm_core::error::StorageError::IntegrityFailure,
         )) => ApduResponse::err(SW_SECURITY_STATUS),
