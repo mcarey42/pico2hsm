@@ -124,6 +124,20 @@ jobs:
           cp "$ELF_SRC" "$ELF_DST"
           picotool uf2 convert "$ELF_DST" "$UF2_DST" --family rp2350-arm-s
           ( cd release-assets && sha256sum "${BASE}.uf2" > "${BASE}.uf2.sha256" )
+          # The board's partition tables (docs/FLASH_LAYOUT_2_0.md): install
+          # once, then the firmware.  -dev keeps the table replaceable from
+          # BOOTSEL; -prod (to be signed at provisioning) does not.
+          case "$BOARD" in
+            pico2_4m|rp2350_one_4m) SIZE=4m ;;
+            *)                      SIZE=16m ;;
+          esac
+          for KIND in dev prod; do
+            JSON="boards/pt_${SIZE}.json"
+            [ "$KIND" = prod ] && JSON="boards/pt_${SIZE}_prod.json"
+            PT="pico2hsm-${BOARD}-pt-${KIND}.uf2"
+            picotool partition create "$JSON" "release-assets/${PT}"
+            ( cd release-assets && sha256sum "${PT}" > "${PT}.sha256" )
+          done
           ls -la release-assets
 
       - name: Upload per-board artifacts

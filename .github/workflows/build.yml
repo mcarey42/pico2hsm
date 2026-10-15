@@ -295,11 +295,27 @@ jobs:
           picotool uf2 convert "$ELF_NAMED" "$UF2" --family rp2350-arm-s
           echo "Built: $UF2 ($(stat -c%s "$UF2") bytes)"
 
+      # Every board boots through a partition table (docs/FLASH_LAYOUT_2_0.md):
+      # install the table UF2 once, then the firmware UF2 (it lands in a slot).
+      # `-dev` leaves the table's own sector open to BOOTSEL; `-prod` closes it.
+      - name: Partition table UF2s
+        run: |
+          case "${{ matrix.board }}" in
+            pico2_4m|rp2350_one_4m) SIZE=4m ;;
+            *)                      SIZE=16m ;;
+          esac
+          picotool partition create boards/pt_${SIZE}.json pico2hsm-${{ matrix.board }}-pt-dev.uf2
+          picotool partition create boards/pt_${SIZE}_prod.json pico2hsm-${{ matrix.board }}-pt-prod.uf2
+          ls -l pico2hsm-${{ matrix.board }}-pt-*.uf2
+
       - name: Upload UF2 artifact
         uses: actions/upload-artifact@v4
         with:
           name: pico2hsm-${{ matrix.board }}-unsigned
-          path: pico2hsm-${{ matrix.board }}-unsigned.uf2
+          path: |
+            pico2hsm-${{ matrix.board }}-unsigned.uf2
+            pico2hsm-${{ matrix.board }}-pt-dev.uf2
+            pico2hsm-${{ matrix.board }}-pt-prod.uf2
           retention-days: 30
 
       # Upload as release asset when a version tag is pushed
@@ -307,7 +323,10 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: pico2hsm-${{ matrix.board }}-unsigned.uf2
+          files: |
+            pico2hsm-${{ matrix.board }}-unsigned.uf2
+            pico2hsm-${{ matrix.board }}-pt-dev.uf2
+            pico2hsm-${{ matrix.board }}-pt-prod.uf2
           body: |
             **These UF2 files are UNSIGNED and for evaluation/development use only.**
 
