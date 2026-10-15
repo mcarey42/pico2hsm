@@ -326,8 +326,11 @@ mod tests {
     #[test]
     fn partition_tables_match_the_maps() {
         // Development tables leave the table's own sector (unpartitioned
-        // space) open, so a dev board can always be taken back; production
-        // tables close it, so BOOTSEL can neither erase nor replace them.
+        // space) open, so a dev board can always be taken back.  Production
+        // tables make it read-only to the bootloader: BOOTSEL can neither
+        // erase nor replace the table, yet can still program the firmware
+        // slots (on RP2350 A2, BOOTSEL refuses every flash program unless
+        // the bootloader can read unpartitioned space; FLASH_LAYOUT_2_0 §5.5).
         let tables: [(&str, &str, Map, &str); 4] = [
             (
                 "pt_4m",
@@ -345,13 +348,13 @@ mod tests {
                 "pt_4m_prod",
                 include_str!("../../../boards/pt_4m_prod.json"),
                 MAP_4M,
-                "",
+                "r",
             ),
             (
                 "pt_16m_prod",
                 include_str!("../../../boards/pt_16m_prod.json"),
                 MAP_16M,
-                "",
+                "r",
             ),
         ];
         for (name, json, map, unpartitioned_bl) in tables {

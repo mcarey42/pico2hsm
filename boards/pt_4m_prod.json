@@ -11,7 +11,7 @@
         "permissions": {
             "secure": "rw",
             "nonsecure": "",
-            "bootloader": ""
+            "bootloader": "r"
         }
     },
     "partitions": [
