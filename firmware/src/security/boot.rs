@@ -174,29 +174,17 @@ fn is_production_mode_otp() -> Result<bool, ()> {
 /// SECURE_BOOT_ENABLE is bit 0 of **CRIT1** (OTP row 0x40), NOT in
 /// BOOT_FLAGS0 (row 0x48, which controls boot paths, not secure boot).
 ///
-/// CRIT1 uses RBIT-8 redundancy (rows 0x40–0x47).  The ROM resolves
-/// the 8 copies via majority vote, but a simple raw read of row 0x40
-/// is sufficient for a runtime check — if the fuse was programmed
-/// correctly via `picotool otp set OTP_DATA_CRIT1.SECURE_BOOT_ENABLE 1`,
-/// all 8 copies are identical.
-///
-/// # Safety
-/// Uses `embassy_rp::otp::read_raw_word` which performs a memory-mapped
-/// read of the OTP_DATA_RAW region (base address 0x4013_4000).
-/// This is a read-only operation on a well-known hardware register.
+/// CRIT1 uses RBIT-8 redundancy (rows 0x40–0x47); the hardware resolves
+/// the 8 copies by a 3-of-8 vote at OTP reset and latches the result in
+/// the OTP CRITICAL register, which is what this reads (the same value the
+/// bootrom and the debug logic act on).
 ///
 /// Returns `true` if the SECURE_BOOT_ENABLE fuse is set.
 pub fn is_secure_boot_enabled() -> bool {
-    use embassy_rp::otp;
-    // CRIT1 is at OTP row 0x40 (pico-sdk OTP_DATA_CRIT1_ROW, rp-pac
-    // otp_data_raw byte offset 0x100 / 4 = row 0x40).
-    // Bit 0 = SECURE_BOOT_ENABLE.
-    const RP2350_OTP_CRIT1_ROW: usize = 0x40;
-    const CRIT1_SECURE_BOOT_ENABLE_BIT: u32 = 1 << 0;
-
-    otp::read_raw_word(RP2350_OTP_CRIT1_ROW)
-        .map(|bits| bits & CRIT1_SECURE_BOOT_ENABLE_BIT != 0)
-        .unwrap_or(false)
+    // The OTP CRITICAL register holds the hardware's decision: CRIT1's 8
+    // copies (rows 0x40–0x47) read by a 3-of-8 vote at OTP reset.  A raw
+    // read of row 0x40 alone could disagree with it.
+    embassy_rp::pac::OTP.critical().read().secure_boot_enable()
 }
 
 /// Record JTAG-disabled status in the pico2hsm application boot flags.
