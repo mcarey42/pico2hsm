@@ -170,6 +170,17 @@ never protected.  Export what you need **before** provisioning (step 4
 works on an up store too), then FORMAT STORE after it.  See
 [PROVISIONING.md](PROVISIONING.md).
 
+## BOOTSEL cannot wipe the store
+
+Since the 2.0 flash layout ([FLASH_LAYOUT_2_0.md](FLASH_LAYOUT_2_0.md)),
+the binding, counter log, RSA pool and keystore are partitions closed to
+the bootloader: from BOOTSEL, picotool can neither read nor erase them,
+not even with a full-chip erase.  Recovery goes through the firmware
+(the steps above) or SWD.  On a **development** board the partition table
+itself can still be erased from BOOTSEL (`picotool erase -r 0x10000000
+0x10001000`), which reopens everything; **production** tables close that
+too.
+
 ## What never happens by itself
 
 - No format: not of a blank, foreign, damaged or missing store.  Only a
