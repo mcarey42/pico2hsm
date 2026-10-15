@@ -522,6 +522,36 @@ pub const DEV_STORAGE_KEY_ALLOWED: bool =
 /// Fails closed: an OTP read error (state unknown) or a failed page lock
 /// yields `None` rather than a fallback key or an unlocked page.
 pub fn boot_storage_master_key() -> Option<zeroize::Zeroizing<[u8; 32]>> {
+    let smk = otp_storage_master_key();
+    // The store regions must be the partitions the firmware was built for,
+    // closed to the bootloader (FLASH_LAYOUT_2_0.md).  Checked after the
+    // OTP work above, so the key page is locked whatever happens here.
+    #[cfg(target_arch = "arm")]
+    {
+        use crate::boot_slot::{read_layout, Layout};
+        match read_layout() {
+            Layout::Matches => {}
+            l if cfg!(debug_assertions) => {
+                defmt::warn!(
+                    "layout: {} — store opened anyway (debug build)",
+                    defmt::Debug2Format(&l)
+                );
+            }
+            l => {
+                defmt::error!(
+                    "layout: {} — keystore disabled (no storage key)",
+                    defmt::Debug2Format(&l)
+                );
+                return None;
+            }
+        }
+    }
+    smk
+}
+
+/// The storage master key from OTP, page locked (see
+/// [`boot_storage_master_key`], which also checks the partition table).
+fn otp_storage_master_key() -> Option<zeroize::Zeroizing<[u8; 32]>> {
     match provisioning_state() {
         Ok(false) => {
             // Definitely blank: leave the page writable so it can be provisioned.

@@ -79,13 +79,16 @@ pub const MAP_4M: Map = Map {
 
 /// The 16 MB boards (Geek, Waveshare LCD, RP2350-One with a 16 MB chip;
 /// QMI and SD variants): A/B slots of 4 MB less the table, the store
-/// regions from 8 MB.  The keystore stops one sector short of the end:
-/// picotool keeps the last sector out of every partition (erratum
-/// RP2350-E10's absolute block).
+/// regions from 8 MB + 4 KB.  The sector at 8 MB stays outside every
+/// partition: on hardware (LCD board, 2026-10-14), a partition closed to
+/// the bootloader that *starts* at 0x800000 made the bootrom refuse every
+/// BOOTSEL write, anywhere in flash; one starting a sector later did not.
+/// The keystore stops one sector short of the end: picotool keeps the
+/// last sector out of every partition (erratum RP2350-E10's absolute block).
 pub const MAP_16M: Map = Map {
     slot_size: 0x0040_0000 - SLOT_A,
     slot_b: 0x0040_0000,
-    store_base: 0x0080_0000,
+    store_base: 0x0080_1000,
     keystore_end: 0x0100_0000 - SECTOR,
     flash_size: 0x0100_0000,
 };

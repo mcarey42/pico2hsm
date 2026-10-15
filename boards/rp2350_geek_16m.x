@@ -10,12 +10,13 @@
  *            (physical 0x002000) or slot B (0x400000) through the bootrom's
  *            address translation, or flat from 0 (no partition table); see
  *            docs/FLASH_LAYOUT_2_0.md and firmware/src/storage/flash_layout.rs.
- *   Store regions (physical, from 8 MB; not part of any image):
- *   BINDING  0x10800000 + 0x8000 (32KB, 8 sectors)  binding block ring
- *   RETRY_COUNTERS 0x10808000 + 0x10000 (64KB)      counter log v2
- *   RSA_POOL 0x10818000 + 0xC000 (48KB)             RSA key pool
- *   LEGACY_COUNTERS 0x10824000 + 0x4000 (16KB)      blank placeholder
- *   KEYSTORE 0x10828000 + 0x7D7000 (~7.8 MB; QMI boards; the last sector
+ *   Store regions (physical, from 8 MB + 4 KB; closed partitions; nothing
+ *   closed may start at 8 MB: see flash_layout.rs MAP_16M):
+ *   BINDING  0x10801000 + 0x8000 (32KB, 8 sectors)  binding block ring
+ *   RETRY_COUNTERS 0x10809000 + 0x10000 (64KB)      counter log v2
+ *   RSA_POOL 0x10819000 + 0xC000 (48KB)             RSA key pool
+ *   LEGACY_COUNTERS 0x10825000 + 0x4000 (16KB)      blank placeholder
+ *   KEYSTORE 0x10829000 + 0x7D6000 (~7.8 MB; QMI boards; the last sector
  *            stays outside every partition: erratum RP2350-E10)
  *   RAM      0x20000000 + 0x82000 (520KB)
  *
@@ -28,14 +29,14 @@ MEMORY {
     BOOT2    : ORIGIN = 0x10000000, LENGTH = 0x100
     FLASH    : ORIGIN = 0x10000100, LENGTH = 0x3FDF00
     /* Storage V2 binding block ring; see firmware/src/storage/flash_layout.rs */
-    BINDING  : ORIGIN = 0x10800000, LENGTH = 0x8000
+    BINDING  : ORIGIN = 0x10801000, LENGTH = 0x8000
     /* Counter log v2; see firmware/src/storage/flash_layout.rs */
-    RETRY_COUNTERS : ORIGIN = 0x10808000, LENGTH = 0x10000
+    RETRY_COUNTERS : ORIGIN = 0x10809000, LENGTH = 0x10000
     /* RSA key pool; see firmware/src/storage/flash_layout.rs */
-    RSA_POOL : ORIGIN = 0x10818000, LENGTH = 0xC000
+    RSA_POOL : ORIGIN = 0x10819000, LENGTH = 0xC000
     /* Version-1 counter log (migrated once); see flash_layout.rs */
-    LEGACY_COUNTERS : ORIGIN = 0x10824000, LENGTH = 0x4000
-    KEYSTORE : ORIGIN = 0x10828000, LENGTH = 0x7D7000
+    LEGACY_COUNTERS : ORIGIN = 0x10825000, LENGTH = 0x4000
+    KEYSTORE : ORIGIN = 0x10829000, LENGTH = 0x7D6000
     RAM      : ORIGIN = 0x20000000, LENGTH = 0x82000
 }
 

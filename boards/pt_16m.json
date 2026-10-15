@@ -50,7 +50,7 @@
         {
             "name": "binding",
             "id": 16,
-            "start": "8192K",
+            "start": "8196K",
             "size": "32K",
             "families": [
                 "data"
@@ -66,7 +66,7 @@
         {
             "name": "counters",
             "id": 17,
-            "start": "8224K",
+            "start": "8228K",
             "size": "64K",
             "families": [
                 "data"
@@ -82,7 +82,7 @@
         {
             "name": "rsa-pool",
             "id": 18,
-            "start": "8288K",
+            "start": "8292K",
             "size": "48K",
             "families": [
                 "data"
@@ -98,7 +98,7 @@
         {
             "name": "spare",
             "id": 19,
-            "start": "8336K",
+            "start": "8340K",
             "size": "16K",
             "families": [
                 "data"
@@ -114,8 +114,8 @@
         {
             "name": "keystore",
             "id": 20,
-            "start": "8352K",
-            "size": "8028K",
+            "start": "8356K",
+            "size": "8024K",
             "families": [
                 "data"
             ],

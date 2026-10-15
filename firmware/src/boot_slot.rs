@@ -63,6 +63,77 @@ pub fn init() -> Option<BootInfo> {
     info
 }
 
+/// What the loaded partition table says about the store regions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Layout {
+    /// Every store region is a partition of its own, at the compiled
+    /// offsets, open to Secure code only.
+    Matches,
+    /// No partition table was loaded (a flat image).
+    NoTable,
+    /// The table disagrees with the compiled layout for this region.
+    Mismatch(&'static str),
+}
+
+/// Location word permission bits (26..31: Secure R, Secure W, NS R, NS W,
+/// bootloader R, bootloader W): a store partition is Secure read/write only.
+const PERMS_SECURE_ONLY: u32 = 0b00_0011;
+
+/// Check `get_partition_table_info(PT_INFO | PARTITION_LOCATION_AND_FLAGS)`
+/// output against the compiled store regions.  Layout of `words`: the
+/// mask of flags filled; `count | present << 8`; the unpartitioned space
+/// (two words); then two words per partition, the first holding the first
+/// sector (bits 0..12), the last sector (13..25) and the permissions.
+pub fn check_layout(words: &[u32]) -> Layout {
+    use crate::storage::flash_layout as fl;
+    if words.len() < 4 || words[0] & 0x11 != 0x11 || words[1] & 0x100 == 0 {
+        return Layout::NoTable;
+    }
+    let count = (words[1] & 0xFF) as usize;
+    let parts: heapless::Vec<u32, 16> = words[4..]
+        .chunks(2)
+        .take(count)
+        .filter_map(|c| c.first().copied())
+        .collect();
+    let regions: [(&'static str, u32, u32); 5] = [
+        ("binding", fl::BINDING_OFFSET, fl::BINDING_SIZE),
+        ("counters", fl::RETRY_COUNTER_OFFSET, fl::RETRY_COUNTER_SIZE),
+        ("rsa-pool", fl::RSA_POOL_OFFSET, fl::RSA_POOL_SIZE),
+        ("spare", fl::LEGACY_COUNTER_OFFSET, fl::LEGACY_COUNTER_SIZE),
+        (
+            "keystore",
+            fl::QMI_KEYSTORE_OFFSET,
+            fl::QMI_KEYSTORE_END - fl::QMI_KEYSTORE_OFFSET,
+        ),
+    ];
+    for (name, start, size) in regions {
+        let first = start / fl::SECTOR;
+        let last = (start + size) / fl::SECTOR - 1;
+        let found = parts
+            .iter()
+            .find(|&&w| w & 0x1FFF == first && (w >> 13) & 0x1FFF == last);
+        match found {
+            Some(&w) if w >> 26 == PERMS_SECURE_ONLY => {}
+            _ => return Layout::Mismatch(name),
+        }
+    }
+    Layout::Matches
+}
+
+/// Read the loaded partition table and check it (boot, core0).
+#[cfg(target_arch = "arm")]
+pub fn read_layout() -> Layout {
+    let mut words = [0u32; 40];
+    // SAFETY: the buffer is `words.len()` words long.
+    let n = unsafe {
+        embassy_rp::rom_data::get_partition_table_info(words.as_mut_ptr(), words.len(), 0x11)
+    };
+    if n <= 0 {
+        return Layout::NoTable;
+    }
+    check_layout(&words[..(n as usize).min(words.len())])
+}
+
 /// This image runs on trial (not bought yet).
 pub fn buy_pending() -> bool {
     BUY_PENDING.load(Ordering::SeqCst)
@@ -111,6 +182,58 @@ pub fn buy_if_pending() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `get_partition_table_info` from the Waveshare LCD board with
+    /// boards/pt_16m.json (2026-10-14).
+    const LCD_16M: [u32; 18] = [
+        0x11,
+        0x107,
+        0xffff_e000,
+        0xfc00_8000,
+        0xfc7f_e002,
+        0xfc02_1001,
+        0xfcff_a400,
+        0xfc02_1003,
+        0x0d01_0801,
+        0x0c01_1601,
+        0x0d03_0809,
+        0x0c01_1601,
+        0x0d04_8819,
+        0x0c01_1601,
+        0x0d05_0825,
+        0x0c01_1601,
+        0x0dff_c829,
+        0x0c01_1601,
+    ];
+
+    #[test]
+    fn the_lcd_board_table_matches_the_16m_map() {
+        let expected = if crate::storage::flash_layout::FLASH_16M {
+            Layout::Matches
+        } else {
+            Layout::Mismatch("binding")
+        };
+        assert_eq!(check_layout(&LCD_16M), expected);
+    }
+
+    #[test]
+    fn a_store_partition_open_to_the_bootloader_is_a_mismatch() {
+        if !crate::storage::flash_layout::FLASH_16M {
+            return;
+        }
+        let mut w = LCD_16M;
+        w[16] |= 0b11 << 30; // keystore: bootloader read/write
+        assert_eq!(check_layout(&w), Layout::Mismatch("keystore"));
+        let mut w = LCD_16M;
+        w[8] += 1; // binding moved a sector
+        assert_eq!(check_layout(&w), Layout::Mismatch("binding"));
+    }
+
+    #[test]
+    fn no_table() {
+        assert_eq!(check_layout(&[0x11, 0x000, 0, 0]), Layout::NoTable);
+        assert_eq!(check_layout(&[]), Layout::NoTable);
+    }
 
     #[test]
     fn decodes_the_boot_info_word() {
