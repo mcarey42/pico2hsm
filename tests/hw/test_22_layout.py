@@ -41,7 +41,7 @@ STORE_4M = {
     "counters": (0x1E0, 0x1EF),
     "rsa-pool": (0x1F0, 0x1FB),
     "spare": (0x1FC, 0x1FF),
-    "keystore": (0x200, 0x3FF),
+    "keystore": (0x201, 0x3FF),
 }
 STORE_16M = {
     "binding": (0x801, 0x808),

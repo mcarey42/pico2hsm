@@ -20,7 +20,8 @@
  *   LEGACY_COUNTERS 0x101FC000 + 0x4000 (16KB, 4 sectors)
  *            The version-1 counter log: migrated into RETRY_COUNTERS once,
  *            then erased; reserved until the 2.0 layout (phase 6).
- *   KEYSTORE 0x10200000 + 0x200000 (2MB — no external flash on stock Pico 2)
+ *   KEYSTORE 0x10201000 + 0x1FF000 (the sector at the 2 MB midpoint stays
+ *            outside every closed partition: flash_layout.rs MIDPOINT_RULE)
  *   RAM      0x20000000 + 0x82000 (520KB)
  */
 
@@ -35,7 +36,7 @@ MEMORY {
     RSA_POOL : ORIGIN = 0x101F0000, LENGTH = 0xC000
     /* Version-1 counter log (migrated once); see flash_layout.rs */
     LEGACY_COUNTERS : ORIGIN = 0x101FC000, LENGTH = 0x4000
-    KEYSTORE : ORIGIN = 0x10200000, LENGTH = 0x200000
+    KEYSTORE : ORIGIN = 0x10201000, LENGTH = 0x1FF000
     RAM      : ORIGIN = 0x20000000, LENGTH = 0x82000
 }
 

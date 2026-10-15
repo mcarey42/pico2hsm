@@ -55,11 +55,21 @@ pub struct Map {
     pub slot_b: u32,
     /// First byte of the store regions (the binding ring).
     pub store_base: u32,
+    /// First byte of the keystore partition.
+    pub keystore_start: u32,
     /// Exclusive end of the keystore partition.
     pub keystore_end: u32,
     /// Flash size.
     pub flash_size: u32,
 }
+
+/// Found on hardware (2026-10-14, LCD board 16 MB, RP2350-One 4 MB): if a
+/// partition closed to the bootloader contains the flash's midpoint (8 MB,
+/// 2 MB), the bootrom refuses every BOOTSEL write, anywhere in flash —
+/// whether the partition starts there or straddles it; one starting a
+/// sector past it does not.  So the sector at the midpoint stays outside
+/// every closed partition (the host test checks the tables).
+pub const MIDPOINT_RULE: () = ();
 
 /// The partition table's own space at the start of flash (every board).
 pub const PT_SIZE: u32 = 0x2000;
@@ -67,28 +77,30 @@ pub const PT_SIZE: u32 = 0x2000;
 pub const SLOT_A: u32 = PT_SIZE;
 
 /// The 4 MB boards (Pico 2, RP2350-One): one slot of 1.83 MB, the store
-/// regions where the flat 1.x/2.0 interim layout had them (0x1D8000).
-/// No slot B: the room goes to the firmware (post-quantum algorithms).
+/// regions where the flat 1.x/2.0 interim layout had them (0x1D8000),
+/// except the keystore, which starts a sector past the midpoint (see
+/// [`MIDPOINT_RULE`]).  No slot B: the room goes to the firmware
+/// (post-quantum algorithms).
 pub const MAP_4M: Map = Map {
     slot_size: 0x001D_8000 - SLOT_A,
     slot_b: 0,
     store_base: 0x001D_8000,
+    keystore_start: 0x0020_1000,
     keystore_end: 0x0040_0000,
     flash_size: 0x0040_0000,
 };
 
 /// The 16 MB boards (Geek, Waveshare LCD, RP2350-One with a 16 MB chip;
 /// QMI and SD variants): A/B slots of 4 MB less the table, the store
-/// regions from 8 MB + 4 KB.  The sector at 8 MB stays outside every
-/// partition: on hardware (LCD board, 2026-10-14), a partition closed to
-/// the bootloader that *starts* at 0x800000 made the bootrom refuse every
-/// BOOTSEL write, anywhere in flash; one starting a sector later did not.
-/// The keystore stops one sector short of the end: picotool keeps the
-/// last sector out of every partition (erratum RP2350-E10's absolute block).
+/// regions from 8 MB + 4 KB, so no closed partition holds the midpoint
+/// (see [`MIDPOINT_RULE`]).  The keystore stops one sector short of the
+/// end: picotool keeps the last sector out of every partition (erratum
+/// RP2350-E10's absolute block).
 pub const MAP_16M: Map = Map {
     slot_size: 0x0040_0000 - SLOT_A,
     slot_b: 0x0040_0000,
     store_base: 0x0080_1000,
+    keystore_start: 0x0080_1000 + 0x2_8000,
     keystore_end: 0x0100_0000 - SECTOR,
     flash_size: 0x0100_0000,
 };
@@ -150,7 +162,7 @@ pub const LEGACY_COUNTER_SECTORS: u32 = 4;
 pub const LEGACY_COUNTER_SIZE: u32 = LEGACY_COUNTER_SECTORS * SECTOR;
 
 /// Start of the keystore partition on the QMI boards.
-pub const QMI_KEYSTORE_OFFSET: u32 = MAP.store_base + 0x2_8000;
+pub const QMI_KEYSTORE_OFFSET: u32 = MAP.keystore_start;
 
 /// Exclusive end of the keystore partition on the QMI boards.
 pub const QMI_KEYSTORE_END: u32 = MAP.keystore_end;
@@ -178,7 +190,14 @@ const _: () = {
     assert!(LEGACY_COUNTER_OFFSET + LEGACY_COUNTER_SIZE <= QMI_KEYSTORE_OFFSET);
     assert!(QMI_KEYSTORE_OFFSET < QMI_FLASH_SIZE);
     // The 4 MB store regions stay where boards already have them.
-    assert!(MAP_4M.store_base == 0x001D_8000 && MAP_4M.store_base + 0x2_8000 == 0x0020_0000);
+    assert!(MAP_4M.store_base == 0x001D_8000);
+    // The keystore follows the other regions, and no closed region holds
+    // the midpoint (MIDPOINT_RULE).
+    assert!(MAP_4M.store_base + 0x2_8000 <= MAP_4M.keystore_start);
+    assert!(MAP_16M.store_base + 0x2_8000 <= MAP_16M.keystore_start);
+    assert!(MAP_4M.keystore_start > MAP_4M.flash_size / 2);
+    assert!(MAP_4M.store_base + 0x2_8000 <= MAP_4M.flash_size / 2);
+    assert!(MAP_16M.store_base > MAP_16M.flash_size / 2);
     // Slots: sector aligned, below the store, B after A.
     assert!(SLOT_A % SECTOR == 0 && PT_SIZE % SECTOR == 0);
     assert!(SLOT_A + MAP_4M.slot_size <= MAP_4M.store_base);
@@ -272,7 +291,7 @@ mod tests {
                 end = o + l;
             }
             let (ko, kl) = at("KEYSTORE");
-            assert_eq!(ko, XIP_BASE + base + 0x2_8000, "{name}: KEYSTORE origin");
+            assert_eq!(ko, XIP_BASE + map.keystore_start, "{name}: KEYSTORE origin");
             assert!(end <= ko, "{name}: reserved regions overlap the keystore");
             assert_eq!(ko + kl, XIP_BASE + map.keystore_end, "{name}: KEYSTORE end");
         }
@@ -372,13 +391,25 @@ mod tests {
                 ("counters", b + 0x8000, RETRY_COUNTER_SIZE),
                 ("rsa-pool", b + 0x1_8000, RSA_POOL_SIZE),
                 ("spare", b + 0x2_4000, LEGACY_COUNTER_SIZE),
-                ("keystore", b + 0x2_8000, map.keystore_end - (b + 0x2_8000)),
+                (
+                    "keystore",
+                    map.keystore_start,
+                    map.keystore_end - map.keystore_start,
+                ),
             ];
             for (p, start, size) in store {
                 let (_, s, l, bl) = get(p);
                 assert_eq!((s, l), (start, size), "{name}: {p}");
                 // Closed to BOOTSEL (picotool, UF2 writes).
                 assert_eq!(bl, "", "{name}: {p} open to the bootloader");
+            }
+            // MIDPOINT_RULE: no closed partition holds the flash midpoint.
+            let mid = map.flash_size / 2;
+            for (p, s, l, bl) in &parts {
+                assert!(
+                    bl != "" || !(*s <= mid && mid < s + l),
+                    "{name}: {p} holds the midpoint {mid:#x}"
+                );
             }
         }
     }

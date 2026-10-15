@@ -96,8 +96,8 @@
         {
             "name": "keystore",
             "id": 20,
-            "start": "2048K",
-            "size": "2048K",
+            "start": "2052K",
+            "size": "2044K",
             "families": [
                 "data"
             ],
