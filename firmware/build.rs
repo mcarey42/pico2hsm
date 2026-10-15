@@ -107,4 +107,5 @@ fn image_version() {
         minor * 256 + patch
     );
     println!("cargo:rerun-if-env-changed=PICO2HSM_IMAGE_VERSION");
+    println!("cargo:rerun-if-env-changed=PICO2HSM_TEST_NO_BUY");
 }

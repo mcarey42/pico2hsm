@@ -17,7 +17,7 @@
 
 use embassy_rp::block::{
     item_generic_1bs, item_image_type_exe, item_vector_table, Architecture, Block, Security,
-    ITEM_1BS_VECTOR_TABLE, ITEM_1BS_VERSION,
+    IMAGE_TYPE_TBYB, ITEM_1BS_VECTOR_TABLE, ITEM_1BS_VERSION,
 };
 
 /// The vector table address as set by every board linker script.
@@ -46,6 +46,15 @@ pub const IMAGE_MAJOR: u16 = parse_u16(env!("PICO2HSM_IMAGE_MAJOR"));
 /// Minor version: `minor * 256 + patch`.
 pub const IMAGE_MINOR: u16 = parse_u16(env!("PICO2HSM_IMAGE_MINOR"));
 
+/// IMAGE_TYPE item: Secure ARM RP2350 EXE; on the A/B (16 MB) boards also
+/// try-before-you-buy, so a new image keeps its slot only once it has
+/// worked (`boot_slot::buy_if_pending`).
+const IMAGE_TYPE: u32 = if crate::storage::flash_layout::FLASH_16M {
+    item_image_type_exe(Security::Secure, Architecture::Arm) | ((IMAGE_TYPE_TBYB as u32) << 16)
+} else {
+    item_image_type_exe(Security::Secure, Architecture::Arm)
+};
+
 /// VERSION item: header (no OTP rollback rows), then `major << 16 | minor`.
 const VERSION: [u32; 2] = [
     item_generic_1bs(0, 2, ITEM_1BS_VERSION),
@@ -56,7 +65,7 @@ const VERSION: [u32; 2] = [
 ///
 /// Block layout (9 words total):
 ///   [0] BLOCK_MARKER_START
-///   [1] IMAGE_TYPE item  (Secure ARM RP2350 EXE)
+///   [1] IMAGE_TYPE item  (Secure ARM RP2350 EXE; TBYB on 16 MB boards)
 ///   [2] VECTOR_TABLE item header
 ///   [3] VECTOR_TABLE address = 0x10000100
 ///   [4] VERSION item header
@@ -66,10 +75,4 @@ const VERSION: [u32; 2] = [
 ///   [8] BLOCK_MARKER_END
 #[link_section = ".start_block"]
 #[used]
-pub static IMAGE_DEF: Block<5> = Block::new([
-    item_image_type_exe(Security::Secure, Architecture::Arm),
-    VT[0],
-    VT[1],
-    VERSION[0],
-    VERSION[1],
-]);
+pub static IMAGE_DEF: Block<5> = Block::new([IMAGE_TYPE, VT[0], VT[1], VERSION[0], VERSION[1]]);
