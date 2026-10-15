@@ -1,0 +1,131 @@
+{
+    "$schema": "https://raw.githubusercontent.com/raspberrypi/picotool/develop/json/schemas/partition-table-schema.json",
+    "version": [
+        1,
+        0
+    ],
+    "unpartitioned": {
+        "families": [
+            "absolute"
+        ],
+        "permissions": {
+            "secure": "rw",
+            "nonsecure": "",
+            "bootloader": ""
+        }
+    },
+    "partitions": [
+        {
+            "name": "fw-a",
+            "id": 0,
+            "start": "8K",
+            "size": "4088K",
+            "families": [
+                "rp2350-arm-s"
+            ],
+            "permissions": {
+                "secure": "rw",
+                "nonsecure": "rw",
+                "bootloader": "rw"
+            }
+        },
+        {
+            "name": "fw-b",
+            "id": 1,
+            "start": "4096K",
+            "size": "4088K",
+            "families": [
+                "rp2350-arm-s"
+            ],
+            "permissions": {
+                "secure": "rw",
+                "nonsecure": "rw",
+                "bootloader": "rw"
+            },
+            "link": [
+                "a",
+                0
+            ]
+        },
+        {
+            "name": "binding",
+            "id": 16,
+            "start": "8196K",
+            "size": "32K",
+            "families": [
+                "data"
+            ],
+            "permissions": {
+                "secure": "rw",
+                "nonsecure": "",
+                "bootloader": ""
+            },
+            "ignored_during_arm_boot": true,
+            "ignored_during_riscv_boot": true
+        },
+        {
+            "name": "counters",
+            "id": 17,
+            "start": "8228K",
+            "size": "64K",
+            "families": [
+                "data"
+            ],
+            "permissions": {
+                "secure": "rw",
+                "nonsecure": "",
+                "bootloader": ""
+            },
+            "ignored_during_arm_boot": true,
+            "ignored_during_riscv_boot": true
+        },
+        {
+            "name": "rsa-pool",
+            "id": 18,
+            "start": "8292K",
+            "size": "48K",
+            "families": [
+                "data"
+            ],
+            "permissions": {
+                "secure": "rw",
+                "nonsecure": "",
+                "bootloader": ""
+            },
+            "ignored_during_arm_boot": true,
+            "ignored_during_riscv_boot": true
+        },
+        {
+            "name": "spare",
+            "id": 19,
+            "start": "8340K",
+            "size": "16K",
+            "families": [
+                "data"
+            ],
+            "permissions": {
+                "secure": "rw",
+                "nonsecure": "",
+                "bootloader": ""
+            },
+            "ignored_during_arm_boot": true,
+            "ignored_during_riscv_boot": true
+        },
+        {
+            "name": "keystore",
+            "id": 20,
+            "start": "8356K",
+            "size": "8024K",
+            "families": [
+                "data"
+            ],
+            "permissions": {
+                "secure": "rw",
+                "nonsecure": "",
+                "bootloader": ""
+            },
+            "ignored_during_arm_boot": true,
+            "ignored_during_riscv_boot": true
+        }
+    ]
+}

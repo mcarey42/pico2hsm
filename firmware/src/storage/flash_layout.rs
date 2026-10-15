@@ -306,15 +306,45 @@ mod tests {
 
     #[test]
     fn partition_tables_match_the_maps() {
-        let tables: [(&str, &str, Map); 2] = [
-            ("pt_4m", include_str!("../../../boards/pt_4m.json"), MAP_4M),
+        // Development tables leave the table's own sector (unpartitioned
+        // space) open, so a dev board can always be taken back; production
+        // tables close it, so BOOTSEL can neither erase nor replace them.
+        let tables: [(&str, &str, Map, &str); 4] = [
+            (
+                "pt_4m",
+                include_str!("../../../boards/pt_4m.json"),
+                MAP_4M,
+                "rw",
+            ),
             (
                 "pt_16m",
                 include_str!("../../../boards/pt_16m.json"),
                 MAP_16M,
+                "rw",
+            ),
+            (
+                "pt_4m_prod",
+                include_str!("../../../boards/pt_4m_prod.json"),
+                MAP_4M,
+                "",
+            ),
+            (
+                "pt_16m_prod",
+                include_str!("../../../boards/pt_16m_prod.json"),
+                MAP_16M,
+                "",
             ),
         ];
-        for (name, json, map) in tables {
+        for (name, json, map, unpartitioned_bl) in tables {
+            let un = &json
+                [json.find("\"unpartitioned\"").unwrap()..json.find("\"partitions\"").unwrap()];
+            let bl = &un[un.find("\"bootloader\"").unwrap() + 12..];
+            let bl = &bl[bl.find('"').unwrap() + 1..];
+            assert_eq!(
+                &bl[..bl.find('"').unwrap()],
+                unpartitioned_bl,
+                "{name}: unpartitioned bootloader access"
+            );
             let parts = partitions(json);
             let get = |p: &str| {
                 parts
