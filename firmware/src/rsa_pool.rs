@@ -273,7 +273,8 @@ impl Engine {
         self.rng_ok = ok;
     }
 
-    /// Forget the loaded state (tests: simulate a reboot).
+    /// Forget the loaded state: config, clock and sequence load again at
+    /// the next use (after FORMAT STORE; tests: simulate a reboot).
     pub fn reboot(&mut self) {
         self.kg.reset();
         *self = Engine {

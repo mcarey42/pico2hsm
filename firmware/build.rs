@@ -18,6 +18,8 @@ use std::fs;
 use std::path::PathBuf;
 
 fn main() {
+    image_version();
+
     // Only emit ARM linker arguments when targeting bare-metal ARM.
     let target = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
     if target != "arm" {
@@ -26,7 +28,10 @@ fn main() {
     }
 
     // Select board linker script based on active feature flag.
-    let board = if cfg!(feature = "rp2350_one_4m") {
+    // rp2350_one_16m turns on rp2350_one_4m: test it first.
+    let board = if cfg!(feature = "rp2350_one_16m") {
+        "rp2350_one_16m"
+    } else if cfg!(feature = "rp2350_one_4m") {
         "rp2350_one_4m"
     } else if cfg!(feature = "rp2350_geek_16m") {
         "rp2350_geek_16m"
@@ -74,4 +79,34 @@ fn main() {
 
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed={}", boards_dir.display());
+}
+
+/// IMAGE_DEF version (the bootrom boots the higher of two A/B images):
+/// major from the crate version, minor = minor * 256 + patch.
+/// PICO2HSM_IMAGE_VERSION ("2.0.1") overrides it, for A/B tests.  Host
+/// builds need it too (`image_def` is in the library).
+fn image_version() {
+    let version = std::env::var("PICO2HSM_IMAGE_VERSION")
+        .unwrap_or_else(|_| std::env::var("CARGO_PKG_VERSION").expect("CARGO_PKG_VERSION"));
+    let parts: Vec<u32> = version
+        .split(['.', '-', '+'])
+        .take(3)
+        .map(|p| {
+            p.parse()
+                .unwrap_or_else(|_| panic!("bad image version {version}"))
+        })
+        .collect();
+    let (major, minor, patch) = (parts[0], parts[1], parts.get(2).copied().unwrap_or(0));
+    assert!(
+        major <= 0xFFFF && minor <= 0xFF && patch <= 0xFF,
+        "image version {version}"
+    );
+    println!("cargo:rustc-env=PICO2HSM_IMAGE_MAJOR={major}");
+    println!(
+        "cargo:rustc-env=PICO2HSM_IMAGE_MINOR={}",
+        minor * 256 + patch
+    );
+    println!("cargo:rerun-if-env-changed=PICO2HSM_IMAGE_VERSION");
+    println!("cargo:rerun-if-env-changed=PICO2HSM_TEST_NO_BUY");
+    println!("cargo:rerun-if-env-changed=PICO2HSM_TBYB");
 }

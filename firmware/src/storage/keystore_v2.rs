@@ -597,6 +597,15 @@ fn applet_group(owner: AppletId) -> usize {
     }
 }
 
+/// An SC-HSM user key: SC-HSM applet byte, no file-ID high byte (an EF's
+/// key ID always has one: `KeyId::sc_hsm_ef_checked`), below the reserved
+/// refs (0xFC..).
+fn is_sc_hsm_user_key(key_id: u32) -> bool {
+    (key_id >> 16) & 0xFF == 0
+        && (key_id >> 8) & 0xFF == 0
+        && ((key_id & 0xFF) as u8) < crate::protocol::sc_hsm::RESERVED_KEY_REF_MIN
+}
+
 impl<F: StoreFlash, B: CounterFlash, L: RetryCounterBackend> KeyStore for FlashKeyStoreV2<F, B, L> {
     fn save_key(&mut self, obj: &KeyObject) -> Result<(), HsmError> {
         // A new SC-HSM object past the SC-HSM index's capacity would be
@@ -617,6 +626,18 @@ impl<F: StoreFlash, B: CounterFlash, L: RetryCounterBackend> KeyStore for FlashK
             });
             if sc_hsm >= crate::protocol::sc_hsm::MAX_KEY_INDEX {
                 return Err(HsmError::Storage(StorageError::KeystoreFull));
+            }
+            // The per-board key cap (MAX_SC_HSM_KEYS: 128 on 4 MB boards).
+            if is_sc_hsm_user_key(obj.key_id) {
+                let mut keys = 0usize;
+                let _ = self.store.for_each(&mut |e| {
+                    if is_sc_hsm_user_key(e.key_id) {
+                        keys += 1;
+                    }
+                });
+                if keys >= crate::protocol::sc_hsm::MAX_SC_HSM_KEYS {
+                    return Err(HsmError::Storage(StorageError::KeystoreFull));
+                }
             }
         }
         let smk = self.smk()?;
@@ -1118,6 +1139,38 @@ pub(crate) mod tests {
         r.unwrap();
         assert_eq!(ks.status(), StoreStatus::Up);
         assert_eq!(so_of(&ks), None);
+    }
+
+    #[test]
+    fn the_sc_hsm_key_cap_counts_keys_not_files() {
+        use crate::protocol::sc_hsm::MAX_SC_HSM_KEYS;
+        // Room for every key the cap allows (one sector per object).
+        let mut d = Dev::new_sd();
+        d.store = Nor::new(600);
+        d.store.sd = true;
+        let (mut ks, r) = d.boot();
+        r.unwrap();
+        for i in 0..MAX_SC_HSM_KEYS as u32 {
+            ks.save_key(&key(i + 1, 1)).unwrap();
+        }
+        // One more key is refused (in SC-HSM partition 1: on the 16 MB
+        // boards the cap is every user key ref of partition 0)...
+        let over = key(0x0100_0001, 1);
+        assert_eq!(
+            ks.save_key(&over),
+            Err(HsmError::Storage(StorageError::KeystoreFull))
+        );
+        // ...an update of an existing one is not, nor a file, nor a PIV key.
+        ks.save_key(&key(1, 2)).unwrap();
+        let mut ef = KeyObject::new(
+            KeyType::Generic,
+            0xC401,
+            AppletId::ScHsm,
+            AlgorithmId::AesGcm,
+        );
+        let _ = ef.private_key.extend_from_slice(b"prkd");
+        ks.save_key(&ef).unwrap();
+        ks.save_key(&key(0x0001_0005, 5)).unwrap();
     }
 
     /// A factory-fresh device: nothing on flash, the counter log included.

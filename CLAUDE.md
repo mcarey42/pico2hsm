@@ -20,7 +20,7 @@ cargo build -p pico2hsm-firmware --no-default-features --features pico2_4m,rsa,a
 # ELF: target/thumbv8m.main-none-eabihf/debug/pico2hsm
 ```
 
-Valid board arguments: `pico2_4m`, `rp2350_one_4m`, `rp2350_geek_16m`, `rp2350_geek_sdcard`, `waveshare_rp2350_lcd_16m`, `waveshare_rp2350_lcd_sdcard`.
+Valid board arguments: `pico2_4m`, `rp2350_one_4m`, `rp2350_one_16m` (a One with a 16 MB chip fitted), `rp2350_geek_16m`, `rp2350_geek_sdcard`, `waveshare_rp2350_lcd_16m`, `waveshare_rp2350_lcd_sdcard`.
 
 This script:
 - Builds with `DEFMT_LOG=trace` (required for defmt log output to survive optimisation)
@@ -35,7 +35,9 @@ This script:
     HSM fleet — **not** a project-wide test key. The filename is gitignored;
     the `dist/` signed artifacts are gitignored; no key material is ever
     committed. See `docs/PROVISIONING.md` Option A / Option B for generation.
-- Flashes via `probe-rs run --chip RP235x` (uses signed ELF if signing occurred)
+- Writes the board's partition table (`boards/pt_4m.json` or `pt_16m.json`) at `0x10000000` and the image into slot A at `0x10002000` with `probe-rs download`, resets, then `probe-rs attach` for RTT. Every board boots through a partition table; the store regions are partitions closed to BOOTSEL. See `docs/FLASH_LAYOUT_2_0.md`.
+- **Boards without a probe** (Waveshare LCD, RP2350-One): `80 FE 14 00` (debug builds, SC-HSM selected) reboots into BOOTSEL; then `picotool load --ser <serial> <table>.uf2`, `picotool reboot -u`, `picotool load --ser <serial> -p 0 -x <image>.uf2`. With two boards in BOOTSEL, always pass `--ser`.
+- A try-before-you-buy image (16 MB release builds, or `PICO2HSM_TBYB=1`) boots only on an update boot (`picotool load -x`, a UF2 drop), never after a probe flash and reset.
 - Streams RTT output to the terminal until Ctrl+C
 
 The connected hardware is a **Raspberry Pi Pico 2 (pico2_4m feature)** with a Debugprobe (CMSIS-DAP) on the SWD port.
@@ -335,7 +337,10 @@ write/erase and key load, for blocking storage work on core0.
   mode and core0 stalls on a full RTT buffer, the watchdog now reboots the
   board instead of it hanging.
 - `debug`-feature test hooks (SC-HSM selected): `80 FE 10 00` wedges core1,
-  `80 FE 11 00` wedges core0 after replying, `80 FE 12 00` resets now.
+  `80 FE 11 00` wedges core0 after replying, `80 FE 12 00` resets now,
+  `80 FE 13 nn` moves the keystore anchor ahead, `80 FE 14 00` reboots
+  into BOOTSEL, `80 FE 15 00` returns the image version and boot info
+  (slot booted, trial state), `80 FE 16 00` the loaded partition table.
 - Boards without SWD (the Waveshare LCD): each core leaves breadcrumbs
   (`watchdog::crumb`, code table in `watchdog.rs`) in watchdog scratch
   registers and a 16-entry ring in `.uninit`; HardFaults and panics record

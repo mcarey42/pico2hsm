@@ -16,6 +16,7 @@
 # Valid board features:
 #   pico2_4m               Raspberry Pi Pico 2 4MB
 #   rp2350_one_4m          Waveshare RP2350-One  4MB
+#   rp2350_one_16m         Waveshare RP2350-One with a 16MB chip fitted
 #   rp2350_geek_16m        Waveshare RP2350-Geek 16MB
 #   rp2350_geek_sdcard     Waveshare RP2350-Geek SDCard
 #   waveshare_rp2350_lcd_16m           Waveshare RP2350-LCD-1.47-B 16MB
@@ -44,6 +45,7 @@ fi
 VALID_FEATURES=(
     pico2_4m
     rp2350_one_4m
+    rp2350_one_16m
     rp2350_geek_16m
     rp2350_geek_sdcard
     waveshare_rp2350_lcd_16m
@@ -126,11 +128,29 @@ else
     warn "Run ./generate_firmware_signing_keys.sh to create the key pair"
 fi
 
+# ── Partition table + slot image ──────────────────────────────────────────────
+# Every board boots through a bootrom partition table (docs/FLASH_LAYOUT_2_0.md):
+# the table at 0x10000000, the image in slot A at 0x10002000 (it runs there
+# through address translation).  The store regions are closed partitions at
+# the offsets they always had, so flashing never touches the keystore.
+case "$FEAT" in
+    pico2_4m|rp2350_one_4m) PT_SIZE=4m ;;
+    *)                      PT_SIZE=16m ;;
+esac
+PT_JSON="boards/pt_${PT_SIZE}.json"
+SLOT_A_ADDR=0x10002000
+command -v picotool >/dev/null 2>&1 || die "picotool is required (it builds the partition table)"
+OBJCOPY="$(command -v arm-none-eabi-objcopy || command -v rust-objcopy || command -v llvm-objcopy || true)"
+[[ -n "$OBJCOPY" ]] || die "an objcopy is required (arm-none-eabi-objcopy, rust-objcopy or llvm-objcopy)"
+mkdir -p dist
+PT_BIN="dist/pt_${PT_SIZE}.bin"
+IMG_BIN="dist/pico2hsm-${FEAT}-${PROFILE}.bin"
+picotool partition create "$PT_JSON" "$PT_BIN" -t bin >/dev/null || die "picotool partition create $PT_JSON failed"
+"$OBJCOPY" -O binary "$FLASH_ELF" "$IMG_BIN" || die "objcopy failed"
+ok "Partition table $PT_JSON → $PT_BIN; image → $IMG_BIN"
+
 # ── Flash + run ───────────────────────────────────────────────────────────────
 section "Flash + RTT monitor: $FEAT"
-info "Flashing with probe-rs run --chip $CHIP ..."
-info "RTT output will appear below.  Press Ctrl+C to stop monitoring."
-echo ""
 
 # if the environment defines a PROBE_SERIAL value we add the --probe argument to target a specific probe. This is useful when multiple probes are connected.
 if [[ -n "${PROBE_SERIAL:-}" ]]; then
@@ -139,4 +159,12 @@ if [[ -n "${PROBE_SERIAL:-}" ]]; then
 else
     PROBE_ARG=""
 fi
-probe-rs run ${PROBE_ARG} --chip "$CHIP" "$FLASH_ELF"
+info "probe-rs: partition table at 0x10000000, image at $SLOT_A_ADDR ..."
+probe-rs download ${PROBE_ARG} --chip "$CHIP" --binary-format bin --base-address 0x10000000 "$PT_BIN" \
+    || die "flashing the partition table failed"
+probe-rs download ${PROBE_ARG} --chip "$CHIP" --binary-format bin --base-address "$SLOT_A_ADDR" "$IMG_BIN" \
+    || die "flashing the image failed"
+probe-rs reset ${PROBE_ARG} --chip "$CHIP" || die "reset failed"
+info "RTT output will appear below.  Press Ctrl+C to stop monitoring."
+echo ""
+probe-rs attach ${PROBE_ARG} --chip "$CHIP" "$FLASH_ELF"

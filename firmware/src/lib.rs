@@ -48,6 +48,7 @@ pub mod watchdog;
 // ARM-only.)
 #[cfg(target_arch = "arm")]
 pub mod board;
+pub mod boot_slot;
 #[cfg(target_arch = "arm")]
 pub mod image_def;
 // The storage module's keystore.rs (KeyStore trait + NullKeyStore) is

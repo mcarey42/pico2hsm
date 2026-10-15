@@ -275,8 +275,27 @@ pub enum OpBufState {
 /// Capacity of the SC-HSM key/EF index (8 bytes per entry).  The store
 /// refuses a new SC-HSM object past it (`keystore_v2`, 6A84): with a
 /// smaller index than the store, an object was saved (9000) yet
-/// unreachable until a reset.
-pub const MAX_KEY_INDEX: usize = 340;
+/// unreachable until a reset.  Room for [`MAX_SC_HSM_KEYS`] keys with a
+/// private key descriptor and a certificate each, plus the reserved
+/// objects and some free-standing files.
+pub const MAX_KEY_INDEX: usize = if crate::storage::flash_layout::FLASH_16M {
+    768
+} else {
+    400
+};
+
+/// SC-HSM user keys a device holds (key refs below
+/// [`RESERVED_KEY_REF_MIN`]): every one on the 16 MB boards, 128 on the
+/// 4 MB boards, whose ~2 MB keystore holds 128 keys with a descriptor and
+/// a certificate each next to PIV and OpenPGP (FLASH_LAYOUT_2_0.md).  A
+/// key generation or import past it fails with 6A84.
+pub const MAX_SC_HSM_KEYS: usize = if crate::storage::flash_layout::FLASH_16M {
+    251
+} else {
+    128
+};
+
+const _: () = assert!(MAX_KEY_INDEX >= MAX_SC_HSM_KEYS * 3 + 4);
 
 /// Lightweight metadata for a key or EF file stored in flash.
 /// Kept in RAM so LIST KEYS, SELECT, MSE SET, and PRKD generation

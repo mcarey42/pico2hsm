@@ -1246,6 +1246,20 @@ async fn main(spawner: Spawner) {
     // task does it.  Paused while a debugger halts either core.
     let boot_report = pico2hsm_firmware::watchdog::boot_init();
     log_boot_report(&boot_report);
+    match pico2hsm_firmware::boot_slot::init() {
+        Some(b) => defmt::info!(
+            "boot: partition={} type={} tbyb=0x{:02x}{}",
+            b.partition,
+            b.boot_type,
+            b.tbyb,
+            if pico2hsm_firmware::boot_slot::buy_pending() {
+                " (on trial)"
+            } else {
+                ""
+            }
+        ),
+        None => defmt::warn!("boot: no BOOT_INFO from the bootrom"),
+    }
     spawner.spawn(watchdog_feeder().expect("watchdog feeder task"));
 
     defmt::info!("pico2hsm: peripherals initialised");
@@ -1580,8 +1594,23 @@ fn flash_op_code(op: &FlashOp) -> u32 {
 #[cfg(target_arch = "arm")]
 async fn recv_core1_response() -> Response {
     RESP_READY.receive().await;
-    pico2hsm_firmware::watchdog::note_core1_response();
+    core1_responded();
     take_response()
+}
+
+/// Core0: core1 has answered an APDU.  Counts it for the watchdog feeder,
+/// and buys this image if it runs on trial (the first answer proves USB,
+/// CCID, core1 and the store work end to end; `boot_slot`).
+#[cfg(target_arch = "arm")]
+fn core1_responded() {
+    pico2hsm_firmware::watchdog::note_core1_response();
+    if pico2hsm_firmware::boot_slot::buy_pending() {
+        if pico2hsm_firmware::boot_slot::buy_if_pending() {
+            defmt::info!("boot: image bought (try-before-you-buy)");
+        } else {
+            defmt::error!("boot: buying this image failed; the next boot reverts");
+        }
+    }
 }
 
 /// The response core1 announced on `RESP_READY` (always filled first).
@@ -1625,7 +1654,7 @@ async fn await_core1_response<'d, D: embassy_usb::driver::Driver<'d>>(
         pico2hsm_firmware::watchdog::crumb(0x0113_0000);
         match select(RESP_READY.receive(), Timer::at(deadline)).await {
             Either::First(()) => {
-                pico2hsm_firmware::watchdog::note_core1_response();
+                core1_responded();
                 return Some(take_response());
             }
             Either::Second(()) => {
