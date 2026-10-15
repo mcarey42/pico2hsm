@@ -71,10 +71,17 @@ cargo build --release --no-default-features --features pico2_4m
 ### Waveshare RP2350-One
 
 ```sh
-# 4 MB flash variant
+# 4 MB flash (stock): one firmware slot, 128 SC-HSM keys
 cargo build --release --no-default-features --features rp2350_one_4m
 
+# 16 MB flash chip fitted: the One board code with the 16 MB map
+# (A/B slots, try-before-you-buy, all 251 SC-HSM keys)
+cargo build --release --no-default-features --features rp2350_one_16m
 ```
+
+Every board boots through a partition table: 4 MB boards use
+`boards/pt_4m.json`, 16 MB boards `boards/pt_16m.json` (production:
+`pt_*_prod.json`).  See [FLASH_LAYOUT_2_0.md](FLASH_LAYOUT_2_0.md).
 
 ### Waveshare RP2350-Geek
 
