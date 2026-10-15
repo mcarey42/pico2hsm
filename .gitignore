@@ -12,6 +12,8 @@ tools/python/build/
 .claude/
 !.claude/agents/
 !.claude/agents/**
-ec_firmware_signing_key.pem
+# Signing keys under any name (primary, backup, per-slot): never commit.
+ec_firmware_signing_key*.pem
+*.pem
 ec_firmware_signing_key.pub
 tools/m33bench/target/
