@@ -25,7 +25,7 @@ accordingly.
 
 Initiate this runbook if any of the following occur:
 
-- `ec_firmware_signing_key.pem` is suspected or confirmed to have leaked.
+- `ec_firmware_signing_key-bootkey0.pem` is suspected or confirmed to have leaked.
 - A firmware vulnerability is disclosed via GitHub Security Advisories (see
   `SECURITY.md`) or discovered internally.
 - A release UF2 or SHA256SUMS file is reported to be corrupt, truncated, or
@@ -37,14 +37,14 @@ Initiate this runbook if any of the following occur:
 
 ## Signing-key compromise
 
-Scope: the EC private key in `ec_firmware_signing_key.pem` (or its HSM-backed
+Scope: the EC private key in `ec_firmware_signing_key-bootkey0.pem` (or its HSM-backed
 equivalent) has leaked, been lost, or is otherwise no longer trustworthy.
 Impact: any attacker with the key can sign firmware that will boot on
 production-locked devices.
 
 Runbook:
 
-1. **Rotate the signing key.** Generate a new `ec_firmware_signing_key.pem`
+1. **Rotate the signing key.** Generate a new `ec_firmware_signing_key-bootkey0.pem`
    following `docs/PROVISIONING.md` Phase 1. Store the new key under the same
    offline custody procedure as the original. Do not reuse the old key.
 2. **Revoke prior release tags.** On GitHub Releases, edit every release signed

@@ -82,15 +82,23 @@ if [[ $SKIP_ARM -eq 0 ]]; then
 fi
 
 # ── Firmware signing key ─────────────────────────────────────────────────────
-KEY_FILE="ec_firmware_signing_key.pem"
+# Signing key: the OTP BOOTKEY0 key by default (BOOTKEY1, the offline
+# backup, only via SIGNING_KEY=ec_firmware_signing_key-bootkey1.pem).
+KEY_FILE="${SIGNING_KEY:-ec_firmware_signing_key-bootkey0.pem}"
+# picotool used to seal: needs a build with `seal` (mbedtls); point
+# PICOTOOL at one if the picotool on PATH lacks it.
+PICOTOOL_SEAL="${PICOTOOL:-picotool}"
+if [[ ! -f "$KEY_FILE" && -f ec_firmware_signing_key.pem ]]; then
+    echo "[WARN] ec_firmware_signing_key.pem is the old name: rename it to ec_firmware_signing_key-bootkey0.pem" >&2
+fi
 if [[ -f "$KEY_FILE" ]]; then
-    if ! command -v picotool >/dev/null 2>&1; then
-        die "ec_firmware_signing_key.pem found but picotool is not installed — cannot sign"
+    if ! "$PICOTOOL_SEAL" help seal >/dev/null 2>&1; then
+        die "$KEY_FILE found but $PICOTOOL_SEAL cannot seal (not installed, or built without mbedtls) — set PICOTOOL=/path/to/picotool"
     fi
     ok "Signing key present — all firmware outputs will be signed (picotool seal --hash --sign)"
     SIGN=1
 else
-    warn "No signing key found (ec_firmware_signing_key.pem) — outputs will NOT be signed"
+    warn "No signing key found ($KEY_FILE) — outputs will NOT be signed"
     warn "Run ./generate_firmware_signing_keys.sh to create the key pair"
     SIGN=0
 fi
@@ -186,8 +194,8 @@ if [[ $SKIP_ARM -eq 0 ]]; then
             # OTP for the bootrom to accept this firmware.
             if [[ $SIGN -eq 1 ]]; then
                 SIGNED_ELF="dist/pico2hsm-${FEAT}-signed.elf"
-                OTP_JSON="dist/pico2hsm-${FEAT}-otp.json"
-                SIGN_OUT=$(picotool seal --hash --sign \
+                OTP_JSON="dist/pico2hsm-${FEAT}-seal-otp-ENABLES-SECURE-BOOT.json"
+                SIGN_OUT=$("$PICOTOOL_SEAL" seal --hash --sign \
                         "dist/pico2hsm-${FEAT}.elf" -t elf \
                         "$SIGNED_ELF" -t elf \
                         "$KEY_FILE" \
@@ -196,7 +204,7 @@ if [[ $SKIP_ARM -eq 0 ]]; then
                 SIGN_RC=$?
                 if [[ $SIGN_RC -eq 0 ]]; then
                     ok "  Signed → $SIGNED_ELF"
-                    ok "  OTP config → $OTP_JSON"
+                    warn "  seal OTP file → $OTP_JSON: it ENABLES SECURE BOOT; never load it (use tools/otp-bootkeys.sh)"
                 else
                     die "picotool seal failed for $NAME (rc=$SIGN_RC): $SIGN_OUT"
                 fi

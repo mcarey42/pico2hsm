@@ -71,7 +71,15 @@ case "$PROFILE" in
 esac
 ELF="target/thumbv8m.main-none-eabihf/$PROFILE/pico2hsm"
 CHIP="RP235x"
-KEY_FILE="ec_firmware_signing_key.pem"
+# Signing key: the OTP BOOTKEY0 key by default (BOOTKEY1, the offline
+# backup, only via SIGNING_KEY=ec_firmware_signing_key-bootkey1.pem).
+KEY_FILE="${SIGNING_KEY:-ec_firmware_signing_key-bootkey0.pem}"
+# picotool used to seal: needs a build with `seal` (mbedtls); point
+# PICOTOOL at one if the picotool on PATH lacks it.
+PICOTOOL_SEAL="${PICOTOOL:-picotool}"
+if [[ ! -f "$KEY_FILE" && -f ec_firmware_signing_key.pem ]]; then
+    echo "[WARN] ec_firmware_signing_key.pem is the old name: rename it to ec_firmware_signing_key-bootkey0.pem" >&2
+fi
 
 # ── Build (debug profile) ─────────────────────────────────────────────────────
 FEATURES="$FEAT,rsa,applet-piv,applet-openpgp-curve25519${EXTRA_FEATURES:+,$EXTRA_FEATURES}"
@@ -94,16 +102,17 @@ arm-none-eabi-size "$ELF" 2>/dev/null || true
 # set in OTP. Signing debug builds is safe and ensures the same artifact
 # pipeline is exercised in both debug and production.
 FLASH_ELF="$ELF"
-if [[ -f "$KEY_FILE" ]]; then
-    if ! command -v picotool >/dev/null 2>&1; then
-        die "ec_firmware_signing_key.pem found but picotool is not installed — cannot sign"
-    fi
+if [[ -f "$KEY_FILE" ]] && ! "$PICOTOOL_SEAL" help seal >/dev/null 2>&1; then
+    # A debug flash must not depend on signing: warn and flash unsigned.
+    warn "$KEY_FILE found but $PICOTOOL_SEAL cannot seal (built without mbedtls?) — set PICOTOOL=/path/to/picotool to sign"
+    warn "Flashing UNSIGNED debug build"
+elif [[ -f "$KEY_FILE" ]]; then
     mkdir -p dist
     SIGNED_ELF="dist/pico2hsm-${FEAT}-${PROFILE}-signed.elf"
-    OTP_JSON="dist/pico2hsm-${FEAT}-${PROFILE}-otp.json"
+    OTP_JSON="dist/pico2hsm-${FEAT}-${PROFILE}-seal-otp-ENABLES-SECURE-BOOT.json"
     section "Signing debug build: $FEAT"
-    info "picotool seal --hash --sign $ELF → $SIGNED_ELF"
-    SIGN_OUT=$(picotool seal --hash --sign \
+    info "$PICOTOOL_SEAL seal --hash --sign $ELF → $SIGNED_ELF"
+    SIGN_OUT=$("$PICOTOOL_SEAL" seal --hash --sign \
             "$ELF" -t elf \
             "$SIGNED_ELF" -t elf \
             "$KEY_FILE" \
@@ -112,7 +121,7 @@ if [[ -f "$KEY_FILE" ]]; then
     SIGN_RC=$?
     if [[ $SIGN_RC -eq 0 ]]; then
         ok "Signed → $SIGNED_ELF"
-        ok "OTP config → $OTP_JSON"
+        warn "seal OTP file → $OTP_JSON: it ENABLES SECURE BOOT; never load it (use tools/otp-bootkeys.sh)"
         # NOTE: probe-rs 0.31.0 rejects picotool-signed debug ELFs due to a
         # defmt parse bug (.sigx section alignment=0). Flash the unsigned ELF;
         # the signed artifact in dist/ is kept for OTP provisioning workflows.
@@ -124,7 +133,7 @@ if [[ -f "$KEY_FILE" ]]; then
         echo "       (Secure boot is likely disabled on this dev device; unsigned flash is safe.)"
     fi
 else
-    warn "No signing key found (ec_firmware_signing_key.pem) — flashing unsigned debug build"
+    warn "No signing key found ($KEY_FILE) — flashing unsigned debug build"
     warn "Run ./generate_firmware_signing_keys.sh to create the key pair"
 fi
 

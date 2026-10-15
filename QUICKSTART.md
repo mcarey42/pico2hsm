@@ -118,9 +118,9 @@ Think of a signing key like a wax seal on a letter. When you seal a letter, anyo
 
 There are two parts:
 
-- **Private key** (`ec_firmware_signing_key.pem`) — This is like your personal seal stamp. Keep it secret. If someone else gets it, they could build firmware that your device trusts. If you lose it, you will not be able to install firmware updates on any device you lock down with it.
+- **Private key** (`ec_firmware_signing_key-bootkey0.pem`) — This is like your personal seal stamp. Keep it secret. If someone else gets it, they could build firmware that your device trusts. If you lose it, you will not be able to install firmware updates on any device you lock down with it.
 
-- **Public key** (`ec_firmware_signing_key.pub`) — This is like the impression your seal leaves on wax. It's safe to share. The device stores a fingerprint of this key in its permanent memory (OTP) to know whose firmware to trust.
+- **Public key** (`ec_firmware_signing_key-bootkey0.pub`) — This is like the impression your seal leaves on wax. It's safe to share. The device stores a fingerprint of this key in its permanent memory (OTP) to know whose firmware to trust.
 
 ### Generate the key
 
@@ -137,7 +137,7 @@ SHA-256 fingerprint of public key (record this):
   a3f8...c920
 
 ===============================================================================
-  WARNING: The private key (ec_firmware_signing_key.pem) is EXTREMELY SENSITIVE.
+  WARNING: The private key (ec_firmware_signing_key-bootkey0.pem) is EXTREMELY SENSITIVE.
   ...
 ===============================================================================
 ```
