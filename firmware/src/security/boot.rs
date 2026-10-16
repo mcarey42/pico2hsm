@@ -112,7 +112,7 @@ pub fn security_checks() {
 
             // Record the JTAG-disabled bookkeeping bit in the boot flags row.
             // Hardware JTAG disable (CRIT1.DEBUG_DISABLE) must be set via
-            // picotool during provisioning — see docs/PROVISIONING.md Phase 8.
+            // picotool during provisioning — see docs/PROVISIONING.md stage 9.
             disable_jtag_permanent();
         }
     }

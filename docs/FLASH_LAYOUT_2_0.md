@@ -32,13 +32,13 @@ the three together.
 
 | Range | Size | Partition | Bootloader |
 |---|---|---|---|
-| `0x000000–0x002000` | 8 KB | the table (unpartitioned) | dev: rw; prod: none |
+| `0x000000–0x002000` | 8 KB | the table (unpartitioned) | dev: rw; prod: r |
 | `0x002000–0x1D8000` | 1,880 KB | `fw-a` | rw |
 | `0x1D8000–0x1E0000` | 32 KB | `binding` | none |
 | `0x1E0000–0x1F0000` | 64 KB | `counters` | none |
 | `0x1F0000–0x1FC000` | 48 KB | `rsa-pool` | none |
 | `0x1FC000–0x200000` | 16 KB | `spare` | none |
-| `0x200000–0x201000` | 4 KB | unpartitioned (the midpoint, §5.2) | dev: rw; prod: none |
+| `0x200000–0x201000` | 4 KB | unpartitioned (the midpoint, §5.2) | dev: rw; prod: r |
 | `0x201000–0x400000` | 2,044 KB | `keystore` | none |
 
 The store regions are where the flat interim layout had them, except the
@@ -49,16 +49,16 @@ keystore, which starts one sector later (§5.2).  Release images are
 
 | Range | Size | Partition | Bootloader |
 |---|---|---|---|
-| `0x000000–0x002000` | 8 KB | the table (unpartitioned) | dev: rw; prod: none |
+| `0x000000–0x002000` | 8 KB | the table (unpartitioned) | dev: rw; prod: r |
 | `0x002000–0x400000` | 4,088 KB | `fw-a` | rw |
 | `0x400000–0x7FE000` | 4,088 KB | `fw-b` (A/B with `fw-a`) | rw |
-| `0x7FE000–0x801000` | 12 KB | unpartitioned (gap, midpoint §5.2) | dev: rw; prod: none |
+| `0x7FE000–0x801000` | 12 KB | unpartitioned (gap, midpoint §5.2) | dev: rw; prod: r |
 | `0x801000–0x809000` | 32 KB | `binding` | none |
 | `0x809000–0x819000` | 64 KB | `counters` | none |
 | `0x819000–0x825000` | 48 KB | `rsa-pool` | none |
 | `0x825000–0x829000` | 16 KB | `spare` | none |
 | `0x829000–0xFFF000` | ~7.8 MB | `keystore` (QMI boards; reserved on SD boards) | none |
-| `0xFFF000–0x1000000` | 4 KB | unpartitioned (RP2350-E10, §5.3) | dev: rw; prod: none |
+| `0xFFF000–0x1000000` | 4 KB | unpartitioned (RP2350-E10, §5.3) | dev: rw; prod: r |
 
 `rp2350_one_16m` is the RP2350-One with a 16 MB chip fitted: the One board
 code with this map.
@@ -141,18 +141,31 @@ outside the chip and the table UF2 writes nothing there.
 The table's own sector is unpartitioned space.  On **development** tables
 it stays open, so erasing it from BOOTSEL (`picotool erase -r 0x10000000
 0x10001000`) reopens every region: the way back for a dev board.  The
-**production** tables (`pt_*_prod.json`) close the unpartitioned space, so
-from BOOTSEL the table can be neither erased nor replaced.
+**production** tables (`pt_*_prod.json`) make the unpartitioned space
+read-only to the bootloader, so from BOOTSEL the table can be neither erased
+nor replaced (verified on the Pico 2 and the RP2350-One).
+
+### 5.5 A2 silicon: BOOTSEL needs to read unpartitioned space
+
+If the table gives the bootloader **no** access to unpartitioned space, an
+A2 bootrom refuses **every** BOOTSEL flash program (picotool and UF2), even
+into a firmware slot the bootloader may write; erases still work.  Bisected
+on the Pico 2 over SWD, 2026-10-15: unpartitioned `bootloader: "r"` makes
+slot writes work again, while table erase or overwrite, a full-chip erase
+and reads of the store partitions all stay refused.  So the production
+tables use `"r"`; the table itself and the unpartitioned gaps hold nothing
+secret.  (Padding the gaps with closed partitions instead did not help.)
 
 ## 6. Production
 
 - Install the `-prod` table, signed with the firmware signing key
   (`ec_firmware_signing_key-bootkey0.pem`, secp256k1).  Secure boot needs that key's
   hash in an OTP boot-key slot and the secure-boot enable bit: the same
-  OTP burn covers the firmware and the table.  Whether secure boot alone
-  makes the bootrom require a signed table, or a further OTP flag does,
-  is to be confirmed before provisioning (owner approval for every OTP
-  write; rehearse on a designated board).
+  OTP burn covers the firmware and the table.  Secure boot alone does not
+  make the bootrom *require* a signed table; `BOOT_FLAGS0.SECURE_PARTITION_TABLE`
+  would, and with it an invalid table is replaced by an empty, open one, so
+  provisioning leaves that flag off.  The whole procedure, verified on an
+  RP2350-One, is [PROVISIONING.md](PROVISIONING.md).
 - Recovery on a production board is through the firmware (STORE STATUS,
   OPEN DEGRADED, ACCEPT STORE, FORMAT STORE; [KEYSTORE_RECOVERY.md](KEYSTORE_RECOVERY.md))
   or SWD where debug is enabled; BOOTSEL cannot wipe the store.

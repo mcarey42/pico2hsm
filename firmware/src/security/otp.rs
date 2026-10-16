@@ -230,7 +230,7 @@ impl Otp {
     /// flag only.  The hardware JTAG fuse is CRIT1.DEBUG_DISABLE (OTP
     /// rows 0x40–0x47, RBIT-8) and must be set via `picotool otp set
     /// OTP_DATA_CRIT1.DEBUG_DISABLE 1` during provisioning.  See
-    /// docs/PROVISIONING.md Phase 8 for the complete procedure.
+    /// docs/PROVISIONING.md stage 9 for the complete procedure.
     pub fn disable_jtag_permanent(&mut self) -> Result<(), HsmError> {
         if !self.is_production_mode() {
             defmt::error!("OTP: JTAG disable attempted outside production mode");
