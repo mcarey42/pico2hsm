@@ -1825,7 +1825,7 @@ MF  (3F00)
 
 6. **DECIPHER / DERIVE ASYM sharing INS=0x62:** DERIVE ASYMMETRIC is selected only by P1=0x01 **and** P2=0x00; everything else routes to DECIPHER (see §3.22).
 
-7. **LIST KEYS / IMPORT KEY sharing INS=0x58:** When INS=0x58 and P2=0x93, the IMPORT KEY handler is invoked. P2=0x00 routes to LIST KEYS.
+7. **LIST KEYS owns INS=0x58:** P1=P2=0x00 lists keys; anything else is 6A86. Key import (UNWRAP KEY) is INS=0x74 with P2=0x93 (§3.25), not 0x58.
 
 8. **EF.PrKDF is always empty:** The standard PKCS#15 PrKDF mechanism is not used. OpenSC is expected to call LIST KEYS (INS=0x58) to discover occupied slots, then read per-key PRKD (C4xx) EFs for key metadata.
 
