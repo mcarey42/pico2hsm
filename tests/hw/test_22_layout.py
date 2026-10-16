@@ -33,6 +33,7 @@ SELECT_SC_HSM = "00A404000BE82B0601040181C31F020100"
 IMAGE_INFO = apdu(0x80, 0xFE, 0x15, 0x00)
 PT_INFO = apdu(0x80, 0xFE, 0x16, 0x00)
 TO_BOOTSEL = apdu(0x80, 0xFE, 0x14, 0x00)
+GET_STATUS = apdu(0x80, 0xF0, 0x00, 0x00)
 
 # Store regions as (first sector, last sector), per flash map
 # (firmware/src/storage/flash_layout.rs).
@@ -84,6 +85,35 @@ def test_boots_from_a_partition():
     partition = (boot[1] >> 16) & 0xFF
     assert partition in (0, 1), f"booted flat (partition byte {partition:#x})"
     assert major >= 1, f"image version {major}.{minor}"
+
+
+def _status_tlv() -> dict[int, bytes]:
+    """GET PROVISIONING STATUS (80 F0): every build, no PIN."""
+    with session() as s:
+        s.ok(SELECT_SC_HSM)
+        data, sw = s.send(GET_STATUS)
+    assert sw == 0x9000, f"GET PROVISIONING STATUS: {sw:04X}"
+    data = bytes(data)
+    assert data[0] == 0x6F and data[1] == len(data) - 2, data.hex()
+    tags, i = {}, 2
+    while i + 1 < len(data):
+        tags[data[i]] = data[i + 2 : i + 2 + data[i + 1]]
+        i += 2 + data[i + 1]
+    return tags
+
+
+def test_status_reports_the_image_version():
+    """Release builds report the running image's version (tag 85), so a
+    host can recommend an update; debug builds must agree with 80 FE 15."""
+    v = _status_tlv().get(0x85)
+    assert v is not None and len(v) == 4, "no image version (tag 85)"
+    major, minor = int.from_bytes(v[0:2], "big"), int.from_bytes(v[2:4], "big")
+    assert major >= 1, f"image version {major}.{minor}"
+    with session() as s:
+        s.ok(SELECT_SC_HSM)
+        data, sw = s.send(IMAGE_INFO)
+    if sw == 0x9000:
+        assert bytes(data[:4]) == v, f"80 FE 15 says {bytes(data[:4]).hex()}, status {v.hex()}"
 
 
 def test_store_regions_are_closed_partitions():
