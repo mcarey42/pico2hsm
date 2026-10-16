@@ -67,10 +67,9 @@ and resumes domain sync. The card checks are implemented (Storage V2,
 [docs/STORAGE_V2.md](docs/STORAGE_V2.md) §8, §11); domains and sync are
 designed in [docs/CLUSTER_PLAN_V3.md](docs/CLUSTER_PLAN_V3.md).
 
-### 2.0.0 (upcoming): breaking
+### 2.0.0: breaking
 
-The next release series is 2.0.0 (`main` already carries it; no 2.0.0
-tag yet). It brings a new flash layout with a partition table on every
+2.0.0 brings a new flash layout with a partition table on every
 board ([docs/FLASH_LAYOUT_2_0.md](docs/FLASH_LAYOUT_2_0.md)) and a
 journaled keystore format ([docs/STORAGE_V2.md](docs/STORAGE_V2.md)), and
 removes the unused RAID-1 / WAL / multi-chip storage code. There is no
@@ -219,6 +218,14 @@ Key security properties:
 - PIN retry counter prevents brute force; lockout is enforced in constant time
 - Secure boot verifies the firmware signature before execution once the device is provisioned ([docs/PROVISIONING.md](docs/PROVISIONING.md)); debug access is then left open, key-protected or disabled for good, as the owner chooses
 - The store partitions are closed to BOOTSEL: picotool and UF2 cannot read, write or erase them
+
+**Silicon revision.** Use RP2350 **A4** silicon for any business or
+production use. Revisions A2 and A3 have erratum RP2350-E24: an attacker
+with the board in hand can bypass the secure-boot signature check by
+glitching and swapping the flash chip. A2 also has BOOTSEL glitch errata
+(E20, E21). A2/A3 boards are fine for a homelab or evaluation;
+`picotool info -a` prints the revision. See
+[docs/PROVISIONING.md](docs/PROVISIONING.md) §1.
 
 ## License
 
