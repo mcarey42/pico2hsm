@@ -7,7 +7,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 Security and robustness release from the October 2026 audit
-(`docs/AUDIT_2026-10.md` lists every finding with its commit).
+(`docs/AUDIT_2026-10.md` lists every finding with its commit), and the
+start of the 2.0.0 series (Storage V2 and the 2.0 flash layout; not yet
+tagged).
+
+### Breaking — Storage V2 and the 2.0 flash layout
+- **Journaled keystore (Storage V2, `docs/STORAGE_V2.md`).** Journal ring,
+  MACed index snapshots, objects sealed under per-object keys with their
+  header as AAD, a binding block and a rollback anchor on internal flash.
+  The 1.x filesystem and the unused RAID-1 / WAL / multi-chip code are
+  removed. **1.x keys do not carry over**: a 1.x keystore is refused
+  (E12 FORMAT STORE NEEDED on the display boards) until FORMAT STORE
+  (`80 54 4E`, data `FORMAT-STORE-V2`); a blank store formats itself.
+- **Store recovery:** STORE STATUS (`80 54 52`), OPEN DEGRADED
+  (`80 54 4F`), ACCEPT STORE (`80 54 53`); the SC-HSM SO-PIN lives in the
+  binding block (`docs/KEYSTORE_RECOVERY.md`).
+- **Counter log v2** (16 sectors on internal flash on every board): retry
+  counters, device values, the keystore anchor and the OpenPGP signature
+  counter; the 1.x log is migrated once.
+- **A bootrom partition table on every board** (`docs/FLASH_LAYOUT_2_0.md`):
+  install the board's table before the firmware. The store regions are
+  partitions closed to BOOTSEL; a release build checks the loaded table at
+  boot and disables its keystore if it differs. 4 MB boards: one 1,880 KB
+  slot, keystore at 0x201000, **128 SC-HSM keys**. 16 MB boards: A/B slots
+  of 4 MB with try-before-you-buy (an image is bought once core1 has
+  answered its first APDU) and the store moved to 8 MB + 4 KB.
+  Production tables (`pt_*_prod.json`) keep the table read-only to
+  BOOTSEL. CI ships `pico2hsm-<board>-pt-dev.uf2` / `-pt-prod.uf2`.
+- **New board feature `rp2350_one_16m`:** the RP2350-One with a 16 MB chip
+  fitted.
+- **IMAGE_DEF version item**; `debug` APDUs `80 FE 14` (reboot to BOOTSEL),
+  `80 FE 15` (image version and boot info), `80 FE 16` (partition table).
+- **OTP:** the storage secret's chaff (the complement of each raw IKM row)
+  at rows 0x120–0x13F; secure-boot state read from the CRITICAL register.
+- **Provisioning:** two signing keys, one per OTP boot-key slot
+  (`ec_firmware_signing_key-bootkey0.pem` signs, `-bootkey1.pem` is the
+  offline backup; the old `ec_firmware_signing_key.pem` name only warns);
+  `tools/otp-bootkeys.sh` and staged, read-back-checked provisioning with
+  `tools/provision-device.py` (`docs/PROVISIONING.md`). The OTP JSON that
+  `picotool seal` writes is now named `…-seal-otp-ENABLES-SECURE-BOOT.json`
+  and must never be loaded.
 
 ### Added — RSA key pool and sliced RSA key generation (`rsa` feature)
 - **Pre-generated RSA keys.**  Core1 fills a pool of RSA-2048/3072/4096

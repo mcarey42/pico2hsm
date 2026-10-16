@@ -5,6 +5,10 @@ Each item carries a severity and a target milestone.
 
 Last updated: 2026-04-18 (v1.0.0: first stable release — see CHANGELOG.md)
 
+> Not updated since v1.0.0. Later findings and fixes are tracked in
+> [docs/AUDIT_2026-10.md](docs/AUDIT_2026-10.md) and the CHANGELOG; the
+> 2.0 storage work in [docs/STORAGE_V2.md](docs/STORAGE_V2.md).
+
 ---
 
 ## Closed items
