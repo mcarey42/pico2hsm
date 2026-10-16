@@ -343,8 +343,13 @@ RP2350-One, chip ID 139E6D9547578EEE, silicon A2, 2026-10-15. The board ran debu
 | 3 | BOOT_FLAGS1 = 0x0C03 in all 3 copies. |
 | 4 | Page 4 is unreadable from BOOTSEL; the keystore opens. |
 | 5 | Boot diagnostic: MATCHING KEY + VERIFIED OK. The unsigned image was refused (the board fell back to BOOTSEL), and the signed image restored. |
-| — | Full hardware suite under secure boot: see the stage 5 suite run. |
-| 6–8 | See below. |
+| — | Full hardware suite under secure boot: 368 passed, 0 failed (the 12 skips need SWD or opt-in). |
+| 6 | BOOT_FLAGS0 = 0x082000 in all 3 copies. BOOTSEL still offers both picotool and the USB drive; the firmware boots. |
+| 7 | CRIT1 = 0x000011 in all 8 copies. 10 reboot cycles through BOOTSEL and the firmware, all clean. |
+| 8 | Row 0x140 = 0x000006. After a reboot the firmware reports production 1, secure boot 1, key page locked 1, glitch detector armed 1. |
+| — | Full hardware suite in production mode (glitch detector at maximum sensitivity): 368 passed, 0 failed, no spurious resets. |
+
+`glitch_armed` reports the firmware's own runtime arming, which happens in production mode only. It stays 0 after stage 7, because the OTP flag arms the detector in hardware separately.
 
 ---
 
