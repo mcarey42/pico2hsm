@@ -161,7 +161,7 @@ $P status                                   # read-only report of every relevant
 $P stage 0                                  # preflight
 $P --burn stage 1                           # boot-key hashes
 $P --burn stage 2                           # storage IKM + chaff
-#   then: FORMAT STORE and INITIALIZE (your SO-PIN, PIN, DKEK shares)
+#   then: pico2hsm-tool store format --no-so-pin, and INITIALIZE (your SO-PIN, PIN, DKEK shares)
 $P --burn stage 3                           # key slots
 $P --burn stage 4                           # page-4 lock
 $P --burn --table pt-prod-signed.uf2 --image firmware-signed.uf2 \
@@ -231,7 +231,7 @@ $P --burn --so-pin-file so-pin.txt stage 8  # production mode
 - The page-4 lock comes after the IKM and chaff are complete, because a locked page can never be completed.
 - The page-4 lock also comes before secure boot. After secure boot, RAM helpers such as `picotool otp permissions` would need signing.
 
-**Between stage 2 and stage 8.** The new IKM re-keys the keystore. Format it (`pico2hsm-tool store format`) and INITIALIZE the device as you would any new HSM (`sc-hsm-tool --initialize …`). Stage 8 needs the SO-PIN you chose, in a file, as 16 hex digits. Delete that file afterwards.
+**Between stage 2 and stage 8.** The new IKM re-keys the keystore. Format it with `pico2hsm-tool store format --no-so-pin`: the old binding, and the old SO-PIN with it, was sealed under the old key and can no longer be checked, so the SO-PIN is reported as blocked and the format needs none. Use firmware 2.0.1 or later: 2.0.0 could fail this format on a store that had been in use, and then stayed down at every boot. Then INITIALIZE the device as you would any new HSM (`sc-hsm-tool --initialize …`). Stage 8 needs the SO-PIN you chose, in a file, as 16 hex digits. Delete that file afterwards.
 
 **What production mode changes.** At every boot, the firmware:
 
@@ -350,6 +350,16 @@ RP2350-One, chip ID 139E6D9547578EEE, silicon A2, 2026-10-15. The board ran debu
 | — | Full hardware suite in production mode (glitch detector at maximum sensitivity): 368 passed, 0 failed, no spurious resets. |
 
 `glitch_armed` reports the firmware's own runtime arming, which happens in production mode only. It stays 0 after stage 7, because the OTP flag arms the detector in hardware separately.
+
+Waveshare RP2350-LCD-1.47-B 16 MB (`waveshare_rp2350_lcd_16m`), chip ID 10ECEA541D6808A9, silicon A2, 2026-10-16: the first production LCD board. Provisioned with a signed 2.0.1 debug image, then the signed 2.0.1 release image installed into slot A.
+
+| Stage | Result |
+|---|---|
+| 0–1 | As on the One; all 32 BOOTKEY rows match. |
+| 2 | IKM and chaff written and verified. The FORMAT STORE that follows failed on 2.0.0 (the new store reused the old store's generation and the anchor refused it; the store then stayed down at every boot). Fixed in 2.0.1: the board finished the format at its next boot. |
+| 3–4 | BOOT_FLAGS1 = 0x0C03; PAGE4_LOCK1 = 0x3D3D3D; the store opens and the PIN verifies. |
+| 5 | The signed production table was already installed (byte-identical, so not reloaded). Secure boot on; an unsigned image was refused and the signed one restored. |
+| 6–8 | BOOT_FLAGS0 = 0x082000; CRIT1 = 0x000011 (10 clean reboot cycles); row 0x140 = 0x000006; the firmware reports production, secure boot, key page locked and glitch detector armed. |
 
 ---
 

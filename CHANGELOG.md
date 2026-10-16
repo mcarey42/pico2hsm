@@ -6,6 +6,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.0.1] - 2026-10-16
+
+### Fixed
+- **FORMAT STORE after OTP provisioning could leave the store down for
+  good.** Provisioning the storage secret changes the storage key, so the
+  old binding no longer verifies and its store generation is unknown;
+  the new store then took generation 1. If the old store was also
+  generation 1 and in use, the rollback anchor refused the new store's
+  head as going backwards, the format failed, and every boot's resume
+  failed the same way (STORE STATUS `04`, no PIN-less format, the
+  SO-PIN reported blocked). A format now picks a generation clear of the
+  anchor, and a resumed format stuck on the anchor's generation moves to
+  the next one, so a device left in that state recovers at its next
+  boot. Found provisioning the first production LCD board.
+
+### Changed
+- **`tools/provision-device.py` stage 5** skips loading the production
+  table when the board already holds the same table byte for byte (a
+  production table cannot be replaced from BOOTSEL, but stays readable).
+- **`docs/PROVISIONING.md`:** format after stage 2 with
+  `pico2hsm-tool store format --no-so-pin`; the LCD board's provisioning
+  record.
+
 ## [2.0.0] - 2026-10-16
 
 The 2.0 series: Storage V2 (a journaled keystore), a bootrom partition

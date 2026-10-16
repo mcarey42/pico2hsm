@@ -296,12 +296,14 @@ impl<F: StoreFlash, B: CounterFlash, L: RetryCounterBackend> FlashKeyStoreV2<F, 
         carry: Option<&Binding>,
         auth: FormatAuth,
     ) -> Result<(), StorageError> {
+        let after_binding = carry
+            .or(self.binding.as_ref())
+            .map_or(1, |o| o.format_gen.wrapping_add(1).max(1));
+        let format_gen = self.gen_clear_of_anchor(after_binding);
         let mut b = Binding {
             state: BindState::Formatting,
             store_id: random()?,
-            format_gen: carry
-                .or(self.binding.as_ref())
-                .map_or(1, |o| o.format_gen.wrapping_add(1).max(1)),
+            format_gen,
             e_store: random()?,
             e_group: [random()?, random()?, random()?],
             group_gen: [0; 3],
@@ -329,6 +331,28 @@ impl<F: StoreFlash, B: CounterFlash, L: RetryCounterBackend> FlashKeyStoreV2<F, 
         self.finish_format(Some(auth))
     }
 
+    /// `gen`, or the next one if the counter log's anchor already carries
+    /// it with a store behind it.  The anchor refuses a head that goes back
+    /// within one generation, so a new store must never reuse the old
+    /// store's.  The binding usually rules that out (`format_gen` + 1), but
+    /// not when it cannot be read: after OTP provisioning changes the
+    /// storage key, the old binding no longer verifies and its generation
+    /// is unknown.
+    /// An anchor that cannot be read changes nothing (the anchor write
+    /// that follows decides, as before).
+    fn gen_clear_of_anchor(&mut self, gen: u32) -> u32 {
+        let anchor = self
+            .counters
+            .as_mut()
+            .and_then(|l| l.anchor().ok().flatten());
+        match anchor {
+            Some(a) if a.format_gen == gen as u16 && (a.head_seq, a.head_slot) != (0, 0) => {
+                gen.wrapping_add(1).max(1)
+            }
+            _ => gen,
+        }
+    }
+
     /// Steps 2–4 of a format (§8.3), resumable from a FORMATTING binding.
     fn finish_format(&mut self, auth: Option<FormatAuth>) -> Result<(), StorageError> {
         let auth = auth.ok_or(StorageError::IntegrityFailure)?;
@@ -336,6 +360,19 @@ impl<F: StoreFlash, B: CounterFlash, L: RetryCounterBackend> FlashKeyStoreV2<F, 
         if b.state != BindState::Formatting {
             return Err(StorageError::IntegrityFailure);
         }
+        // A FORMATTING binding whose generation an older store's anchor
+        // still holds (firmware before 2.0.1 could write one after OTP
+        // provisioning): move it to the next generation, or the anchor
+        // write below refuses it at every boot and the store stays down.
+        let gen = b.format_gen;
+        let clear = self.gen_clear_of_anchor(gen);
+        if clear != gen {
+            let mut nb = self.binding.clone().ok_or(StorageError::NotFormatted)?;
+            nb.format_gen = clear;
+            self.write_binding(&mut nb)?;
+            self.binding = Some(nb);
+        }
+        let b = self.binding.as_ref().ok_or(StorageError::NotFormatted)?;
         let info = self.mount_info(b)?;
         // The binding is now FORMATTING with a new store_id: the engine's
         // first-boot check would see the anchor of the previous store (if
@@ -1071,11 +1108,16 @@ pub(crate) mod tests {
 
         /// Boot: open the log (formatting a blank one), the binding, init.
         pub(crate) fn boot(&self) -> (Ks, Result<(), StorageError>) {
+            self.boot_with(SMK)
+        }
+
+        /// Boot under another storage key (OTP provisioning changes it).
+        pub(crate) fn boot_with(&self, smk: [u8; 32]) -> (Ks, Result<(), StorageError>) {
             let mut log = CounterLog::open(self.log.clone(), 16);
             if self.log.mem.iter().all(|&b| b == 0xFF) {
                 log.format(&[]).unwrap();
             }
-            let mut ks = Ks::new(self.store.clone(), Some(Zeroizing::new(SMK)));
+            let mut ks = Ks::new(self.store.clone(), Some(Zeroizing::new(smk)));
             ks.attach_retry_counters(log);
             ks.attach_binding(self.bind.clone(), 8).unwrap();
             let r = ks.init();
@@ -1131,6 +1173,62 @@ pub(crate) mod tests {
             SoPinHome::Binding(s) => s,
             SoPinHome::Record => panic!("V2 keeps the SO-PIN in the binding"),
         }
+    }
+
+    /// The storage key OTP provisioning brings (any other than [`SMK`]).
+    const OTP_SMK: [u8; 32] = [6; 32];
+
+    /// A device with a store in use (anchor head past 0) under [`SMK`].
+    fn used_device() -> Dev {
+        let (mut ks, r) = Dev::new().boot();
+        r.unwrap();
+        for i in 1..=5 {
+            ks.save_key(&key(i, i as u8)).unwrap();
+        }
+        Dev::of(&mut ks)
+    }
+
+    #[test]
+    fn format_after_a_storage_key_change_moves_past_the_old_anchor() {
+        // OTP provisioning: the old binding no longer verifies, so its
+        // generation is unknown; the new store must not reuse the anchor's
+        // (the anchor would refuse head 0 within the old generation).
+        let (mut ks, r) = used_device().boot_with(OTP_SMK);
+        assert!(r.is_err());
+        assert_eq!(ks.status(), StoreStatus::BindingUnverifiable);
+        assert!(ks.format_needs_no_pin());
+        ks.format_store_now(false).unwrap();
+        assert_eq!(ks.status(), StoreStatus::Up);
+        ks.save_key(&key(9, 9)).unwrap();
+        let (mut ks, r) = Dev::of(&mut ks).boot_with(OTP_SMK);
+        r.unwrap();
+        assert_eq!(tag(&mut ks, 9), Some(9));
+        assert_eq!(tag(&mut ks, 1), None);
+    }
+
+    #[test]
+    fn a_format_stuck_on_the_old_anchors_generation_finishes_at_boot() {
+        // What firmware before the fix left behind: a FORMATTING binding
+        // under the new key with the generation the old store's anchor
+        // still holds.  Every boot's resume failed; now it moves on.
+        let (mut ks, _) = used_device().boot_with(OTP_SMK);
+        let mut b = Binding {
+            state: BindState::Formatting,
+            store_id: random().unwrap(),
+            format_gen: 1,
+            e_store: random().unwrap(),
+            e_group: [random().unwrap(), random().unwrap(), random().unwrap()],
+            ..Binding::default()
+        };
+        ks.write_binding(&mut b).unwrap();
+        let (mut ks, r) = Dev::of(&mut ks).boot_with(OTP_SMK);
+        r.unwrap();
+        assert_eq!(ks.status(), StoreStatus::Up);
+        assert_eq!(ks.binding.as_ref().unwrap().format_gen, 2);
+        ks.save_key(&key(3, 3)).unwrap();
+        let (mut ks, r) = Dev::of(&mut ks).boot_with(OTP_SMK);
+        r.unwrap();
+        assert_eq!(tag(&mut ks, 3), Some(3));
     }
 
     #[test]
