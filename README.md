@@ -217,8 +217,8 @@ Key security properties:
 - All key material is encrypted under a device-tied Storage Master Key derived from OTP fuses
 - HSM-to-HSM backup uses DKEK wrap (AES-256 + CMAC), not plaintext export
 - PIN retry counter prevents brute force; lockout is enforced in constant time
-- JTAG is permanently disabled after provisioning
-- Secure boot verifies firmware signature before execution
+- Secure boot verifies the firmware signature before execution once the device is provisioned ([docs/PROVISIONING.md](docs/PROVISIONING.md)); debug access is then left open, key-protected or disabled for good, as the owner chooses
+- The store partitions are closed to BOOTSEL: picotool and UF2 cannot read, write or erase them
 
 ## License
 
