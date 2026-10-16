@@ -36,6 +36,7 @@ import os
 import re
 import secrets
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
@@ -67,6 +68,17 @@ GET_PROV_STATUS = "80F0000000"
 
 STAGES = ["preflight", "bootkeys", "ikm", "key-slots", "lock-page4",
           "secure-boot", "bootsel-trim", "glitch", "production"]
+
+
+def uf2_payload(b: bytes) -> list[tuple[int, bytes]]:
+    """(target address, data) of every block of a UF2 file."""
+    out = []
+    for off in range(0, len(b) - 511, 512):
+        magic0, magic1, _flags, addr, size = struct.unpack_from("<IIIII", b, off)
+        if magic0 != 0x0A324655 or magic1 != 0x9E5D5157:
+            raise Fail("not a UF2 file")
+        out.append((addr, b[off + 32:off + 32 + size]))
+    return out
 
 
 def secret_dir() -> tempfile.TemporaryDirectory:
@@ -283,6 +295,20 @@ class Device:
         self.card.wait(True)
         time.sleep(2)
 
+    def table_installed(self, table_uf2: str) -> bool:
+        """Whether flash already holds exactly the table in `table_uf2`.
+        A production table cannot be replaced from BOOTSEL, but its sector
+        stays readable (unpartitioned space is bootloader-read-only)."""
+        blocks = uf2_payload(Path(table_uf2).read_bytes())
+        with tempfile.TemporaryDirectory() as d:
+            for addr, data in blocks:
+                p = Path(d) / "chunk.bin"
+                r = subprocess.run([self.pt.exe, "save", "-r", hex(addr), hex(addr + len(data)), str(p),
+                                    "--ser", self.pt.serial], capture_output=True, text=True, timeout=60)
+                if r.returncode != 0 or not p.exists() or p.read_bytes() != data:
+                    return False
+        return True
+
     def require_burn(self, what: str) -> None:
         if not self.args.burn:
             raise Fail(f"{what} writes OTP permanently: rerun with --burn")
@@ -482,11 +508,16 @@ class Device:
             raise Fail("page 4 not locked (stage 4)")
         if not a.table or not a.image:
             raise Fail("stage 5 needs --table <signed production table UF2> and --image <signed firmware UF2>")
-        say("  installing the signed production table and the signed image...")
-        self.pt.run("load", a.table)
-        self.pt.run("reboot", "-u", check=False)
-        time.sleep(4)
-        self.to_bootsel()
+        if self.table_installed(a.table):
+            say("  the signed production table is already installed (byte-identical); installing the signed image...")
+        else:
+            say("  installing the signed production table and the signed image...")
+            self.pt.run("load", a.table)
+            self.pt.run("reboot", "-u", check=False)
+            time.sleep(4)
+            self.to_bootsel()
+            if not self.table_installed(a.table):
+                raise Fail("the table on the board is not the signed table just loaded")
         self.pt.run("load", "-p", str(a.slot), "-x", a.image)
         self.card.wait(True)
         time.sleep(2)
