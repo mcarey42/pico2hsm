@@ -4,8 +4,8 @@
 
 | Version | Status |
 |---------|--------|
-| 2.0.x | In development on `main` (Storage V2, partition tables; breaking, not yet tagged) |
-| 1.0.x | Current release series (`v1.0.1`) |
+| 2.0.x | Current release series (`v2.0.0`: Storage V2, partition tables; breaking) |
+| 1.0.x | Previous release series (`v1.0.1`); upgrade to 2.0 |
 | 0.9.x | Pre-release series; not supported |
 
 ## Threat model summary
@@ -36,6 +36,8 @@ For encrypted communication, a GPG key or Signal contact can be provided on requ
 ## Known limitations (not considered vulnerabilities)
 
 These are documented design limitations within the current threat model, not bugs:
+
+- **Silicon errata on RP2350 A2/A3.** Erratum RP2350-E24 lets an attacker with physical access bypass the secure-boot signature check by glitching and swapping the flash chip; A2 also has BOOTSEL glitch errata (E20, E21). These are fixed only in **A4** silicon, which is **required for business or production use**. A2/A3 boards are acceptable for a homelab or evaluation. Check the revision with `picotool info -a` before provisioning (`docs/PROVISIONING.md` §1).
 
 - **PIN hashing without a per-device salt.** PINs are hashed with PBKDF2-HMAC-SHA256 (10,000 iterations) and a random 16-byte salt per credential, but the device-identity part of the salt is a fixed string, not derived from hardware identity. The PIN records are themselves encrypted under the device's storage key, so an offline dictionary attack against short PINs needs both the flash contents and the OTP storage secret. Physical extraction of both is outside the current threat model. See PUNCHOUT for tracking.
 

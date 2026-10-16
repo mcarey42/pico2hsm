@@ -4,7 +4,8 @@
 #
 # Usage:
 #   ./build-all.sh              # host tests + build all ARM variants + generate UF2
-#   ./build-all.sh --flash rp2350_one_4m   # also flash that variant
+#   ./build-all.sh --flash rp2350_one_4m   # also flash that variant over SWD (table + slot A;
+#                                          # PROBE_SERIAL=<serial> with several probes)
 #   ./build-all.sh --test-only  # host tests only (no ARM build)
 #   ./build-all.sh --arm-only   # skip host tests, build all ARM variants + generate UF2
 #   ./build-all.sh --no-uf2     # skip UF2 generation
@@ -113,6 +114,7 @@ COMMON_FEATURES="rsa,applet-piv,applet-openpgp-curve25519"
 declare -a VARIANTS=(
     "pico2_4m                 | Raspberry Pi Pico 2 4MB                | RP2350"
     "rp2350_one_4m            | Waveshare RP2350-One  4MB              | RP2350"
+    "rp2350_one_16m           | Waveshare RP2350-One 16MB (chip swap)  | RP2350"
     "rp2350_geek_16m          | Waveshare RP2350-Geek 16MB             | RP2350"
     "rp2350_geek_sdcard               | Waveshare RP2350-Geek SDCard           | RP2350"
     "waveshare_rp2350_lcd_16m         | Waveshare RP2350-LCD-1.47-B 16MB       | RP2350"
@@ -298,56 +300,69 @@ if [[ -n "$FLASH_TARGET" ]]; then
         ELF="dist/pico2hsm-${FLASH_TARGET}-signed.elf"
         info "Using signed ELF: $ELF"
     else
-        ELF="target/thumbv8m.main-none-eabihf/release/pico2hsm"
+        # The per-variant copy: target/…/release/pico2hsm holds whichever
+        # board was built last.
+        ELF="dist/pico2hsm-${FLASH_TARGET}.elf"
     fi
     [[ -f "$ELF" ]] || die "ELF not found — run without --test-only first"
 
+    # Every 2.0 board boots through a partition table (docs/FLASH_LAYOUT_2_0.md):
+    # the table at 0x10000000, the image in slot A at 0x10002000.  Writing the
+    # ELF to its link address (0x10000000) would overwrite the table.
+    case "$FLASH_TARGET" in
+        pico2_4m|rp2350_one_4m) PT_SIZE=4m ;;
+        *)                      PT_SIZE=16m ;;
+    esac
+    OBJCOPY="$(command -v arm-none-eabi-objcopy || command -v rust-objcopy || command -v llvm-objcopy || true)"
+    [[ -n "$OBJCOPY" ]] || die "an objcopy is required (arm-none-eabi-objcopy, rust-objcopy or llvm-objcopy)"
+    PT_BIN="dist/pt_${PT_SIZE}.bin"
+    IMG_BIN="dist/pico2hsm-${FLASH_TARGET}-flash.bin"
+    picotool partition create "boards/pt_${PT_SIZE}.json" "$PT_BIN" -t bin >/dev/null \
+        || die "picotool partition create boards/pt_${PT_SIZE}.json failed"
+    "$OBJCOPY" -O binary "$ELF" "$IMG_BIN" || die "objcopy failed"
+
+    # PROBE_SERIAL picks one probe when several are attached (as in build-all-debug.sh).
+    PROBE_ARG=""
+    [[ -n "${PROBE_SERIAL:-}" ]] && PROBE_ARG="--probe 2e8a:000c:$PROBE_SERIAL"
+
     info "Connecting to probe (chip: $CHIP)..."
-    probe-rs info --chip "$CHIP" 2>&1 | grep -E "Core|Memory|Vendor" || true
+    probe-rs info ${PROBE_ARG} --chip "$CHIP" 2>&1 | grep -E "Core|Memory|Vendor" || true
 
-    info "Flashing $ELF → $CHIP ..."
-    probe-rs download \
-        --chip "$CHIP" \
-        --format elf \
-        "$ELF"
+    # Readers before flashing: the smoke test waits for the count to return.
+    count_readers() { opensc-tool --list-readers 2>/dev/null | grep -c "pico2hsm" || true; }
+    BEFORE=0
+    command -v opensc-tool >/dev/null 2>&1 && BEFORE=$(count_readers)
 
-    info "Resetting device and capturing 3 s of RTT output..."
-    # probe-rs run streams RTT until the process is killed or the target halts.
-    # We capture 3 seconds of output for smoke-test purposes.
-    RTT_LOG=$(mktemp /tmp/pico2hsm-rtt-XXXXXX.log)
-    timeout 5 probe-rs run \
-        --chip "$CHIP" \
-        --no-location \
-        "$ELF" 2>&1 | tee "$RTT_LOG" || true   # timeout exit expected; $ELF is signed if key present
+    info "Flashing partition table (pt_${PT_SIZE}) and $ELF into slot A → $CHIP ..."
+    probe-rs download ${PROBE_ARG} --chip "$CHIP" --binary-format bin --base-address 0x10000000 "$PT_BIN" \
+        || die "flashing the partition table failed"
+    probe-rs download ${PROBE_ARG} --chip "$CHIP" --binary-format bin --base-address 0x10002000 "$IMG_BIN" \
+        || die "flashing the image failed"
+    probe-rs reset ${PROBE_ARG} --chip "$CHIP" || die "reset failed"
 
-    section "RTT smoke-test results"
-    PASS=1
-
-    check_rtt() {
-        local pattern="$1"
-        local label="$2"
-        if grep -q "$pattern" "$RTT_LOG" 2>/dev/null; then
-            ok "  $label"
+    # Release images carry no defmt version symbol, so probe-rs cannot decode
+    # their RTT log (build-all-debug.sh streams it for debug builds).  The
+    # smoke test is that the board comes back as a CCID reader.
+    info "Waiting for the device to enumerate..."
+    if command -v opensc-tool >/dev/null 2>&1; then
+        # The flashed board drops off USB during the flash; wait until it is
+        # back (one more reader than before if it was not enumerated then).
+        WANT=$BEFORE
+        sleep 3
+        [[ $WANT -gt 0 ]] || WANT=1
+        FOUND=0
+        for _ in $(seq 1 30); do
+            if [[ $(count_readers) -ge $WANT ]]; then FOUND=1; break; fi
+            sleep 1
+        done
+        if [[ $FOUND -eq 1 ]]; then
+            ok "Smoke test PASSED — $(count_readers) pico2hsm reader(s) present (${BEFORE} before flashing)"
         else
-            warn "  MISSING: $label  (pattern: '$pattern')"
-            PASS=0
+            warn "Smoke test FAILED — $(count_readers) pico2hsm reader(s) after 30 s, ${BEFORE} before flashing"
         fi
-    }
-
-    check_rtt "peripherals initialised"    "Board peripherals initialised"
-    check_rtt "provisioned="               "OTP status read"
-    check_rtt "storage master key"         "SMK derivation attempted"
-    check_rtt "entering main loop"         "Main loop reached"
-
-    if [[ $PASS -eq 1 ]]; then
-        ok "Smoke test PASSED — device booted and reached main loop"
     else
-        warn "Smoke test PARTIAL — some expected log lines were missing."
-        warn "This is expected if OTP is not provisioned (SMK will fail)."
-        info "Full RTT log saved to: $RTT_LOG"
+        warn "opensc-tool not found: check that the device enumerates (lsusb, pcsc_scan)"
     fi
-
-    rm -f "$RTT_LOG"
 fi
 
 section "Done"

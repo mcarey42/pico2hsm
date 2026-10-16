@@ -26,7 +26,12 @@ use super::view::*;
 use crate::display_snapshot::{algo, SasRole};
 
 /// Firmware version shown on screen.
+#[cfg(not(test))]
 pub const FW_VERSION: &str = env!("CARGO_PKG_VERSION");
+/// A fixed version in host tests, so the golden frames do not change with
+/// every release.  Same length as a typical release ("2.0.0").
+#[cfg(test)]
+pub const FW_VERSION: &str = "9.9.9";
 
 /// Drawing helper over a target; see the module docs.
 pub struct Painter<'a, D> {

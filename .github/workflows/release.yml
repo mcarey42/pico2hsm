@@ -8,9 +8,9 @@ name: Release
 # with all assets attached.
 #
 # IMPORTANT: The UF2 artifacts attached to the release are UNSIGNED. Production
-# signing is performed offline using a per-project firmware signing key and
-# `picotool seal --hash --sign`. See docs/SECURE_PROVISIONING_PLAN.md for the
-# full secure boot procedure.
+# signing is performed offline with the owner's own signing keys and
+# `picotool seal --hash --sign`. See docs/PROVISIONING.md for the full
+# procedure.
 #
 # Dry-run mode: push a tag with a `-ci-test` suffix (e.g. `v1.0.0-ci-test`) to
 # exercise the workflow. The workflow still publishes a GitHub Release — you
@@ -94,20 +94,17 @@ jobs:
           sudo cmake --install /tmp/picotool/build
           picotool version
 
-      - name: Build firmware (release, unsigned)
+      - name: Build and stage firmware (release, unsigned)
         env:
           BOARD: ${{ matrix.board }}
-        run: |
-          cargo build \
-            --manifest-path firmware/Cargo.toml \
-            --release \
-            --no-default-features \
-            --features "${BOARD},applet-piv,applet-openpgp-curve25519" \
-            --target thumbv8m.main-none-eabihf
-
-      - name: Stage ELF + UF2
-        env:
-          BOARD: ${{ matrix.board }}
+        # Two images per board, all applets and RSA (the default features):
+        #   pico2hsm-<board>-unsigned: the production image.  Its keystore
+        #     works only on an OTP-provisioned device (docs/PROVISIONING.md);
+        #     on a blank chip it stays down by design.
+        #   pico2hsm-<board>-dev-INSECURE-keystore-unsigned: adds
+        #     `insecure-dev-keystore`, so the keystore opens under a fixed
+        #     development key on a chip without OTP provisioning.  For
+        #     evaluation only: anyone with the flash contents can read it.
         run: |
           set -euo pipefail
           mkdir -p release-assets
@@ -115,15 +112,26 @@ jobs:
           # `cargo build --manifest-path firmware/Cargo.toml` runs inside a
           # Cargo workspace, cargo writes to the workspace's shared target/.
           ELF_SRC=target/thumbv8m.main-none-eabihf/release/pico2hsm
-          BASE="pico2hsm-${BOARD}-unsigned"
-          ELF_DST="release-assets/${BASE}.elf"
-          UF2_DST="release-assets/${BASE}.uf2"
-          # picotool 2.x infers input type from file extension; the cargo
-          # binary has no extension (`[[bin]] name = "pico2hsm"`), so pass
-          # the already-staged .elf copy instead of the raw ELF_SRC.
-          cp "$ELF_SRC" "$ELF_DST"
-          picotool uf2 convert "$ELF_DST" "$UF2_DST" --family rp2350-arm-s
-          ( cd release-assets && sha256sum "${BASE}.uf2" > "${BASE}.uf2.sha256" )
+          FEATURES="${BOARD},rsa,applet-piv,applet-openpgp-curve25519"
+          for VARIANT in prod dev; do
+            if [ "$VARIANT" = prod ]; then
+              BASE="pico2hsm-${BOARD}-unsigned"; EXTRA=""
+            else
+              BASE="pico2hsm-${BOARD}-dev-INSECURE-keystore-unsigned"; EXTRA=",insecure-dev-keystore"
+            fi
+            cargo build \
+              --manifest-path firmware/Cargo.toml \
+              --release \
+              --no-default-features \
+              --features "${FEATURES}${EXTRA}" \
+              --target thumbv8m.main-none-eabihf
+            # picotool 2.x infers input type from file extension; the cargo
+            # binary has no extension (`[[bin]] name = "pico2hsm"`), so
+            # convert the staged .elf copy.
+            cp "$ELF_SRC" "release-assets/${BASE}.elf"
+            picotool uf2 convert "release-assets/${BASE}.elf" "release-assets/${BASE}.uf2" --family rp2350-arm-s
+            ( cd release-assets && sha256sum "${BASE}.uf2" > "${BASE}.uf2.sha256" )
+          done
           # The board's partition tables (docs/FLASH_LAYOUT_2_0.md): install
           # once, then the firmware.  -dev keeps the table replaceable from
           # BOOTSEL; -prod (to be signed at provisioning) does not.
@@ -252,9 +260,12 @@ jobs:
           EXPECTED_BOARDS=(pico2_4m rp2350_one_4m rp2350_one_16m rp2350_geek_16m rp2350_geek_sdcard waveshare_rp2350_lcd_16m waveshare_rp2350_lcd_sdcard)
           MISSING=()
           for b in "${EXPECTED_BOARDS[@]}"; do
-            if ! ls "release/pico2hsm-${b}-unsigned.uf2" >/dev/null 2>&1; then
-              MISSING+=("$b")
-            fi
+            for f in "pico2hsm-${b}-unsigned.uf2" "pico2hsm-${b}-dev-INSECURE-keystore-unsigned.uf2" \
+                     "pico2hsm-${b}-pt-dev.uf2" "pico2hsm-${b}-pt-prod.uf2"; do
+              if ! ls "release/${f}" >/dev/null 2>&1; then
+                MISSING+=("$f")
+              fi
+            done
           done
           if [ ${#MISSING[@]} -gt 0 ]; then
             echo "ERROR: missing UF2 artifacts for boards: ${MISSING[*]}" >&2
@@ -324,14 +335,28 @@ jobs:
             fi
             echo "## :warning: UNSIGNED FIRMWARE"
             echo ""
-            echo "The UF2 files attached to this release are **unsigned**. They are suitable for"
-            echo "evaluation, development, and reproducing CI builds locally. For production"
-            echo "deployment you must generate your own firmware signing key, sign the ELF with"
-            echo "\`picotool seal --hash --sign\`, and lock the OTP fuses."
+            echo "The UF2 files attached to this release are **unsigned**. pico2hsm ships no"
+            echo "signing keys: for a device with secure boot you generate your own keys, sign"
+            echo "the ELF with \`picotool seal --hash --sign\` and provision the OTP; see"
+            echo "[docs/PROVISIONING.md](docs/PROVISIONING.md). Unsigned firmware does not run on"
+            echo "a device with secure boot enabled."
             echo ""
-            echo "See [docs/SECURE_PROVISIONING_PLAN.md](docs/SECURE_PROVISIONING_PLAN.md) for the full"
-            echo "secure boot procedure. Unsigned firmware will not run on devices that have secure"
-            echo "boot enabled."
+            echo "## Which file to install"
+            echo ""
+            echo "Install the board's partition table first (\`pico2hsm-<board>-pt-dev.uf2\`),"
+            echo "then the firmware (\`picotool load -p 0 -x <file>.uf2\`); see"
+            echo "[docs/FLASH_LAYOUT_2_0.md](docs/FLASH_LAYOUT_2_0.md) §4."
+            echo ""
+            echo "- \`pico2hsm-<board>-unsigned.uf2\`: the production image. Its keystore only"
+            echo "  opens on a device whose OTP holds a storage secret (provisioning stage 2); on"
+            echo "  a blank chip every key operation fails, by design."
+            echo "- \`pico2hsm-<board>-dev-INSECURE-keystore-unsigned.uf2\`: for evaluation on a"
+            echo "  chip without OTP provisioning. The keystore is sealed under a fixed,"
+            echo "  public development key: **anyone with the flash contents can read every"
+            echo "  key.** Never use it for keys you care about."
+            echo ""
+            echo "Use RP2350 **A4** silicon for business or production use: A2/A3 have erratum"
+            echo "RP2350-E24 (secure-boot bypass by glitching plus a flash swap)."
             echo ""
             echo "## Changes"
             echo ""
@@ -345,8 +370,9 @@ jobs:
             echo ""
             echo "## Assets"
             echo ""
-            echo "- \`<board>.uf2\` — flashable firmware image (UF2, RP2350 family \`rp2350-arm-s\`)."
-            echo "- \`<board>.elf\` — original ELF (for debugging with probe-rs / picotool)."
+            echo "- \`pico2hsm-<board>-[dev-INSECURE-keystore-]unsigned.uf2\` — firmware image (UF2, RP2350 family \`rp2350-arm-s\`)."
+            echo "- \`…-unsigned.elf\` — the same image as ELF (for signing with picotool seal, and debugging)."
+            echo "- \`pico2hsm-<board>-pt-dev.uf2\` / \`-pt-prod.uf2\` — the board's partition table (prod: sign it at provisioning)."
             echo "- \`<board>.uf2.sha256\` — per-file SHA256 (also aggregated in SHA256SUMS)."
             echo "- \`*.cdx.json\` — CycloneDX 1.4 SBOM, one per workspace crate."
             echo ""

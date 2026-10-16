@@ -6,10 +6,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-Security and robustness release from the October 2026 audit
-(`docs/AUDIT_2026-10.md` lists every finding with its commit), and the
-start of the 2.0.0 series (Storage V2 and the 2.0 flash layout; not yet
-tagged).
+## [2.0.0] - 2026-10-16
+
+The 2.0 series: Storage V2 (a journaled keystore), a bootrom partition
+table on every board with A/B firmware slots on 16 MB boards, staged
+production provisioning (secure boot, OTP storage secret), and the
+security and robustness fixes from the October 2026 audit
+(`docs/AUDIT_2026-10.md` lists every finding with its commit).
+
+**Breaking: 1.x keys do not carry over.** Install the board's partition
+table before the firmware, then FORMAT STORE and initialise the device
+as new; see the README ("2.0.0: breaking").
+
+**Release images.** `pico2hsm-<board>-unsigned.uf2` is the production
+image: its keystore opens only on an OTP-provisioned device
+(`docs/PROVISIONING.md`). For evaluation on a blank chip use
+`pico2hsm-<board>-dev-INSECURE-keystore-unsigned.uf2`, whose keystore is
+sealed under a fixed, public development key. Both include RSA.
+
+**Silicon.** Use RP2350 A4 silicon for business or production use: A2/A3
+have erratum RP2350-E24 (secure-boot bypass by glitching and a flash
+swap). A2/A3 are fine for a homelab.
+
+Hardware-verified on the Pico 2, RP2350-One and Waveshare LCD (SD and
+16 MB) boards; the full provisioning procedure (stages 0–8) on an
+RP2350-One, and a production rehearsal (signed release image, signed
+production table, A/B update) on an LCD board.
+
+### Added — firmware version reporting
+- **GET PROVISIONING STATUS (`80 F0`) reports the running image's
+  version** (tag `85`: major, minor × 256 + patch) on every build, no
+  PIN, so a host can recommend an update; pico2hsm-tool `status` does.
+
+### Changed — release and build tooling
+- **Release workflow:** UF2s include RSA; a second, clearly named
+  development-keystore image per board; the release notes say which file
+  to install and point to `docs/PROVISIONING.md`.
+- **`build-all.sh --flash`** writes the partition table and puts the image
+  in slot A (it wrote the ELF over the table); `PROBE_SERIAL` selects a
+  probe; `rp2350_one_16m` is built.
+- **Hardware tests:** OpenSC is configured for more than four readers
+  (`tests/hw/helpers/opensc.conf`).
 
 ### Breaking — Storage V2 and the 2.0 flash layout
 - **Journaled keystore (Storage V2, `docs/STORAGE_V2.md`).** Journal ring,
@@ -98,7 +135,9 @@ tagged).
   after every key and restart.
 
 ### Changed — RSA key pool
-- **Flash layout:** the pool takes 48 KB (12 sectors) at
+- **Flash layout** (as first added; the 2.0 layout keeps it at
+  `0x1F0000` on 4 MB boards and moves it to `0x819000` on 16 MB boards):
+  the pool takes 48 KB (12 sectors) at
   `0x1F0000`–`0x1FC000`, just below the retry-counter log, on every board;
   the firmware image limit shrinks from 0x1FC000 to 0x1F0000 (`boards/*.x`;
   the largest debug image is about 1.2 MB).  The region was never written
