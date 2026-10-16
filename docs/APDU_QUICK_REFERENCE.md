@@ -63,57 +63,6 @@ RESPONSE (C0) is served by the dispatcher for every applet.
 Not implemented anywhere (6D00): A5 SELECT DATA, CC GET NEXT DATA, F8 GET
 SERIAL, F9 ATTEST, FA SET PIN RETRIES, FD GET VERSION, PIV FE IMPORT KEY.
 
----|---|---|---|---|---|
-| 20 | VERIFY | implemented | stub | stub | P2 meaning differs per applet |
-| 22 | MSE SET | implemented | — | stub | SC-HSM: P1=41/F3; OpenPGP: P1=41/81 |
-| 24 | CHANGE REFERENCE DATA | implemented | stub | stub | |
-| 26 | SESSION PIN | implemented | — | — | SC-HSM only; CLA 00 or 80 |
-| 28 | PUK AUTH | implemented | — | — | SC-HSM only |
-| 2A | PSO (sign/decipher/MAC) | implemented | — | stub | P1/P2 distinguish operation |
-| 2C | RESET RETRY COUNTER | implemented | stub | stub | |
-| 34 | EXPORT KEY | stub | — | — | returns 6D00 |
-| 44 | ACTIVATE FILE | — | — | stub | OpenPGP factory reset |
-| 46 | GENERATE KEY PAIR | implemented | — | — | SC-HSM only; returns CVC |
-| 47 | GENERATE KEY PAIR | — | stub | stub | PIV/OpenPGP; returns 7F49 pubkey |
-| 48 | GENERATE SYMMETRIC KEY | implemented | — | — | SC-HSM only; AES-128/192/256 |
-| 50 | INITIALIZE | implemented | — | — | SC-HSM only |
-| 52 | KEY DOMAIN | partial | — | — | P1=04 query implemented; rest stub |
-| 54 | EXTRAS (KDF/MAC) | implemented | — | — | SC-HSM only |
-| 58 | LIST KEYS / IMPORT KEY | LIST: implemented; IMPORT: stub | — | — | P2=00 list; P2=93 import |
-| 60 | BIP32/SLIP-0010 HD DERIVE | implemented | — | — | SC-HSM only |
-| 62 | DECIPHER / DERIVE ASYM | implemented | — | — | P1=key_id or P1=01 for derive |
-| 68 | SIGN | implemented | — | — | SC-HSM only; P1=key_id, P2=algo |
-| 78 | SYMMETRIC CIPHER | implemented | — | — | SC-HSM only; AES-CBC/CTR/GCM/CMAC |
-| 82 | EXTERNAL AUTHENTICATE | implemented | — | — | SC-HSM only; HMAC-SHA256 |
-| 84 | GET CHALLENGE | implemented | — | stub | |
-| 86 | GENERAL AUTHENTICATE | implemented | — | — | SC-HSM DAT challenge-sign |
-| 87 | GENERAL AUTHENTICATE | — | stub | — | PIV sign/ECDH/mutual auth |
-| 88 | INTERNAL AUTHENTICATE | — | — | stub | OpenPGP AUTH key slot |
-| A4 | SELECT | implemented | stub | stub | |
-| A5 | SELECT DATA | — | — | stub | OpenPGP cert occurrence select |
-| B0 | READ BINARY | implemented | — | — | SC-HSM virtual filesystem |
-| B1 | READ BINARY ODD | implemented | — | — | SC-HSM; offset TLV in data |
-| C0 | GET RESPONSE | — | stub | stub | PIV/OpenPGP chaining |
-| CA | GET DATA (even) | — | — | stub | OpenPGP DO by P1P2 tag |
-| CB | GET DATA (odd) | — | stub | stub | PIV: wrapped in 5C TLV |
-| CC | GET NEXT DATA | — | — | stub | OpenPGP next cert occurrence |
-| D3 | (internal) | — | — | — | OpenPGP Reset Code write via PUT DATA |
-| D6 | UPDATE BINARY | implemented | — | — | SC-HSM; writes current EF |
-| D7 | WRITE DATA | implemented | — | — | SC-HSM; TLV data to addressed EF |
-| DA | PUT DATA (even) | — | — | stub | OpenPGP DO by P1P2 tag |
-| DB | PUT DATA (odd) | — | stub | stub | PIV/OpenPGP; key import via DB |
-| E0 | CREATE FILE | implemented | — | — | SC-HSM only |
-| E4 | DELETE FILE | implemented | — | — | SC-HSM only |
-| E6 | TERMINATE DF | — | — | stub | OpenPGP |
-| F7 | GET METADATA | — | stub | — | YubiKey extension |
-| F8 | GET SERIAL | — | stub | — | YubiKey extension |
-| F9 | ATTEST | — | stub | — | YubiKey extension |
-| FA | SET PIN RETRIES | — | stub | — | YubiKey extension |
-| FB | RESET | — | stub | — | YubiKey PIV reset |
-| FD | GET VERSION | — | stub | — | YubiKey extension |
-| FE | IMPORT KEY / DEBUG DUMP | SC-HSM: debug only | stub | — | YubiKey import key; SC-HSM debug dump |
-| FF | SET MANAGEMENT KEY | — | stub | — | YubiKey extension |
-
 ---
 
 ## 2. Per-Applet Command Tables
