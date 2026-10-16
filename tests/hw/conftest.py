@@ -118,6 +118,9 @@ def gpg_card_status_cmd(learn: bool = False) -> tuple[list[str] | None, str | No
 
 
 def pytest_configure(config):
+    # OpenSC's PKCS#11 module lists only four readers by default; see
+    # helpers/opensc.conf.
+    os.environ.setdefault("OPENSC_CONF", str(_HW_DIR / "helpers" / "opensc.conf"))
     if "OPENSC_DEFAULT_READER" not in os.environ and "PICO2HSM_READER" not in os.environ:
         return
     os.environ["PATH"] = f"{_HW_DIR / 'helpers' / 'bin'}{os.pathsep}{os.environ['PATH']}"
