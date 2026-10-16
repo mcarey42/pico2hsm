@@ -7,57 +7,61 @@ Hex values: bare uppercase in tables, `0x`-prefixed in prose.
 
 ## 1. INS Byte Master Table
 
+"implemented" means the applet routes the INS to a handler; "—" means it
+answers 6D00 (INS not supported). Routing: `route_with_store` /
+`dispatch_with_store` in `firmware/src/protocol/<applet>/mod.rs`; GET
+RESPONSE (C0) is served by the dispatcher for every applet.
+
 | INS | Command | SC-HSM | PIV | OpenPGP | pico2hsm notes |
 |---|---|---|---|---|---|
-| 20 | VERIFY | implemented | stub | stub | P2 meaning differs per applet |
-| 22 | MSE SET | implemented | — | stub | SC-HSM: P1=41/F3; OpenPGP: P1=41/81 |
-| 24 | CHANGE REFERENCE DATA | implemented | stub | stub | |
+| 20 | VERIFY | implemented | implemented | implemented | P2 meaning differs per applet |
+| 22 | MSE SET | implemented | — | — | SC-HSM: P1=41/F3 |
+| 24 | CHANGE REFERENCE DATA | implemented | implemented | implemented | |
 | 26 | SESSION PIN | implemented | — | — | SC-HSM only; CLA 00 or 80 |
 | 28 | PUK AUTH | implemented | — | — | SC-HSM only |
-| 2A | PSO (sign/decipher/MAC) | implemented | — | stub | P1/P2 distinguish operation |
-| 2C | RESET RETRY COUNTER | implemented | stub | stub | |
-| 34 | EXPORT KEY | stub | — | — | returns 6D00 |
-| 44 | ACTIVATE FILE | — | — | stub | OpenPGP factory reset |
+| 2A | PSO (sign/decipher/MAC) | implemented | — | implemented | P1/P2 distinguish operation |
+| 2C | RESET RETRY COUNTER | implemented | implemented | implemented | |
+| 34 | WRAP KEY (alias of 72) | implemented | — | — | SC-HSM |
+| 44 | ACTIVATE FILE | — | — | implemented | OpenPGP, after TERMINATE DF |
 | 46 | GENERATE KEY PAIR | implemented | — | — | SC-HSM only; returns CVC |
-| 47 | GENERATE KEY PAIR | — | stub | stub | PIV/OpenPGP; returns 7F49 pubkey |
+| 47 | GENERATE KEY PAIR | — | implemented | implemented | PIV/OpenPGP; returns 7F49 pubkey |
 | 48 | GENERATE SYMMETRIC KEY | implemented | — | — | SC-HSM only; AES-128/192/256 |
 | 50 | INITIALIZE | implemented | — | — | SC-HSM only |
-| 52 | KEY DOMAIN | partial | — | — | P1=04 query implemented; rest stub |
-| 54 | EXTRAS (KDF/MAC) | implemented | — | — | SC-HSM only |
-| 58 | LIST KEYS / IMPORT KEY | LIST: implemented; IMPORT: stub | — | — | P2=00 list; P2=93 import |
+| 52 | KEY DOMAIN | implemented | — | — | P1=00 status / share import (OpenSC); P1=01–05 pico2hsm-specific |
+| 54 | EXTRAS | implemented | — | — | SC-HSM only; KDF/MAC, device key, DKEK exchange, domains, store recovery, RSA pool (`SC_HSM_APDU_REFERENCE.md` §3.29) |
+| 58 | LIST KEYS | implemented | — | — | P1=P2=00 only (else 6A86) |
 | 60 | BIP32/SLIP-0010 HD DERIVE | implemented | — | — | SC-HSM only |
-| 62 | DECIPHER / DERIVE ASYM | implemented | — | — | P1=key_id or P1=01 for derive |
+| 62 | DECIPHER / DERIVE ASYM | implemented | — | — | P1=01 with P2=00 = derive |
 | 68 | SIGN | implemented | — | — | SC-HSM only; P1=key_id, P2=algo |
+| 72 | WRAP KEY (EXPORT) | implemented | — | — | CardContact blob under the DKEK |
+| 74 | UNWRAP KEY (IMPORT) | implemented | — | — | CardContact blob under the DKEK |
 | 78 | SYMMETRIC CIPHER | implemented | — | — | SC-HSM only; AES-CBC/CTR/GCM/CMAC |
-| 82 | EXTERNAL AUTHENTICATE | implemented | — | — | SC-HSM only; HMAC-SHA256 |
-| 84 | GET CHALLENGE | implemented | — | stub | |
+| 82 | EXTERNAL AUTHENTICATE | — | — | — | removed 2026-10 (6D00) |
+| 84 | GET CHALLENGE | implemented | — | implemented | |
 | 86 | GENERAL AUTHENTICATE | implemented | — | — | SC-HSM DAT challenge-sign |
-| 87 | GENERAL AUTHENTICATE | — | stub | — | PIV sign/ECDH/mutual auth |
-| 88 | INTERNAL AUTHENTICATE | — | — | stub | OpenPGP AUTH key slot |
-| A4 | SELECT | implemented | stub | stub | |
-| A5 | SELECT DATA | — | — | stub | OpenPGP cert occurrence select |
+| 87 | GENERAL AUTHENTICATE | — | implemented | — | PIV sign/ECDH/mutual auth |
+| 88 | INTERNAL AUTHENTICATE | — | — | implemented | OpenPGP AUTH key slot |
+| A4 | SELECT | implemented | implemented | implemented | |
 | B0 | READ BINARY | implemented | — | — | SC-HSM virtual filesystem |
 | B1 | READ BINARY ODD | implemented | — | — | SC-HSM; offset TLV in data |
-| C0 | GET RESPONSE | — | stub | stub | PIV/OpenPGP chaining |
-| CA | GET DATA (even) | — | — | stub | OpenPGP DO by P1P2 tag |
-| CB | GET DATA (odd) | — | stub | stub | PIV: wrapped in 5C TLV |
-| CC | GET NEXT DATA | — | — | stub | OpenPGP next cert occurrence |
-| D3 | (internal) | — | — | — | OpenPGP Reset Code write via PUT DATA |
+| C0 | GET RESPONSE | dispatcher | dispatcher | dispatcher | chaining (`61 XX`) |
+| CA | GET DATA (even) | — | — | implemented | OpenPGP DO by P1P2 tag |
+| CB | GET DATA (odd) | — | implemented | — | PIV: wrapped in 5C TLV |
 | D6 | UPDATE BINARY | implemented | — | — | SC-HSM; writes current EF |
 | D7 | WRITE DATA | implemented | — | — | SC-HSM; TLV data to addressed EF |
-| DA | PUT DATA (even) | — | — | stub | OpenPGP DO by P1P2 tag |
-| DB | PUT DATA (odd) | — | stub | stub | PIV/OpenPGP; key import via DB |
+| DA | PUT DATA (even) | — | — | implemented | OpenPGP DO by P1P2 tag |
+| DB | PUT DATA (odd) | — | implemented | implemented | PIV data objects; OpenPGP: same handler as DA, no key import (3FFF) |
 | E0 | CREATE FILE | implemented | — | — | SC-HSM only |
 | E4 | DELETE FILE | implemented | — | — | SC-HSM only |
-| E6 | TERMINATE DF | — | — | stub | OpenPGP |
-| F7 | GET METADATA | — | stub | — | YubiKey extension |
-| F8 | GET SERIAL | — | stub | — | YubiKey extension |
-| F9 | ATTEST | — | stub | — | YubiKey extension |
-| FA | SET PIN RETRIES | — | stub | — | YubiKey extension |
-| FB | RESET | — | stub | — | YubiKey PIV reset |
-| FD | GET VERSION | — | stub | — | YubiKey extension |
-| FE | IMPORT KEY / DEBUG DUMP | SC-HSM: debug only | stub | — | YubiKey import key; SC-HSM debug dump |
-| FF | SET MANAGEMENT KEY | — | stub | — | YubiKey extension |
+| E6 | TERMINATE DF | — | — | implemented | OpenPGP |
+| F0–F2 | PROVISIONING | implemented | — | — | status; production mode, OTP row lock (SO-PIN); F3 reserved (6D00) |
+| F7 | GET METADATA | — | implemented | — | YubiKey extension |
+| FB | RESET | — | implemented | — | YubiKey PIV reset; only while PIN and PUK are blocked |
+| FE | DEBUG | `debug` builds only | — | — | `SC_HSM_APDU_REFERENCE.md` §3.30 |
+| FF | SET MANAGEMENT KEY | — | implemented | — | YubiKey extension; 3DES |
+
+Not implemented anywhere (6D00): A5 SELECT DATA, CC GET NEXT DATA, F8 GET
+SERIAL, F9 ATTEST, FA SET PIN RETRIES, FD GET VERSION, PIV FE IMPORT KEY.
 
 ---
 
@@ -74,8 +78,7 @@ Hex values: bare uppercase in tables, `0x`-prefixed in prose.
 | D7 | FID[15:8] | FID[7:0] | Write TLV data to addressed EF | 9000 | 6982, 6A80 |
 | E0 | 00 | 00 | Create transparent EF (FID in data) | 9000 | 6982, 6A80 |
 | E4 | 00/02 | 00 | Delete key or EF (FID in data when P1=02) | 9000 | 6982, 6A82 |
-| 58 | 00 | 00 | List key container slots | 9000 | — |
-| 58 | key_id | 93 | Import wrapped key (DKEK) — stub | — | 6D00 |
+| 58 | 00 | 00 | List key container slots | 9000 | 6A86 |
 | 20 | 00 | 81/82/88 | Verify User PIN / session PIN / SO-PIN | 9000 | 63CX, 6983, 6984 |
 | 24 | 00/01 | 81/88 | Change User PIN or SO-PIN | 9000 | 63CX, 6983, 6700 |
 | 26 | 00 | 00 | Generate one-time session PIN | 9000 | 6982 |
@@ -85,8 +88,9 @@ Hex values: bare uppercase in tables, `0x`-prefixed in prose.
 | 22 | 41/F3 | A4/B8/B4/03 | MSE SET: select key/algo for operation | 9000 | 6A80 |
 | 46 | key_id | 00 | Generate EC/RSA key pair (returns CVC) | 9000 | 6982, 6A80, 6985 |
 | 48 | key_id | 00 | Generate AES-128/192/256 symmetric key | 9000 | 6982, 6A80, 6985 |
-| 34 | key_id | 00 | Export DKEK-wrapped key — stub | — | 6D00 |
-| 52 | 01–05 | domain_id | DKEK key domain (P1=04 query only) | 9000 | 6982, 6D00 |
+| 72 / 34 | key_id | 92 | WRAP KEY: DKEK-wrapped CardContact blob | 9000 | 6982, 6985, 6A81, 6A86 |
+| 74 | key_id | 93 | UNWRAP KEY: import a CardContact blob | 9000 | 6982, 6985, 6A80, 6A81, 6581 |
+| 52 | 00–05 | domain_id | DKEK key domain (P1=00 OpenSC status / share import) | 9000 | 6982, 6A86, 6A88 |
 | 60 | master_id | flags | BIP32/SLIP-0010 HD key derivation | 9000 | 6982, 6A82, 6A80 |
 | 68 | key_id | algo | ECDSA / RSA sign | 9000 | 6982, 6A82, 6D00 |
 | 62 | key_id | algo | ECDH / RSA decrypt (P1=01 = derive) | 9000 | 6982, 6A82, 6D00 |
@@ -94,13 +98,12 @@ Hex values: bare uppercase in tables, `0x`-prefixed in prose.
 | 2A | 80 | 86 | PSO decipher (uses MSE key/algo) | 9000 | 6982, 6985, 6A82 |
 | 2A | 8E | 80 | PSO compute MAC (AES-CMAC or HMAC-SHA256) | 9000 | 6982, 6985 |
 | 78 | 01/02 | 02/03/05/06 | Symmetric cipher AES-CBC/CTR/GCM/CMAC | 9000 | 6982, 6985, 6700 |
-| 82 | 00 | 00 | External auth HMAC-SHA256 challenge | 9000 | 6982, 6984, 6700 |
 | 84 | 00 | 00 | Get challenge (random bytes, 8 stored) | 9000 | — |
 | 86 | 00 | 00 | General auth DAT challenge-sign | 9000 | 6982, 6A80, 6985 |
-| 54 | 01–06 | 00 | KDF/MAC extras (HKDF/PBKDF2/CMAC/HMAC) | 9000 | 6982, 6700, 6A80 |
-| FE | 00/01/02 | 00 | Debug dump — debug build only (stub) | 6A80 | — |
+| 54 | 01–06, 30–53 | 00 | EXTRAS: KDF/MAC, device key, DKEK exchange, domains, store recovery, RSA pool | 9000 | 6982, 6700, 6A80 |
+| FE | 10–16, 20–21 | — | Debug hooks — `debug` builds only (CLA 80); 00–02 dump stub → 6A80 | 9000 | 6A80 |
 
-### 2.2 PIV Commands (all stub — returns 6D00; CLA = 00)
+### 2.2 PIV Commands (CLA = 00; `applet-piv`)
 
 | INS | P1 | P2 | Description | SW success | Key error SWs |
 |---|---|---|---|---|---|
@@ -112,17 +115,15 @@ Hex values: bare uppercase in tables, `0x`-prefixed in prose.
 | DB | 3F | FF | PUT DATA (data = `5C`+tag + `53`+content) | 9000 | 6982, 6A82, 6A84 |
 | 87 | algo | key_ref | GENERAL AUTHENTICATE (sign/ECDH/mutual) | 9000 | 6982, 6A80, 6A88 |
 | 47 | 00 | key_ref | GENERATE KEY PAIR | 9000 | 6982, 6A80, 6A86 |
-| C0 | 00 | 00 | GET RESPONSE (chain `61 XX`) | 9000 | 6A86 |
+| C0 | 00 | 00 | GET RESPONSE (chain `61 XX`; served by the dispatcher) | 9000 | 6A86 |
 | F7 | 00 | key_ref | GET METADATA (YubiKey extension) | 9000 | 6A88 |
-| F8 | 00 | 00 | GET SERIAL (YubiKey extension) | 9000 | — |
-| F9 | 00 | key_ref | ATTEST (YubiKey extension) | 9000 | 6A88 |
-| FA | 00 | 00 | SET PIN RETRIES (YubiKey extension) | 9000 | 6982 |
-| FB | 00 | 00 | RESET PIV application (YubiKey extension) | 9000 | — |
-| FD | 00 | 00 | GET VERSION (YubiKey extension) | 9000 | — |
-| FE | 00 | key_ref | IMPORT KEY (YubiKey extension) | 9000 | 6982, 6A80 |
-| FF | 00 | 9B | SET MANAGEMENT KEY (YubiKey extension) | 9000 | 6982, 6A80 |
+| FB | 00 | 00 | RESET PIV application (YubiKey extension; PIN and PUK blocked) | 9000 | 6985 |
+| FF | FF | FF/FE | SET MANAGEMENT KEY (YubiKey extension; `03 9B 18` + 3DES key) | 9000 | 6982, 6A80 |
 
-### 2.3 OpenPGP Commands (all stub — returns 6D00; CLA = 00)
+F8 GET SERIAL, F9 ATTEST, FA SET PIN RETRIES, FD GET VERSION and FE IMPORT
+KEY are not implemented (6D00).
+
+### 2.3 OpenPGP Commands (CLA = 00; `applet-openpgp`)
 
 | INS | P1 | P2 | Description | SW success | Key error SWs |
 |---|---|---|---|---|---|
@@ -131,21 +132,19 @@ Hex values: bare uppercase in tables, `0x`-prefixed in prose.
 | 24 | 00/01 | 81/83 | CHANGE REFERENCE DATA PW1 or PW3 | 9000 | 63CX, 6983, 6700 |
 | 2C | 00/02 | 81 | RESET RETRY COUNTER (Reset Code or PW3) | 9000 | 63CX, 6983, 6982 |
 | CA | tag[15:8] | tag[7:0] | GET DATA (even) — simple/primitive DOs | 9000 | 6A88, 6982, 61XX |
-| CB | tag[15:8] | tag[7:0] | GET DATA (odd) — constructed DOs | 9000 | 6A88, 6982 |
-| CC | 00 | tag | GET NEXT DATA (cardholder certificate) | 9000 | 6A88 |
 | DA | tag[15:8] | tag[7:0] | PUT DATA (even) — write simple DO | 9000 | 6982, 6A80, 6A88 |
-| DB | tag[15:8] | tag[7:0] | PUT DATA (odd) — write constructed DO / key | 9000 | 6982, 6A80 |
+| DB | tag[15:8] | tag[7:0] | PUT DATA (odd) — same DOs as DA; key import (3FFF) not implemented | 9000 | 6982, 6A80 |
 | 2A | 9E | 9A | PSO:CDS — compute digital signature | 9000 | 6982, 6985, 6700 |
-| 2A | 80 | 86 | PSO:DECIPHER — RSA decrypt or ECDH | 9000 | 6982, 6985 |
-| 2A | 86 | 80 | PSO:ENCIPHER — AES symmetric encrypt | 9000 | 6982, 6985 |
+| 2A | 80 | 86 | PSO:DECIPHER — ECDH (NIST curves, X25519) | 9000 | 6982, 6985 |
 | 88 | 00 | 00 | INTERNAL AUTHENTICATE (AUTH key) | 9000 | 6982, 6985 |
 | 47 | 80/81 | 00 | GENERATE KEY PAIR / read public key | 9000 | 6982, 6A88, 6F00 |
 | 84 | 00 | 00 | GET CHALLENGE | 9000 | 6A81, 6700 |
 | C0 | 00 | 00 | GET RESPONSE (chain `61 XX`) | 9000 | — |
-| 22 | 41/81 | B6/B8/A4 | MSE — override active key slot | 9000 | 6982 |
-| A5 | n | 04 | SELECT DATA — cert occurrence index | 9000 | 6A88 |
 | E6 | 00 | 00 | TERMINATE DF | 9000 | 6982 |
 | 44 | 00 | 00 | ACTIVATE FILE (factory reset) | 9000 | 6985 |
+
+Not implemented (6D00): CB GET DATA odd, CC GET NEXT DATA, 22 MSE, A5
+SELECT DATA, PSO:ENCIPHER (P1=86).
 
 ---
 

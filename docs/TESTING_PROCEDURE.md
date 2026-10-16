@@ -8,7 +8,7 @@ multi-applet validation, and security-specific checks.
 
 ## Prerequisites
 
-- One or more pico2hsm devices (Pico 2 4MB, RP2350-ONE, RP2350-GEEK, or Waveshare LCD)
+- One or more pico2hsm devices (Pico 2 4MB, RP2350-One, RP2350-Geek, or Waveshare LCD), each with its partition table installed (`docs/FLASH_LAYOUT_2_0.md` §4)
 - Debugprobe (CMSIS-DAP) for SWD flashing (or BOOTSEL mode with `picotool`)
 - Linux host with: `pcscd`, `opensc`, `opensc-tool`, `pkcs15-tool`, `pkcs11-tool`
 - Python 3.10+ with `pip`
@@ -25,22 +25,24 @@ handling.
 
 ```sh
 cd firmware
-cargo test --target x86_64-unknown-linux-gnu --no-default-features --features pico2_4m
+cargo test --target x86_64-unknown-linux-gnu --no-default-features \
+    --features pico2_4m,rsa,applet-piv,applet-openpgp-curve25519
 ```
 
-**Expected:** All tests pass. Zero failures.
+**Expected:** All tests pass. Zero failures. (CI also runs the library tests
+for every board, with and without `rsa`.)
 
 Check for specific security-critical tests:
 ```sh
-cargo test --target x86_64-unknown-linux-gnu --no-default-features --features pico2_4m 2>&1 \
-  | grep -E "test_unwrap_bad_padding|test_reinit_wrong_sopin|test_challenge_cache|debug_gate"
+cargo test --target x86_64-unknown-linux-gnu --no-default-features \
+    --features pico2_4m,rsa,applet-piv,applet-openpgp-curve25519 2>&1 \
+  | grep -E "test_reinit_wrong_sopin|test_challenge_cache|debug_module_gated"
 ```
 
-**Expected:** All four test families present and passing:
-- `test_unwrap_bad_padding_rejected_constant_time` — constant-time PKCS#7 validation
+**Expected:** All three present and passing:
 - `test_reinit_wrong_sopin_rejected` — constant-time SO-PIN comparison
 - `test_challenge_cache_full_rotation` — replay cache ring buffer
-- `debug_module_gated` — debug module excluded from release builds
+- `debug_module_gated` — debug module excluded from non-`debug` builds
 
 ---
 
@@ -49,8 +51,17 @@ cargo test --target x86_64-unknown-linux-gnu --no-default-features --features pi
 Verify that all 7 board variants compile in both debug and release profiles.
 
 ```sh
-./build-all.sh          # Release builds, all 7 variants
-./build-all-debug.sh    # Debug builds, all 7 variants (without flashing)
+./build-all.sh          # Release builds of 6 variants (rp2350_one_16m is not in its list)
+
+# The seventh release build, and the debug builds (build-all-debug.sh
+# always flashes, so build them with cargo):
+cargo build --release -p pico2hsm-firmware --no-default-features \
+    --features rp2350_one_16m,rsa,applet-piv,applet-openpgp-curve25519
+for b in pico2_4m rp2350_one_4m rp2350_one_16m rp2350_geek_16m rp2350_geek_sdcard \
+         waveshare_rp2350_lcd_16m waveshare_rp2350_lcd_sdcard; do
+  cargo build -p pico2hsm-firmware --no-default-features \
+      --features $b,rsa,applet-piv,applet-openpgp-curve25519 || echo "FAIL $b"
+done
 ```
 
 **Expected:** All 14 builds succeed (7 release + 7 debug). Check that no
@@ -58,17 +69,18 @@ variant has a linker error or feature-flag conflict.
 
 ### RAM budget check
 
-After release builds, verify BSS stays within the 520 KB SRAM limit:
+After release builds, check static RAM (`.data` + `.bss` + `.uninit`)
+against the 520 KB SRAM; core0's stack gets the rest:
 
 ```sh
-for elf in dist/*-release.elf; do
+for elf in dist/pico2hsm-*.elf; do
   echo "=== $(basename $elf) ==="
-  arm-none-eabi-size "$elf" | tail -1 | awk '{printf "  text=%d data=%d bss=%d total=%d KB\n", $1, $2, $3, ($1+$2+$3)/1024}'
+  arm-none-eabi-size -A "$elf" | awk '/^\.(data|bss|uninit) /{r+=$2} END{printf "  static RAM=%d KB\n", r/1024}'
 done
 ```
 
-**Expected:** Total (text+data+bss) under 520 KB for all variants. Current
-worst case is Waveshare LCD at ~398 KB (77%).
+**Expected:** Well under 520 KB for all variants. Measured 2026-10-15: the
+worst case is `rp2350_one_16m` at ~254 KB (49%; `docs/BUILD_CONFIGURATIONS.md`).
 
 ---
 
@@ -96,7 +108,7 @@ opensc-tool --list-readers
 ./run_tests.sh
 ```
 
-**Expected:** 158+ tests pass. Known acceptable results:
+**Expected:** every test passes or skips with a stated reason. Known acceptable results:
 - `xfail` on secp256k1 ECDH (OpenSC limitation, not a firmware bug)
 - `skip` on tests requiring second device or specific board features
 
@@ -112,24 +124,30 @@ minutes instead of ~45 minutes.
 ### 3.4 Run specific test modules
 
 ```sh
-# Provisioning + basic ops
+# Basic ops: keygen, sign, ECDH
 ./run_tests.sh -k "test_01 or test_02 or test_03"
 
 # PIV applet
-./run_tests.sh -k "test_09"
+./run_tests.sh -k "test_piv"
 
 # OpenPGP applet
-./run_tests.sh -k "test_10"
+./run_tests.sh -k "test_openpgp"
 
-# DKEK wrap/unwrap
-./run_tests.sh -k "test_11"
+# DKEK exchange (two devices) and wrap/unwrap
+./run_tests.sh -k "test_10 or test_11"
 
 # PIN lifecycle
 ./run_tests.sh -k "test_12"
 
 # Security state isolation
 ./run_tests.sh -k "test_13"
+
+# Persistence across resets, the 2.0 layout, store recovery
+./run_tests.sh -k "test_14 or test_22 or test_21"
 ```
+
+The file list is `tests/hw/test_*.py`; `test_21_store_recovery.py` needs a
+`debug` build (`EXTRA_FEATURES=debug ./build-all-debug.sh <board>`).
 
 ---
 
@@ -191,8 +209,9 @@ pkcs15-tool -D
 Generate a key with NO_EXPORT, then attempt export:
 
 ```sh
-# This is tested automatically in test_11 (DKEK test)
-./run_tests.sh -k "test_11"
+# Tested in test_14 (the flag survives a reset) and test_16 (EXPORT KEY
+# without the PIN)
+./run_tests.sh -k "test_no_export_flag_persists or test_export_key_without_pin"
 ```
 
 ### 5.2 PIN retry counter
@@ -216,9 +235,9 @@ Verify that authentication state is cleared when switching applets:
 Verify that release builds do not include debug_dump functionality:
 
 ```sh
-# Check that INS=0xDB (debug dump) returns SW_INS_NOT_SUPPORTED in release
+# The debug dump (SC-HSM INS 0xFE) is compiled only with the `debug` feature
 cargo test --target x86_64-unknown-linux-gnu --no-default-features \
-  --features pico2_4m debug_gate 2>&1 | grep -i "ok\|FAILED"
+  --features pico2_4m debug_module_gated 2>&1 | grep -i "ok\|FAILED"
 ```
 
 ---
@@ -296,8 +315,8 @@ covering:
    padding on real hardware using timing measurements or power analysis.
 3. **TLS configuration review** — Verify daemon TLS in CA-authenticated mode
    with real CA infrastructure.
-4. **Provisioning subsystem** — Test secure boot chain, OTP locking, and JTAG
-   disable on production hardware.
+4. **Provisioning subsystem** — Test the secure boot chain, OTP locking and
+   the debug-access choice on production hardware (`docs/PROVISIONING.md`).
 
 See `docs/SECURITY_SUMMARY.md` for the complete resolved issues list and
 recommendations.

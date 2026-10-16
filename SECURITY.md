@@ -4,12 +4,13 @@
 
 | Version | Status |
 |---------|--------|
-| 1.0.x | Future stable series -- will be supported on release |
-| 0.9.x | Current pre-release development series |
+| 2.0.x | In development on `main` (Storage V2, partition tables; breaking, not yet tagged) |
+| 1.0.x | Current release series (`v1.0.1`) |
+| 0.9.x | Pre-release series; not supported |
 
 ## Threat model summary
 
-pico2hsm protects against several classes of attack: network-level key theft is prevented by DKEK-encrypted key export (AES-256-CBC with key-check values); unauthorized key usage requires PIN or SO-PIN authentication with configurable retry lockout; firmware tampering is detected via secure boot when the firmware signing key and OTP row locking are applied; and USB passive eavesdropping is mitigated by OS-level access control on the CCID interface (the device does not implement wireless transport).
+pico2hsm protects against several classes of attack: network-level key theft is prevented by DKEK-encrypted key export (AES-256-CBC with key-check values); unauthorized key usage requires PIN or SO-PIN authentication with configurable retry lockout; firmware tampering is detected via secure boot once the device is provisioned (`docs/PROVISIONING.md`); and USB passive eavesdropping is mitigated by OS-level access control on the CCID interface (the device does not implement wireless transport).
 
 pico2hsm does **not** protect against: physical attackers with flash-read hardware (the RP2350 is a general-purpose microcontroller, not a certified secure element -- OTP row locking improves but does not eliminate the physical attack surface); side-channel attacks on the Cortex-M33 (ECC operations use software implementations without masking or constant-time guarantees beyond what the RustCrypto crates provide, and there is no hardware ECC accelerator); or denial-of-service via USB (any process with USB device access can send arbitrary CCID commands to the device).
 
@@ -36,10 +37,8 @@ For encrypted communication, a GPG key or Signal contact can be provided on requ
 
 These are documented design limitations within the current threat model, not bugs:
 
-- **PIN hashing without per-device salt.** PIN verification uses PBKDF2 but does not incorporate a per-device salt derived from hardware identity. An attacker who can extract flash contents could mount an offline dictionary attack against short PINs. Physical flash extraction is outside the current threat model. See PUNCHOUT for tracking.
+- **PIN hashing without a per-device salt.** PINs are hashed with PBKDF2-HMAC-SHA256 (10,000 iterations) and a random 16-byte salt per credential, but the device-identity part of the salt is a fixed string, not derived from hardware identity. The PIN records are themselves encrypted under the device's storage key, so an offline dictionary attack against short PINs needs both the flash contents and the OTP storage secret. Physical extraction of both is outside the current threat model. See PUNCHOUT for tracking.
 
-- **V1 Noise exchange provides no mutual authentication.** The V1 DKEK exchange (P1=0x30..0x34) uses unauthenticated ephemeral ECDH. It is deprecated; use V2 (P1=0x35..0x38) for new deployments. Note that V2 mutual authentication signature verification is not yet implemented (see PUNCHOUT C1) and must be completed before v1.0.
-
-- **DKEK V2 exchange requires pre-shared device identity.** The V2 Noise_XX DKEK exchange authenticates peers using static device identity keys stored in OTP. These keys must be exchanged out-of-band before the first DKEK transfer. See `docs/SECURE_PROVISIONING_PLAN.md` for the provisioning workflow.
+- **DKEK exchange requires an enrolled peer.** The DKEK exchange (EXTRAS P1=0x35..0x38; ephemeral P-256 ECDH, not full Noise_XX) authenticates the peer by its device identity key (SC-HSM key ref 0xFE, generated from the TRNG at INITIALIZE), which must be enrolled with the SO-PIN before the first transfer (P1=0x3D; PUNCHOUT C1, resolved). The unauthenticated V1 exchange (P1=0x31..0x33) is removed and returns 6D00.
 
 - **No side-channel hardening.** Cryptographic operations (ECDSA sign, ECDH, RSA) use unmasked software implementations. Timing and power analysis attacks are feasible for an attacker with physical access to the device.

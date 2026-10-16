@@ -11,8 +11,9 @@ needed or supported.
 The SD-card builds exist for one use case: enroll the board in a domain,
 then ship it with the card sent separately.  The card alone is useless (its
 objects are encrypted under keys derived from the device's OTP-based storage
-master key); the device alone holds no user keys.  Verifying the card on
-reinsertion is planned for 2.0 (`docs/STORAGE_V2.md` §8, §11).
+master key); the device alone holds no user keys.  The device verifies the
+card on reinsertion (store ID, MACs, the rollback anchor on internal flash;
+`docs/STORAGE_V2.md` §8, §11; `docs/KEYSTORE_RECOVERY.md` if it refuses).
 
 ---
 
@@ -70,10 +71,10 @@ controller, so we use SPI mode with SCK/MOSI/MISO/CS only.
 
 ```sh
 # No SD card
-cargo build --release --no-default-features --features rp2350_geek_16m
+cargo build --release -p pico2hsm-firmware --no-default-features --features rp2350_geek_16m
 
 # Built-in SD slot
-cargo build --release --no-default-features --features rp2350_geek_sdcard
+cargo build --release -p pico2hsm-firmware --no-default-features --features rp2350_geek_sdcard
 ```
 
 ---
@@ -103,10 +104,10 @@ SPI0. A second card is not supported.
 
 ```sh
 # 16 MB flash keystore
-cargo build --release --no-default-features --features waveshare_rp2350_lcd_16m
+cargo build --release -p pico2hsm-firmware --no-default-features --features waveshare_rp2350_lcd_16m
 
 # SD card as sole keystore
-cargo build --release --no-default-features --features waveshare_rp2350_lcd_sdcard
+cargo build --release -p pico2hsm-firmware --no-default-features --features waveshare_rp2350_lcd_sdcard
 ```
 
 ---

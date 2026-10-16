@@ -24,12 +24,13 @@ One of the following supported boards:
 | Board | Where to get it | Notes |
 |-------|----------------|-------|
 | Raspberry Pi Pico 2 | raspberrypi.com | Cheapest option; needs a USB cable |
-| Waveshare RP2350-One 4MB | waveshare.com | Smallest, USB-A dongle form factor |
+| Waveshare RP2350-One 4MB | waveshare.com | Smallest, USB-A dongle form factor (`rp2350_one_16m` if you fitted a 16 MB chip) |
 | Waveshare RP2350-Geek | waveshare.com | ST7789 LCD screen, SD card slot |
 | Waveshare RP2350-LCD-1.47-B | waveshare.com | ST7789V3 LCD + WS2812B LED, SD card slot |
 
 You do **not** need a debug probe to follow this guide. You will flash the
-firmware by holding a button and plugging in USB (called BOOTSEL mode).
+firmware by holding a button and plugging in USB (called BOOTSEL mode) and
+loading it with `picotool`.
 
 ### A computer running Linux or macOS
 
@@ -70,7 +71,11 @@ rustup target add thumbv8m.main-none-eabihf
 
 ### 1c. Install picotool
 
-`picotool` is a Raspberry Pi tool that handles UF2 files and firmware signing.
+`picotool` is a Raspberry Pi tool that handles UF2 files, partition tables
+and firmware signing. You need version 2.1 or later; signing needs a
+picotool built with `seal` support (mbedtls). If yours lacks it, the build
+stops when it finds a signing key (`PICOTOOL=/path/to/picotool` points it at
+another build).
 
 ```sh
 # Debian / Ubuntu
@@ -127,8 +132,13 @@ There are two parts:
 Run this script from the project root:
 
 ```sh
-./generate_firmware_signing_keys.sh
+./generate_firmware_signing_keys.sh      # key 0 (BOOTKEY0): signs every build
+./generate_firmware_signing_keys.sh 1    # key 1 (BOOTKEY1): offline backup
 ```
+
+Key 1 is only needed before you lock a device for production (see
+[docs/PROVISIONING.md](docs/PROVISIONING.md) §1); for development key 0 is
+enough.
 
 You should see output ending with something like:
 
@@ -157,8 +167,8 @@ should also keep a backup copy somewhere secure. Good options:
   the key files in that backup.
 
 > What NOT to do:
-> - Don't commit these files to git (they are in `.gitignore` — the project
->   will refuse to build if they are accidentally added)
+> - Don't commit these files to version control (they are in `.gitignore`;
+>   nothing stops a forced add)
 > - Don't email them to yourself or store them in cloud storage unencrypted
 > - Don't lose them — there is no recovery if your device is locked and the
 >   key is gone
@@ -175,20 +185,40 @@ The build script does everything automatically. Just run:
 
 What it does:
 1. Checks that all tools are installed
-2. Detects your signing key and signs every firmware file it builds
-3. Builds firmware for all supported board variants
-4. Creates UF2 files for each board (ready for drag-and-drop flashing)
-5. Saves signed firmware and OTP configuration files to the `dist/` folder
+2. Runs the host tests
+3. Detects your signing key and signs every firmware file it builds
+4. Builds release firmware for every board variant (all applets + RSA;
+   `rp2350_one_16m` is not in its list yet: build that one by hand, see
+   [docs/BUILD_CONFIGURATIONS.md](docs/BUILD_CONFIGURATIONS.md))
+5. Creates UF2 files for each board
 
-A full build takes about 5–10 minutes. When it finishes you should see a summary like:
+A full build takes about 5–10 minutes. When it finishes you should see a
+summary like this (sizes in bytes; "flash" is `.text` + `.data`, "ram" is
+`.data` + `.bss`):
 
 ```
 ══ Build summary ══
-Raspberry Pi Pico 2 4MB         OK     flash=476KB  ram=381KB
-Waveshare RP2350-One  4MB       OK     flash=476KB  ram=381KB
-Waveshare RP2350-One 16MB       OK     flash=476KB  ram=381KB
+Feature                               Status  Size
+Raspberry Pi Pico 2 4MB               OK      flash=662036B  ram=247924B
+Waveshare RP2350-One  4MB             OK      flash=665816B  ram=247972B
 ...
 ```
+
+> **A release build needs a provisioned board to store keys.** On a board
+> whose OTP storage secret has not been provisioned, release firmware
+> (what `build-all.sh` makes) disables its keystore rather than encrypt
+> keys under a key anyone can compute: Step 7 then fails. For a
+> development board, use a debug build (`./build-all-debug.sh <board>`,
+> Method B below) or add the `insecure-dev-keystore` feature to a release
+> build. Never deploy either: the development storage key is public.
+>
+> ```sh
+> cargo build --release -p pico2hsm-firmware --no-default-features \
+>     --features pico2_4m,rsa,applet-piv,applet-openpgp-curve25519,insecure-dev-keystore
+> cp target/thumbv8m.main-none-eabihf/release/pico2hsm /tmp/pico2hsm-dev.elf
+> picotool uf2 convert /tmp/pico2hsm-dev.elf -t elf /tmp/pico2hsm-dev.uf2 \
+>     --family rp2350-arm-s
+> ```
 
 ### What is in the `dist/` folder?
 
@@ -200,58 +230,71 @@ dist/
   pico2hsm-rp2350_one_4m.uf2         ← Flash this file to an RP2350-One 4MB
   pico2hsm-rp2350_geek_16m.uf2       ← Flash this file to an RP2350-Geek
   ...
-  pico2hsm-pico2_4m-signed.elf       ← Signed firmware binary (for probe-rs)
-  pico2hsm-pico2_4m-otp.json         ← OTP settings for locking the device
+  pico2hsm-pico2_4m.elf              ← Unsigned firmware binary
+  pico2hsm-pico2_4m-signed.elf       ← Signed firmware binary
+  pico2hsm-pico2_4m-seal-otp-ENABLES-SECURE-BOOT.json   ← never load this
   ...
 ```
 
-The UF2 files are what you will copy to the device. The OTP JSON files record
-what needs to be burned into the device's permanent memory to enable secure
-boot — you will use these later when you are ready to lock devices for
-production.
+The UF2 files are what you will load onto the device (signed if a key was
+found). The `-seal-otp-ENABLES-SECURE-BOOT.json` files are what `picotool
+seal` writes: loading one into OTP turns on secure boot in a single step.
+**Never load them.** Production devices are provisioned stage by stage with
+`tools/provision-device.py` ([docs/PROVISIONING.md](docs/PROVISIONING.md)).
 
 ---
 
 ## Step 5: Flash your device
 
+Every board boots through a **partition table** (see
+[docs/FLASH_LAYOUT_2_0.md](docs/FLASH_LAYOUT_2_0.md)). You install it once
+per board; after that, updates are the firmware alone. The 4 MB boards
+(Pico 2, RP2350-One) use `boards/pt_4m.json`, the 16 MB boards (Geek,
+Waveshare LCD, RP2350-One with a 16 MB chip) `boards/pt_16m.json`.
+
 There are two ways to flash. Pick the one that matches your setup.
 
-### Method A: BOOTSEL drag-and-drop (no extra hardware needed)
+### Method A: BOOTSEL and picotool (no extra hardware needed)
 
-This is the easiest method. You just need a USB cable.
-
-1. **Hold the BOOTSEL button** on your board (it is labelled BOOTSEL)
+1. **Hold the BOOTSEL button** on your board (labelled BOOTSEL or BOOT)
 2. **While holding BOOTSEL, plug in the USB cable** to your computer
-3. The board appears as a USB drive called `RPI-RP2` (on Linux it mounts under `/media/`)
-4. **Copy the right UF2 file** for your board:
+3. The board appears as a USB drive called `RP2350`
+4. Install the partition table (first time only), then the firmware:
 
 ```sh
+# The partition table — 4 MB boards (use pt_16m.json on a 16 MB board):
+picotool partition create boards/pt_4m.json /tmp/pt_4m.uf2
+picotool load /tmp/pt_4m.uf2
+picotool reboot -u          # back into BOOTSEL with the table in place
+
+# The firmware, into partition 0 (slot A); -x starts it afterwards.
 # For Raspberry Pi Pico 2:
-cp dist/pico2hsm-pico2_4m.uf2 /media/$USER/RPI-RP2/
-
+picotool load -p 0 -x dist/pico2hsm-pico2_4m.uf2
 # For Waveshare RP2350-One 4MB:
-cp dist/pico2hsm-rp2350_one_4m.uf2 /media/$USER/RPI-RP2/
-
+picotool load -p 0 -x dist/pico2hsm-rp2350_one_4m.uf2
 # For Waveshare RP2350-Geek 16MB:
-cp dist/pico2hsm-rp2350_geek_16m.uf2 /media/$USER/RPI-RP2/
+picotool load -p 0 -x dist/pico2hsm-rp2350_geek_16m.uf2
 ```
 
-On macOS, the drive appears in Finder as `RPI-RP2`. You can drag and drop the file.
+With more than one board in BOOTSEL, add `--ser <serial>` to every
+picotool command.
 
-5. The board automatically reboots and runs the firmware. The USB drive
-   disappears — that's normal and means it worked.
+5. The board reboots and runs the firmware. The USB drive disappears —
+   that's normal and means it worked.
 
-### Method B: Probe-rs (requires a debug probe)
+### Method B: probe-rs (requires a debug probe)
 
 If you have a debug probe (Raspberry Pi Debug Probe, or any CMSIS-DAP adapter)
 connected via SWD:
 
 ```sh
-./build-all.sh --flash pico2_4m
+./build-all-debug.sh pico2_4m                     # debug build
+PROFILE=release ./build-all-debug.sh pico2_4m     # release optimisation
 ```
 
-Replace `pico2_4m` with your board's feature name. This builds, flashes, and
-shows you the boot log. Press Ctrl+C when you have seen enough output.
+Replace `pico2_4m` with your board's feature name. This builds, writes the
+partition table and the (unsigned) image with probe-rs, and shows you the
+boot log. Press Ctrl+C when you have seen enough output.
 
 ---
 
@@ -280,9 +323,8 @@ You should see something like:
 
 ```
 Available slots:
-Slot 0 (0x0): Feitian ...
-  token label  : SmartCard-HSM (UserPIN)
-  token manufacturer: ...
+Slot 0 (0x0): pico2hsm pico2hsm SC-HSM ...
+  token label  : ...
 ```
 
 If you see a slot listed, the firmware is running correctly.
@@ -357,10 +399,11 @@ for APDU reference documentation for each applet.
 Once you are happy the device works, you can lock it down so only firmware
 signed with your key will run. This is a permanent, irreversible operation.
 
-The steps (covered in `docs/SECURE_PROVISIONING_PLAN.md`) are:
-1. Use the provisioning APDUs (INS=0xF1 SET_PRODUCTION_MODE) to put the device in production mode
-2. Use the `picotool otp load` command with the OTP JSON file from `dist/` to burn the key fingerprint into the device
-3. The device will then verify your firmware signature on every boot
+Follow [docs/PROVISIONING.md](docs/PROVISIONING.md). It provisions a board
+one stage at a time with `tools/provision-device.py` (boot-key hashes from
+`tools/otp-bootkeys.sh`, a per-device storage secret, secure boot, the
+signed production partition table), checking every precondition and
+reading back every OTP write. Read its §1 before you touch a board.
 
 > **Important**: Only do this on a device you intend to deploy. You cannot
 > undo it. If you want to keep experimenting, use a separate development device.
@@ -394,8 +437,12 @@ Your signing key may be in the wrong format. Delete both key files and run
 
 ### The device appears as a drive every time I plug it in
 
-The firmware did not flash successfully. Try the BOOTSEL method again, making
-sure you hold the button until the drive appears, then copy the file.
+The firmware did not flash or does not boot. Check that the partition table
+is installed (`picotool partition info`), then load the firmware again with
+`picotool load -p 0 -x`. On a 16 MB board a release image runs on trial
+(try-before-you-buy) and boots only on an update boot: an image that never
+answered an APDU, and so was never bought, does not boot after a plain
+reset, and with no other image the board stays in BOOTSEL.
 
 ### pkcs11-tool shows no slots
 

@@ -43,13 +43,16 @@ All SC-HSM commands use `CLA = 0x00` unless noted. OpenSC's session-PIN flow use
 
 | Resource | Limit |
 |---|---|
-| EC key slots (in-memory) | 16 |
-| RSA key slots (in-memory, feature `rsa`) | 4 |
-| Symmetric key slots (in-memory) | 8 |
-| EF (data file) slots (in-memory) | 16 |
-| Max EF file size | 2048 bytes |
+| SC-HSM user keys (`MAX_SC_HSM_KEYS`) | 128 on 4 MB boards, 251 (every user key ref) on 16 MB boards; past it 6A84 |
+| Key / EF index entries (`MAX_KEY_INDEX`) | 400 on 4 MB boards, 768 on 16 MB boards |
+| Reserved key refs | `0xFC`–`0xFF` (refused by user key commands) |
+| EF cache (in RAM) | 16 entries of up to 1024 bytes |
 | Max PIN length | 16 bytes |
 | Max SO-PIN length | 16 bytes |
+
+Keys and EFs live in the Storage V2 keystore (internal flash or the SD
+card); RAM holds one decrypted object at a time (`OpBuffer`) plus the EF
+cache.
 
 ---
 
@@ -69,11 +72,12 @@ All SC-HSM commands use `CLA = 0x00` unless noted. OpenSC's session-PIN flow use
 | `0x48` | GENERATE SYMMETRIC KEY | Generate AES-128/192/256 key on-device | Implemented |
 | `0x50` | INITIALIZE | Initialize / re-initialize device | Implemented |
 | `0x52` | KEY DOMAIN | DKEK share import and status (CardContact); pico2hsm domain management | Partially implemented |
-| `0x54` | EXTRAS | Additional KDF / MAC primitives | Implemented |
+| `0x54` | EXTRAS | KDF / MAC primitives, device key, DKEK exchange, domains, store recovery (STORE STATUS / OPEN DEGRADED / ACCEPT STORE / FORMAT STORE), RSA key pool (§3.29) | Implemented |
 | `0x58` | LIST KEYS | List key slots (IMPORT KEY uses `0x74`; see §3.25) | Implemented |
 | `0x60` | BIP/SLIP HD DERIVE | BIP32 / SLIP-0010 hierarchical key derivation | Implemented |
 | `0x62` | DECIPHER / DERIVE ASYM | ECDH key agreement or RSA decrypt (P1=key_id, P2=algo) or derive asymmetric key (P1=0x01 **and** P2=0x00) | Implemented |
 | `0x68` | SIGN | Compute digital signature (ECDSA / RSA) | Implemented |
+| `0x74` | IMPORT KEY (UNWRAP) | Import a CardContact key blob under the DKEK (§3.25) | Implemented |
 | `0x78` | SYMMETRIC CIPHER | AES-CBC / CTR / GCM / CMAC | Implemented |
 | `0x82` | EXTERNAL AUTHENTICATE | Removed (2026-10): keyed by the stored SO-PIN hash, so reading the PIN record granted SO. Returns `6D00`. | Removed |
 | `0x84` | GET CHALLENGE | Return random bytes from TRNG | Implemented |
@@ -85,7 +89,8 @@ All SC-HSM commands use `CLA = 0x00` unless noted. OpenSC's session-PIN flow use
 | `0xD7` | WRITE DATA | Write TLV-framed data blob to addressed EF | Implemented |
 | `0xE0` | CREATE FILE | Create new transparent EF (sets current file) | Implemented |
 | `0xE4` | DELETE FILE | Delete key or EF from store | Implemented |
-| `0xFE` | DEBUG DUMP | Dump RAM/flash region (debug feature only) | Debug build only |
+| `0xF0`–`0xF3` | PROVISIONING | Status (F0); set production mode, lock OTP rows (F1, F2; SO-PIN). F3 (write CRIT1) is reserved and returns 6D00 | Implemented |
+| `0xFE` | DEBUG | Test hooks (watchdog, recovery, BOOTSEL, boot info); the memory dump is a stub (§3.30) | `debug` feature only |
 
 ---
 
@@ -1491,8 +1496,11 @@ Test hooks on the same INS (CLA `0x80`): P1 `0x10` wedges core1, `0x11`
 wedges core0 after replying, `0x12` resets through the watchdog (watchdog
 tests); `0x13` moves the keystore anchor P2 records ahead of the journal,
 so the next boot refuses the store as behind its anchor (recovery test,
-`tests/hw/test_21_store_recovery.py`); `0x20`/`0x21` RSA benchmark and
-self-test.
+`tests/hw/test_21_store_recovery.py`); `0x14` reboots into BOOTSEL,
+`0x15` returns the image version and the bootrom's boot info (slot,
+trial state), `0x16` the loaded partition table
+([FLASH_LAYOUT_2_0.md](FLASH_LAYOUT_2_0.md) §3); `0x20`/`0x21` RSA
+benchmark and self-test (`rsa` builds).
 
 **Command:**
 
@@ -1807,7 +1815,7 @@ MF  (3F00)
 
 ## 9. pico2hsm-Specific Deviations from Reference SC-HSM
 
-1. **PIN storage:** PINs are stored as SHA-256 hashes in RAM only (volatile). Flash persistence of PIN hashes is not yet implemented; PINs must be re-set after power cycle by re-running INITIALIZE.
+1. **PIN storage:** the user PIN and PUK are stored as salted PBKDF2-HMAC-SHA256 hashes (10,000 iterations) in the PIN record (reserved key ref `0xFF`); the SO-PIN lives in the Storage V2 binding block, so it verifies even on a refused store. Retry counters are in the counter log on internal flash and are spent before each comparison. All survive power cycles.
 
 2. **Key persistence:** EC and RSA keys are persisted to flash via `storage::KeyStore`. Symmetric keys are also persisted. Keys survive power cycles.
 
@@ -1819,7 +1827,7 @@ MF  (3F00)
 
 6. **DECIPHER / DERIVE ASYM sharing INS=0x62:** DERIVE ASYMMETRIC is selected only by P1=0x01 **and** P2=0x00; everything else routes to DECIPHER (see §3.22).
 
-7. **LIST KEYS / IMPORT KEY sharing INS=0x58:** When INS=0x58 and P2=0x93, the IMPORT KEY handler is invoked. P2=0x00 routes to LIST KEYS.
+7. **LIST KEYS owns INS=0x58:** P1=P2=0x00 lists keys; anything else is 6A86. Key import (UNWRAP KEY) is INS=0x74 with P2=0x93 (§3.25), not 0x58.
 
 8. **EF.PrKDF is always empty:** The standard PKCS#15 PrKDF mechanism is not used. OpenSC is expected to call LIST KEYS (INS=0x58) to discover occupied slots, then read per-key PRKD (C4xx) EFs for key metadata.
 

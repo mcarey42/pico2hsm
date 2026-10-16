@@ -38,15 +38,16 @@ What each parameter does:
 - `--pin` -- The user PIN. This is what you type every time you sign, decrypt, or use a key. The default `648219` is for testing only -- pick something stronger for real use.
 - `--dkek-shares 1` -- Configures the device to accept one DKEK (Device Key Encryption Key) share. The DKEK is required for key backup and restore. Setting this to `0` disables key export entirely.
 
-**Warning:** `--initialize` erases all SC-HSM keys on the device. PIV and OpenPGP keys (if present) are not affected.
+**Warning:** `--initialize` erases all SC-HSM keys on the device, its domain records and any pre-generated RSA keys. PIV and OpenPGP keys (if present) are not affected.
 
 ---
 
 ## Step 2 -- Create and import a DKEK share
 
-The DKEK encrypts every key stored on the device. Without the DKEK share
-file, keys cannot be backed up or restored to a new device. This is the
-most important file you will create.
+The DKEK wraps keys for backup (WRAP KEY) and restore (UNWRAP KEY). Keys at
+rest on the device are encrypted under its own storage key, not the DKEK,
+but without the DKEK share file, keys cannot be backed up or restored to a
+new device. This is the most important file you will create.
 
 ```sh
 # Create an encrypted DKEK share file
@@ -246,7 +247,10 @@ pkcs11-tool --change-pin --pin 648219 --new-pin 123456
 
 ### Reset a locked PIN
 
-If the user PIN is locked (too many wrong attempts), use the SO-PIN to reset it:
+If the user PIN is locked (too many wrong attempts), the SO-PIN can reset
+its counter without erasing anything (RESET RETRY COUNTER, INS `2C`; see
+[SC_HSM_APDU_REFERENCE.md](SC_HSM_APDU_REFERENCE.md) §3.11). With OpenSC
+tools alone, re-initialise with the SO-PIN:
 
 ```sh
 sc-hsm-tool --initialize \

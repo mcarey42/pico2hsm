@@ -40,10 +40,13 @@ This project adopts the Contributor Covenant 2.1. See `CODE_OF_CONDUCT.md`.
 rustup target add thumbv8m.main-none-eabihf
 
 # Flashing and debugging tools
-cargo install probe-rs-tools picotool elf2uf2-rs
+cargo install probe-rs-tools
+# picotool >= 2.1 (partition tables, UF2, signing with `seal`):
+# your package manager, or https://github.com/raspberrypi/picotool
+sudo apt install picotool binutils-arm-none-eabi
 
-# Host-side smartcard tools (Ubuntu/Debian)
-sudo apt install opensc pcscd pkcs11-tools
+# Host-side smartcard tools (Ubuntu/Debian; opensc provides pkcs11-tool)
+sudo apt install opensc pcscd
 
 # Python test dependencies are installed automatically by run_tests.sh
 ```
@@ -52,7 +55,7 @@ sudo apt install opensc pcscd pkcs11-tools
 
 This section is critical. Getting the build flags wrong is the most common contributor mistake.
 
-**Never run `cargo build` directly.** The debug script handles `DEFMT_LOG=trace` (required for defmt log output to survive optimization), the correct target, feature flags, and optional firmware signing.
+**Flash only through the debug script.** A bare `cargo build` is fine for compile checks and size analysis (always with `-p pico2hsm-firmware --no-default-features --features <board>,...`), but the script handles `DEFMT_LOG=trace` (required for defmt log output to survive optimization), the feature flags, optional firmware signing, and writing the partition table and slot A.
 
 ### Build and flash
 
@@ -66,6 +69,7 @@ Replace `pico2_4m` with your board. Valid board arguments:
 |----------|-------|
 | `pico2_4m` | Raspberry Pi Pico 2 (4MB) |
 | `rp2350_one_4m` | Waveshare RP2350-One (4MB) |
+| `rp2350_one_16m` | Waveshare RP2350-One with a 16MB chip fitted |
 | `rp2350_geek_16m` | Waveshare RP2350-Geek (16MB) |
 | `rp2350_geek_sdcard` | Waveshare RP2350-Geek (SDCard) |
 | `waveshare_rp2350_lcd_16m` | Waveshare RP2350-LCD-1.47-B (16MB) |
@@ -88,8 +92,10 @@ cargo build --release --manifest-path firmware/Cargo.toml --features pico2_4m
 
 ```sh
 cargo test -p pico2hsm-core --target x86_64-unknown-linux-gnu
+cargo test -p pico2hsm-integration-tests --target x86_64-unknown-linux-gnu
 cargo test -p pico2hsm-firmware --lib --no-default-features \
-    --features pico2_4m --target x86_64-unknown-linux-gnu
+    --features pico2_4m,rsa,applet-piv,applet-openpgp-curve25519 \
+    --target x86_64-unknown-linux-gnu
 ```
 
 ## Running the test suite
@@ -107,11 +113,13 @@ sleep 5
 # Skip RSA tests during development (keygen takes 2-16 min on hardware)
 ./run_tests.sh --no-rsa
 
-# Target a specific reader if multiple devices are connected
-OPENSC_DEFAULT_READER=1 ./run_tests.sh
+# Target a specific device if several are connected (its USB serial, part
+# of the reader name; OPENSC_DEFAULT_READER=<index> also works, but indexes
+# shift when a board re-enumerates)
+PICO2HSM_READER=<serial> ./run_tests.sh
 ```
 
-Run `opensc-tool --list-readers` to see which reader index corresponds to which device.
+Run `opensc-tool --list-readers` to see the reader names.
 
 If `probe-rs` reports "interface is busy (errno 16)", kill the previous session:
 
@@ -123,10 +131,10 @@ pkill -9 -f "probe-rs"
 
 CI runs on every push and pull request. It verifies:
 
-- Firmware compiles for all seven board targets (release profile)
+- Firmware compiles for all seven board targets (release profile; all applets with and without RSA, and SC-HSM only)
 - `cargo fmt --all -- --check` passes
-- `cargo clippy` passes for `pico2hsm-core` (warnings are errors)
-- Host-side unit tests pass (`pico2hsm-core` and `pico2hsm-integration-tests`)
+- `cargo clippy -D warnings` runs for `pico2hsm-core` and the firmware, but is non-blocking for now (`continue-on-error`)
+- Host-side tests pass: `pico2hsm-core`, `pico2hsm-integration-tests`, the firmware library tests for every board (with and without RSA), and the firmware integration tests (`firmware/tests`, on `pico2_4m`)
 
 CI does not run hardware integration tests. Those are your responsibility.
 
@@ -158,7 +166,7 @@ Closes PUNCHOUT C1
 
 1. Fork and create a branch from `main`.
 2. All firmware changes must compile for **all** board targets. CI checks all seven variants.
-3. Run `cargo fmt` and `cargo clippy --no-default-features --features pico2_4m` before pushing.
+3. Run `cargo fmt --all` and `cargo clippy -p pico2hsm-firmware --target thumbv8m.main-none-eabihf` before pushing.
 4. If you changed firmware behavior, the hardware integration test suite must pass (`./run_tests.sh`). State this in the PR description.
 5. Add or update unit tests in `firmware/src/` for any new `#[cfg(test)]` modules.
 6. Update `PUNCHOUT.md` if your PR closes an item.

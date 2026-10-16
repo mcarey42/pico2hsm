@@ -242,19 +242,21 @@ In the SD-card build the card is the keystore.  `init_sd_keystore()` in
 `main.rs` sets up SPI1 at 400 kHz for card identification, then raises it
 to 25 MHz (`SDCARD_SPI_FREQ_HZ`).  `SdCardFlash` (`firmware/src/storage/sdcard.rs`) uses the
 `embedded-sdmmc` block driver only: raw 512-byte block I/O, no FAT
-filesystem.  The PIN/PUK retry-counter log stays on internal flash.
+filesystem.  The binding block, the counter log (PIN/PUK retry counters,
+keystore anchor) and the RSA key pool stay on internal flash.
 
 In the `waveshare_rp2350_lcd_16m` build, SPI1 is set up at 40 MHz but the
-slot is not used; the keystore is on internal flash (2 MB at offset
-0x200000).
+slot is not used; the keystore is on internal flash (the `keystore`
+partition at 0x829000, ~7.8 MB; [FLASH_LAYOUT_2_0.md](FLASH_LAYOUT_2_0.md)).
 
 **Why an SD-card build?**  An SD-card board can be enrolled in a domain and
 shipped to a remote party with the card sent separately.  The card alone is
 useless: its objects are encrypted under keys derived from the device's
 OTP-based storage master key.  The device alone holds no user keys.  When
 the card goes back in, the device checks it and resumes domain sync.  The
-card checks (store ID, MACs, rollback anchor on internal flash) are planned
-for 2.0; see `docs/STORAGE_V2.md` §8 and §11 and `docs/CLUSTER_PLAN_V3.md`.
+card checks (store ID, MACs, rollback anchor on internal flash) are
+implemented by Storage V2; see `docs/STORAGE_V2.md` §8 and §11,
+`docs/KEYSTORE_RECOVERY.md` and `docs/CLUSTER_PLAN_V3.md`.
 
 ---
 
@@ -268,18 +270,20 @@ for 2.0; see `docs/STORAGE_V2.md` §8 and §11 and `docs/CLUSTER_PLAN_V3.md`.
 The feature flag activates:
 - `impl Board for WaveshareRp2350LcdBoard` in `waveshare_rp2350_lcd.rs`
 - `run_waveshare_lcd_board()` in `main.rs`
-- Flash layout matching the 16 MB W25Q128 chip (via QSPI / `embassy_rp::flash`)
+- The 16 MB flash map (`flash_layout::MAP_16M`, `boards/pt_16m.json`): A/B
+  slots with try-before-you-buy, the store from 8 MB
 
 ---
 
 ## Build command
 
 ```sh
-# SC-HSM only (default applet set):
+# Debug build with all applets + RSA, flashed by probe-rs (needs SWD;
+# without a probe, use BOOTSEL: FLASH_LAYOUT_2_0.md §4):
 ./build-all-debug.sh waveshare_rp2350_lcd_16m
 
-# Or manually with cargo:
-cargo build --release \
+# Or manually with cargo (SC-HSM only):
+cargo build --release -p pico2hsm-firmware \
   --no-default-features \
   --features waveshare_rp2350_lcd_16m
 ```

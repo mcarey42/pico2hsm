@@ -1,6 +1,6 @@
 # P2K5 Flash Storage Format Specification
 
-**Status**: Design document (not yet implemented)
+**Status**: Superseded, never implemented. Storage V2 (2.0) replaced the 1.x sector format instead ([STORAGE_V2.md](STORAGE_V2.md)); the `KeyObject` blob inside a V2 object still carries the `P2K4` magic (`P2KP` with a usage policy).
 **Date**: 2026-04-12
 **Supersedes**: P2K4 format (no backwards compatibility maintained)
 **Upgrade path**: Re-INITIALIZE required after firmware update. All P2K2/P2K3/P2K4 read paths are removed.

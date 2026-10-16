@@ -1,5 +1,15 @@
 # pico2hsm Security Summary — v0.9.9-rc2
 
+> **Historical snapshot (2026-04-11).** It describes v0.9.9-rc2. Since
+> then the October 2026 audit ([AUDIT_2026-10.md](AUDIT_2026-10.md)) and
+> Storage V2 changed several of the mechanisms below: keys live in the
+> Storage V2 journaled store (`P2K4`/`P2KP` blobs inside V2 objects;
+> [STORAGE_V2.md](STORAGE_V2.md)); retry counters are in the counter log
+> and spent before every comparison; the enrolled peer at `0xFC` is
+> migrated at boot to a single-use pinned peer; the OTP boot flags are at
+> row `0x140`. Use the audit and `CLAUDE.md` (Security invariants) for the
+> current state.
+
 Prepared: 2026-04-11
 Scope: Full source code review, APDU robustness assessment, cryptographic mechanism audit,
 Python daemon transport security, and provisioning subsystem review.

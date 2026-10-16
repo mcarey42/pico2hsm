@@ -23,9 +23,11 @@ Probe or any CMSIS-DAP compatible SWD adapter works with both RP2350 boards.
 
 ### picotool (for UF2 generation)
 
-`build-all.sh` uses `picotool` to convert ELF → UF2 files for drag-and-drop
-flashing. Download from https://github.com/raspberrypi/picotool or install via
-your package manager:
+`build-all.sh` uses `picotool` to convert ELF → UF2 files and to sign them;
+`build-all-debug.sh` uses it to build the partition table. Signing needs a
+picotool built with `seal` (mbedtls); CI builds 2.2.0 from source. Download
+from https://github.com/raspberrypi/picotool or install via your package
+manager:
 
 ```sh
 # Debian/Ubuntu (24.04+)
@@ -34,7 +36,9 @@ sudo apt install picotool
 brew install picotool
 ```
 
-If `picotool` is not found, UF2 generation is skipped with a warning.
+If `picotool` is not found, `build-all.sh` skips UF2 generation with a
+warning; `build-all-debug.sh` stops (it needs picotool for the partition
+table).
 
 ### Optional: arm-none-eabi-size (for binary size reporting)
 
@@ -49,14 +53,20 @@ brew install arm-none-eabi-binutils
 
 ## Board Variants
 
-| Feature flag | Hardware | Flash | Storage |
-|---|---|---|---|
-| `rp2350_one_4m` (default) | Waveshare RP2350-One | 4 MB | 2 MB keystore |
-| `rp2350_geek_16m` | Waveshare RP2350-Geek | 16 MB | 6 MB keystore |
-| `rp2350_geek_sdcard` | Waveshare RP2350-Geek + SDCard | 16 MB + SD | 14 MB keystore |
-| `waveshare_rp2350_lcd_16m` | Waveshare RP2350-LCD-1.47-B | 16 MB | 14 MB keystore |
-| `waveshare_rp2350_lcd_sdcard` | Waveshare RP2350-LCD-1.47-B + SDCard | 16 MB + SD | SD keystore |
-| `pico2_4m` | Raspberry Pi Pico 2 (stock) | 4 MB | 2 MB keystore |
+| Feature flag | Hardware | Flash | Keystore | Partition table |
+|---|---|---|---|---|
+| `rp2350_one_4m` (default) | Waveshare RP2350-One | 4 MB | 2,044 KB internal | `boards/pt_4m.json` |
+| `rp2350_one_16m` | Waveshare RP2350-One with a 16 MB chip | 16 MB | ~7.8 MB internal | `boards/pt_16m.json` |
+| `rp2350_geek_16m` | Waveshare RP2350-Geek | 16 MB | ~7.8 MB internal | `boards/pt_16m.json` |
+| `rp2350_geek_sdcard` | Waveshare RP2350-Geek + SDCard | 16 MB + SD | SD card | `boards/pt_16m.json` |
+| `waveshare_rp2350_lcd_16m` | Waveshare RP2350-LCD-1.47-B | 16 MB | ~7.8 MB internal | `boards/pt_16m.json` |
+| `waveshare_rp2350_lcd_sdcard` | Waveshare RP2350-LCD-1.47-B + SDCard | 16 MB + SD | SD card | `boards/pt_16m.json` |
+| `pico2_4m` | Raspberry Pi Pico 2 (stock) | 4 MB | 2,044 KB internal | `boards/pt_4m.json` |
+
+Every board boots through a bootrom partition table: one firmware slot on
+4 MB boards, A/B slots with try-before-you-buy on 16 MB boards, and the
+store regions as partitions closed to BOOTSEL
+([docs/FLASH_LAYOUT_2_0.md](docs/FLASH_LAYOUT_2_0.md)).
 
 > **Note:** Board feature flags are mutually exclusive. Always pass
 > `--no-default-features --features <flag>` when building for a specific board.
@@ -67,13 +77,14 @@ brew install arm-none-eabi-binutils
 
 | Feature | Effect | Default? |
 |---|---|---|
-| `rsa` | Enable RSA key operations (adds ~1 MB; requires 48 KB heap) | **Yes** |
+| `rsa` | Enable RSA-2048/3072/4096 and the RSA key pool (adds ~115 KB flash; 48 KB heap) | **Yes** |
 | `applet-piv` | Enable PIV applet (NIST SP 800-73-4); slots 9A/9C/9D/9E | **Yes** |
 | `applet-openpgp` | Enable OpenPGP Card 3.4 applet; NIST ECC (P-256/384/521) | implied by curve25519 |
 | `applet-openpgp-curve25519` | Add Ed25519/X25519 to OpenPGP (implies `applet-openpgp`) | **Yes** |
-| `debug` | Enable RAM dump APDUs; disable secure-boot enforcement | No — never in production |
+| `debug` | Enable the debug APDUs (INS `0xFE`: watchdog and recovery test hooks, BOOTSEL reboot, boot/partition info); skip the production-mode boot checks | No — never in production |
+| `insecure-dev-keystore` | Let a release build use the fixed, public development storage key on unprovisioned OTP (debug builds always do) | No — never in production |
 
-All four non-debug capabilities are on by default. Use `--no-default-features`
+The four capabilities (`rsa` and the three applet flags) are on by default. Use `--no-default-features`
 plus explicit `--features` to opt out of specific capabilities for size-constrained builds.
 
 ---
@@ -124,20 +135,27 @@ root. Generate the key pair once:
 This creates `ec_firmware_signing_key-bootkey0.pem` (private — keep it safe) and
 `ec_firmware_signing_key-bootkey0.pub` (public — safe to share). Both are gitignored.
 
-After generating the key, every `./build-all.sh` or `./build-all-debug.sh` run
-will produce signed outputs in `dist/`:
+After generating the key, every `./build-all.sh` run produces signed
+outputs in `dist/`:
 
 ```
-dist/pico2hsm-<board>-signed.elf    ← flash this (or the UF2)
-dist/pico2hsm-<board>-otp.json      ← burn this to lock the device
-dist/pico2hsm-<board>.uf2           ← generated from the signed ELF
+dist/pico2hsm-<board>-signed.elf                          ← signed ELF
+dist/pico2hsm-<board>.uf2                                 ← generated from the signed ELF
+dist/pico2hsm-<board>-seal-otp-ENABLES-SECURE-BOOT.json   ← never load this
 ```
 
-> The RP2350 bootrom only enforces the signature when `secure_boot_enable` is
-> burned into OTP. Signing debug builds is safe — unsigned devices boot
+`./build-all-debug.sh` also writes `dist/pico2hsm-<board>-debug-signed.elf`,
+but flashes the unsigned ELF (probe-rs cannot parse picotool-signed debug
+ELFs).
+
+> The RP2350 bootrom only enforces the signature when secure boot is
+> enabled in OTP. Signing debug builds is safe — unsigned devices boot
 > normally; locked devices reject unsigned images.
-
-See `docs/SECURE_PROVISIONING_PLAN.md` for the OTP programming procedure.
+>
+> The `-seal-otp-ENABLES-SECURE-BOOT.json` file `picotool seal` writes sets
+> `crit1.secure_boot_enable` in one step: **never load it**. Boot keys are
+> provisioned with `tools/otp-bootkeys.sh` and `tools/provision-device.py`;
+> see [docs/PROVISIONING.md](docs/PROVISIONING.md).
 
 ---
 
@@ -191,60 +209,40 @@ cargo build --release \
 
 ## Flashing hardware (without OTP burn)
 
-> **Note — OTP state**: The RP2350 OTP is blank on a fresh board. The firmware
-> detects this and logs `OTP: device may be unprovisioned`. Storage Master Key
-> derivation will fail gracefully. The main loop still starts; RTT output and
-> LED status can be verified without provisioning OTP.
+> **Note — OTP state**: The RP2350 OTP is blank on a fresh board. A
+> **release** build then has no storage key and disables its keystore
+> (`OTP: unprovisioned — keystore disabled (no storage key)`); key
+> operations fail. A **debug** build, or a release build with
+> `insecure-dev-keystore`, uses the fixed public development key and warns
+> at boot. A release build also disables its keystore if the loaded
+> partition table is not the one it was built for.
 
 ### 1. Wire the SWD probe
 
-Connect your debug probe to the 3-pin SWD header on the board:
+Connect your debug probe to the board's SWD pads or header (SWDIO, SWCLK,
+GND). The RP2350's SWD port has dedicated pins; it does not use GPIOs.
+If you cannot reach the SWD pads (the project flashes its Waveshare
+RP2350-One and LCD boards without a probe), use BOOTSEL (step 3).
 
-| Signal | RP2350 pin |
-|--------|-----------|
-| SWDIO  | GPIO 24 (or board-specific pad) |
-| SWDCLK | GPIO 25 (or board-specific pad) |
-| GND    | GND |
-
-Do **not** connect SWDIO/SWDCLK to JTAG pins — the RP2350 defaults to SWD.
-
-### 2. Flash using the build script
+### 2. Flash with the debug script (probe)
 
 ```sh
-./build-all.sh --flash rp2350_one_4m
+./build-all-debug.sh pico2_4m                    # debug profile
+PROFILE=release ./build-all-debug.sh pico2_4m    # release profile, symbols kept
 ```
 
-This will:
-1. Run host tests
-2. Build the selected variant in release mode
-3. Flash via `probe-rs download`
-4. Reset the device and capture 5 s of RTT output
-5. Verify expected boot-sequence log lines
+This builds the board with all applets and RSA, writes the partition table
+(`boards/pt_4m.json` or `pt_16m.json`) at `0x10000000` and the image into
+slot A at `0x10002000` with `probe-rs download`, resets, and attaches for
+RTT. Set `PROBE_SERIAL=<serial>` when several probes are connected.
 
-### 3. Flash manually
+`./build-all.sh --flash <board>` predates the partition table: it downloads
+the ELF to `0x10000000`, over the table's sector. Do not use it on a 2.0
+board.
 
-```sh
-# Build first
-cargo build --release \
-    --manifest-path firmware/Cargo.toml \
-    --no-default-features \
-    --features rp2350_one_4m
+### 3. BOOTSEL and picotool (no probe needed)
 
-# Flash (probe-rs auto-detects the probe)
-probe-rs download \
-    --chip RP2350 \
-    --format elf \
-    target/thumbv8m.main-none-eabihf/release/pico2hsm
-
-# Run with live RTT log
-probe-rs run \
-    --chip RP2350 \
-    target/thumbv8m.main-none-eabihf/release/pico2hsm
-```
-
-### 4. UF2 drag-and-drop (no probe needed)
-
-`build-all.sh` automatically generates UF2 files for every board variant:
+`build-all.sh` generates UF2 files for every board variant in its list:
 
 ```
 dist/pico2hsm-pico2_4m.uf2
@@ -255,88 +253,48 @@ dist/pico2hsm-waveshare_rp2350_lcd_16m.uf2
 dist/pico2hsm-waveshare_rp2350_lcd_sdcard.uf2
 ```
 
-To flash via UF2:
+Install the partition table once per board, then the firmware:
 
 ```sh
-# 1. Hold the BOOTSEL button on the board
-# 2. Plug in USB — the board appears as a mass-storage drive (RPI-RP2)
-# 3. Copy the correct UF2 file
-
-cp dist/pico2hsm-rp2350_one_4m.uf2 /media/$USER/RPI-RP2/
+# 1. Hold BOOTSEL and plug in USB (or send 80 FE 14 00 to a debug build)
+# 2. The partition table (pt_16m.json on 16 MB boards):
+picotool partition create boards/pt_4m.json /tmp/pt_4m.uf2
+picotool load /tmp/pt_4m.uf2
+picotool reboot -u
+# 3. The firmware into partition 0 (slot A); -x runs it
+picotool load -p 0 -x dist/pico2hsm-rp2350_one_4m.uf2
 ```
 
-The board will reboot and run the firmware automatically.
+With several boards in BOOTSEL, pass `--ser <serial>` to every picotool
+command. Later updates are step 3 alone. CI release assets ship the
+tables ready-made as `pico2hsm-<board>-pt-dev.uf2` / `-pt-prod.uf2`.
 
-To generate UF2 files manually (requires `picotool` ≥ 2.1):
+To generate a firmware UF2 manually (requires `picotool` ≥ 2.1):
 
 ```sh
-# Build
 cargo build --release \
     --manifest-path firmware/Cargo.toml \
     --no-default-features \
-    --features rp2350_one_4m
+    --features rp2350_one_4m,rsa,applet-piv,applet-openpgp-curve25519
+cp target/thumbv8m.main-none-eabihf/release/pico2hsm /tmp/pico2hsm.elf
 
-# Convert ELF → UF2 (RP2350 family ID = 0xe48bff59)
-picotool uf2 convert \
-    target/thumbv8m.main-none-eabihf/release/pico2hsm \
-    -t elf \
-    pico2hsm-rp2350_one_4m.uf2 \
-    --family 0xe48bff59 \
-    --platform rp2350
+# Convert ELF → UF2 (RP2350 Arm Secure family, 0xe48bff59)
+picotool uf2 convert /tmp/pico2hsm.elf -t elf /tmp/pico2hsm-rp2350_one_4m.uf2 \
+    --family rp2350-arm-s
 ```
 
-> UF2 flashing gives no RTT output. Use the probe path to see boot logs.
+> BOOTSEL flashing gives no RTT output. Debug builds also log to the CDC
+> serial port (`/dev/ttyACMx`) once a terminal opens it.
 
 ---
 
-## Expected boot sequence (RTT output)
+## Boot log (RTT)
 
-When the device boots against a blank (unprovisioned) OTP, you should see:
-
-```
-INFO  pico2hsm: peripherals initialised
-INFO  OTP: provisioned=false, production_mode=false
-WARN  OTP: derive_smk failed — device may be unprovisioned
-INFO  Storage: manager init stub — not yet scanning chips
-INFO  USB: transport init stub — CCID not yet enabled
-INFO  Board: RP2350-One initialising
-INFO  pico2hsm (RP2350-One): entering main loop
-TRACE heartbeat
-TRACE heartbeat
-...
-```
-
-The LED will cycle through `Busy` → `Ready` (solid green / white on RGB LED).
-
-### What "passing" means at this firmware stage
-
-The USB CCID transport and storage manager are stubs — they are not yet wired
-up. A hardware test at this stage confirms:
-
-- [x] Embassy executor starts and runs async tasks
-- [x] Board peripheral init completes (SPI, LED)
-- [x] OTP driver reads device state without panicking
-- [x] Security checks complete (debugger detection, JTAG OTP flag)
-- [x] Main loop is reached and heartbeat timer fires
-- [x] LED transitions from Busy → Ready
-
----
-
-## Hardware smoke test — manual checklist
-
-After flashing, verify the following with a probe attached:
-
-```sh
-# 1. Check probe can connect and read device info
-probe-rs info --chip RP2350
-
-# 2. Verify RTT boot messages (Ctrl-C to stop after a few seconds)
-probe-rs run --chip RP2350 \
-    target/thumbv8m.main-none-eabihf/release/pico2hsm
-
-# 3. Check LED colour (physical inspection)
-#    Busy = red/orange during init, Ready = green/white after main loop entry
-```
+The first lines of every boot say why the last reset happened
+(`reset: …`), then which slot booted and `pico2hsm: peripherals
+initialised`, the OTP state (`OTP: provisioned=… production=…`), the store
+state, and `… entering main loop`. On debug builds the watchdog feeder
+later logs `core1 stack high water: N of 98304 bytes` as the stack grows.
 
 ---
 
@@ -346,10 +304,11 @@ probe-rs run --chip RP2350 \
 |---|---|---|
 | `probe-rs: target not found` | Probe not connected or wrong chip ID | Check USB connection; try `probe-rs list` |
 | `error: invalid instruction mnemonic 'sev'` | ARM target not installed | `rustup target add thumbv8m.main-none-eabihf` |
-| `cc: error: unrecognized command-line option '--nmagic'` | Building for x86 with wrong target | Use `--target thumbv8m.main-none-eabihf` or run `cargo test` not `cargo build` |
-| Build fails with `No board feature flag set` | No `--features` passed | Always pass `--no-default-features --features <variant>` or rely on the workspace default |
-| RTT shows `derive_smk failed` | OTP not provisioned | Expected on blank hardware; OTP provisioning is a separate step |
-| No RTT output | UF2 path used (no probe) | Attach probe and use `probe-rs run` |
+| `cc: error: unrecognized command-line option '--nmagic'` | Host tests run without `--target x86_64-unknown-linux-gnu` | `.cargo/config.toml` defaults to thumbv8m; pass the host target to `cargo test` |
+| `can't find crate for std` in `pico2hsm-integration-tests` | `cargo build` from the root without naming the package | Add `-p pico2hsm-firmware` or `--manifest-path firmware/Cargo.toml` |
+| `OTP: unprovisioned — keystore disabled` | Release build on blank OTP | Expected; use a debug or `insecure-dev-keystore` build for development, or provision ([docs/PROVISIONING.md](docs/PROVISIONING.md)) |
+| `layout: … — keystore disabled` | Release build without its partition table | Install the board's table (see above) |
+| No RTT output | BOOTSEL path used (no probe) | Attach a probe and use `build-all-debug.sh` |
 
 ---
 
@@ -359,19 +318,29 @@ All crypto, PIN, DKEK, key management, and APDU tests run on x86_64 with no
 hardware:
 
 ```sh
-# All tests (lib + integration)
-cargo test --target x86_64-unknown-linux-gnu \
-    --manifest-path firmware/Cargo.toml
-
-# Lib tests only (faster)
-cargo test --lib --target x86_64-unknown-linux-gnu \
-    --manifest-path firmware/Cargo.toml
-
-# A specific test
+# Firmware library tests (the bulk)
 cargo test --lib --target x86_64-unknown-linux-gnu \
     --manifest-path firmware/Cargo.toml \
+    --no-default-features \
+    --features pico2_4m,rsa,applet-piv,applet-openpgp-curve25519
+
+# Firmware integration tests (firmware/tests)
+cargo test --test '*' --target x86_64-unknown-linux-gnu \
+    --manifest-path firmware/Cargo.toml \
+    --no-default-features \
+    --features pico2_4m,rsa,applet-piv,applet-openpgp-curve25519
+
+# Core crate and the std integration crate
+cargo test -p pico2hsm-core --target x86_64-unknown-linux-gnu
+cargo test -p pico2hsm-integration-tests --target x86_64-unknown-linux-gnu
+
+# A specific module
+cargo test --lib --target x86_64-unknown-linux-gnu \
+    --manifest-path firmware/Cargo.toml \
+    --no-default-features \
+    --features pico2_4m,rsa,applet-piv,applet-openpgp-curve25519 \
     -- security::dkek::tests
 ```
 
-Expected output: **222 tests pass, 0 fail** (1 ignored: SLIP-10 child key
-spec divergence under investigation).
+These are the commands CI runs (`.github/workflows/build.yml`, every board
+for the library tests).

@@ -25,16 +25,16 @@ Valid board arguments: `pico2_4m`, `rp2350_one_4m`, `rp2350_one_16m` (a One with
 This script:
 - Builds with `DEFMT_LOG=trace` (required for defmt log output to survive optimisation)
 - Uses the debug profile so `#[cfg(debug_assertions)]` sentinels are active
-- Includes `applet-piv` and `applet-openpgp` features (required for PIV/OpenPGP integration tests)
-- **Signs the ELF with `picotool seal --hash --sign` if `ec_firmware_signing_key-bootkey0.pem` is present**
-  - Signed output → `dist/pico2hsm-<feat>-debug-signed.elf`
+- Builds with `rsa,applet-piv,applet-openpgp-curve25519` (PIV/OpenPGP are required by the integration tests); `EXTRA_FEATURES=debug` adds the debug APDUs, `PROFILE=release` builds the release profile with symbols kept
+- **Signs a copy of the ELF with `picotool seal --hash --sign` if `ec_firmware_signing_key-bootkey0.pem` is present**
+  - Signed output → `dist/pico2hsm-<feat>-debug-signed.elf`, kept for provisioning workflows. The script always **flashes the unsigned ELF** (probe-rs 0.31.0 cannot parse picotool-signed debug ELFs)
   - The OTP file `seal` writes → `dist/pico2hsm-<feat>-debug-seal-otp-ENABLES-SECURE-BOOT.json`. **Never load it**: it sets `crit1.secure_boot_enable`. Boot keys are provisioned from `tools/otp-bootkeys.sh` (two keys: `-bootkey0` signs builds, `-bootkey1` is the offline backup; `SIGNING_KEY=` overrides, `PICOTOOL=` points at a picotool built with `seal`)
-  - If no key is present, flashes unsigned (warns but continues)
+  - If no key is present, or picotool cannot seal, it warns and continues
   - **About `ec_firmware_signing_key-bootkey0.pem`**: each user of this project generates
     and holds their own secp256k1 key. It is the root of trust for that user's
     HSM fleet — **not** a project-wide test key. The filename is gitignored;
     the `dist/` signed artifacts are gitignored; no key material is ever
-    committed. See `docs/PROVISIONING.md` Option A / Option B for generation.
+    committed. See `docs/PROVISIONING.md` §3 for generation.
 - Writes the board's partition table (`boards/pt_4m.json` or `pt_16m.json`) at `0x10000000` and the image into slot A at `0x10002000` with `probe-rs download`, resets, then `probe-rs attach` for RTT. Every board boots through a partition table; the store regions are partitions closed to BOOTSEL. See `docs/FLASH_LAYOUT_2_0.md`.
 - **Boards without a probe** (Waveshare LCD, RP2350-One): `80 FE 14 00` (debug builds, SC-HSM selected) reboots into BOOTSEL; then `picotool load --ser <serial> <table>.uf2`, `picotool reboot -u`, `picotool load --ser <serial> -p 0 -x <image>.uf2`. With two boards in BOOTSEL, always pass `--ser`.
 - A try-before-you-buy image (16 MB release builds, or `PICO2HSM_TBYB=1`) boots only on an update boot (`picotool load -x`, a UF2 drop), never after a probe flash and reset.
@@ -70,7 +70,8 @@ pkill -9 -f "probe-rs"
 
 **RSA key pool** (`rsa` feature; `firmware/src/rsa_pool.rs`, `storage/rsa_pool.rs`,
 `crypto/rsa_keygen.rs`): pre-generated RSA-2048/3072/4096 keys in 12 sectors of
-internal flash at `0x1F0000` (every board), encrypted under the storage key;
+internal flash on every board (the `rsa-pool` partition: `0x1F0000` on 4 MB
+boards, `0x819000` on 16 MB boards), encrypted under the storage key;
 SC-HSM GENERATE KEY PAIR takes one (slot marked taken on flash first) or
 generates live with the sliced generator.  Config / clock / sequence are
 value records in the retry-counter log.  The generator state (~9 KB) is a
@@ -84,13 +85,14 @@ Core0 issues `cortex_m::asm::sev()` after every `APDU_BOX` fill and `FLASH_RESP.
 **APDU dispatch chain** (all on core1, synchronous):
 ```
 dispatcher_loop()
-  └─ Dispatcher::dispatch()          [apdu/dispatcher.rs]
+  └─ Dispatcher::dispatch_into()     [apdu/dispatcher.rs]
        ├─ SELECT AID → activates one of:
        │     ScHsm  (always present)
        │     Piv    (#[cfg(feature = "applet-piv")])
        │     OpenPgp (#[cfg(feature = "applet-openpgp")])
-       └─ all other INS → active protocol's process_apdu()
-            └─ ScHsm::dispatch() → <command>::handle()   [protocol/sc_hsm/commands/]
+       └─ all other INS → active protocol's process_apdu_with_store()
+            └─ dispatch_with_store() → route_with_store() → <command>::handle*()
+                                                   [protocol/<applet>/commands/]
 ```
 
 ## Multi-applet feature flag architecture
@@ -119,34 +121,40 @@ cargo build --release --no-default-features \
     --features pico2_4m,applet-piv,applet-openpgp,applet-openpgp-curve25519
 ```
 
-**Flash / RAM budget (release, all applets + RSA + curve25519, v1.0.1 after the
-display redesign; `arm-none-eabi-size -A`):**
+**Flash / RAM budget (release, all applets + RSA + curve25519, 1.0.1 workspace
+version after Storage V2 phase 6, measured 2026-10-15 with `arm-none-eabi-size -A`;
+flash = `.boot2`+`.vector_table`+`.text`+`.rodata`+`.data`, static RAM =
+`.data`+`.bss`+`.uninit` of the 520 KB SRAM; the rest is core0's stack):**
 
-| Board | .text | .bss | .bss before the redesign |
+| Board | Flash | Static RAM | SRAM % |
 |---|---|---|---|
-| Pico 2 4MB | 510 KB | 297.4 KB | — |
-| RP2350-One 4MB | 515 KB | 297.6 KB | — |
-| RP2350-Geek 16MB | 532 KB | 276.6 KB | 321.7 KB |
-| RP2350-Geek SDCard | 535 KB | 269.3 KB | 314.4 KB |
-| Waveshare LCD 16MB | 534 KB | 278.5 KB | 354.8 KB |
-| Waveshare LCD SDCard | 537 KB | 271.2 KB | 347.5 KB |
+| Pico 2 4MB | 647 KB | 251 KB | 48% |
+| RP2350-One 4MB | 650 KB | 251 KB | 48% |
+| RP2350-One 16MB | 650 KB | 254 KB | 49% |
+| RP2350-Geek 16MB | 679 KB | 246 KB | 47% |
+| RP2350-Geek SDCard | 684 KB | 246 KB | 47% |
+| Waveshare LCD 16MB | 684 KB | 248 KB | 48% |
+| Waveshare LCD SDCard | 689 KB | 248 KB | 48% |
 
-Flash is not a concern.  RAM is the metric to watch; the 96 KB core1 stack (128 KB before the 2026-10 RAM pass, which freed 52 KB on the Waveshare LCD 16MB board)
-dominates.  The display boards no longer hold a framebuffer (48 KB Geek,
-83 KB Waveshare): they render through a 16-row band buffer (5.6 KB / 7.5 KB),
-which freed ~45 KB on the Geek and ~76 KB on the Waveshare boards (Waveshare
-LCD 16MB: ~39 KB → ~115 KB free SRAM).
+Flash is not a concern (slot A is 1,880 KB on 4 MB boards, 4,088 KB on
+16 MB boards).  RAM is the metric to watch; the 96 KB core1 stack (128 KB
+before the 2026-10 RAM pass) dominates, then the RSA heap (48 KB, `rsa`).
+The display boards hold no framebuffer: they render through a 16-row band
+buffer (5.6 KB Geek / 7.5 KB Waveshare).
 
 **Storage hardware:** off-the-shelf boards only. The keystore is internal QMI
 flash, or the microSD card on the two `_sdcard` builds. No external SPI flash,
-no RAID: `storage/raid.rs`, `wal.rs` and multi-chip support are dead code,
-removed in 2.0 (`docs/STORAGE_V2.md` §12).
+no RAID: the RAID-1, WAL and multi-chip code was removed in Storage V2 phase 5
+(`docs/STORAGE_V2.md` §12).  The flash map (partition table, firmware slots,
+store partitions) is `firmware/src/storage/flash_layout.rs` and
+`docs/FLASH_LAYOUT_2_0.md`; the OTP map is `security/otp_layout.rs`.
 
 **Storage namespace — implemented:**
 
 All three applets share one flash keystore.  Ownership is encoded in the `KeyId` u32
-via the `applet_id` byte (bits 23–16); SC-HSM `INITIALIZE` calls
-`wipe_by_owner(AppletId::ScHsm)` and leaves PIV and OpenPGP keys untouched.
+via the `applet_id` byte (bits 23–16); SC-HSM `INITIALIZE` wipes the SC-HSM
+group (`KeyStore::reset_sc_hsm`) and the domain records
+(`wipe_by_owner(AppletId::Domain)`) and leaves PIV and OpenPGP keys untouched.
 
 `KeyId` u32 encoding (in `pico2hsm-core/src/key.rs`):
 ```
@@ -157,7 +165,9 @@ bits  7–0:  proto_ref     (u8)  — protocol-level key reference
 ```
 
 Constructors: `KeyId::sc_hsm(partition, key_ref)`, `KeyId::piv(key_ref)`,
-`KeyId::openpgp(slot)`.
+`KeyId::openpgp(slot)`.  Inside each V2 object the sealed `KeyObject` blob
+still carries the `P2K4` magic (`P2KP` for a key with a usage policy;
+`security/key_management.rs`).
 
 **Storage V2 (2.0) — the keystore engine** (`docs/STORAGE_V2.md`):
 `storage/store_v2.rs` (journal ring, snapshots, lookup, allocation; host
@@ -177,9 +187,12 @@ store; STORE STATUS / OPEN DEGRADED / ACCEPT STORE (`80 54 52/4F/53`)
 recover one (docs/KEYSTORE_RECOVERY.md).  Locked-out SC-HSM credentials
 (`creds_locked`) persist only the SO-PIN.  The 1.x filesystem, RAID, WAL and `StorageManager` are gone (phase 5).
 
-**Still required before PIV/OpenPGP command handlers:**
-Per-applet PIN slots in flash.  SC-HSM already has a PIN slot; PIV needs its own;
-OpenPGP needs PW1 + PW3.  A `PinSlot` enum is planned but not yet implemented.
+**Per-applet credentials — implemented:** each applet keeps its own PIN
+record in the keystore (SC-HSM `KeyId::sc_hsm(0, 0xFF)`, its SO-PIN in the
+binding block; PIV `0x000100FF`; OpenPGP PW1 `0x000200FE`, PW3 `0x000200FF`)
+and its retry counters in the counter log (`retry_counter::Credential`:
+SC-HSM PIN/SO-PIN/PUK, PIV PIN/PUK, OpenPGP PW1/PW3).
+`pico2hsm_core::key::PinSlot` names the slots.
 
 ## Reference documentation
 
@@ -187,7 +200,7 @@ The `docs/` directory contains generated reference documents:
 
 | File | Contents |
 |---|---|
-| `SC_HSM_APDU_REFERENCE.md` | All 28 SC-HSM commands — INS bytes, TLV tags, algo IDs, pico2hsm deviations |
+| `SC_HSM_APDU_REFERENCE.md` | Every SC-HSM command (incl. the EXTRAS 0x54 family and the debug hooks) — INS bytes, TLV tags, algo IDs, pico2hsm deviations |
 | `PIV_APDU_REFERENCE.md` | Full NIST SP 800-73-4 command set, 3DES GENERAL AUTHENTICATE, key slots |
 | `OPENPGP_APDU_REFERENCE.md` | OpenPGP Card 3.4 — PSO:CDS/DECIPHER, Ed25519/X25519 algo attrs, PW1/PW3 |
 | `BOARD_RP2350_ONE.md` | GPIO pinout, WS2812B PIO timing |
@@ -196,6 +209,10 @@ The `docs/` directory contains generated reference documents:
 | `SD_CARD_WIRING.md` | Per-board SD card wiring tables, embedded-sdmmc integration notes |
 | `BUILD_CONFIGURATIONS.md` | All feature flag combinations with exact cargo commands, flash/RAM budget |
 | `STORAGE_V2.md` | 2.0 journaled keystore design (breaking, no 1.x migration); removal of the unused RAID-1/WAL/multi-chip code |
+| `FLASH_LAYOUT_2_0.md` | 2.0 flash layout as built: partition tables, A/B slots and TBYB (16 MB), closed store partitions, the midpoint rule |
+| `KEYSTORE_RECOVERY.md` | STORE STATUS / OPEN DEGRADED / ACCEPT STORE / FORMAT STORE runbook |
+| `PROVISIONING.md` | Production provisioning with `tools/provision-device.py` (OTP boot keys, storage secret, secure boot) |
+| `INCIDENT_RESPONSE.md` | Maintainer runbook: signing-key compromise, disclosed firmware vulnerability, corrupt release artifact |
 | `CLUSTER_PLAN_V3.md` | Domains, enrollment, sync records, tombstones; `pico2hsm-syncd` daemon design |
 
 ## Board peripheral implementation
@@ -308,8 +325,9 @@ Keep heavy buffers off the stack (`Zeroizing` helpers like `security::zeroize::k
 
 **Core1 synchronous loop**: Core1 no longer runs an Embassy executor — it uses a
 synchronous `dispatcher_loop()` with `wfe`/`sev` for cooperative sleep/wake.
-This eliminated ~61 KB of async state machine BSS overhead, giving core0 ~188 KB
-of stack space (ample for the ~67 KB debug-build poll frame).
+This eliminated ~61 KB of async state machine BSS overhead.  Core0's stack is
+the SRAM left after static data: ~269 KB on pico2_4m (520 KB less ~251 KB of
+`.data`/`.bss`/`.uninit`, release and debug alike).
 
 ### Hardware watchdog
 
@@ -370,7 +388,7 @@ or `watchdog::crumb`.  Any other lock core1 shares with core0 must be a
 
 **Cause**: pcscd's default XfrBlock timeout is ~2.5 s. P-384/P-521 ECDSA on a Cortex-M33 without hardware ECC takes longer than that.
 
-**Fix**: Core0 sends a `RDR_to_PC_DataBlock` time-extension message (bStatus=0x80, bError=0x01) every 1.5 s while waiting for core1 to finish. Implemented in `firmware/src/transport/ccid.rs` (`send_time_extension`) and called from the select-loop in `run_pico2_board` / `run_one_board` / `run_geek_board` in `main.rs`.
+**Fix**: Core0 sends a `RDR_to_PC_DataBlock` time-extension message (bStatus=0x80, bError=0x01) every 1.5 s while waiting for core1 to finish. Implemented in `firmware/src/transport/ccid.rs` (`send_time_extension`) and called from `await_core1_response` in `main.rs`, which every board runner (`run_pico2_board`, `run_one_board`, `run_geek_board`, `run_waveshare_lcd_board`) uses while it waits for core1.
 
 ### Feature flags and default features
 

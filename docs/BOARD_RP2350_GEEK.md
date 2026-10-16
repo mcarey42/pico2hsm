@@ -152,14 +152,17 @@ The keystore location depends on the build:
 
 | Feature flag          | Keystore                                              |
 |-----------------------|-------------------------------------------------------|
-| `rp2350_geek_16m`     | Internal QSPI flash via QMI (`QmiFlash`), 2 MB at offset 0x200000 |
+| `rp2350_geek_16m`     | Internal QSPI flash via QMI, the `keystore` partition at 0x829000 (~7.8 MB) |
 | `rp2350_geek_sdcard`  | The microSD card on SPI0 (`SdCardFlash`, §6)          |
 
-On both, the PIN/PUK retry-counter log stays on internal flash
-(16 KB at offset 0x1FC000).  The linker script reserves 14 MB above the
-firmware, but the 1.x keystore uses only the first 2 MB of it
-(`docs/STORAGE_V2.md` F3).  No external SPI flash chips are used or
-supported.
+Both boot through the 16 MB partition table (`boards/pt_16m.json`): A/B
+firmware slots of 4,088 KB at 0x002000 and 0x400000, then the store
+regions from 0x801000.  On both, the binding block (0x801000), the counter
+log with the PIN/PUK retry counters and the keystore anchor (0x809000) and
+the RSA key pool (0x819000) stay on internal flash; on the SD-card build the
+`keystore` partition is reserved and unused.  See
+[FLASH_LAYOUT_2_0.md](FLASH_LAYOUT_2_0.md).  No external SPI flash chips
+are used or supported.
 
 ---
 
@@ -218,19 +221,19 @@ avoid conflicting feature combinations (see `CLAUDE.md` for the rationale).
 ### SC-HSM only (no SD card)
 
 ```sh
-cargo build --release --no-default-features --features rp2350_geek_16m
+cargo build --release -p pico2hsm-firmware --no-default-features --features rp2350_geek_16m
 ```
 
 ### SC-HSM + single SD card slot
 
 ```sh
-cargo build --release --no-default-features --features rp2350_geek_sdcard
+cargo build --release -p pico2hsm-firmware --no-default-features --features rp2350_geek_sdcard
 ```
 
 ### With additional applets (example: PIV + OpenPGP)
 
 ```sh
-cargo build --release --no-default-features \
+cargo build --release -p pico2hsm-firmware --no-default-features \
     --features rp2350_geek_16m,applet-piv,applet-openpgp
 ```
 
