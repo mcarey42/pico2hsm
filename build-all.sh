@@ -189,7 +189,7 @@ if [[ $SKIP_ARM -eq 0 ]]; then
             cp -f "$ELF" "dist/pico2hsm-${FEAT}.elf"
 
             # Sign the firmware if a signing key is present.
-            # picotool seal --hash --sign embeds both a hash and an EC P-256
+            # picotool seal --hash --sign embeds both a hash and a secp256k1
             # signature. The OTP JSON records what must be burned into RP2350
             # OTP for the bootrom to accept this firmware.
             if [[ $SIGN -eq 1 ]]; then

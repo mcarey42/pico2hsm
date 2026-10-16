@@ -206,6 +206,14 @@ pub fn handle_set_production_mode(state: &mut ScHsmState, _cmd: &ApduCommand<'_>
         return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED);
     }
 
+    // Release firmware in production mode resets unless secure boot is on
+    // (security::boot): setting the flag first would leave the board in a
+    // reset loop.  Secure boot comes first (docs/PROVISIONING.md, stage 5).
+    #[cfg(target_arch = "arm")]
+    if !crate::security::boot::is_secure_boot_enabled() {
+        return ApduResponse::err(SW_CONDITIONS_NOT_SATISFIED);
+    }
+
     #[cfg(target_arch = "arm")]
     {
         let mut otp = crate::security::otp::Otp::new();

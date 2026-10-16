@@ -37,16 +37,26 @@ Initiate this runbook if any of the following occur:
 
 ## Signing-key compromise
 
-Scope: the EC private key in `ec_firmware_signing_key-bootkey0.pem` (or its HSM-backed
-equivalent) has leaked, been lost, or is otherwise no longer trustworthy.
+Scope: one of the two boot keys (`ec_firmware_signing_key-bootkey0.pem`, which
+signs releases, or the offline backup `-bootkey1.pem`) has leaked, been lost, or
+is otherwise no longer trustworthy.  The project ships no keys: this runbook is
+for whoever signs firmware for a fleet of provisioned devices.
 Impact: any attacker with the key can sign firmware that will boot on
-production-locked devices.
+devices that trust it.
+
+Provisioned devices trust exactly two keys, burned into OTP slots 0 and 1;
+slots 2 and 3 are invalidated at provisioning, so **no new key can ever be
+added** (`docs/PROVISIONING.md` §1).
 
 Runbook:
 
-1. **Rotate the signing key.** Generate a new `ec_firmware_signing_key-bootkey0.pem`
-   following `docs/PROVISIONING.md` Phase 1. Store the new key under the same
-   offline custody procedure as the original. Do not reuse the old key.
+1. **If key 0 is compromised, move to key 1.** Build and sign the next release
+   with `SIGNING_KEY=ec_firmware_signing_key-bootkey1.pem`, install it on every
+   device and confirm it boots.  Then revoke slot 0 on each device
+   (`BOOT_FLAGS1.KEY_INVALID` bit 0) so firmware signed with the leaked key no
+   longer boots.  Key 1 is now the only key: keep it under the strictest
+   custody you have.  **If key 1, or both keys, are compromised,** there is no
+   slot left: the devices must be retired (see the note below).
 2. **Revoke prior release tags.** On GitHub Releases, edit every release signed
    with the compromised key and mark it as "pre-release" or delete the release
    (tags remain; only the release page is affected). Add a banner to each
@@ -57,14 +67,13 @@ Runbook:
    the re-signed release below).
 4. **Post a pinned issue.** Open a pinned issue titled `Signing key rotation —
    action required` linking to the advisory and the new release.
-5. **Ship a re-signed firmware.** Cut the next patch version signed with the
-   new key. Follow `docs/RELEASE_PROCESS.md` for the release cut.
+5. **Ship the re-signed firmware.** Cut the next patch version signed with key 1.
+   Follow `docs/RELEASE_PROCESS.md` for the release cut.
 
-Note: **OTP-locked devices provisioned with the old key trust chain cannot be
-re-keyed.** This is a fundamental property of RP2350 secure boot; see
-`docs/PROVISIONING.md` for the OTP story. Users with locked devices must be
-notified that their hardware is now tied to a compromised signer and should be
-rotated out of production.
+Note: **OTP-locked devices cannot be re-keyed.** This is a fundamental property
+of RP2350 secure boot. Devices that trust no uncompromised key (both keys
+leaked, or key 1 leaked after slot 0 was revoked) are tied to a compromised
+signer: notify their owners and rotate them out of production.
 
 ---
 
