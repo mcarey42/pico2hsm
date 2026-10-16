@@ -1,41 +1,37 @@
 //! Internal (QMI) flash map — the single source of truth for what lives
 //! where on the RP2350's own flash chip.
 //!
-//! Offsets are from the start of flash (XIP address 0x1000_0000).
+//! Offsets are physical, from the start of flash; [`MAP_4M`] and
+//! [`MAP_16M`] are the two maps, and docs/FLASH_LAYOUT_2_0.md describes
+//! them.  The 4 MB map:
 //!
 //! ```text
-//! 0x000000 – 0x1D8000  firmware image      (linker FLASH region, boards/*.x)
+//! 0x000000 – 0x002000  partition table     (boards/pt_4m.json)
+//! 0x002000 – 0x1D8000  firmware slot A     (linker FLASH region, boards/*.x)
 //! 0x1D8000 – 0x1E0000  binding block ring  (8 sectors, Storage V2 §8.1)
 //! 0x1E0000 – 0x1F0000  counter log v2      (16 sectors, every board)
 //! 0x1F0000 – 0x1FC000  RSA key pool        (12 sectors, every board, `rsa`)
 //! 0x1FC000 – 0x200000  counter log v1      (4 sectors: migrated once, then
 //!                                           erased and left spare)
-//! 0x200000 – 0x400000  keystore partition  (QMI boards; unused on SD boards)
+//! 0x200000 – 0x201000  unpartitioned       (the midpoint, MIDPOINT_RULE)
+//! 0x201000 – 0x400000  keystore partition
 //! ```
 //!
-//! Storage V2 (2026-10, phase 1) took the binding ring and the 16-sector
-//! counter log from the top of the firmware region, not from the keystore
-//! (the 1.x filesystem allocates anywhere above 0x200000).  The debug image
-//! (all applets) is ~1.3 MB of the 1.84 MB left.  The 2.0 layout with the
-//! bootrom partition table (STORAGE_V2 §3, phase 6) replaces this map.
+//! The 16 MB map has A/B slots of 4 MB less the table, and the same store
+//! regions from 0x801000 (keystore from 0x829000 to one sector short of
+//! the end; unused on the SD-card boards).
 //!
 //! The retry-counter log lives on internal flash on *every* board, the
 //! SD-card boards included: a removable card must not hold the PIN retry
-//! counters.  It sits at the top of the 2 MB firmware partition rather than
-//! inside the keystore partition, so it can never collide with key-object
-//! sectors already allocated on existing devices, and it exists on the
-//! 4 MB boards as well as the 16 MB ones.  The linker scripts end the
-//! firmware's FLASH region at [`FIRMWARE_END`]: an image that grew into the
-//! counter log fails to link instead of being overwritten (or overwriting
-//! the counters) — `boards_reserve_the_counter_region` checks that every
+//! counters.  The linker scripts end the firmware's FLASH region at the
+//! slot's end ([`FIRMWARE_END`]): an image that grew into the store
+//! fails to link instead of being overwritten (or overwriting the
+//! counters) — `boards_reserve_the_storage_regions` checks that every
 //! board script agrees with the constants here.
 //!
-//! The RSA key pool (`storage::rsa_pool`) sits directly below the counter
-//! log, for the same reasons: internal flash on every board (never the
-//! removable card), and never on top of keystore sectors that existing
-//! devices may already use.  It took the top 48 KB of the firmware
-//! partition (2026-10); the largest image (debug, all applets) is far
-//! below the new end.
+//! The RSA key pool (`storage::rsa_pool`) sits directly after the counter
+//! log, for the same reason: internal flash on every board, never the
+//! removable card.
 
 /// Erase-sector size of the QMI flash.
 pub const SECTOR: u32 = 4096;

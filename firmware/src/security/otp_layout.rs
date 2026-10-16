@@ -16,7 +16,7 @@
 //! another secret) can be read from a passive-voltage-contrast image of a
 //! decapsulated chip; storing the bitwise complement of each raw row (ECC
 //! bits included) in its partner defeats that.  The firmware never reads
-//! the chaff rows; `tools/provision-device.sh` writes them.
+//! the chaff rows; `tools/provision-device.py` writes them.
 //!
 //! Rows 0x0C0–0xF3F are free for applications on the RP2350 (the bootrom
 //! defines rows below 0xC0 and from 0xF48).  Earlier firmware put the boot
