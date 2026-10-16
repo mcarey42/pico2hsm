@@ -209,7 +209,7 @@ class Card:
             time.sleep(1)
         raise Fail(f"timed out waiting for the reader to {'appear' if present else 'go'}")
 
-    def prov_status(self) -> dict[str, int]:
+    def prov_status(self) -> dict[str, int | str]:
         (_, sw), (data, sw2) = self.apdus(SELECT_SC_HSM, GET_PROV_STATUS)
         if sw2 != 0x9000:
             raise Fail(f"GET PROVISIONING STATUS: {sw2:04X}")
@@ -220,6 +220,9 @@ class Card:
             t, ln = data[i], data[i + 1]
             if t in tags:
                 res[tags[t]] = data[i + 2]
+            elif t == 0x85 and ln == 4:   # image version: major, minor * 256 + patch
+                minor = int.from_bytes(data[i + 4:i + 6], "big")
+                res["image"] = f"{int.from_bytes(data[i + 2:i + 4], 'big')}.{minor >> 8}.{minor & 0xFF}"
             i += 2 + ln
         return res
 

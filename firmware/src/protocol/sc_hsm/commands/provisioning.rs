@@ -50,22 +50,6 @@ const SW_INTERNAL_ERROR: u16 = 0x6F00;
 use crate::security::otp_layout::BOOT_FLAG_PRODUCTION_MODE;
 const OTP_BOOT_FLAGS_ROW: usize = crate::security::otp_layout::BOOT_FLAGS_ROW as usize;
 
-/// Handle GET PROVISIONING STATUS (INS=0xF0).
-///
-/// Returns a TLV structure describing the device's current provisioning and
-/// security state. No authentication is required — all returned information
-/// is non-sensitive (it reveals whether security features are enabled, not
-/// any key material or secrets).
-///
-/// Response TLV:
-/// ```text
-/// 6F [len]
-///   80 01 [production_mode: 0|1]
-///   81 01 [jtag_sw_flag: 0|1]         -- boot flags row, bit 0
-///   82 01 [otp_rows_locked: 0|1]      -- key page read-locked this boot
-///   83 01 [secure_boot_enabled: 0|1]  -- CRIT1 row 0x40 bit 0
-///   84 01 [glitch_detector_armed: 0|1]
-/// ```
 /// Whether the OTP production-mode flag is set (`false` on the host and
 /// when the row cannot be read).
 pub fn production_mode() -> bool {
@@ -81,6 +65,27 @@ pub fn production_mode() -> bool {
     }
 }
 
+/// Handle GET PROVISIONING STATUS (INS=0xF0).
+///
+/// Returns a TLV structure describing the device's current provisioning and
+/// security state. No authentication is required — all returned information
+/// is non-sensitive (it reveals whether security features are enabled, not
+/// any key material or secrets).
+///
+/// Response TLV:
+/// ```text
+/// 6F [len]
+///   80 01 [production_mode: 0|1]
+///   81 01 [jtag_sw_flag: 0|1]         -- boot flags row, bit 0
+///   82 01 [otp_rows_locked: 0|1]      -- key page read-locked this boot
+///   83 01 [secure_boot_enabled: 0|1]  -- CRIT1 row 0x40 bit 0
+///   84 01 [glitch_detector_armed: 0|1]
+///   85 04 [image version: major u16, minor u16, big-endian]
+/// ```
+///
+/// Tag 85 is the IMAGE_DEF version the bootrom compares between A/B slots
+/// (`image_version::IMAGE_MAJOR` / `IMAGE_MINOR`; minor = minor * 256 + patch),
+/// so a host can tell which firmware is running and recommend an update.
 pub fn handle_get_status(_state: &mut ScHsmState, _cmd: &ApduCommand<'_>) -> ApduResponse {
     // Read production mode flag from OTP.
     let production_mode = u8::from(production_mode());
@@ -144,8 +149,8 @@ pub fn handle_get_status(_state: &mut ScHsmState, _cmd: &ApduCommand<'_>) -> Apd
     };
 
     // Build TLV response: 6F [len] 80 01 xx 81 01 xx 82 01 xx 83 01 xx 84 01 xx
-    // Inner length = 5 * 3 = 15 bytes
-    let inner_len: u8 = 15;
+    // 85 04 [major] [minor].  Inner length = 5 * 3 + 6 = 21 bytes.
+    let inner_len: u8 = 21;
     let mut resp: Vec<u8, 32> = Vec::new();
     let _ = resp.push(0x6F);
     let _ = resp.push(inner_len);
@@ -169,6 +174,10 @@ pub fn handle_get_status(_state: &mut ScHsmState, _cmd: &ApduCommand<'_>) -> Apd
     let _ = resp.push(0x84);
     let _ = resp.push(0x01);
     let _ = resp.push(glitch_detector_armed);
+
+    let _ = resp.extend_from_slice(&[0x85, 0x04]);
+    let _ = resp.extend_from_slice(&crate::image_version::IMAGE_MAJOR.to_be_bytes());
+    let _ = resp.extend_from_slice(&crate::image_version::IMAGE_MINOR.to_be_bytes());
 
     ApduResponse::ok(&resp)
 }
@@ -299,4 +308,31 @@ pub fn handle_write_crit1(_state: &mut ScHsmState, _cmd: &ApduCommand<'_>) -> Ap
     // INS=0xF3 is reserved but disabled.  CRIT1 must be programmed via
     // picotool during provisioning (handles RBIT-8 automatically).
     ApduResponse::err(SW_INS_NOT_SUPPORTED)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn get_status_reports_the_image_version() {
+        let mut state = ScHsmState::new();
+        let apdu = [0x80, INS_PROV_GET_STATUS, 0x00, 0x00, 0x00];
+        let cmd = ApduCommand::parse(&apdu).unwrap();
+        let resp = handle_get_status(&mut state, &cmd);
+        assert_eq!(resp.sw, 0x9000);
+        let data = &resp.data;
+        assert_eq!(data[0], 0x6F);
+        assert_eq!(usize::from(data[1]), data.len() - 2);
+        let v = &data[data.len() - 6..];
+        assert_eq!(&v[..2], &[0x85, 0x04]);
+        assert_eq!(
+            u16::from_be_bytes([v[2], v[3]]),
+            crate::image_version::IMAGE_MAJOR
+        );
+        assert_eq!(
+            u16::from_be_bytes([v[4], v[5]]),
+            crate::image_version::IMAGE_MINOR
+        );
+    }
 }

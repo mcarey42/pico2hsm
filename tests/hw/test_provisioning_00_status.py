@@ -61,7 +61,8 @@ def test_get_security_status(runner: CLIRunner, run_dir: Path) -> None:
     Sends SELECT SC-HSM followed by INS=0xF0 and validates:
     1. The response SW is 9000.
     2. The response data starts with tag 0x6F (constructed TLV).
-    3. The inner TLV contains tags 80, 81, 82, 83, 84 (each 1 byte).
+    3. The inner TLV contains tags 80, 81, 82, 83, 84 (1 byte each) and
+       85 (the image version, 4 bytes).
     """
     result = _send_apdus_sequence(
         runner,
@@ -98,7 +99,7 @@ def test_get_security_status(runner: CLIRunner, run_dir: Path) -> None:
     payload = data[2:2 + outer_len]
 
     # Parse inner TLV tags and verify expected tags are present.
-    expected_tags = {0x80, 0x81, 0x82, 0x83, 0x84}
+    expected_tags = {0x80, 0x81, 0x82, 0x83, 0x84, 0x85}
     found_tags = set()
     i = 0
     while i < len(payload):
@@ -107,7 +108,8 @@ def test_get_security_status(runner: CLIRunner, run_dir: Path) -> None:
         tag = payload[i]
         length = payload[i + 1]
         found_tags.add(tag)
-        assert length == 1, f"Tag 0x{tag:02X} has length {length}, expected 1"
+        want = 4 if tag == 0x85 else 1
+        assert length == want, f"Tag 0x{tag:02X} has length {length}, expected {want}"
         i += 2 + length
 
     missing = expected_tags - found_tags
