@@ -1,5 +1,17 @@
 # pico2hsm — Secure Provisioning Plan
 
+> **Superseded — do not follow.** This is the April 2026 planning
+> document. Several of its facts are wrong for the current firmware: boot
+> key hashes go in the bootrom's `BOOTKEY0`–`BOOTKEY3` rows (`0x080`–`0x0BF`),
+> not rows `0x20–0x2F`; the storage secret is rows `0x100`–`0x11F` with
+> its chaff at `0x120`–`0x13F` (not an Ed25519 device identity key at
+> `0x120`; the identity-key slot is `0x180`, reserved and not provisioned)
+> and the boot flags at `0x140` (`firmware/src/security/otp_layout.rs`);
+> and the OTP JSON `picotool seal` writes enables secure boot and must
+> never be loaded. The procedure that is verified on hardware is
+> [PROVISIONING.md](PROVISIONING.md) (`tools/provision-device.py`); the
+> OTP map is its §7.
+
 ## 1. Overview
 
 pico2hsm is a cryptographic HSM running on the RP2350 (Raspberry Pi Pico 2). The
