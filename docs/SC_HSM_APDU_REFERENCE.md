@@ -72,11 +72,12 @@ cache.
 | `0x48` | GENERATE SYMMETRIC KEY | Generate AES-128/192/256 key on-device | Implemented |
 | `0x50` | INITIALIZE | Initialize / re-initialize device | Implemented |
 | `0x52` | KEY DOMAIN | DKEK share import and status (CardContact); pico2hsm domain management | Partially implemented |
-| `0x54` | EXTRAS | Additional KDF / MAC primitives | Implemented |
+| `0x54` | EXTRAS | KDF / MAC primitives, device key, DKEK exchange, domains, store recovery (STORE STATUS / OPEN DEGRADED / ACCEPT STORE / FORMAT STORE), RSA key pool (§3.29) | Implemented |
 | `0x58` | LIST KEYS | List key slots (IMPORT KEY uses `0x74`; see §3.25) | Implemented |
 | `0x60` | BIP/SLIP HD DERIVE | BIP32 / SLIP-0010 hierarchical key derivation | Implemented |
 | `0x62` | DECIPHER / DERIVE ASYM | ECDH key agreement or RSA decrypt (P1=key_id, P2=algo) or derive asymmetric key (P1=0x01 **and** P2=0x00) | Implemented |
 | `0x68` | SIGN | Compute digital signature (ECDSA / RSA) | Implemented |
+| `0x74` | IMPORT KEY (UNWRAP) | Import a CardContact key blob under the DKEK (§3.25) | Implemented |
 | `0x78` | SYMMETRIC CIPHER | AES-CBC / CTR / GCM / CMAC | Implemented |
 | `0x82` | EXTERNAL AUTHENTICATE | Removed (2026-10): keyed by the stored SO-PIN hash, so reading the PIN record granted SO. Returns `6D00`. | Removed |
 | `0x84` | GET CHALLENGE | Return random bytes from TRNG | Implemented |
@@ -88,7 +89,8 @@ cache.
 | `0xD7` | WRITE DATA | Write TLV-framed data blob to addressed EF | Implemented |
 | `0xE0` | CREATE FILE | Create new transparent EF (sets current file) | Implemented |
 | `0xE4` | DELETE FILE | Delete key or EF from store | Implemented |
-| `0xFE` | DEBUG DUMP | Dump RAM/flash region (debug feature only) | Debug build only |
+| `0xF0`–`0xF3` | PROVISIONING | Status; set production mode, lock OTP rows, write CRIT1 (SO-PIN) | Implemented |
+| `0xFE` | DEBUG | Test hooks (watchdog, recovery, BOOTSEL, boot info); the memory dump is a stub (§3.30) | `debug` feature only |
 
 ---
 
