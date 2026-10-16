@@ -282,7 +282,11 @@ synchronous work longer than one band render; controller init uses
 `embassy_time` delays on both boards, so the executor and the watchdog
 feeder keep running throughout.
 
-### Measured `.bss` (release, all applets + RSA + curve25519)
+### Measured `.bss` (release, all applets + RSA + curve25519, at the display redesign)
+
+These are the figures from the redesign, before the 2026-10 RAM pass
+(core1 stack 128 KB → 96 KB) and Storage V2; current sizes are in
+[BUILD_CONFIGURATIONS.md](BUILD_CONFIGURATIONS.md).
 
 | Board | before | after | change |
 |---|---|---|---|
@@ -296,7 +300,8 @@ of `.bss` (the review fixes — the 32-bit epoch word, the SAS epoch,
 `SD_FAULT`, the GET RESPONSE flag — added 76–84 B on the display boards).
 Core1: `dispatcher_loop` grew by 8 B (debug build); the new
 `display_end → refresh_display_facts → member::count → fetch_key` branch is
-far shallower than the dispatch path (~89 KB of 128 KB, unchanged).
+far shallower than the dispatch path (then a ~89 KB static estimate of the
+128 KB stack; now 96 KB, with a measured peak of 60.5–62.9 KB, see `CLAUDE.md`).
 
 ## 6. SAS mailbox (enrollment short authentication string)
 
