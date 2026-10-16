@@ -50,7 +50,7 @@ RESPONSE (C0) is served by the dispatcher for every applet.
 | D6 | UPDATE BINARY | implemented | — | — | SC-HSM; writes current EF |
 | D7 | WRITE DATA | implemented | — | — | SC-HSM; TLV data to addressed EF |
 | DA | PUT DATA (even) | — | — | implemented | OpenPGP DO by P1P2 tag |
-| DB | PUT DATA (odd) | — | implemented | implemented | PIV data objects; OpenPGP key import |
+| DB | PUT DATA (odd) | — | implemented | implemented | PIV data objects; OpenPGP: same handler as DA, no key import (3FFF) |
 | E0 | CREATE FILE | implemented | — | — | SC-HSM only |
 | E4 | DELETE FILE | implemented | — | — | SC-HSM only |
 | E6 | TERMINATE DF | — | — | implemented | OpenPGP |
@@ -184,7 +184,7 @@ KEY are not implemented (6D00).
 | 2C | 00/02 | 81 | RESET RETRY COUNTER (Reset Code or PW3) | 9000 | 63CX, 6983, 6982 |
 | CA | tag[15:8] | tag[7:0] | GET DATA (even) — simple/primitive DOs | 9000 | 6A88, 6982, 61XX |
 | DA | tag[15:8] | tag[7:0] | PUT DATA (even) — write simple DO | 9000 | 6982, 6A80, 6A88 |
-| DB | tag[15:8] | tag[7:0] | PUT DATA (odd) — write constructed DO / key | 9000 | 6982, 6A80 |
+| DB | tag[15:8] | tag[7:0] | PUT DATA (odd) — same DOs as DA; key import (3FFF) not implemented | 9000 | 6982, 6A80 |
 | 2A | 9E | 9A | PSO:CDS — compute digital signature | 9000 | 6982, 6985, 6700 |
 | 2A | 80 | 86 | PSO:DECIPHER — ECDH (NIST curves, X25519) | 9000 | 6982, 6985 |
 | 88 | 00 | 00 | INTERNAL AUTHENTICATE (AUTH key) | 9000 | 6982, 6985 |
