@@ -173,7 +173,8 @@ See [BUILDING.md](BUILDING.md) for the full reference.
 - `applet-piv` — PIV applet (NIST SP 800-73-4); slots 9A/9C/9D/9E
 - `applet-openpgp` — OpenPGP Card 3.4 applet; NIST ECC (P-256/384/521)
 - `applet-openpgp-curve25519` — Add Ed25519/X25519 to OpenPGP (implies `applet-openpgp`)
-- `debug` — Debug mode: enable memory dump APDUs, relax secure boot enforcement (NEVER use in production)
+- `debug` — Debug mode: debug APDUs (INS `0xFE`: test hooks, BOOTSEL reboot, boot info), skips the production-mode boot checks (NEVER use in production)
+- `insecure-dev-keystore` — let a release build use the fixed, public development storage key on unprovisioned OTP (NEVER use in production)
 
 ## Project Structure
 
