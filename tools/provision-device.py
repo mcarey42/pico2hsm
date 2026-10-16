@@ -69,6 +69,32 @@ STAGES = ["preflight", "bootkeys", "ikm", "key-slots", "lock-page4",
           "secure-boot", "bootsel-trim", "glitch", "production"]
 
 
+def secret_dir() -> tempfile.TemporaryDirectory:
+    """A private temporary directory, in RAM where the host has one."""
+    shm = "/dev/shm"
+    return tempfile.TemporaryDirectory(dir=shm if os.path.isdir(shm) and os.access(shm, os.W_OK) else None)
+
+
+def write_secret(p: Path, data: bytes) -> None:
+    """Create `p` owner-only (never pre-existing) and write `data`."""
+    fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        os.write(fd, data)
+    finally:
+        os.close(fd)
+
+
+def wipe_secret(p: Path) -> None:
+    """Overwrite `p` with zeros, then delete it (best effort on the medium)."""
+    if not p.exists():
+        return
+    with open(p, "r+b") as f:
+        f.write(b"\0" * p.stat().st_size)
+        f.flush()
+        os.fsync(f.fileno())
+    p.unlink()
+
+
 class Fail(Exception):
     pass
 
@@ -83,12 +109,20 @@ class Picotool:
     def __init__(self, exe: str, serial: str):
         self.exe, self.serial = exe, serial
 
-    def run(self, *args: str, check: bool = True, timeout: int = 180) -> str:
+    def run(self, *args: str, check: bool = True, timeout: int = 180, secret: bool = False) -> str:
+        """Run picotool.  With `secret`, a failure reports only picotool's
+        ERROR lines, never the rest of its output (which can hold OTP row
+        values, the IKM among them)."""
         r = subprocess.run([self.exe, *args, "--ser", self.serial],
                            capture_output=True, text=True, timeout=timeout)
         out = (r.stdout + r.stderr).replace("\r", "\n")
         if check and (r.returncode != 0 or "ERROR" in out):
-            raise Fail(f"picotool {' '.join(args)} failed:\n{out.strip()[-600:]}")
+            if secret:
+                errs = [l.strip() for l in out.splitlines() if "ERROR" in l and "0x" not in l]
+                detail = "\n".join(errs[-3:]) or f"exit status {r.returncode} (output withheld)"
+            else:
+                detail = out.strip()[-600:]
+            raise Fail(f"picotool {' '.join(args)} failed:\n{detail}")
         return out
 
     def in_bootsel(self) -> bool:
@@ -103,7 +137,7 @@ class Picotool:
         """Read rows; never echoed.  picotool prints every row raw (24
         bits, ECC included), so for ECC rows return the 16-bit data after
         checking the stored ECC matches it."""
-        out = self.run("otp", "get", "-r", *[hex(r) for r in rows])
+        out = self.run("otp", "get", "-r", *[hex(r) for r in rows], secret=True)
         vals: dict[int, int] = {}
         cur = None
         for line in out.splitlines():
@@ -344,21 +378,13 @@ class Device:
         ikm = secrets.token_bytes(64)
         words = [ikm[2 * i] | ikm[2 * i + 1] << 8 for i in range(32)]
         expected_raw = [ecc_row(w) for w in words]
-        with tempfile.TemporaryDirectory() as d:
+        with secret_dir() as d:
             p = Path(d) / "ikm.bin"
-            fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            write_secret(p, ikm)
             try:
-                os.write(fd, ikm)
+                self.pt.run("otp", "load", "-e", "-s", hex(IKM), str(p), secret=True)
             finally:
-                os.close(fd)
-            try:
-                self.pt.run("otp", "load", "-e", "-s", hex(IKM), str(p))
-            finally:
-                with open(p, "r+b") as f:
-                    f.write(b"\0" * 64)
-                    f.flush()
-                    os.fsync(f.fileno())
-                p.unlink()
+                wipe_secret(p)
             # Each raw row must equal the ECC encoding of the data written,
             # except at most one 1-bit that failed to program, which the
             # hardware's ECC corrects on every read.
@@ -374,15 +400,18 @@ class Device:
             # Chaff: the complement of each raw row as actually stored.
             actual = [raw[IKM + i] for i in range(32)]
             chaff = b"".join(((~r) & 0xFFFFFF).to_bytes(4, "little") for r in actual)
+            # The chaff is the IKM's complement: as secret as the IKM.
             c = Path(d) / "chaff.bin"
-            c.write_bytes(chaff)
-            self.pt.run("otp", "load", "-r", "-s", hex(CHAFF), str(c))
+            write_secret(c, chaff)
+            try:
+                self.pt.run("otp", "load", "-r", "-s", hex(CHAFF), str(c), secret=True)
+            finally:
+                wipe_secret(c)
             got = self.pt.rows(list(range(CHAFF, CHAFF + 32)))
             bad = [CHAFF + i for i in range(32) if got[CHAFF + i] != (~actual[i]) & 0xFFFFFF]
             if bad:
                 raise Fail(f"chaff read-back mismatch at rows {[hex(r) for r in bad]}")
-            c.write_bytes(b"\0" * len(chaff))
-        del ikm, words, expected_raw, raw, actual
+        del ikm, words, expected_raw, raw, actual, chaff
         say("  chaff (complement of each IKM row) written and verified")
         self.boot()
         st = self.card.prov_status()
