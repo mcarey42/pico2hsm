@@ -43,13 +43,16 @@ All SC-HSM commands use `CLA = 0x00` unless noted. OpenSC's session-PIN flow use
 
 | Resource | Limit |
 |---|---|
-| EC key slots (in-memory) | 16 |
-| RSA key slots (in-memory, feature `rsa`) | 4 |
-| Symmetric key slots (in-memory) | 8 |
-| EF (data file) slots (in-memory) | 16 |
-| Max EF file size | 2048 bytes |
+| SC-HSM user keys (`MAX_SC_HSM_KEYS`) | 128 on 4 MB boards, 251 (every user key ref) on 16 MB boards; past it 6A84 |
+| Key / EF index entries (`MAX_KEY_INDEX`) | 400 on 4 MB boards, 768 on 16 MB boards |
+| Reserved key refs | `0xFC`–`0xFF` (refused by user key commands) |
+| EF cache (in RAM) | 16 entries of up to 1024 bytes |
 | Max PIN length | 16 bytes |
 | Max SO-PIN length | 16 bytes |
+
+Keys and EFs live in the Storage V2 keystore (internal flash or the SD
+card); RAM holds one decrypted object at a time (`OpBuffer`) plus the EF
+cache.
 
 ---
 
@@ -1491,8 +1494,11 @@ Test hooks on the same INS (CLA `0x80`): P1 `0x10` wedges core1, `0x11`
 wedges core0 after replying, `0x12` resets through the watchdog (watchdog
 tests); `0x13` moves the keystore anchor P2 records ahead of the journal,
 so the next boot refuses the store as behind its anchor (recovery test,
-`tests/hw/test_21_store_recovery.py`); `0x20`/`0x21` RSA benchmark and
-self-test.
+`tests/hw/test_21_store_recovery.py`); `0x14` reboots into BOOTSEL,
+`0x15` returns the image version and the bootrom's boot info (slot,
+trial state), `0x16` the loaded partition table
+([FLASH_LAYOUT_2_0.md](FLASH_LAYOUT_2_0.md) §3); `0x20`/`0x21` RSA
+benchmark and self-test (`rsa` builds).
 
 **Command:**
 
@@ -1807,7 +1813,7 @@ MF  (3F00)
 
 ## 9. pico2hsm-Specific Deviations from Reference SC-HSM
 
-1. **PIN storage:** PINs are stored as SHA-256 hashes in RAM only (volatile). Flash persistence of PIN hashes is not yet implemented; PINs must be re-set after power cycle by re-running INITIALIZE.
+1. **PIN storage:** the user PIN and PUK are stored as salted PBKDF2-HMAC-SHA256 hashes (10,000 iterations) in the PIN record (reserved key ref `0xFF`); the SO-PIN lives in the Storage V2 binding block, so it verifies even on a refused store. Retry counters are in the counter log on internal flash and are spent before each comparison. All survive power cycles.
 
 2. **Key persistence:** EC and RSA keys are persisted to flash via `storage::KeyStore`. Symmetric keys are also persisted. Keys survive power cycles.
 
