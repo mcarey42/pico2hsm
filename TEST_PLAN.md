@@ -13,15 +13,18 @@ This document defines what the device **must** do, and how to verify each capabi
 ## Test Environment
 
 ### Hardware
-- Raspberry Pi Pico 2 (or RP2350-One / RP2350-Geek)
+- Raspberry Pi Pico 2 (or any supported board), with its partition table installed
 - USB connection to Linux host
+- A debug build (`./build-all-debug.sh <board>`) or a provisioned board: a
+  release build on blank OTP has its keystore disabled
 
 ### Host Software
 - `opensc` (provides `sc-hsm-tool`, `pkcs11-tool`, `opensc-tool`)
 - `pcscd` (PC/SC daemon)
 - `pcsc_scan` (ATR scanner)
 - `openssl` (signature verification)
-- `cargo test` (unit/integration tests)
+- `cargo test --target x86_64-unknown-linux-gnu` (unit/integration tests, §11)
+- `pytest` (`tests/hw/`, run through `./run_tests.sh`)
 
 ### Device State Conventions
 - **Factory fresh** — never initialized, all storage blank
@@ -507,17 +510,16 @@ of that file must return `6A 82`.
 
 ## 8. DKEK (Device Key Encryption Key)
 
-### 8.1 DKEK Import via Noise_XX
+### 8.1 DKEK Import via the DKEK exchange
 
-**Spec:** The EXTRAS command (INS=0x54) implementing the Noise_XX handshake must allow
-a host to establish a shared DKEK transport session and inject a DKEK share into the
-device.
+**Spec:** The DKEK exchange (EXTRAS INS=0x54, P1=0x35–0x38; P-256 ECDH, HKDF,
+AES-256-GCM — a simplified Noise-like protocol, not Noise_XX) must move a
+DKEK from one device to an enrolled peer, with the SO-PIN, and never
+overwrite a DKEK that is already set.
 
-**Test:** (Requires `hsm-tool` CLI or custom Noise_XX client)
-```bash
-cargo run -p hsm-tool -- dkek-import --pin 648219 --share-file dkek_share.bin
-```
-**Pass:** Command exits 0; device accepts the DKEK share.
+**Test:** `tests/hw/test_10_cluster_dkek_exchange.py` (two devices) and
+`tests/hw/test_11_dkek_roundtrip.py`; the `hsm-tool` CLI lives in the
+separate `pico2hsm-tool` repository.
 
 ---
 
@@ -558,8 +560,8 @@ pkcs11-tool --login --pin 648219 --list-objects
 a Storage Master Key (SMK) derived from OTP-resident root secret. Recovering a flash
 dump without the OTP key must yield only ciphertext.
 
-**Verification:** Offline / code review — confirmed by architecture (see `storage/integrity.rs`,
-`security/otp.rs`, `storage/filesystem.rs`).
+**Verification:** Offline / code review — confirmed by architecture (see `security/otp.rs`
+`derive_smk`, `storage/keystore_v2.rs`, `storage/store_v2.rs`, `security/key_management.rs`).
 
 ---
 
@@ -569,7 +571,9 @@ dump without the OTP key must yield only ciphertext.
 PIN comparison is performed. This prevents timing attacks from power-cycling the device
 mid-comparison to avoid counter decrement.
 
-**Verification:** Code review — `security/pin.rs` must decrement counter before `ct_eq`.
+**Verification:** Code review — every credential check goes through
+`with_persisted_attempt` (SC-HSM, PIV, OpenPGP), which spends the attempt in
+the counter log (`storage/retry_counter.rs`) before the comparison.
 
 ---
 
@@ -609,8 +613,11 @@ pkcs11-tool --keypairgen --key-type EC:prime256v1 --id 99 --label "no-auth"
 
 ### 9.6 JTAG Disabled After Provisioning
 
-**Spec:** On a provisioned device, the RP2350 OTP JTAG-disable fuse must be programmed,
-preventing hardware debugging. The device must not respond on the SWD/JTAG port.
+**Spec:** Where the owner chose to disable debug in provisioning stage 9
+(`CRIT1.DEBUG_DISABLE`, `docs/PROVISIONING.md` §6; leaving debug enabled or
+key-protected are the other options), the device must not respond on the
+SWD port. In production mode the firmware itself halts at boot when a
+debugger is attached.
 
 **Verification:** Hardware probe — SWD attach returns error after provisioning.
 (Note: This test is irreversible. Only perform on a production device, not a dev unit.)
@@ -619,38 +626,52 @@ preventing hardware debugging. The device must not respond on the SWD/JTAG port.
 
 ## 10. Storage Durability
 
-### 10.1 Write-Ahead Log Recovery
+### 10.1 Power Loss During a Keystore Write
 
-**Spec:** If power is interrupted during a write operation, the WAL must allow recovery
-to a consistent state on the next boot. No data corruption or key loss must occur.
+**Spec:** If power is interrupted during a write, the Storage V2 journal must
+mount on the next boot in a consistent state: either the old or the new
+object, never a corrupt one, and the anchor in the counter log must still
+match (`docs/STORAGE_V2.md` §6, §9).
 
-**Test:**
-1. Write a key
-2. Simulate power failure (pull USB during write — use a script or modified firmware)
-3. Re-enumerate and verify key state
+**Test:** host fault-injection tests in `firmware/src/storage/store_v2_tests.rs`
+(a write cut at every step, then a remount). The SD power-pull campaign on
+hardware is still to do (`docs/STORAGE_V2.md`, phase 7).
 
-**Pass:** Device boots cleanly; either old state or new state is present (no corruption).
+**Pass:** Every cut remounts; either old state or new state is present.
 
 ---
 
-### 10.2 RAID-1 Mirror Redundancy
+### 10.2 Refused Store and Recovery
 
-**Spec:** If one flash chip in a RAID-1 mirror pair fails (returns all-FF or CRC error),
-reads must succeed from the mirror. Writes must continue to succeed to the healthy chip.
+**Spec:** A store whose journal is behind its anchor, or whose binding does
+not verify, is refused rather than mounted; STORE STATUS, OPEN DEGRADED,
+ACCEPT STORE and FORMAT STORE recover it (`docs/KEYSTORE_RECOVERY.md`).
 
-**Verification:** Code review + unit test (`storage/raid.rs`). Hardware test requires
-deliberate chip damage.
+**Test:** `tests/hw/test_21_store_recovery.py` (needs a `debug` build:
+`80 FE 13` moves the anchor ahead) and the host tests in
+`firmware/src/protocol/sc_hsm/store_recovery_tests.rs`.
 
 ---
 
 ## 11. Unit and Integration Tests (cargo test)
 
-These tests run on x86_64 and do not require hardware.
+These tests run on x86_64 and do not require hardware. `.cargo/config.toml`
+defaults to the thumbv8m target, so every command needs
+`--target x86_64-unknown-linux-gnu` and a board feature, e.g.:
+
+```bash
+cargo test --manifest-path firmware/Cargo.toml --test crypto_tests \
+    --no-default-features --features pico2_4m,rsa,applet-piv,applet-openpgp-curve25519 \
+    --target x86_64-unknown-linux-gnu
+```
+
+The library's own unit tests (`--lib`) are the bulk of the host tests;
+CI runs them for every board (`.github/workflows/build.yml`).
 
 ### 11.1 Crypto Algorithm Correctness
 
 ```bash
-cargo test -p pico2hsm-firmware crypto_tests
+cargo test --manifest-path firmware/Cargo.toml --test crypto_tests <features, --target as above>
 ```
 
 **Must pass:**
@@ -670,7 +691,7 @@ cargo test -p pico2hsm-firmware crypto_tests
 ### 11.2 APDU Dispatcher
 
 ```bash
-cargo test -p pico2hsm-firmware apdu_integration
+cargo test --manifest-path firmware/Cargo.toml --test apdu_integration <features, --target as above>
 ```
 
 **Must pass:**
@@ -684,7 +705,7 @@ cargo test -p pico2hsm-firmware apdu_integration
 ### 11.3 PIN Logic
 
 ```bash
-cargo test -p pico2hsm-firmware pin_tests
+cargo test --manifest-path firmware/Cargo.toml --test pin_tests <features, --target as above>
 ```
 
 **Must pass:**
@@ -698,7 +719,7 @@ cargo test -p pico2hsm-firmware pin_tests
 ### 11.4 Key Management
 
 ```bash
-cargo test -p pico2hsm-firmware key_management_tests
+cargo test --manifest-path firmware/Cargo.toml --test key_management_tests <features, --target as above>
 ```
 
 **Must pass:**
@@ -711,11 +732,11 @@ cargo test -p pico2hsm-firmware key_management_tests
 ### 11.5 DKEK Tests
 
 ```bash
-cargo test -p pico2hsm-firmware dkek_tests
+cargo test --manifest-path firmware/Cargo.toml --test dkek_tests <features, --target as above>
 ```
 
 **Must pass:**
-- Noise_XX handshake completes (both sides simulated)
+- DKEK exchange handshake completes (both sides simulated; P-256 ECDH, not Noise_XX)
 - DKEK key wrap/unwrap is reversible
 - Wrong DKEK yields authentication error on unwrap
 
@@ -781,7 +802,7 @@ must reset on each SELECT per NIST SP 800-73-4 §3.1.2.
 **Spec:** GET DATA (INS=0xCB) for standard data objects (CHUID, CCC, X.509
 certificate slots) must return correct TLV-encoded responses.
 
-**Test:** `tests/hw/test_piv_01_getdata.py` — hardware-validated 2026-04-05.
+**Test:** `tests/hw/test_piv_00_select.py` (slot listing through PKCS#11) and `tests/hw/test_piv_04_large_object.py` (certificate objects up to the maximum size, PUT/GET DATA) — hardware-validated 2026-04-05.
 
 ---
 
@@ -791,7 +812,7 @@ certificate slots) must return correct TLV-encoded responses.
 COUNTER (INS=0x2C) must behave per NIST SP 800-73-4. PIN is flash-persistent
 (survives power cycle).
 
-**Test:** `tests/hw/test_piv_02_pin.py` — hardware-validated 2026-04-05.
+**Test:** `tests/hw/test_piv_01_verify.py`, `tests/hw/test_piv_05_pin_policy.py` — hardware-validated 2026-04-05.
 
 ---
 
@@ -811,7 +832,7 @@ must return SW=6982.
 `7C → 7F49 → 86` TLV per NIST SP 800-73-4 Part 2 Table 3.3-1. Keys are
 flash-persistent.
 
-**Test:** `tests/hw/test_piv_04_keygen.py` — hardware-validated 2026-04-05.
+**Test:** `tests/hw/test_piv_02_keygen.py` — hardware-validated 2026-04-05.
 
 ---
 
@@ -834,7 +855,7 @@ Security state must reset on each SELECT.
 PW3 are flash-persistent. PW1 retry counter is RAM-only (resets on power cycle)
 per OpenPGP Card 3.4 spec.
 
-**Test:** `tests/hw/test_openpgp_01_pin.py` — hardware-validated 2026-04-05.
+**Test:** `tests/hw/test_openpgp_01_verify.py`, `tests/hw/test_openpgp_05_pw1_status.py` — hardware-validated 2026-04-05.
 
 ---
 
@@ -861,8 +882,10 @@ Card 3.4 spec. P-256 = 64 bytes, P-384 = 96 bytes.
 **Spec:** PSO:DECIPHER performs ECDH key agreement. INTERNAL AUTHENTICATE signs
 with the AUTH slot key.
 
-**Test:** `tests/hw/test_openpgp_04_decipher.py`, `test_openpgp_05_auth.py` —
-hardware-validated 2026-04-05.
+**Test:** X25519 PSO:DECIPHER in `tests/hw/test_openpgp_04_curve25519.py`
+(with Ed25519 PSO:CDS). There is no automated hardware test of NIST-curve
+PSO:DECIPHER or of INTERNAL AUTHENTICATE; the 2026-04-05 validation of
+those was manual.
 
 ---
 
@@ -903,7 +926,7 @@ hardware-validated 2026-04-05.
 | 7.1 | READ BINARY PKCS#15 Files | PASS |
 | 7.2 | WRITE DATA / UPDATE BINARY | PASS |
 | 7.3 | DELETE FILE | PASS |
-| 8.1 | DKEK Import via Noise_XX | - |
+| 8.1 | DKEK Import via the DKEK exchange | - |
 | 8.2 | Key Export Under DKEK | - |
 | 8.3 | Key Import Under DKEK | - |
 | 9.1 | Storage Encryption at Rest | CODE REVIEW |
@@ -912,8 +935,8 @@ hardware-validated 2026-04-05.
 | 9.4 | Secret Key Zeroization (PIN hash) | PASS |
 | 9.5 | Operations Require Authentication | PASS |
 | 9.6 | JTAG Disabled | HARDWARE ONLY |
-| 10.1 | WAL Recovery | - |
-| 10.2 | RAID-1 Redundancy | CODE REVIEW |
+| 10.1 | Power loss during a keystore write | HOST (fault injection); hardware campaign to do |
+| 10.2 | Refused store and recovery | `test_21_store_recovery.py` |
 | 11.1 | Crypto Unit Tests | PASS |
 | 11.2 | APDU Dispatcher Tests | PASS |
 | 11.3 | PIN Logic Tests | PASS |
