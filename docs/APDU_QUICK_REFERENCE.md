@@ -54,7 +54,7 @@ RESPONSE (C0) is served by the dispatcher for every applet.
 | E0 | CREATE FILE | implemented | — | — | SC-HSM only |
 | E4 | DELETE FILE | implemented | — | — | SC-HSM only |
 | E6 | TERMINATE DF | — | — | implemented | OpenPGP |
-| F0–F3 | PROVISIONING | implemented | — | — | status, production mode, OTP row lock, CRIT1 write |
+| F0–F2 | PROVISIONING | implemented | — | — | status; production mode, OTP row lock (SO-PIN); F3 reserved (6D00) |
 | F7 | GET METADATA | — | implemented | — | YubiKey extension |
 | FB | RESET | — | implemented | — | YubiKey PIV reset; only while PIN and PUK are blocked |
 | FE | DEBUG | `debug` builds only | — | — | `SC_HSM_APDU_REFERENCE.md` §3.30 |

@@ -89,7 +89,7 @@ cache.
 | `0xD7` | WRITE DATA | Write TLV-framed data blob to addressed EF | Implemented |
 | `0xE0` | CREATE FILE | Create new transparent EF (sets current file) | Implemented |
 | `0xE4` | DELETE FILE | Delete key or EF from store | Implemented |
-| `0xF0`–`0xF3` | PROVISIONING | Status; set production mode, lock OTP rows, write CRIT1 (SO-PIN) | Implemented |
+| `0xF0`–`0xF3` | PROVISIONING | Status (F0); set production mode, lock OTP rows (F1, F2; SO-PIN). F3 (write CRIT1) is reserved and returns 6D00 | Implemented |
 | `0xFE` | DEBUG | Test hooks (watchdog, recovery, BOOTSEL, boot info); the memory dump is a stub (§3.30) | `debug` feature only |
 
 ---
