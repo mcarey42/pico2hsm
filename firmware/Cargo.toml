@@ -38,11 +38,11 @@ waveshare_rp2350_lcd_16m = ["uart-debug"]
 # Waveshare RP2350-LCD-1.47-B: single SD card keystore on SPI1 (CS=GPIO15)
 waveshare_rp2350_lcd_sdcard = ["uart-debug"]
 uart-debug = []     # UART1 PAC-direct debug output — implied by probe-less boards
-rsa = ["dep:rsa", "dep:embedded-alloc"]  # RSA support — adds ~1MB to binary; disabled by default
-debug = []         # Debug mode: enables memory dump APDUs, disables secure boot enforcement
+rsa = ["dep:rsa", "dep:embedded-alloc"]  # RSA support and the RSA key pool — adds ~115 KB flash, 48 KB heap; in the defaults
+debug = []         # Debug mode: debug APDUs (INS 0xFE), skips the production-mode boot checks
 applet-piv = ["dep:des"]                 # PIV applet (NIST SP 800-73-4); adds 3DES (~10 KB)
-applet-openpgp = []                      # OpenPGP Card 3.4 applet (RSA + NIST ECC)
-applet-openpgp-curve25519 = ["applet-openpgp", "dep:ed25519-dalek", "dep:x25519-dalek"]  # Adds Ed25519/X25519 (~50 KB)
+applet-openpgp = []                      # OpenPGP Card 3.4 applet (NIST ECC; no RSA)
+applet-openpgp-curve25519 = ["applet-openpgp", "dep:ed25519-dalek", "dep:x25519-dalek"]  # Adds Ed25519/X25519 (~18 KB)
 
 # ─── Platform-agnostic dependencies ──────────────────────────────────────────
 # All of these compile on both x86_64 (for tests) and thumbv8m.main-none-eabihf
