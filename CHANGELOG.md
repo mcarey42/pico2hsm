@@ -6,6 +6,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.1.0] - 2026-10-31
+
+One definition for every board's flash map (issue #24, step 1), a key cap
+computed from the keystore's real size, and a real "pure HSM" build.
+
+**4 MB boards: the SC-HSM key cap is 109 (was 128, which never fit).**
+Keys already stored above 109 stay usable; new keys are refused (6A84)
+until fewer than 109 remain. Existing flash maps, partition tables and
+keystores are unchanged: a 2.0.x device keeps its keys across the update.
+
 ### Added
 - **`pico2hsm-layout` crate and CLI (`layout/`).** One definition of every
   board's flash map: 4 MB and 16 MB profiles, the board table, compile-time
