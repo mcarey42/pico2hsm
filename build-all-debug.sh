@@ -142,10 +142,10 @@ fi
 # the table at 0x10000000, the image in slot A at 0x10002000 (it runs there
 # through address translation).  The store regions are closed partitions at
 # the offsets they always had, so flashing never touches the keystore.
-case "$FEAT" in
-    pico2_4m|rp2350_one_4m) PT_SIZE=4m ;;
-    *)                      PT_SIZE=16m ;;
-esac
+# The profile comes from pico2hsm-layout (an unknown board aborts).  The
+# repo's cargo config defaults to the ARM target, so name the host.
+PT_SIZE="$(cargo run -q -p pico2hsm-layout --features std --target "$(rustc -vV | sed -n 's/^host: //p')" -- profile "$FEAT")" \
+    || die "no flash layout profile for board '$FEAT'"
 PT_JSON="boards/pt_${PT_SIZE}.json"
 SLOT_A_ADDR=0x10002000
 command -v picotool >/dev/null 2>&1 || die "picotool is required (it builds the partition table)"
