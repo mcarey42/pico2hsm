@@ -255,6 +255,16 @@ def storage_v2_ready():
     yield
 
 
+@pytest.fixture(autouse=True)
+def _skip_absent_applet(request):
+    """test_piv_* / test_openpgp_* skip when the build lacks that applet."""
+    from helpers.applets import APPLETS, applet_present, module_applet
+
+    key = module_applet(request.module.__name__.rsplit(".", 1)[-1])
+    if key is not None and not applet_present(key):
+        pytest.skip(f"{APPLETS[key][0]} applet not present in this build")
+
+
 @pytest.fixture(scope="session")
 def config() -> dict:
     """Return HSM configuration from environment variables (with defaults)."""
