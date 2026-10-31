@@ -18,3 +18,8 @@ std = []
 
 [lints]
 workspace = true
+
+[[bin]]
+name = "pico2hsm-layout"
+path = "src/main.rs"
+required-features = ["std"]
