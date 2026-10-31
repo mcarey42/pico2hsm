@@ -136,8 +136,20 @@ const STORE_REGIONS: [Region; 4] = [
     },
 ];
 
-/// Total size of the store regions (binding, counters, rsa-pool, spare).
-const STORE_SIZE: u32 = 0x2_8000;
+/// Total size of the store regions (binding, counters, rsa-pool, spare):
+/// the sum of their sizes, so a region change moves the 16 MB keystore
+/// with it instead of leaving a gap or an overlap.
+const STORE_SIZE: u32 = {
+    let mut total = 0;
+    let mut i = 0;
+    while i < STORE_REGIONS.len() {
+        total += STORE_REGIONS[i].size;
+        i += 1;
+    }
+    total
+};
+// The 2.0.x map: 40 sectors.
+const _: () = assert!(STORE_SIZE == 0x2_8000);
 
 /// The 4 MB boards: one slot, the store regions at 0x1D8000, the keystore a
 /// sector past the midpoint (MIDPOINT_RULE).  No slot B.
@@ -300,7 +312,13 @@ pub enum BoardError {
 impl fmt::Display for BoardError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            BoardError::None => f.write_str("no board feature is active"),
+            BoardError::None => {
+                f.write_str("no board feature is active; enable exactly one of:")?;
+                for b in BOARDS.iter() {
+                    write!(f, " {}", b.feature)?;
+                }
+                f.write_str(" (with --no-default-features)")
+            }
             BoardError::Several(names) => {
                 f.write_str("several board features are active:")?;
                 for n in names.iter().flatten() {

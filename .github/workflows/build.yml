@@ -52,6 +52,9 @@ jobs:
 
       - name: Image budget (${{ matrix.feature }})
         # The all-applets release image must fit its slot (pico2hsm-layout).
+        # This measures the unsigned image; the signed (sealed) image
+        # `picotool seal` makes is slightly larger (signature and hash
+        # blocks), so keep some headroom above zero.
         run: |
           arm-none-eabi-objcopy -O binary target/thumbv8m.main-none-eabihf/release/pico2hsm "$RUNNER_TEMP/image.bin"
           # The later no-RSA / SC-HSM-only builds overwrite this ELF, so this

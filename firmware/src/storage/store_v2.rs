@@ -149,6 +149,12 @@ const SNAP_ENTRY: usize = 24;
 pub const OBJECT_HEADER: usize = 40;
 /// Largest object blob.
 pub const MAX_OBJECT_BLOB: usize = SECTOR as usize - OBJECT_HEADER;
+/// Data sectors a PUT keeps free past the snapshot it may need: the one
+/// its new version takes before the old one is erased (plus one more for
+/// a new key ID).  `pico2hsm_layout::geometry::MAINTENANCE_RESERVE` is this
+/// plus the snapshot sector the tail can add to `live_estimate`.
+const PUT_VERSION_RESERVE: usize = 1;
+const _: () = assert!(shared::MAINTENANCE_RESERVE as usize == PUT_VERSION_RESERVE + 1);
 /// Journal slots a PUT must leave writable (a DELETE, a CHECKPOINT and a
 /// mount VOID always fit, §6.2).
 const SLOT_RESERVE: u32 = 4;
@@ -1704,7 +1710,7 @@ impl<F: StoreFlash> Store<F> {
         self.maybe_checkpoint(env)?;
         let old = self.lookup(key_id)?;
         let needed_snapshot = snapshot_sectors_for(self.live_estimate() + 1);
-        let reserve = needed_snapshot + 1 + if old.is_none() { 1 } else { 0 };
+        let reserve = needed_snapshot + PUT_VERSION_RESERVE + if old.is_none() { 1 } else { 0 };
         if self.free_sectors() < reserve as u32 {
             return Err(StorageError::KeystoreFull);
         }

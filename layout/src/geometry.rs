@@ -62,6 +62,14 @@ const _: () = assert!(SD_CHECKPOINT_TAIL <= SNAP_ENTRIES_PER_SECTOR);
 const _: () = assert!(SNAP_ENTRIES_PER_SECTOR == (crate::SECTOR - 64) / 24);
 
 /// Sectors past the two snapshots a full store keeps free (module docs).
+///
+/// Mirrors the free-sector check in `store_v2::put` (firmware): one sector
+/// for the new version (`store_v2::PUT_VERSION_RESERVE`, const-asserted
+/// against this) plus the one snapshot sector the tail can add to its
+/// estimate.  Its guard is the firmware test
+/// `fills_to_the_cap_on_a_keystore_of_the_profiles_size`
+/// (`storage/keystore_v2.rs`), which fills a keystore of each profile's
+/// size to the cap through the real store and replaces objects at the cap.
 pub const MAINTENANCE_RESERVE: u32 = 2;
 
 // ─── Object budget ───────────────────────────────────────────────────────────
@@ -130,6 +138,12 @@ pub const DOMAIN_MEMBERS: u32 = 32;
 pub const DOMAIN_OBJECTS: u32 = DOMAIN_MEMBERS + 1 + SC_HSM_FILE_OBJECTS;
 
 /// Every object that is not one of an SC-HSM key's [`OBJECTS_PER_KEY`].
+///
+/// The PIV and OpenPGP objects count in every build, also one without
+/// `applet-piv` / `applet-openpgp`: objects an earlier all-applets image
+/// stored stay on flash (nothing erases them when an applet is compiled
+/// out), so the cap must leave room for them.  The cap is a property of the
+/// board, not of the applet set.
 pub const NON_SC_HSM_OBJECTS: u32 =
     PIV_OBJECTS + OPENPGP_OBJECTS + SC_HSM_RESERVED_OBJECTS + SC_HSM_FILE_OBJECTS + DOMAIN_OBJECTS;
 

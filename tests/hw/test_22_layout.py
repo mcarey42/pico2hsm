@@ -47,7 +47,9 @@ def _kib(text: str) -> int:
 def _store_regions(big: bool) -> dict[str, tuple[int, int]]:
     """Store regions as (first sector, last sector), from the committed
     partition table (boards/pt_16m.json or pt_4m.json), which CI keeps equal
-    to the one pico2hsm-layout generates."""
+    to the one pico2hsm-layout generates.  The `_prod` tables
+    (pt_*_prod.json) differ only in their permissions; their store regions
+    are the same, so reading the dev table covers both."""
     table = json.loads((_REPO / "boards" / f"pt_{'16m' if big else '4m'}.json").read_text())
     out = {}
     for p in table["partitions"]:
