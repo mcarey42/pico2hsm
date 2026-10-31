@@ -174,6 +174,7 @@ fn piv_certificate_1500_bytes_round_trip() {
 }
 
 /// OpenPGP: a cardholder certificate (7F21) at the applet's 1024-byte limit.
+#[cfg(feature = "applet-openpgp")]
 #[test]
 fn openpgp_cardholder_certificate_round_trip() {
     use pico2hsm_firmware::protocol::openpgp::OpenPgp;

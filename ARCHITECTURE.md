@@ -7,9 +7,8 @@ This document describes all significant design decisions for the pico2hsm projec
 ## 1. Flash Memory Layout Per Board
 
 Every board boots through a bootrom partition table. The source of truth is
-`firmware/src/storage/flash_layout.rs`; `boards/pt_*.json` are the tables
-and `boards/*.x` the linker scripts, and a host test ties the three
-together. The full description, with the hardware findings behind it, is
+the `pico2hsm-layout` crate (`layout/`); `memory.x` is generated from it at
+build time and `boards/pt_*.json` are the committed tables, checked by CI. The full description, with the hardware findings behind it, is
 [docs/FLASH_LAYOUT_2_0.md](docs/FLASH_LAYOUT_2_0.md).
 
 ### 4 MB boards (Pico 2, RP2350-One): `boards/pt_4m.json`
@@ -99,7 +98,7 @@ a 1.x keystore), see [docs/KEYSTORE_RECOVERY.md](docs/KEYSTORE_RECOVERY.md).
 
 ## 3. Storage Hardware
 
-The keystore lives on the board's own QSPI flash chip (through the RP2350 QMI), or on the microSD card in the SD-card builds. pico2hsm adds no hardware: no external SPI flash chips, no mirrored flash, no custom board. SC-HSM key references are one byte (SmartCard-HSM / OpenSC compatibility), which bounds what one device can usefully hold, so more flash buys nothing. A 4 MB board holds 128 SC-HSM user keys, a 16 MB board all 251 user key refs (`MAX_SC_HSM_KEYS`).
+The keystore lives on the board's own QSPI flash chip (through the RP2350 QMI), or on the microSD card in the SD-card builds. pico2hsm adds no hardware: no external SPI flash chips, no mirrored flash, no custom board. SC-HSM key references are one byte (SmartCard-HSM / OpenSC compatibility), which bounds what one device can usefully hold, so more flash buys nothing. A 4 MB board holds 109 SC-HSM user keys (computed from the keystore size), a 16 MB board all 251 user key refs (`MAX_SC_HSM_KEYS`).
 
 Redundancy comes from other devices instead: members of a domain hold the same keys and keep them in sync (`docs/CLUSTER_PLAN_V3.md`).
 

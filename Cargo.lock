@@ -1666,6 +1666,7 @@ dependencies = [
  "p521",
  "pbkdf2",
  "pico2hsm-core",
+ "pico2hsm-layout",
  "png",
  "rand_core 0.6.4",
  "rfc6979",
@@ -1685,6 +1686,10 @@ version = "2.0.1"
 dependencies = [
  "pico2hsm-core",
 ]
+
+[[package]]
+name = "pico2hsm-layout"
+version = "2.0.1"
 
 [[package]]
 name = "pin-project-lite"

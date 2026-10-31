@@ -34,6 +34,9 @@ log = logging.getLogger(__name__)
 # reader and ignores reader-port; `gpg_card_status_cmd()` reads the device
 # under test by its OpenPGP serial (`gpg-card list <serial>`; per device since
 # 2.0; older firmware shares one, so gpg can then only test reader 0).
+#
+# PICO2HSM_FORMAT_STORE=1 lets the session FORMAT STORE (erasing every key) a
+# device whose store needs it; see `storage_v2_ready` below.
 
 _HW_DIR = Path(__file__).resolve().parent
 
@@ -220,28 +223,64 @@ RSA_KEY_SLOTS: list[dict] = [
 # ---------------------------------------------------------------------------
 
 _FORMAT_STORE = "80544E000F" + b"FORMAT-STORE-V2".hex().upper()
+_STORE_STATUS = "80545200"
+_SELECT_SC_HSM = "00A404000BE82B0601040181C31F020100"
+
+# PICO2HSM_FORMAT_STORE=1 lets the session start with a PIN-less FORMAT STORE
+# on a device whose store is not usable as it is (STORE STATUS state 2
+# "refused" or 3 "FORMAT STORE needed"; e.g. a board flashed with 2.0 over a
+# 1.x keystore, or a new flash layout).  FORMAT STORE erases every key on the
+# device, so it is opt-in: without the variable such a session stops before
+# any test runs and says so.
+_FORMAT_STORE_ENV = "PICO2HSM_FORMAT_STORE"
+
+# STORE STATUS `state` values (extras.rs `handle_store_status`).
+_STORE_REFUSED, _STORE_NEEDS_FORMAT = 2, 3
 
 
 def _format_store_if_needed(index: int) -> None:
-    """Storage V2: a board flashed with 2.0 over a 1.x keystore refuses its
-    store until FORMAT STORE.  The PIN-less form only works when there is
-    no valid binding, so on a board that already has a 2.0 store this is
-    refused (6982) and changes nothing; firmware before 2.0 does not know
-    it."""
+    """Storage V2: a store that is refused or needs FORMAT STORE (a board
+    flashed with 2.0 over a 1.x keystore, a new layout) is formatted only
+    when PICO2HSM_FORMAT_STORE=1; otherwise the session stops.  The
+    PIN-less form only works when there is no valid binding (or a refused
+    one without an SO-PIN); the firmware refuses it (6982) otherwise and
+    changes nothing.  Firmware without STORE STATUS (before 2.0) is left
+    alone."""
     from helpers.pcsc import session
 
     try:
         with session(index) as s:
-            s.send(bytes.fromhex("00A404000BE82B0601040181C31F020100"))
+            s.send(bytes.fromhex(_SELECT_SC_HSM))
+            data, sw = s.send(bytes.fromhex(_STORE_STATUS))
+            if sw != 0x9000 or not data:
+                return  # before 2.0, or no store report
+            state = data[0]
+            if state not in (_STORE_REFUSED, _STORE_NEEDS_FORMAT):
+                return
+            what = "needs FORMAT STORE" if state == _STORE_NEEDS_FORMAT else "is refused"
+            if os.environ.get(_FORMAT_STORE_ENV) != "1":
+                pytest.exit(
+                    f"reader {index}: the device's store {what} (STORE STATUS state "
+                    f"{state}, reason {data[1] if len(data) > 1 else '?'}).  "
+                    f"FORMAT STORE erases every key on it; set {_FORMAT_STORE_ENV}=1 "
+                    "to let the test session format it, or recover it by hand.",
+                    returncode=4,
+                )
             _, sw = s.send(bytes.fromhex(_FORMAT_STORE))
         if sw == 0x9000:
-            log.info("reader %d: Storage V2 store formatted (was a 1.x keystore)", index)
+            log.info("reader %d: Storage V2 store formatted (%s=1)", index, _FORMAT_STORE_ENV)
+        else:
+            log.warning("reader %d: PIN-less FORMAT STORE refused: %04X", index, sw)
     except Exception as e:  # no device, or no pyscard: the tests will say so
+        if isinstance(e, pytest.exit.Exception):
+            raise
         log.debug("format-store probe on reader %d: %s", index, e)
 
 
 @pytest.fixture(scope="session", autouse=True)
 def storage_v2_ready():
+    """Before any test: check (and, with PICO2HSM_FORMAT_STORE=1, format)
+    the store of each device the session uses."""
     from helpers.pcsc import dut_index, peer_index
 
     indexes = set()
@@ -253,6 +292,16 @@ def storage_v2_ready():
     for idx in indexes:
         _format_store_if_needed(idx)
     yield
+
+
+@pytest.fixture(autouse=True)
+def _skip_absent_applet(request):
+    """test_piv_* / test_openpgp_* skip when the build lacks that applet."""
+    from helpers.applets import APPLETS, applet_present, module_applet
+
+    key = module_applet(request.module.__name__.rsplit(".", 1)[-1])
+    if key is not None and not applet_present(key):
+        pytest.skip(f"{APPLETS[key][0]} applet not present in this build")
 
 
 @pytest.fixture(scope="session")

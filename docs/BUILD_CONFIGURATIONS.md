@@ -22,7 +22,10 @@ also holds the host-only `tests/integration` crate, which does not build for
 the default `thumbv8m.main-none-eabihf` target.
 
 **When changing the board target, always pass `--no-default-features`.**
-Board feature flags are mutually exclusive. Adding `--features other_board`
+Board feature flags are mutually exclusive, and the build fails unless
+exactly one board feature is active (`rp2350_one_16m` implies
+`rp2350_one_4m` and wins over it); there is no silent fallback to
+`rp2350_one_4m`. Adding `--features other_board`
 without `--no-default-features` activates both `rp2350_one_4m` and the new
 board simultaneously, causing a compile error.
 
@@ -88,7 +91,7 @@ cargo build --release -p pico2hsm-firmware --no-default-features --features pico
 ### Waveshare RP2350-One
 
 ```sh
-# 4 MB flash (stock): one firmware slot, 128 SC-HSM keys
+# 4 MB flash (stock): one firmware slot, 109 SC-HSM keys
 cargo build --release -p pico2hsm-firmware --no-default-features --features rp2350_one_4m
 
 # 16 MB flash chip fitted: the One board code with the 16 MB map
@@ -99,6 +102,27 @@ cargo build --release -p pico2hsm-firmware --no-default-features --features rp23
 Every board boots through a partition table: 4 MB boards use
 `boards/pt_4m.json`, 16 MB boards `boards/pt_16m.json` (production:
 `pt_*_prod.json`).  See [FLASH_LAYOUT_2_0.md](FLASH_LAYOUT_2_0.md).
+
+The flash map has one definition, the `pico2hsm-layout` crate; `memory.x` is
+generated from it by `firmware/build.rs` and the `boards/pt_*.json` tables
+are rendered from it (CI checks they match). Query it with the host target
+(`.cargo/config.toml` defaults to thumbv8m):
+
+```sh
+HOST=$(rustc -vV | sed -n 's/^host: //p')
+cargo run -q -p pico2hsm-layout --features std --target $HOST -- profile pico2_4m
+cargo run -q -p pico2hsm-layout --features std --target $HOST -- slot-size pico2_4m
+cargo run -q -p pico2hsm-layout --features std --target $HOST -- regions pico2_4m
+cargo run -q -p pico2hsm-layout --features std --target $HOST -- pt 4m [--prod]
+cargo run -q -p pico2hsm-layout --features std --target $HOST -- write   # regenerate boards/pt_*.json
+cargo run -q -p pico2hsm-layout --features std --target $HOST -- check   # CI: committed tables match
+```
+
+The SC-HSM key cap is computed from the keystore size: 109 on 4 MB boards,
+251 on 16 MB boards, pinned 251 on the SD-card boards. To lower it, set
+`PICO2HSM_MAX_SC_HSM_KEYS=<n>` at build time (1 up to the board's cap;
+anything else fails the build and names the bound). The key index never
+shrinks below its 2.0.x size (400 on 4 MB, 768 on 16 MB).
 
 ### Waveshare RP2350-Geek
 

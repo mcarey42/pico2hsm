@@ -39,7 +39,7 @@ const ALG_ECC_P384: u8 = 0x14;
 /// Valid PIV asymmetric key references: PIV Authentication (9A), Digital
 /// Signature (9C), Key Management (9D), Card Authentication (9E) and the
 /// twenty retired Key Management keys (82–95), SP 800-73-4 Part 1 Table 4b.
-pub fn is_valid_key_ref(key_ref: u8) -> bool {
+pub const fn is_valid_key_ref(key_ref: u8) -> bool {
     matches!(key_ref, 0x9A | 0x9C | 0x9D | 0x9E | 0x82..=0x95)
 }
 

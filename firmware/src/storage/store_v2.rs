@@ -52,6 +52,7 @@ use zeroize::Zeroizing;
 
 use crate::crypto::kdf::{hkdf_sha256, hmac_sha256};
 use crate::storage::retry_counter::Anchor;
+use pico2hsm_layout::geometry as shared;
 
 // ─── Geometry ────────────────────────────────────────────────────────────────
 
@@ -103,18 +104,18 @@ impl Geo {
         match media {
             Media::Nor => Geo {
                 media,
-                ring: 16,
+                ring: shared::NOR_RING_SECTORS,
                 slots: 127,
                 stride: 32,
-                threshold: 128,
+                threshold: shared::NOR_CHECKPOINT_TAIL as usize,
                 data_end: sectors,
             },
             Media::Sd => Geo {
                 media,
-                ring: 64,
+                ring: shared::SD_RING_SECTORS,
                 slots: 7,
                 stride: SD_BLOCK,
-                threshold: 64,
+                threshold: shared::SD_CHECKPOINT_TAIL as usize,
                 data_end: sectors,
             },
         }
@@ -134,17 +135,26 @@ impl Geo {
 }
 
 /// Most data sectors the bitmap tracks (16 MiB of keystore).
-pub const MAX_DATA_SECTORS: usize = 4096;
+pub const MAX_DATA_SECTORS: usize = shared::MAX_DATA_SECTORS as usize;
 /// Most snapshot sectors (168 entries each).
-pub const MAX_SNAPSHOT_SECTORS: usize = 32;
+pub const MAX_SNAPSHOT_SECTORS: usize = shared::MAX_SNAPSHOT_SECTORS as usize;
 /// Entries per snapshot sector.
 pub const SNAP_PER_SECTOR: usize = (SECTOR as usize - SNAP_HEADER) / SNAP_ENTRY;
+// The key cap (`pico2hsm_layout::geometry`) is computed from these.
+const _: () = assert!(SNAP_PER_SECTOR == shared::SNAP_ENTRIES_PER_SECTOR as usize);
+const _: () = assert!(SECTOR == pico2hsm_layout::SECTOR);
 const SNAP_HEADER: usize = 64;
 const SNAP_ENTRY: usize = 24;
 /// Bytes of an object sector header (the AAD prefix).
 pub const OBJECT_HEADER: usize = 40;
 /// Largest object blob.
 pub const MAX_OBJECT_BLOB: usize = SECTOR as usize - OBJECT_HEADER;
+/// Data sectors a PUT keeps free past the snapshot it may need: the one
+/// its new version takes before the old one is erased (plus one more for
+/// a new key ID).  `pico2hsm_layout::geometry::MAINTENANCE_RESERVE` is this
+/// plus the snapshot sector the tail can add to `live_estimate`.
+const PUT_VERSION_RESERVE: usize = 1;
+const _: () = assert!(shared::MAINTENANCE_RESERVE as usize == PUT_VERSION_RESERVE + 1);
 /// Journal slots a PUT must leave writable (a DELETE, a CHECKPOINT and a
 /// mount VOID always fit, §6.2).
 const SLOT_RESERVE: u32 = 4;
@@ -1700,7 +1710,7 @@ impl<F: StoreFlash> Store<F> {
         self.maybe_checkpoint(env)?;
         let old = self.lookup(key_id)?;
         let needed_snapshot = snapshot_sectors_for(self.live_estimate() + 1);
-        let reserve = needed_snapshot + 1 + if old.is_none() { 1 } else { 0 };
+        let reserve = needed_snapshot + PUT_VERSION_RESERVE + if old.is_none() { 1 } else { 0 };
         if self.free_sectors() < reserve as u32 {
             return Err(StorageError::KeystoreFull);
         }

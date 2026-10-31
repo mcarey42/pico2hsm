@@ -117,6 +117,11 @@ sleep 5
 # of the reader name; OPENSC_DEFAULT_READER=<index> also works, but indexes
 # shift when a board re-enumerates)
 PICO2HSM_READER=<serial> ./run_tests.sh
+
+# Let the session FORMAT STORE a device whose store needs it (a board
+# flashed with 2.0 over a 1.x keystore, or a new flash layout).  This erases
+# every key on the device; without it such a session stops with a message.
+PICO2HSM_FORMAT_STORE=1 ./run_tests.sh
 ```
 
 Run `opensc-tool --list-readers` to see the reader names.

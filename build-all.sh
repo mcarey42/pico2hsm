@@ -309,10 +309,10 @@ if [[ -n "$FLASH_TARGET" ]]; then
     # Every 2.0 board boots through a partition table (docs/FLASH_LAYOUT_2_0.md):
     # the table at 0x10000000, the image in slot A at 0x10002000.  Writing the
     # ELF to its link address (0x10000000) would overwrite the table.
-    case "$FLASH_TARGET" in
-        pico2_4m|rp2350_one_4m) PT_SIZE=4m ;;
-        *)                      PT_SIZE=16m ;;
-    esac
+    # The profile comes from pico2hsm-layout (an unknown board aborts).  The
+    # repo's cargo config defaults to the ARM target, so name the host.
+    PT_SIZE="$(cargo run -q -p pico2hsm-layout --features std --target "$(rustc -vV | sed -n 's/^host: //p')" -- profile "$FLASH_TARGET")" \
+        || die "no flash layout profile for board '$FLASH_TARGET'"
     OBJCOPY="$(command -v arm-none-eabi-objcopy || command -v rust-objcopy || command -v llvm-objcopy || true)"
     [[ -n "$OBJCOPY" ]] || die "an objcopy is required (arm-none-eabi-objcopy, rust-objcopy or llvm-objcopy)"
     PT_BIN="dist/pt_${PT_SIZE}.bin"

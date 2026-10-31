@@ -13,7 +13,7 @@ built.  The owner's decisions are in §8.
   (TBYB): an update keeps its slot only once it has worked; otherwise the
   board goes back to the previous image.
 - **4 MB boards:** one slot of 1.83 MB, no A/B: the room goes to the
-  firmware (post-quantum algorithms will need it).  128 SC-HSM keys.
+  firmware (post-quantum algorithms will need it).  109 SC-HSM keys.
 - **The store regions are partitions of their own, closed to the
   bootloader** (BOOTSEL: picotool, UF2) and to Non-secure code.  From
   BOOTSEL nothing can read, write or erase them, not even a full-chip
@@ -23,10 +23,16 @@ built.  The owner's decisions are in §8.
 
 ## 2. Layouts
 
-Offsets are physical (from the start of flash).  The source of truth is
-`firmware/src/storage/flash_layout.rs`; `boards/pt_*.json` are the tables
-(picotool format) and `boards/*.x` the linker scripts.  A host test ties
-the three together.
+Offsets are physical (from the start of flash).  The source of truth is the
+`pico2hsm-layout` crate (`layout/`): two profiles (4 MB, 16 MB), the board
+table, and compile-time checks (sector alignment, ordering, the midpoint
+rule, the RP2350-E10 tail).  Everything else is generated from it:
+`firmware/build.rs` writes `memory.x`, `firmware/src/storage/flash_layout.rs`
+takes its constants, and `boards/pt_*.json` (picotool format) are rendered
+by `cargo run -q -p pico2hsm-layout --features std --target <host triple> -- write`
+and committed; CI runs `check` and fails when a committed table differs.
+There are no per-board linker scripts.  Query it with the same CLI:
+`profile|slot-size|regions <board>` and `pt <4m|16m> [--prod]`.
 
 ### 2.1 4 MB boards (Pico 2, RP2350-One): `boards/pt_4m.json`
 
@@ -85,9 +91,17 @@ code with this map.
   store worked end to end), with core1 paused and interrupts off, as for
   any flash write (`boot_slot::buy_if_pending`).  An image that never buys
   is dropped at the next reboot.
-- **Key cap** (`MAX_SC_HSM_KEYS`): 128 SC-HSM user keys on 4 MB boards,
-  251 (every user key ref) on 16 MB boards; the key index holds 400 / 768
-  entries.  A new key past the cap fails with 6A84.
+- **Key cap** (`MAX_SC_HSM_KEYS`): computed from the keystore size and the
+  store engine's geometry (`layout/src/geometry.rs`): 109 SC-HSM user keys
+  on 4 MB boards, 251 (every user key ref) on 16 MB boards, pinned to 251
+  on the SD-card boards.  The 4 MB value is what fits: with a descriptor
+  and a certificate per key beside the PIV, OpenPGP and domain budget the
+  keystore fills at 109 keys (the earlier 128 never fitted).
+  `PICO2HSM_MAX_SC_HSM_KEYS=<n>` at build time lowers it (1 to the
+  board's cap; anything else fails the build naming the bound).  The key
+  index is sized from the cap but never below its 2.0.x size (400 on 4 MB,
+  768 on 16 MB), so upgraded devices keep access to every object.  A new
+  key past the cap fails with 6A84.
 - **Debug commands** (`debug` builds): `80 FE 14` reboots into BOOTSEL,
   `80 FE 15` returns the image version and the bootrom's boot info (slot,
   trial state), `80 FE 16` the loaded table.
@@ -184,7 +198,7 @@ secret.  (Padding the gaps with closed partitions instead did not help.)
 
 - Partition tables on every board and build type; provisioning as close
   to identical as possible.
-- 4 MB: one slot (option A), 128-key cap; 16 MB: A/B, 4 MB slots, store
+- 4 MB: one slot (option A), 109-key cap (computed); 16 MB: A/B, 4 MB slots, store
   from 8 MB, all 251 keys.
 - Production uses signed tables; development tables stay replaceable.
 - TBYB buy rule: the first answered APDU.

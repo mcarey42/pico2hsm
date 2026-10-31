@@ -17,17 +17,17 @@ On a build without the `debug` feature the test skips.
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
 import tempfile
 import time
+from pathlib import Path
 
 import pytest
 
 from helpers.pcsc import apdu, session
-
-pytestmark = pytest.mark.hw
 
 SELECT_SC_HSM = "00A404000BE82B0601040181C31F020100"
 IMAGE_INFO = apdu(0x80, 0xFE, 0x15, 0x00)
@@ -35,22 +35,49 @@ PT_INFO = apdu(0x80, 0xFE, 0x16, 0x00)
 TO_BOOTSEL = apdu(0x80, 0xFE, 0x14, 0x00)
 GET_STATUS = apdu(0x80, 0xF0, 0x00, 0x00)
 
-# Store regions as (first sector, last sector), per flash map
-# (firmware/src/storage/flash_layout.rs).
-STORE_4M = {
-    "binding": (0x1D8, 0x1DF),
-    "counters": (0x1E0, 0x1EF),
-    "rsa-pool": (0x1F0, 0x1FB),
-    "spare": (0x1FC, 0x1FF),
-    "keystore": (0x201, 0x3FF),
-}
-STORE_16M = {
-    "binding": (0x801, 0x808),
-    "counters": (0x809, 0x818),
-    "rsa-pool": (0x819, 0x824),
-    "spare": (0x825, 0x828),
-    "keystore": (0x829, 0xFFE),
-}
+_REPO = Path(__file__).resolve().parents[2]
+_STORE_PARTITIONS = ("binding", "counters", "rsa-pool", "spare", "keystore")
+
+
+def _kib(text: str) -> int:
+    assert text.endswith("K"), text
+    return int(text[:-1]) * 1024
+
+
+def _store_regions(big: bool) -> dict[str, tuple[int, int]]:
+    """Store regions as (first sector, last sector), from the committed
+    partition table (boards/pt_16m.json or pt_4m.json), which CI keeps equal
+    to the one pico2hsm-layout generates.  The `_prod` tables
+    (pt_*_prod.json) differ only in their permissions; their store regions
+    are the same, so reading the dev table covers both."""
+    table = json.loads((_REPO / "boards" / f"pt_{'16m' if big else '4m'}.json").read_text())
+    out = {}
+    for p in table["partitions"]:
+        if p["name"] in _STORE_PARTITIONS:
+            first = _kib(p["start"]) // 4096
+            out[p["name"]] = (first, first + _kib(p["size"]) // 4096 - 1)
+    assert set(out) == set(_STORE_PARTITIONS), out
+    return out
+
+
+def test_store_regions_from_tables():
+    """Host-only: the committed tables give the documented store sectors."""
+    assert _store_regions(False) == {
+        "binding": (0x1D8, 0x1DF),
+        "counters": (0x1E0, 0x1EF),
+        "rsa-pool": (0x1F0, 0x1FB),
+        "spare": (0x1FC, 0x1FF),
+        "keystore": (0x201, 0x3FF),
+    }
+    assert _store_regions(True) == {
+        "binding": (0x801, 0x808),
+        "counters": (0x809, 0x818),
+        "rsa-pool": (0x819, 0x824),
+        "spare": (0x825, 0x828),
+        "keystore": (0x829, 0xFFE),
+    }
+
+
 SECURE_ONLY = 0b000011  # location word bits 26..31: S R, S W only
 
 
@@ -77,6 +104,7 @@ def _partitions() -> list[tuple[int, int, int]]:
     return [(x & 0x1FFF, (x >> 13) & 0x1FFF, x >> 26) for x in locs]
 
 
+@pytest.mark.hw
 def test_boots_from_a_partition():
     data = _read(IMAGE_INFO)
     major, minor = int.from_bytes(data[0:2], "big"), int.from_bytes(data[2:4], "big")
@@ -102,6 +130,7 @@ def _status_tlv() -> dict[int, bytes]:
     return tags
 
 
+@pytest.mark.hw
 def test_status_reports_the_image_version():
     """Release builds report the running image's version (tag 85), so a
     host can recommend an update; debug builds must agree with 80 FE 15."""
@@ -116,10 +145,11 @@ def test_status_reports_the_image_version():
         assert bytes(data[:4]) == v, f"80 FE 15 says {bytes(data[:4]).hex()}, status {v.hex()}"
 
 
+@pytest.mark.hw
 def test_store_regions_are_closed_partitions():
     parts = _partitions()
     big = any(first == 0x400 for first, _, _ in parts)  # slot B: 16 MB map
-    store = STORE_16M if big else STORE_4M
+    store = _store_regions(big)
     for name, (first, last) in store.items():
         touching = [p for p in parts if not (p[0] > last or p[1] < first)]
         assert touching == [(first, last, SECURE_ONLY)], (
@@ -128,6 +158,7 @@ def test_store_regions_are_closed_partitions():
         )
 
 
+@pytest.mark.hw
 @pytest.mark.skipif(
     os.environ.get("PICO2HSM_ALLOW_BOOTSEL") != "1" or not shutil.which("picotool"),
     reason="set PICO2HSM_ALLOW_BOOTSEL=1 (and have picotool) to test from BOOTSEL",
@@ -137,7 +168,7 @@ def test_bootsel_cannot_reach_the_store():
     if not ser:
         pytest.skip("PICO2HSM_READER names the board's USB serial")
     big = any(first == 0x400 for first, _, _ in _partitions())
-    store = STORE_16M if big else STORE_4M
+    store = _store_regions(big)
 
     def picotool(*args: str) -> subprocess.CompletedProcess:
         return subprocess.run(

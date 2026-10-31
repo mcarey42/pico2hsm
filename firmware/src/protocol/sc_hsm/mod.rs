@@ -276,25 +276,28 @@ pub enum OpBufState {
 /// refuses a new SC-HSM object past it (`keystore_v2`, 6A84): with a
 /// smaller index than the store, an object was saved (9000) yet
 /// unreachable until a reset.  Room for [`MAX_SC_HSM_KEYS`] keys with a
-/// private key descriptor and a certificate each, plus the reserved
-/// objects and some free-standing files.
-pub const MAX_KEY_INDEX: usize = if crate::storage::flash_layout::FLASH_16M {
-    768
-} else {
-    400
-};
+/// private key descriptor and a certificate each, the reserved objects and
+/// at least 11 free-standing files, rounded up to 8 entries, and never
+/// below the profile's 2.0.x index (boot skips objects past the index):
+/// `pico2hsm_layout::geometry::key_index_size`.
+pub const MAX_KEY_INDEX: usize = pico2hsm_layout::geometry::key_index_size(
+    crate::storage::flash_layout::BOARD.profile,
+    MAX_SC_HSM_KEYS as u32,
+) as usize;
 
 /// SC-HSM user keys a device holds (key refs below
-/// [`RESERVED_KEY_REF_MIN`]): every one on the 16 MB boards, 128 on the
-/// 4 MB boards, whose ~2 MB keystore holds 128 keys with a descriptor and
-/// a certificate each next to PIV and OpenPGP (FLASH_LAYOUT_2_0.md).  A
-/// key generation or import past it fails with 6A84.
-pub const MAX_SC_HSM_KEYS: usize = if crate::storage::flash_layout::FLASH_16M {
-    251
-} else {
-    128
-};
+/// [`RESERVED_KEY_REF_MIN`]); a key generation or import past it fails
+/// with 6A84.  Computed by `build.rs` from the board's keystore size
+/// (`pico2hsm_layout::geometry::max_sc_hsm_keys`; every key ref, 251, on
+/// the 16 MB and SD boards), so that the keys with a descriptor and
+/// certificate each fit next to everything PIV, OpenPGP and the domain
+/// records can store, with the store's reserves intact.
+/// `PICO2HSM_MAX_SC_HSM_KEYS` at build time may lower it.
+pub const MAX_SC_HSM_KEYS: usize =
+    crate::image_version::parse_u16(env!("PICO2HSM_SC_HSM_KEY_CAP")) as usize;
 
+const _: () = assert!(MAX_SC_HSM_KEYS >= 1);
+const _: () = assert!(MAX_SC_HSM_KEYS <= pico2hsm_layout::geometry::SC_HSM_KEY_REFS as usize);
 const _: () = assert!(MAX_KEY_INDEX >= MAX_SC_HSM_KEYS * 3 + 4);
 
 /// Lightweight metadata for a key or EF file stored in flash.

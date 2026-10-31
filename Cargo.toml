@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "pico2hsm-core",
+    "layout",
     "firmware",
 
     "tests/integration",

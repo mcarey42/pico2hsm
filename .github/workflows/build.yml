@@ -45,6 +45,26 @@ jobs:
       - name: Build firmware (${{ matrix.feature }}, all applets)
         run: cargo build --release -p pico2hsm-firmware --no-default-features --features ${{ matrix.feature }},$APPLETS --target thumbv8m.main-none-eabihf
 
+      - name: Install objcopy
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y binutils-arm-none-eabi
+
+      - name: Image budget (${{ matrix.feature }})
+        # The all-applets release image must fit its slot (pico2hsm-layout).
+        # This measures the unsigned image; the signed (sealed) image
+        # `picotool seal` makes is slightly larger (signature and hash
+        # blocks), so keep some headroom above zero.
+        run: |
+          arm-none-eabi-objcopy -O binary target/thumbv8m.main-none-eabihf/release/pico2hsm "$RUNNER_TEMP/image.bin"
+          # The later no-RSA / SC-HSM-only builds overwrite this ELF, so this
+          # step must stay right after the all-applets build.
+          SLOT=$(cargo run -q -p pico2hsm-layout --features std --target x86_64-unknown-linux-gnu -- slot-size ${{ matrix.feature }})
+          IMG=$(stat -c%s "$RUNNER_TEMP/image.bin")
+          HEAD=$((SLOT - IMG))
+          echo "image $IMG / slot $SLOT = headroom $HEAD ($((HEAD * 100 / SLOT))%)"
+          [ "$IMG" -le "$SLOT" ] || { echo "::error::image exceeds its slot"; exit 1; }
+
       - name: Build firmware (${{ matrix.feature }}, all applets, no RSA)
         run: cargo build --release -p pico2hsm-firmware --no-default-features --features ${{ matrix.feature }},$APPLETS_NO_RSA --target thumbv8m.main-none-eabihf
 
@@ -55,6 +75,10 @@ jobs:
       - name: Test pico2hsm-core (host)
         # Run on host (x86_64) — pico2hsm-core is no_std but tests use std
         run: cargo test -p pico2hsm-core --target x86_64-unknown-linux-gnu
+
+      - name: Test pico2hsm-layout (host)
+        if: matrix.feature == 'pico2_4m'
+        run: cargo test -p pico2hsm-layout --features std --target x86_64-unknown-linux-gnu
 
       - name: Test integration suite (host)
         # Integration tests are std — must run on host target
@@ -103,6 +127,28 @@ jobs:
             --features ${{ matrix.feature }},$APPLETS_NO_RSA \
             --target x86_64-unknown-linux-gnu
 
+      - name: Rust unit tests (firmware library, host target, SC-HSM only)
+        if: matrix.feature == 'pico2_4m' || matrix.feature == 'waveshare_rp2350_lcd_16m'
+        run: |
+          cargo test \
+            --manifest-path firmware/Cargo.toml \
+            --lib \
+            --no-default-features \
+            --features ${{ matrix.feature }},rsa \
+            --target x86_64-unknown-linux-gnu
+
+      - name: Firmware integration tests (firmware/tests, host target, SC-HSM only)
+        # pico2_4m only: the integration tests build main.rs for the host,
+        # which the Waveshare board code does not support.
+        if: matrix.feature == 'pico2_4m'
+        run: |
+          cargo test \
+            --manifest-path firmware/Cargo.toml \
+            --test '*' \
+            --no-default-features \
+            --features ${{ matrix.feature }},rsa \
+            --target x86_64-unknown-linux-gnu
+
   lint:
     runs-on: ubuntu-latest
     steps:
@@ -114,6 +160,9 @@ jobs:
 
       - name: Check formatting
         run: cargo fmt --all -- --check
+
+      - name: Layout tables match the definition
+        run: cargo run -q -p pico2hsm-layout --features std --target x86_64-unknown-linux-gnu -- check
 
       # F-L-005: enforce `-D warnings` on both clippy steps so any lint warning
       # becomes a build error. The workspace `[workspace.lints]` policy in
@@ -300,10 +349,7 @@ jobs:
       # `-dev` leaves the table's own sector open to BOOTSEL; `-prod` closes it.
       - name: Partition table UF2s
         run: |
-          case "${{ matrix.board }}" in
-            pico2_4m|rp2350_one_4m) SIZE=4m ;;
-            *)                      SIZE=16m ;;
-          esac
+          SIZE=$(cargo run -q -p pico2hsm-layout --features std --target x86_64-unknown-linux-gnu -- profile "${{ matrix.board }}")
           picotool partition create boards/pt_${SIZE}.json pico2hsm-${{ matrix.board }}-pt-dev.uf2
           picotool partition create boards/pt_${SIZE}_prod.json pico2hsm-${{ matrix.board }}-pt-prod.uf2
           ls -l pico2hsm-${{ matrix.board }}-pt-*.uf2

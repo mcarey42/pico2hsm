@@ -146,7 +146,14 @@ buffer (5.6 KB Geek / 7.5 KB Waveshare).
 flash, or the microSD card on the two `_sdcard` builds. No external SPI flash,
 no RAID: the RAID-1, WAL and multi-chip code was removed in Storage V2 phase 5
 (`docs/STORAGE_V2.md` §12).  The flash map (partition table, firmware slots,
-store partitions) is `firmware/src/storage/flash_layout.rs` and
+store partitions) is defined once, in the `pico2hsm-layout` crate (`layout/`):
+`firmware/build.rs` generates `memory.x` from it (the `boards/*.x` linker
+scripts are gone), `boards/pt_*.json` are rendered from it and checked by CI
+(`cargo run -q -p pico2hsm-layout --features std --target <host triple> -- check`;
+the host target is needed because `.cargo/config.toml` defaults to thumbv8m).
+The build fails unless exactly one board feature is active.  The SC-HSM key
+cap is computed from the keystore size (109 on 4 MB boards, 251 on 16 MB and
+SD boards; `PICO2HSM_MAX_SC_HSM_KEYS` lowers it).  See
 `docs/FLASH_LAYOUT_2_0.md`; the OTP map is `security/otp_layout.rs`.
 
 **Storage namespace — implemented:**

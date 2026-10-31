@@ -135,10 +135,7 @@ jobs:
           # The board's partition tables (docs/FLASH_LAYOUT_2_0.md): install
           # once, then the firmware.  -dev keeps the table replaceable from
           # BOOTSEL; -prod (to be signed at provisioning) does not.
-          case "$BOARD" in
-            pico2_4m|rp2350_one_4m) SIZE=4m ;;
-            *)                      SIZE=16m ;;
-          esac
+          SIZE=$(cargo run -q -p pico2hsm-layout --features std --target x86_64-unknown-linux-gnu -- profile "$BOARD")
           for KIND in dev prod; do
             JSON="boards/pt_${SIZE}.json"
             [ "$KIND" = prod ] && JSON="boards/pt_${SIZE}_prod.json"
