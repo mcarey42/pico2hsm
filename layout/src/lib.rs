@@ -4,7 +4,10 @@
 //! the profile and storage media it uses.  Linker scripts and partition
 //! tables are rendered from these values, and [`validate`] checks them at
 //! compile time.  Offsets are physical, from the start of flash.
-#![no_std]
+#![cfg_attr(not(feature = "std"), no_std)]
+
+#[cfg(feature = "std")]
+pub mod render;
 
 use core::fmt;
 
@@ -330,6 +333,7 @@ pub fn resolve_board(active: &[&str]) -> Result<&'static Board, BoardError> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(not(feature = "std"))]
     extern crate std;
     use super::*;
     use std::string::ToString;
@@ -363,6 +367,7 @@ mod tests {
     fn region_sizes_and_ids() {
         for p in PROFILES {
             let r = p.regions;
+            #[allow(unused_qualifications)]
             let got: std::vec::Vec<_> = r
                 .iter()
                 .map(|r| (r.name, r.partition, r.id, r.size))
