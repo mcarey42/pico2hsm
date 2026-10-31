@@ -2,7 +2,8 @@
 //!
 //! Resolves the one active board feature through `pico2hsm-layout` (the
 //! build fails naming the active boards if there is none or several),
-//! passes it to the crate as `PICO2HSM_BOARD`, and, for ARM builds,
+//! passes it to the crate as `PICO2HSM_BOARD` (and its SC-HSM key cap as
+//! `PICO2HSM_SC_HSM_KEY_CAP`), and, for ARM builds,
 //! renders the board's `memory.x` into `$OUT_DIR` for `cortex-m-rt`.
 //!
 //! ## How cortex-m-rt linker scripts work
@@ -35,6 +36,7 @@ fn main() {
         .collect();
     let board = pico2hsm_layout::resolve_board(&active).unwrap_or_else(|e| panic!("{e}"));
     println!("cargo:rustc-env=PICO2HSM_BOARD={}", board.feature);
+    key_cap(board);
 
     // Only write memory.x and emit linker arguments for bare-metal ARM.
     let target = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
@@ -59,6 +61,19 @@ fn main() {
     println!("cargo:rustc-link-arg=-Tdefmt.x");
     // --nmagic: disable page-aligned ELF segments (required for bare-metal flash).
     println!("cargo:rustc-link-arg=--nmagic");
+}
+
+/// The SC-HSM key cap: the board's (computed from its keystore size by
+/// `pico2hsm_layout::geometry::max_sc_hsm_keys`), or a lower
+/// `PICO2HSM_MAX_SC_HSM_KEYS`.  The build fails, naming the board's cap,
+/// on 0, a larger value or junk.  Passed on as `PICO2HSM_SC_HSM_KEY_CAP`.
+fn key_cap(board: &pico2hsm_layout::Board) {
+    use pico2hsm_layout::geometry::{checked_cap, max_sc_hsm_keys};
+    println!("cargo:rerun-if-env-changed=PICO2HSM_MAX_SC_HSM_KEYS");
+    let over = std::env::var("PICO2HSM_MAX_SC_HSM_KEYS").ok();
+    let cap = checked_cap(over.as_deref(), max_sc_hsm_keys(board))
+        .unwrap_or_else(|e| panic!("{} ({}): {e}", board.feature, board.profile.name));
+    println!("cargo:rustc-env=PICO2HSM_SC_HSM_KEY_CAP={cap}");
 }
 
 /// IMAGE_DEF version (the bootrom boots the higher of two A/B images):

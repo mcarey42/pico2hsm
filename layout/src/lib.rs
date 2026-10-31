@@ -6,6 +6,7 @@
 //! compile time.  Offsets are physical, from the start of flash.
 #![cfg_attr(not(feature = "std"), no_std)]
 
+pub mod geometry;
 #[cfg(feature = "std")]
 pub mod render;
 

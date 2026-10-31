@@ -52,6 +52,7 @@ use zeroize::Zeroizing;
 
 use crate::crypto::kdf::{hkdf_sha256, hmac_sha256};
 use crate::storage::retry_counter::Anchor;
+use pico2hsm_layout::geometry as shared;
 
 // ─── Geometry ────────────────────────────────────────────────────────────────
 
@@ -103,18 +104,18 @@ impl Geo {
         match media {
             Media::Nor => Geo {
                 media,
-                ring: 16,
+                ring: shared::NOR_RING_SECTORS,
                 slots: 127,
                 stride: 32,
-                threshold: 128,
+                threshold: shared::NOR_CHECKPOINT_TAIL as usize,
                 data_end: sectors,
             },
             Media::Sd => Geo {
                 media,
-                ring: 64,
+                ring: shared::SD_RING_SECTORS,
                 slots: 7,
                 stride: SD_BLOCK,
-                threshold: 64,
+                threshold: shared::SD_CHECKPOINT_TAIL as usize,
                 data_end: sectors,
             },
         }
@@ -134,11 +135,14 @@ impl Geo {
 }
 
 /// Most data sectors the bitmap tracks (16 MiB of keystore).
-pub const MAX_DATA_SECTORS: usize = 4096;
+pub const MAX_DATA_SECTORS: usize = shared::MAX_DATA_SECTORS as usize;
 /// Most snapshot sectors (168 entries each).
-pub const MAX_SNAPSHOT_SECTORS: usize = 32;
+pub const MAX_SNAPSHOT_SECTORS: usize = shared::MAX_SNAPSHOT_SECTORS as usize;
 /// Entries per snapshot sector.
 pub const SNAP_PER_SECTOR: usize = (SECTOR as usize - SNAP_HEADER) / SNAP_ENTRY;
+// The key cap (`pico2hsm_layout::geometry`) is computed from these.
+const _: () = assert!(SNAP_PER_SECTOR == shared::SNAP_ENTRIES_PER_SECTOR as usize);
+const _: () = assert!(SECTOR == pico2hsm_layout::SECTOR);
 const SNAP_HEADER: usize = 64;
 const SNAP_ENTRY: usize = 24;
 /// Bytes of an object sector header (the AAD prefix).

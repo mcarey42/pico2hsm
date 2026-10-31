@@ -71,8 +71,8 @@ pub fn handle_with_store(
 }
 
 /// Low bytes of the SP 800-73-4 data objects 5FC101–5FC123.
-const PIV_OBJECT_MIN: u8 = 0x01;
-const PIV_OBJECT_MAX: u8 = 0x23;
+pub(crate) const PIV_OBJECT_MIN: u8 = 0x01;
+pub(crate) const PIV_OBJECT_MAX: u8 = 0x23;
 
 /// The stored-object tag (low byte) a GET/PUT DATA body names:
 /// `5C 03 5F C1 xx` or `5C 01 7E` (discovery object).

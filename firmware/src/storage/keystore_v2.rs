@@ -643,6 +643,71 @@ fn is_sc_hsm_user_key(key_id: u32) -> bool {
         && ((key_id & 0xFF) as u8) < crate::protocol::sc_hsm::RESERVED_KEY_REF_MIN
 }
 
+// The object budget behind the SC-HSM key cap
+// (`pico2hsm_layout::geometry::NON_SC_HSM_OBJECTS`), term by term against
+// the constants of the code that stores the objects.
+mod cap_budget {
+    use crate::protocol::{openpgp, piv, sc_hsm};
+    use pico2hsm_layout::geometry as g;
+
+    const _: () = assert!(g::PIV_KEY_SLOTS as usize >= piv::MAX_PIV_KEYS);
+    #[cfg(feature = "applet-piv")]
+    const _: () = {
+        // Every key ref GENERATE accepts has an index slot.
+        let (mut r, mut n) = (0u32, 0u32);
+        while r <= 0xFF {
+            if piv::commands::generate_keypair::is_valid_key_ref(r as u8) {
+                n += 1;
+            }
+            r += 1;
+        }
+        assert!(n == g::PIV_KEY_SLOTS);
+        // Flash holds every SP 800-73-4 object (5FC1xx) and 7E; RAM only
+        // caches MAX_PIV_DATA_OBJECTS of them.
+        use piv::commands::put_data::{PIV_OBJECT_MAX, PIV_OBJECT_MIN};
+        assert!(g::PIV_DATA_OBJECTS == (PIV_OBJECT_MAX - PIV_OBJECT_MIN + 1) as u32 + 1);
+        // PIN/PUK record (`piv_pin_key_id`, ref FF) and management key
+        // (`piv_mgmt_key_id`, 9B): two key IDs outside the slots.
+        assert!(
+            g::PIV_RECORDS == 2
+                && !piv::commands::generate_keypair::is_valid_key_ref(0xFF)
+                && !piv::commands::generate_keypair::is_valid_key_ref(0x9B)
+        );
+    };
+    const _: () = assert!(g::PIV_DATA_OBJECTS as usize >= piv::MAX_PIV_DATA_OBJECTS);
+
+    const _: () = assert!(
+        g::OPENPGP_KEY_SLOTS == 3
+            && openpgp::SLOT_DEC == openpgp::SLOT_SIG + 1
+            && openpgp::SLOT_AUTH == openpgp::SLOT_SIG + 2
+    );
+    // The persisted DOs and the legacy signature-counter record.
+    const _: () = assert!(
+        g::OPENPGP_DATA_OBJECTS as usize == openpgp::commands::put_data::PERSISTED_TAGS.len() + 1
+    );
+    const _: () = assert!(
+        g::OPENPGP_PW_RECORDS == 2
+            && openpgp::OPENPGP_PW1_KEY_ID.0 != openpgp::OPENPGP_PW3_KEY_ID.0
+    );
+
+    const _: () =
+        assert!(g::SC_HSM_RESERVED_OBJECTS == 0x100 - sc_hsm::RESERVED_KEY_REF_MIN as u32);
+    // The cap's ceiling: the user key refs 01..=FB below the reserved ones
+    // (GENERATE KEYPAIR also takes 00, so the ceiling is not tight).
+    const _: () = assert!(g::SC_HSM_KEY_REFS == sc_hsm::RESERVED_KEY_REF_MIN as u32 - 1);
+    // The index admits no more SC-HSM objects than the budget counts.
+    const _: () = assert!(
+        sc_hsm::MAX_KEY_INDEX
+            <= sc_hsm::MAX_SC_HSM_KEYS * g::OBJECTS_PER_KEY as usize
+                + (g::SC_HSM_RESERVED_OBJECTS + g::SC_HSM_FILE_OBJECTS) as usize
+    );
+
+    const _: () = assert!(
+        g::DOMAIN_MEMBERS == crate::domain::member::MAX_MEMBERS as u32
+            && g::DOMAIN_OBJECTS == g::DOMAIN_MEMBERS + 1 + g::SC_HSM_FILE_OBJECTS
+    );
+}
+
 impl<F: StoreFlash, B: CounterFlash, L: RetryCounterBackend> KeyStore for FlashKeyStoreV2<F, B, L> {
     fn save_key(&mut self, obj: &KeyObject) -> Result<(), HsmError> {
         // A new SC-HSM object past the SC-HSM index's capacity would be
@@ -664,7 +729,8 @@ impl<F: StoreFlash, B: CounterFlash, L: RetryCounterBackend> KeyStore for FlashK
             if sc_hsm >= crate::protocol::sc_hsm::MAX_KEY_INDEX {
                 return Err(HsmError::Storage(StorageError::KeystoreFull));
             }
-            // The per-board key cap (MAX_SC_HSM_KEYS: 128 on 4 MB boards).
+            // The per-board key cap (MAX_SC_HSM_KEYS, computed from the
+            // keystore size: 109 on 4 MB boards).
             if is_sc_hsm_user_key(obj.key_id) {
                 let mut keys = 0usize;
                 let _ = self.store.for_each(&mut |e| {
@@ -1098,6 +1164,13 @@ pub(crate) mod tests {
             }
         }
 
+        /// A device whose keystore region has `sectors` sectors.
+        pub(crate) fn with_store_sectors(sectors: u32) -> Self {
+            let mut d = Dev::new();
+            d.store = Nor::new(sectors as usize);
+            d
+        }
+
         /// The same with the keystore on an SD card.
         pub(crate) fn new_sd() -> Self {
             let mut d = Dev::new();
@@ -1269,6 +1342,81 @@ pub(crate) mod tests {
         let _ = ef.private_key.extend_from_slice(b"prkd");
         ks.save_key(&ef).unwrap();
         ks.save_key(&key(0x0001_0005, 5)).unwrap();
+    }
+
+    /// The computed key cap is a bound the store keeps: on a keystore of
+    /// this board's size (the 4 MB profile's 511 sectors for pico2_4m;
+    /// an SD board's counted size), the cap's keys with a descriptor and a
+    /// certificate each, a full key index, and every other object the
+    /// budget counts all fit; they survive a reboot, every one can still be
+    /// replaced (checkpoints included), and one key more is refused (6A84).
+    #[test]
+    fn fills_to_the_cap_on_a_keystore_of_the_profiles_size() {
+        use crate::protocol::sc_hsm::{MAX_KEY_INDEX, MAX_SC_HSM_KEYS};
+        use crate::storage::flash_layout::BOARD;
+        use pico2hsm_layout::geometry as g;
+        use pico2hsm_layout::Media as M;
+
+        let cap = MAX_SC_HSM_KEYS as u32;
+        let sectors = match BOARD.media {
+            M::Nor => BOARD.profile.keystore_sectors(),
+            M::Sd => g::data_sectors(BOARD) + g::SD_RING_SECTORS,
+        };
+        if BOARD.profile.name == "4m" {
+            assert_eq!(sectors, pico2hsm_layout::PROFILE_4M.keystore_sectors());
+        }
+        let mut d = Dev::with_store_sectors(sectors);
+        d.store.sd = BOARD.media == M::Sd;
+        let (mut ks, r) = d.boot();
+        r.unwrap();
+
+        let mut ids: Vec<u32> = Vec::new();
+        // The keys, each with a descriptor (C4) and a certificate (CE).
+        for r in 1..=cap {
+            let r = r as u8;
+            ids.push(KeyId::sc_hsm(0, r).0);
+            ids.push(KeyId::sc_hsm_ef(0, 0xC4, r).0);
+            ids.push(KeyId::sc_hsm_ef(0, 0xCE, r).0);
+        }
+        // Everything else: reserved refs, standalone files up to a full
+        // index, and the rest of the budget as PIV, OpenPGP and domain
+        // records.
+        let mut others: Vec<u32> = (0xFCu32..=0xFF).collect();
+        let files = MAX_KEY_INDEX as u32 - cap * g::OBJECTS_PER_KEY - 4;
+        others.extend((0..files).map(|i| KeyId::sc_hsm_ef(0, 0xC8, i as u8).0));
+        others.extend((0..g::PIV_OBJECTS).map(|i| 0x0001_0000 | i));
+        others.extend((0..g::OPENPGP_OBJECTS).map(|i| 0x0002_0000 | i));
+        let rest = g::NON_SC_HSM_OBJECTS - others.len() as u32;
+        others.extend((0..rest).map(|i| 0x0110_0000 | i));
+        assert_eq!(others.len() as u32, g::NON_SC_HSM_OBJECTS);
+        ids.extend_from_slice(&others);
+        assert_eq!(ids.len() as u32, g::max_live_objects(cap));
+
+        for (n, &id) in ids.iter().enumerate() {
+            ks.save_key(&key(id, n as u8))
+                .unwrap_or_else(|e| panic!("object {n} of {} ({id:#010x}): {e:?}", ids.len()));
+        }
+        let (mut ks, r) = Dev::of(&mut ks).boot();
+        r.unwrap();
+        for (n, &id) in ids.iter().enumerate() {
+            assert_eq!(tag(&mut ks, id), Some(n as u8), "{id:#010x}");
+        }
+        // One key more: the cap (partition 1, so it is a new key on every
+        // board).
+        assert_eq!(
+            ks.save_key(&key(0x0100_0001, 1)),
+            Err(HsmError::Storage(StorageError::KeystoreFull))
+        );
+        // Full, the store still replaces every object, through checkpoints.
+        for (n, &id) in ids.iter().enumerate() {
+            ks.save_key(&key(id, n as u8 ^ 0xA5))
+                .unwrap_or_else(|e| panic!("replace {id:#010x}: {e:?}"));
+        }
+        let (mut ks, r) = Dev::of(&mut ks).boot();
+        r.unwrap();
+        for (n, &id) in ids.iter().enumerate() {
+            assert_eq!(tag(&mut ks, id), Some(n as u8 ^ 0xA5), "{id:#010x}");
+        }
     }
 
     /// A factory-fresh device: nothing on flash, the counter log included.
