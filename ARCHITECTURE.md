@@ -7,9 +7,8 @@ This document describes all significant design decisions for the pico2hsm projec
 ## 1. Flash Memory Layout Per Board
 
 Every board boots through a bootrom partition table. The source of truth is
-`firmware/src/storage/flash_layout.rs`; `boards/pt_*.json` are the tables
-and `boards/*.x` the linker scripts, and a host test ties the three
-together. The full description, with the hardware findings behind it, is
+the `pico2hsm-layout` crate (`layout/`); `memory.x` is generated from it at
+build time and `boards/pt_*.json` are the committed tables, checked by CI. The full description, with the hardware findings behind it, is
 [docs/FLASH_LAYOUT_2_0.md](docs/FLASH_LAYOUT_2_0.md).
 
 ### 4 MB boards (Pico 2, RP2350-One): `boards/pt_4m.json`
