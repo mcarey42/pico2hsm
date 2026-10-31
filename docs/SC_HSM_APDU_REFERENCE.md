@@ -43,8 +43,8 @@ All SC-HSM commands use `CLA = 0x00` unless noted. OpenSC's session-PIN flow use
 
 | Resource | Limit |
 |---|---|
-| SC-HSM user keys (`MAX_SC_HSM_KEYS`) | 128 on 4 MB boards, 251 (every user key ref) on 16 MB boards; past it 6A84 |
-| Key / EF index entries (`MAX_KEY_INDEX`) | 400 on 4 MB boards, 768 on 16 MB boards |
+| SC-HSM user keys (`MAX_SC_HSM_KEYS`) | 109 on 4 MB boards (computed from the keystore size), 251 (every user key ref) on 16 MB boards; past it 6A84 |
+| Key / EF index entries (`MAX_KEY_INDEX`) | at least 400 on 4 MB boards, 768 on 16 MB boards (never below the 2.0.x size) |
 | Reserved key refs | `0xFC`–`0xFF` (refused by user key commands) |
 | EF cache (in RAM) | 16 entries of up to 1024 bytes |
 | Max PIN length | 16 bytes |

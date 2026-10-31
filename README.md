@@ -41,8 +41,8 @@ mirrored flash would buy nothing.
 
 | Board | Flash | Keystore | SC-HSM keys | Display / LED | Feature flag |
 |-------|-------|----------|-------------|---------------|--------------|
-| Raspberry Pi Pico 2 | 4MB | 2,044 KB internal | 128 | GPIO LED | `pico2_4m` |
-| Waveshare RP2350-One | 4MB | 2,044 KB internal | 128 | WS2812B LED | `rp2350_one_4m` |
+| Raspberry Pi Pico 2 | 4MB | 2,044 KB internal | 109 | GPIO LED | `pico2_4m` |
+| Waveshare RP2350-One | 4MB | 2,044 KB internal | 109 | WS2812B LED | `rp2350_one_4m` |
 | Waveshare RP2350-One, 16 MB chip fitted | 16MB | ~7.8 MB internal | 251 | WS2812B LED | `rp2350_one_16m` |
 | Waveshare RP2350-Geek | 16MB | ~7.8 MB internal | 251 | ST7789 LCD | `rp2350_geek_16m` |
 | Waveshare RP2350-Geek, SD-card build | 16MB | microSD card | 251 | ST7789 LCD | `rp2350_geek_sdcard` |

@@ -266,8 +266,8 @@ through the RP2350 QMI.  The 4 MB chip boots through the partition table
 | 0x200000 – 0x200FFF     | 4 KB     | Unpartitioned (the flash midpoint)       |
 | 0x201000 – 0x3FFFFF     | 2,044 KB | Keystore (Storage V2)                    |
 
-The layout is set in `firmware/src/storage/flash_layout.rs`,
-`boards/rp2350_one_4m.x` and `boards/pt_4m.json`
+The layout is set in the `pico2hsm-layout` crate (`layout/`; it generates
+`memory.x` at build time) and `boards/pt_4m.json`
 ([FLASH_LAYOUT_2_0.md](FLASH_LAYOUT_2_0.md)).  It is the same as on the
 stock Pico 2.  No external flash chips are used or supported.  With a
 16 MB chip fitted, build `rp2350_one_16m`: the same board code with the
@@ -295,7 +295,7 @@ are never driven.  Treat those GPIOs as free.
 
 | Feature flag              | Flash  | Keystore                | Notes                     |
 |---------------------------|--------|-------------------------|---------------------------|
-| `rp2350_one_4m`           | 4 MB   | Internal flash, 2,044 KB, 128 SC-HSM keys | **Default** in Cargo.toml |
+| `rp2350_one_4m`           | 4 MB   | Internal flash, 2,044 KB, 109 SC-HSM keys | **Default** in Cargo.toml |
 | `rp2350_one_16m`          | 16 MB  | Internal flash, ~7.8 MB, 251 SC-HSM keys  | A 16 MB chip fitted; implies `rp2350_one_4m` |
 
 Always pass `--no-default-features` when selecting a non-default board flag to
