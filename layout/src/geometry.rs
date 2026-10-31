@@ -26,10 +26,13 @@
 //!   one for the over-estimate).
 //!
 //! # Not covered
-//! A host that spends key slots on standalone files instead (each with a
-//! sidecar), or gives symmetric keys certificates, can fill the store
-//! before the cap: the next new object fails with 6A84 (the store's own
-//! reserve check), nothing is lost.
+//! The budget counts [`SC_HSM_FILE_OBJECTS`] standalone files (and their
+//! sidecars).  The key index has more room than that ([`key_index_size`]
+//! never shrinks below the 2.0.x index), so a host that stores more files
+//! (each with a sidecar), spends key slots on files, or gives symmetric
+//! keys certificates can fill the store before the cap: the next new
+//! object fails with 6A84 (the store's own reserve check) and nothing is
+//! lost.
 
 use core::fmt;
 
@@ -138,17 +141,34 @@ pub const fn key_index_capacity(cap: u32) -> u32 {
     n.div_ceil(KEY_INDEX_ROUND) * KEY_INDEX_ROUND
 }
 
-// The index never admits more SC-HSM objects than the budget counts.
-const _: () = {
-    let mut cap = 0;
-    while cap <= SC_HSM_KEY_REFS {
-        assert!(
-            key_index_capacity(cap)
-                <= cap * OBJECTS_PER_KEY + SC_HSM_RESERVED_OBJECTS + SC_HSM_FILE_OBJECTS
-        );
-        cap += 1;
+/// The 2.0.x key index on the 4 MB boards.
+pub const KEY_INDEX_FLOOR_4M: u32 = 400;
+/// The 2.0.x key index on the 16 MB boards (QMI and SD).
+pub const KEY_INDEX_FLOOR_16M: u32 = 768;
+
+/// The key index a profile's firmware never goes below: its 2.0.x size.
+/// Boot skips SC-HSM objects past the index, so a smaller index would cut
+/// off objects a 2.0.x device may already hold.
+pub const fn key_index_floor(p: &crate::Profile) -> u32 {
+    if p.flash_size >= 0x0100_0000 {
+        KEY_INDEX_FLOOR_16M
+    } else {
+        KEY_INDEX_FLOOR_4M
     }
-};
+}
+
+/// The SC-HSM key/EF index of a build: [`key_index_capacity`] of its cap,
+/// at least the profile's [`key_index_floor`].  Room past the budgeted
+/// files is not backed by the store (module docs, "Not covered").
+pub const fn key_index_size(p: &crate::Profile, cap: u32) -> u32 {
+    let n = key_index_capacity(cap);
+    let floor = key_index_floor(p);
+    if n > floor {
+        n
+    } else {
+        floor
+    }
+}
 
 // ─── The cap ─────────────────────────────────────────────────────────────────
 
@@ -199,6 +219,16 @@ pub const fn max_sc_hsm_keys(b: &Board) -> u32 {
         cap -= 1;
     }
     cap
+}
+
+/// Most live objects `d` data sectors hold with the store's reserves (the
+/// largest `m` with `m + snapshot_reserve(m) + MAINTENANCE_RESERVE <= d`).
+pub const fn max_live_in(d: u32) -> u32 {
+    let mut m = d;
+    while m > 0 && m + snapshot_reserve(m) + MAINTENANCE_RESERVE > d {
+        m -= 1;
+    }
+    m
 }
 
 // SD boards hold every key ref; no board's snapshot outgrows its chain.
@@ -300,6 +330,29 @@ mod tests {
         assert_eq!(key_index_capacity(251), 768);
         for cap in 0..=SC_HSM_KEY_REFS {
             assert!(key_index_capacity(cap) >= cap * OBJECTS_PER_KEY + 4);
+        }
+    }
+    #[test]
+    fn the_index_never_shrinks_below_2_0() {
+        for b in &BOARDS {
+            let cap = max_sc_hsm_keys(b);
+            let want = if b.profile.name == "4m" { 400 } else { 768 };
+            assert_eq!(key_index_size(b.profile, cap), want, "{}", b.feature);
+            for c in 1..=cap {
+                assert!(key_index_size(b.profile, c) >= want);
+                assert!(key_index_size(b.profile, c) >= c * OBJECTS_PER_KEY + 4);
+            }
+        }
+    }
+    #[test]
+    fn the_cap_is_the_largest_that_fits() {
+        for b in &BOARDS {
+            let cap = max_sc_hsm_keys(b);
+            assert!(sectors_needed(cap) <= data_sectors(b));
+            assert!(max_live_objects(cap) <= max_live_in(data_sectors(b)));
+            if cap < SC_HSM_KEY_REFS {
+                assert!(sectors_needed(cap + 1) > data_sectors(b), "{}", b.feature);
+            }
         }
     }
 }
