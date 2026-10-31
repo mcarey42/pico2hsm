@@ -1,15 +1,17 @@
 //! Build script for pico2hsm-firmware.
 //!
-//! Selects the correct memory layout based on the active board feature flag
-//! and writes `memory.x` to `$OUT_DIR` for `cortex-m-rt` to include.
+//! Resolves the one active board feature through `pico2hsm-layout` (the
+//! build fails naming the active boards if there is none or several),
+//! passes it to the crate as `PICO2HSM_BOARD`, and, for ARM builds,
+//! renders the board's `memory.x` into `$OUT_DIR` for `cortex-m-rt`.
 //!
 //! ## How cortex-m-rt linker scripts work
 //!
 //! `cortex-m-rt` ships a `link.x` that defines all section layout. It
-//! includes `memory.x` via `INCLUDE memory.x` (line 23 of link.x). The user
-//! crate must provide `memory.x` somewhere in the linker search path.
-//! The idiomatic way is to write it to `$OUT_DIR` and add that to the search
-//! path with `cargo:rustc-link-search`.
+//! includes `memory.x` via `INCLUDE memory.x`. The user crate must provide
+//! `memory.x` somewhere in the linker search path: we write it to
+//! `$OUT_DIR` and add that to the search path with
+//! `cargo:rustc-link-search`.
 //!
 //! ARM-specific linker args are only emitted when building for ARM so that
 //! `cargo test --target x86_64` is unaffected.
@@ -19,50 +21,31 @@ use std::path::PathBuf;
 
 fn main() {
     image_version();
+    println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=../layout/src");
 
-    // Only emit ARM linker arguments when targeting bare-metal ARM.
+    // Board features arrive as CARGO_FEATURE_<NAME> (upper case, `-` → `_`).
+    let active: Vec<&str> = pico2hsm_layout::BOARDS
+        .iter()
+        .map(|b| b.feature)
+        .filter(|f| {
+            let var = format!("CARGO_FEATURE_{}", f.to_uppercase().replace('-', "_"));
+            std::env::var_os(var).is_some()
+        })
+        .collect();
+    let board = pico2hsm_layout::resolve_board(&active).unwrap_or_else(|e| panic!("{e}"));
+    println!("cargo:rustc-env=PICO2HSM_BOARD={}", board.feature);
+
+    // Only write memory.x and emit linker arguments for bare-metal ARM.
     let target = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
     if target != "arm" {
-        println!("cargo:rerun-if-changed=build.rs");
         return;
     }
 
-    // Select board linker script based on active feature flag.
-    // rp2350_one_16m turns on rp2350_one_4m: test it first.
-    let board = if cfg!(feature = "rp2350_one_16m") {
-        "rp2350_one_16m"
-    } else if cfg!(feature = "rp2350_one_4m") {
-        "rp2350_one_4m"
-    } else if cfg!(feature = "rp2350_geek_16m") {
-        "rp2350_geek_16m"
-    } else if cfg!(feature = "rp2350_geek_sdcard") {
-        "rp2350_geek_sdcard"
-    } else if cfg!(feature = "pico2_4m") {
-        "pico2_4m"
-    } else if cfg!(feature = "waveshare_rp2350_lcd_16m")
-        || cfg!(feature = "waveshare_rp2350_lcd_sdcard")
-    {
-        "waveshare_rp2350_lcd_16m"
-    } else {
-        // Fallback — should not happen with workspace defaults.
-        "rp2350_one_4m"
-    };
-
-    // Locate the boards/ directory (sibling of the firmware/ crate).
-    let manifest_dir =
-        std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR set by cargo");
-    let boards_dir = PathBuf::from(&manifest_dir)
-        .parent()
-        .expect("firmware/ has a parent")
-        .join("boards");
-
-    let src = boards_dir.join(format!("{board}.x"));
-
-    // Write the selected layout to $OUT_DIR/memory.x so cortex-m-rt can find
-    // it via `INCLUDE memory.x`.
     let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR set by cargo");
     let dst = PathBuf::from(&out_dir).join("memory.x");
-    fs::copy(&src, &dst).unwrap_or_else(|e| panic!("failed to copy {}: {e}", src.display()));
+    fs::write(&dst, pico2hsm_layout::render::memory_x(board.profile))
+        .unwrap_or_else(|e| panic!("failed to write {}: {e}", dst.display()));
 
     // Add $OUT_DIR to the linker search path so `memory.x` is found by link.x.
     println!("cargo:rustc-link-search={out_dir}");
@@ -76,9 +59,6 @@ fn main() {
     println!("cargo:rustc-link-arg=-Tdefmt.x");
     // --nmagic: disable page-aligned ELF segments (required for bare-metal flash).
     println!("cargo:rustc-link-arg=--nmagic");
-
-    println!("cargo:rerun-if-changed=build.rs");
-    println!("cargo:rerun-if-changed={}", boards_dir.display());
 }
 
 /// IMAGE_DEF version (the bootrom boots the higher of two A/B images):

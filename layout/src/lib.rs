@@ -273,6 +273,19 @@ pub fn board(feature: &str) -> Option<&'static Board> {
     BOARDS.iter().find(|b| b.feature == feature)
 }
 
+/// The board with this feature name, in const context: panics (a compile
+/// error in a const item) on an unknown name.
+pub const fn board_const(feature: &str) -> &'static Board {
+    let mut i = 0;
+    while i < BOARDS.len() {
+        if str_eq(BOARDS[i].feature, feature) {
+            return &BOARDS[i];
+        }
+        i += 1;
+    }
+    panic!("unknown board feature");
+}
+
 /// Why no single board could be chosen.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BoardError {
@@ -431,6 +444,19 @@ mod tests {
         let e = resolve_board(&["pico2_4m", "rp2350_geek_16m"]).unwrap_err();
         let s = e.to_string();
         assert!(s.contains("pico2_4m") && s.contains("rp2350_geek_16m"));
+    }
+    #[test]
+    fn board_const_finds_every_board() {
+        const B: &Board = board_const("rp2350_geek_sdcard");
+        assert_eq!((B.profile.name, B.media), ("16m", Media::Sd));
+        for bd in &BOARDS {
+            assert_eq!(board_const(bd.feature).feature, bd.feature);
+        }
+    }
+    #[test]
+    #[should_panic(expected = "unknown board feature")]
+    fn board_const_panics_on_unknown() {
+        board_const("pico2_4mm");
     }
     #[test]
     fn unknown_feature_is_ignored_by_lookup() {

@@ -48,6 +48,8 @@ applet-openpgp-curve25519 = ["applet-openpgp", "dep:ed25519-dalek", "dep:x25519-
 # All of these compile on both x86_64 (for tests) and thumbv8m.main-none-eabihf
 [dependencies]
 pico2hsm-core = { path = "../pico2hsm-core" }
+# The single definition of every board's flash map.
+pico2hsm-layout = { path = "../layout" }
 
 # Utilities (no_std compatible)
 heapless = { version = "0.9", features = ["zeroize"] }
@@ -150,8 +152,11 @@ hex = { version = "0.4" }
 png = { version = "0.17" }
 heapless = { version = "0.9" }
 rand_core = { version = "0.6" }
+# Partition-table generator for the committed-table test.
+pico2hsm-layout = { path = "../layout", features = ["std"] }
 
 [build-dependencies]
+pico2hsm-layout = { path = "../layout", features = ["std"] }
 
 [lints]
 workspace = true
