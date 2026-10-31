@@ -645,9 +645,14 @@ fn is_sc_hsm_user_key(key_id: u32) -> bool {
 
 // The object budget behind the SC-HSM key cap
 // (`pico2hsm_layout::geometry::NON_SC_HSM_OBJECTS`), term by term against
-// the constants of the code that stores the objects.
+// the constants of the code that stores the objects.  The budget counts the
+// PIV and OpenPGP objects in every build (objects an earlier all-applets
+// image stored stay on flash); the checks against an applet's constants run
+// in the builds that compile it.
 mod cap_budget {
-    use crate::protocol::{openpgp, piv, sc_hsm};
+    #[cfg(feature = "applet-openpgp")]
+    use crate::protocol::openpgp;
+    use crate::protocol::{piv, sc_hsm};
     use pico2hsm_layout::geometry as g;
 
     const _: () = assert!(g::PIV_KEY_SLOTS as usize >= piv::MAX_PIV_KEYS);
@@ -676,15 +681,18 @@ mod cap_budget {
     };
     const _: () = assert!(g::PIV_DATA_OBJECTS as usize >= piv::MAX_PIV_DATA_OBJECTS);
 
+    #[cfg(feature = "applet-openpgp")]
     const _: () = assert!(
         g::OPENPGP_KEY_SLOTS == 3
             && openpgp::SLOT_DEC == openpgp::SLOT_SIG + 1
             && openpgp::SLOT_AUTH == openpgp::SLOT_SIG + 2
     );
     // The persisted DOs and the legacy signature-counter record.
+    #[cfg(feature = "applet-openpgp")]
     const _: () = assert!(
         g::OPENPGP_DATA_OBJECTS as usize == openpgp::commands::put_data::PERSISTED_TAGS.len() + 1
     );
+    #[cfg(feature = "applet-openpgp")]
     const _: () = assert!(
         g::OPENPGP_PW_RECORDS == 2
             && openpgp::OPENPGP_PW1_KEY_ID.0 != openpgp::OPENPGP_PW3_KEY_ID.0
@@ -712,7 +720,8 @@ mod cap_budget {
 impl<F: StoreFlash, B: CounterFlash, L: RetryCounterBackend> KeyStore for FlashKeyStoreV2<F, B, L> {
     fn save_key(&mut self, obj: &KeyObject) -> Result<(), HsmError> {
         // A new SC-HSM object past the SC-HSM index's capacity would be
-        // stored yet unreachable (the index is in RAM, 340 entries): refuse
+        // stored yet unreachable (the index is in RAM, MAX_KEY_INDEX
+        // entries): refuse
         // it, as the 1.x directory did.  Updates always go through.
         if (obj.key_id >> 16) & 0xFF == 0
             && self

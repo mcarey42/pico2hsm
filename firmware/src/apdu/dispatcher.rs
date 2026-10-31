@@ -8,13 +8,14 @@
 //!
 //! # Protocol priority
 //! 1. SC-HSM (primary — always registered)
-//! 2. PIV (stub)
-//! 3. OpenPGP (stub)
+//! 2. PIV (`applet-piv`)
+//! 3. OpenPGP (`applet-openpgp`)
 //!
 //! # AID routing
 //! - SC-HSM AID `E8 2B 06 01 04 01 81 C3 1F 02 01` → ScHsm, returns FCI
-//! - PIV AID     `A0 00 00 03 08 00 00 10 00 01 00` → Piv stub
-//! - OpenPGP AID `D2 76 00 01 24 01 ...`            → OpenPgp stub
+//! - PIV AID     `A0 00 00 03 08 00 00 10 00 01 00` → Piv (6A82 without `applet-piv`)
+//! - OpenPGP AID `D2 76 00 01 24 01 ...`            → OpenPgp (6A82 without `applet-openpgp`;
+//!   the OpenPGP module is compiled out then)
 //! - Any other AID                                   → SW_FILE_NOT_FOUND
 
 use heapless::Vec;
@@ -35,8 +36,9 @@ pub const MAX_RESPONSE_DATA: usize = 4096 - 10 - 2;
 /// INS byte for GET RESPONSE (ISO 7816-4 §7.6.1).
 const INS_GET_RESPONSE: u8 = 0xC0;
 
+#[cfg(feature = "applet-openpgp")]
+use crate::protocol::openpgp::{OpenPgp, OPENPGP_AID_PREFIX};
 use crate::protocol::{
-    openpgp::{OpenPgp, OPENPGP_AID_PREFIX},
     piv::{Piv, PIV_AID},
     sc_hsm::{ScHsm, SC_HSM_AID},
 };
@@ -55,7 +57,8 @@ enum ActiveProtocol {
     ScHsm,
     /// PIV stub is the active protocol.
     Piv,
-    /// OpenPGP stub is the active protocol.
+    /// OpenPGP is the active protocol.
+    #[cfg(feature = "applet-openpgp")]
     OpenPgp,
 }
 
@@ -68,6 +71,7 @@ pub struct Dispatcher {
     active: ActiveProtocol,
     sc_hsm: ScHsm,
     piv: Piv,
+    #[cfg(feature = "applet-openpgp")]
     openpgp: OpenPgp,
     /// Shared GET RESPONSE chaining buffer — replaces per-protocol buffers.
     shared_buf: SharedResponseBuffer,
@@ -139,6 +143,7 @@ impl Dispatcher {
             active: ActiveProtocol::None,
             sc_hsm: ScHsm::new(),
             piv: Piv::new(),
+            #[cfg(feature = "applet-openpgp")]
             openpgp: OpenPgp::new(),
             shared_buf: SharedResponseBuffer::new(),
             display: DisplayBook::new(),
@@ -171,6 +176,7 @@ impl Dispatcher {
             core::ptr::addr_of_mut!((*ptr).active).write(ActiveProtocol::None);
             ScHsm::init_in_place(core::ptr::addr_of_mut!((*ptr).sc_hsm));
             Piv::init_in_place(core::ptr::addr_of_mut!((*ptr).piv));
+            #[cfg(feature = "applet-openpgp")]
             Self::init_openpgp_in_place(core::ptr::addr_of_mut!((*ptr).openpgp));
             // SharedResponseBuffer has a 4 KB inline [u8; 4096].
             // Write fields individually to keep it off the stack.
@@ -190,6 +196,7 @@ impl Dispatcher {
     /// Initialise `OpenPgp` in its own stack frame to avoid inflating
     /// `init_in_place`.  `OpenPgpState` is ~2 KB; `#[inline(never)]` keeps
     /// that temporary out of the caller's frame.
+    #[cfg(feature = "applet-openpgp")]
     #[inline(never)]
     fn init_openpgp_in_place(dest: *mut OpenPgp) {
         unsafe {
@@ -291,6 +298,7 @@ impl Dispatcher {
 
         #[cfg(feature = "applet-piv")]
         self.piv.load_from_store(store);
+        #[cfg(feature = "applet-openpgp")]
         self.openpgp.load_from_store(store);
         ScHsm::load_pin_state_from_store(&mut self.sc_hsm.state, store);
         ScHsm::load_dkek_from_store(&mut self.sc_hsm.state, store);
@@ -335,6 +343,7 @@ impl Dispatcher {
         ScHsm::legacy_retry_seeds(store, &mut seeds)?;
         #[cfg(feature = "applet-piv")]
         Piv::legacy_retry_seeds(store, &mut seeds)?;
+        #[cfg(feature = "applet-openpgp")]
         OpenPgp::legacy_retry_seeds(store, &mut seeds)?;
         store
             .retry_counters()
@@ -343,6 +352,7 @@ impl Dispatcher {
         ScHsm::clear_legacy_retry_counts(store)?;
         #[cfg(feature = "applet-piv")]
         Piv::clear_legacy_retry_counts(store)?;
+        #[cfg(feature = "applet-openpgp")]
         OpenPgp::clear_legacy_retry_counts(store)?;
         Ok(true)
     }
@@ -397,6 +407,7 @@ impl Dispatcher {
         let mut resp = match self.active {
             ActiveProtocol::ScHsm => self.sc_hsm.process_apdu_with_store(raw_apdu, store),
             ActiveProtocol::Piv => self.piv.process_apdu_with_store(raw_apdu, store),
+            #[cfg(feature = "applet-openpgp")]
             ActiveProtocol::OpenPgp => self.openpgp.process_apdu_with_store(raw_apdu, store),
             ActiveProtocol::None => {
                 return ApduResponse::err(SW_INS_NOT_SUPPORTED).serialize_into(out)
@@ -450,6 +461,7 @@ impl Dispatcher {
         let raw_resp: Vec<u8, 4098> = match self.active {
             ActiveProtocol::ScHsm => self.sc_hsm.process_apdu(raw_apdu),
             ActiveProtocol::Piv => self.piv.process_apdu(raw_apdu),
+            #[cfg(feature = "applet-openpgp")]
             ActiveProtocol::OpenPgp => self.openpgp.process_apdu(raw_apdu),
             ActiveProtocol::None => {
                 // No AID selected yet — return INS not supported
@@ -575,10 +587,13 @@ impl Dispatcher {
             piv.mgmt_key_authenticated = false;
             piv.mgmt_challenge = None;
         }
-        let pgp = &mut self.openpgp.state;
-        pgp.pw1_verified_sign = false;
-        pgp.pw1_verified_other = false;
-        pgp.pw3_verified = false;
+        #[cfg(feature = "applet-openpgp")]
+        {
+            let pgp = &mut self.openpgp.state;
+            pgp.pw1_verified_sign = false;
+            pgp.pw1_verified_other = false;
+            pgp.pw3_verified = false;
+        }
         self.display.tracker.reset();
         self.display.awaiting_get_response = false;
         // A comparison code never outlives its session.
@@ -610,22 +625,22 @@ impl Dispatcher {
             return build_sc_hsm_fci();
         }
 
-        // PIV AID
+        // PIV AID.  Without `applet-piv` there is no PIV applet: 6A82 like
+        // any other unknown AID.
+        #[cfg(feature = "applet-piv")]
         if aid == PIV_AID {
             self.active = ActiveProtocol::Piv;
             // Reset security state on each SELECT (per NIST SP 800-73-4).
-            // Gated on applet-piv: PivState fields don't exist without the feature.
-            #[cfg(feature = "applet-piv")]
-            {
-                self.piv.state.pin_verified = false;
-                self.piv.state.pin_always_ok = false;
-                self.piv.state.mgmt_key_authenticated = false;
-                self.piv.state.mgmt_challenge = None;
-            }
+            self.piv.state.pin_verified = false;
+            self.piv.state.pin_always_ok = false;
+            self.piv.state.mgmt_key_authenticated = false;
+            self.piv.state.mgmt_challenge = None;
             return build_piv_fci();
         }
 
-        // OpenPGP AID (prefix match)
+        // OpenPGP AID (prefix match).  Without `applet-openpgp` the applet is
+        // compiled out: 6A82 like any other unknown AID.
+        #[cfg(feature = "applet-openpgp")]
         if aid.len() >= OPENPGP_AID_PREFIX.len()
             && &aid[..OPENPGP_AID_PREFIX.len()] == OPENPGP_AID_PREFIX
         {
@@ -681,6 +696,7 @@ impl Dispatcher {
             ActiveProtocol::None => Applet::None,
             ActiveProtocol::ScHsm => Applet::Hsm,
             ActiveProtocol::Piv => Applet::Piv,
+            #[cfg(feature = "applet-openpgp")]
             ActiveProtocol::OpenPgp => Applet::Pgp,
         }
     }
@@ -746,6 +762,7 @@ impl Dispatcher {
                 }
                 _ => (algo::NONE, 0),
             },
+            #[cfg(feature = "applet-openpgp")]
             Applet::Pgp => {
                 let st = &self.openpgp.state;
                 let (slot, kt) = match op {
@@ -759,6 +776,9 @@ impl Dispatcher {
                     slot,
                 )
             }
+            // Never active without `applet-openpgp`.
+            #[cfg(not(feature = "applet-openpgp"))]
+            Applet::Pgp => (algo::NONE, 0),
             Applet::None => (algo::NONE, 0),
         }
     }
@@ -802,9 +822,12 @@ impl Dispatcher {
         if self.piv.state.pin_always_ok {
             one |= oneshot::PIV_9C_ARMED;
         }
-        let pgp = &self.openpgp.state;
-        if pgp.pw1_verified_sign && pgp.pw1_status == 0 {
-            one |= oneshot::PGP_SIG_SINGLE;
+        #[cfg(feature = "applet-openpgp")]
+        {
+            let pgp = &self.openpgp.state;
+            if pgp.pw1_verified_sign && pgp.pw1_status == 0 {
+                one |= oneshot::PGP_SIG_SINGLE;
+            }
         }
         one
     }
@@ -950,7 +973,6 @@ impl Dispatcher {
         use pico2hsm_core::op::Applet;
 
         let sc = &self.sc_hsm.state;
-        let pgp = &self.openpgp.state;
         let mut a = 0u8;
         let one = self.display_oneshot();
         let mut blk = 0u8;
@@ -984,18 +1006,32 @@ impl Dispatcher {
         };
         #[cfg(not(feature = "applet-piv"))]
         let (piv_left, piv_max, piv_keys) = (0u8, 0u8, 0usize);
-        if pgp.pw1_verified_sign {
-            a |= auth::PGP_PW1_81;
-        }
-        if pgp.pw1_verified_other {
-            a |= auth::PGP_PW1_82;
-        }
-        if pgp.pw3_verified {
-            a |= auth::PGP_PW3;
-        }
-        if pgp.pw1_retries == 0 {
-            blk |= blocked::PGP;
-        }
+        #[cfg(feature = "applet-openpgp")]
+        let (pgp_left, pgp_max, keys_pgp) = {
+            let pgp = &self.openpgp.state;
+            if pgp.pw1_verified_sign {
+                a |= auth::PGP_PW1_81;
+            }
+            if pgp.pw1_verified_other {
+                a |= auth::PGP_PW1_82;
+            }
+            if pgp.pw3_verified {
+                a |= auth::PGP_PW3;
+            }
+            if pgp.pw1_retries == 0 {
+                blk |= blocked::PGP;
+            }
+            (
+                pgp.pw1_retries,
+                crate::protocol::openpgp::PW1_MAX_RETRIES.max(pgp.pw1_retries),
+                [pgp.sig_key_type, pgp.dec_key_type, pgp.auth_key_type]
+                    .iter()
+                    .filter(|k| k.is_some())
+                    .count(),
+            )
+        };
+        #[cfg(not(feature = "applet-openpgp"))]
+        let (pgp_left, pgp_max, keys_pgp) = (0u8, 0u8, 0usize);
 
         let applet = self.display_applet();
         let (left, max) = match applet {
@@ -1004,10 +1040,7 @@ impl Dispatcher {
                 self.display.hsm_pin_max.max(sc.pin_retry_count),
             ),
             Applet::Piv => (piv_left, piv_max.max(piv_left)),
-            Applet::Pgp => (
-                pgp.pw1_retries,
-                crate::protocol::openpgp::PW1_MAX_RETRIES.max(pgp.pw1_retries),
-            ),
+            Applet::Pgp => (pgp_left, pgp_max),
             Applet::None => (0, 0),
         };
 
@@ -1020,10 +1053,6 @@ impl Dispatcher {
                     && (m.key_id >> 8) & 0xFF == 0
                     && !matches!(m.key_id as u8, 0xFC..=0xFF)
             })
-            .count();
-        let keys_pgp = [pgp.sig_key_type, pgp.dec_key_type, pgp.auth_key_type]
-            .iter()
-            .filter(|k| k.is_some())
             .count();
 
         Snapshot {
@@ -1249,6 +1278,7 @@ fn build_piv_fci() -> ApduResponse {
 ///   A5 xx
 ///     9F6E 04 03 04 00 00   — version 3.4
 /// ```
+#[cfg(feature = "applet-openpgp")]
 fn build_openpgp_fci(openpgp: &mut OpenPgp) -> ApduResponse {
     use crate::protocol::openpgp::openpgp_aid;
 
@@ -1375,8 +1405,11 @@ mod tests {
             d.piv.state.pin_verified = true;
             d.piv.state.mgmt_key_authenticated = true;
         }
-        d.openpgp.state.pw1_verified_sign = true;
-        d.openpgp.state.pw3_verified = true;
+        #[cfg(feature = "applet-openpgp")]
+        {
+            d.openpgp.state.pw1_verified_sign = true;
+            d.openpgp.state.pw3_verified = true;
+        }
         d.sc_hsm.state.exchanged_peer = Some([4; 65]);
 
         d.clear_session();
@@ -1387,6 +1420,7 @@ mod tests {
         assert!(d.sc_hsm.state.session_pin.is_none());
         #[cfg(feature = "applet-piv")]
         assert!(!d.piv.state.pin_verified && !d.piv.state.mgmt_key_authenticated);
+        #[cfg(feature = "applet-openpgp")]
         assert!(!d.openpgp.state.pw1_verified_sign && !d.openpgp.state.pw3_verified);
     }
 
@@ -1447,7 +1481,10 @@ mod tests {
         assert_eq!(run(d, &mut store, &verify), 0x9000);
         d.piv.state.mgmt_key_authenticated = true;
         d.sc_hsm.state.so_pin_verified = true;
-        d.openpgp.state.pw3_verified = true;
+        #[cfg(feature = "applet-openpgp")]
+        {
+            d.openpgp.state.pw3_verified = true;
+        }
         assert_ne!(d.display_snapshot().session.auth, 0);
         d.clear_session();
         d.note_session(8);
@@ -1566,5 +1603,59 @@ mod tests {
         assert_eq!(resp.sw, SW_OK);
         assert!(d.sc_hsm.state.exchanged_peer.is_none());
         assert!(!d.sc_hsm.state.so_pin_verified);
+    }
+
+    /// A full OpenPGP AID (version 3.4, manufacturer FFFE, serial 1).
+    const OPENPGP_AID_FULL: [u8; 16] = [
+        0xD2, 0x76, 0x00, 0x01, 0x24, 0x01, 0x03, 0x04, 0xFF, 0xFE, 0x00, 0x00, 0x00, 0x01, 0x00,
+        0x00,
+    ];
+
+    /// SELECT of an applet answers 9000 only when its feature is built in;
+    /// otherwise 6A82 (application not found) and no protocol becomes
+    /// active.
+    #[test]
+    fn select_answers_only_for_built_in_applets() {
+        let mut slot = core::mem::MaybeUninit::<Dispatcher>::uninit();
+        let d = Dispatcher::init_in_place(&mut slot);
+        let piv = d.select_aid(PIV_AID).sw;
+        let piv_active = d.active;
+        d.active = ActiveProtocol::None;
+        let pgp = d.select_aid(&OPENPGP_AID_FULL).sw;
+        let pgp_active = d.active;
+        // The 6-byte prefix alone (what GnuPG sends) too.
+        d.active = ActiveProtocol::None;
+        let pgp_prefix = d.select_aid(&OPENPGP_AID_FULL[..6]).sw;
+
+        #[cfg(feature = "applet-piv")]
+        assert_eq!((piv, piv_active), (SW_OK, ActiveProtocol::Piv));
+        #[cfg(not(feature = "applet-piv"))]
+        assert_eq!((piv, piv_active), (SW_FILE_NOT_FOUND, ActiveProtocol::None));
+
+        #[cfg(feature = "applet-openpgp")]
+        {
+            assert_eq!((pgp, pgp_active), (SW_OK, ActiveProtocol::OpenPgp));
+            assert_eq!(pgp_prefix, SW_OK);
+        }
+        #[cfg(not(feature = "applet-openpgp"))]
+        {
+            assert_eq!((pgp, pgp_active), (SW_FILE_NOT_FOUND, ActiveProtocol::None));
+            assert_eq!(pgp_prefix, SW_FILE_NOT_FOUND);
+        }
+    }
+
+    /// Without the applets, a failed SELECT leaves the previous selection
+    /// (SC-HSM) active, as for any unknown AID.
+    #[cfg(not(all(feature = "applet-piv", feature = "applet-openpgp")))]
+    #[test]
+    fn select_of_a_missing_applet_keeps_the_current_one() {
+        let mut slot = core::mem::MaybeUninit::<Dispatcher>::uninit();
+        let d = Dispatcher::init_in_place(&mut slot);
+        assert_eq!(d.select_aid(SC_HSM_AID).sw, SW_OK);
+        #[cfg(not(feature = "applet-piv"))]
+        assert_eq!(d.select_aid(PIV_AID).sw, SW_FILE_NOT_FOUND);
+        #[cfg(not(feature = "applet-openpgp"))]
+        assert_eq!(d.select_aid(&OPENPGP_AID_FULL).sw, SW_FILE_NOT_FOUND);
+        assert_eq!(d.active, ActiveProtocol::ScHsm);
     }
 }

@@ -167,8 +167,39 @@ fn test_select_piv_aid() {
     let sel = apdu(0x00, INS_SELECT, 0x04, 0x00, PIV_AID);
     let r = d.dispatch(&sel);
 
-    // PIV stub returns 9000 with empty data
+    #[cfg(feature = "applet-piv")]
     assert_eq!(sw(&r), 0x9000, "PIV AID SELECT must return 9000");
+    // No PIV applet in this build: not found, like any unknown AID.
+    #[cfg(not(feature = "applet-piv"))]
+    assert_eq!(
+        sw(&r),
+        0x6A82,
+        "PIV AID SELECT without applet-piv must return 6A82"
+    );
+}
+
+#[test]
+fn test_select_openpgp_aid() {
+    let mut d = Dispatcher::new();
+    // The 6-byte RID + application prefix, as GnuPG sends it.
+    let sel = apdu(
+        0x00,
+        INS_SELECT,
+        0x04,
+        0x00,
+        &[0xD2, 0x76, 0x00, 0x01, 0x24, 0x01],
+    );
+    let r = d.dispatch(&sel);
+
+    #[cfg(feature = "applet-openpgp")]
+    assert_eq!(sw(&r), 0x9000, "OpenPGP AID SELECT must return 9000");
+    // The OpenPGP applet is compiled out: not found.
+    #[cfg(not(feature = "applet-openpgp"))]
+    assert_eq!(
+        sw(&r),
+        0x6A82,
+        "OpenPGP AID SELECT without applet-openpgp must return 6A82"
+    );
 }
 
 #[test]
