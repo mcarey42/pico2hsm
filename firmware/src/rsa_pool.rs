@@ -872,8 +872,8 @@ impl Budget for Heartbeat {
     }
 }
 
-/// The global engine (core1 only; the flag catches re-entry, and lets
-/// parallel host tests take turns).
+/// The global engine (core1 only; the flag catches re-entry).
+#[cfg(not(test))]
 pub struct EngineCell {
     busy: AtomicBool,
     engine: UnsafeCell<Engine>,
@@ -881,17 +881,19 @@ pub struct EngineCell {
 
 // SAFETY: access only through `with_engine`, which hands out the `&mut`
 // to one caller at a time (the `busy` flag).
+#[cfg(not(test))]
 unsafe impl Sync for EngineCell {}
 
 /// The pool engine.
+#[cfg(not(test))]
 pub static ENGINE: EngineCell = EngineCell {
     busy: AtomicBool::new(false),
     engine: UnsafeCell::new(Engine::new()),
 };
 
 /// Run `f` with exclusive access to the engine.  On the device only core1
-/// uses it, one call at a time, so this never waits; host tests running in
-/// parallel take turns.
+/// uses it, one call at a time, so this never waits.
+#[cfg(not(test))]
 pub fn with_engine<R>(f: impl FnOnce(&mut Engine) -> R) -> R {
     while ENGINE
         .busy
@@ -904,6 +906,24 @@ pub fn with_engine<R>(f: impl FnOnce(&mut Engine) -> R) -> R {
     let r = f(unsafe { &mut *ENGINE.engine.get() });
     ENGINE.busy.store(false, Ordering::Release);
     r
+}
+
+#[cfg(test)]
+extern crate std;
+
+// Host tests: one engine per test thread.  A single shared engine let any
+// test that reaches it through a handler (INITIALIZE wipes the pool,
+// GENERATE KEY PAIR issues from it) change the state another test was
+// asserting on (#37).
+#[cfg(test)]
+std::thread_local! {
+    static ENGINE: core::cell::RefCell<Engine> = const { core::cell::RefCell::new(Engine::new()) };
+}
+
+/// Run `f` with exclusive access to this test thread's engine.
+#[cfg(test)]
+pub fn with_engine<R>(f: impl FnOnce(&mut Engine) -> R) -> R {
+    ENGINE.with(|e| f(&mut e.borrow_mut()))
 }
 
 /// Minutes of uptime (0 on the host).
@@ -1142,13 +1162,28 @@ mod tests {
         assert_eq!(key.e(), &rsa::BigUint::from(65_537u32));
     }
 
-    /// Tests that drive GENERATE through the handler share the global
-    /// engine: one at a time.
-    static GLOBAL_ENGINE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// Another test thread using the engine (here: a reboot, as FORMAT
+    /// STORE does) leaves this thread's engine alone (#37).
+    #[test]
+    fn host_test_threads_do_not_share_the_engine() {
+        let mut s = Store::new();
+        let mut rng = TestRng(23);
+        with_engine(|e| {
+            e.reboot();
+            e.set_rng_ok(true);
+            e.set_config(&mut s, small_cfg(), 0).unwrap();
+            settle(e, &mut s, &mut rng, 0, 5000);
+            issue(e, &mut s, CoreKeyType::RsaPrivate2048, &mut rng, 0).unwrap();
+        });
+        assert_eq!(with_engine(|e| e.status(&mut s, 0).issued), 1);
+        std::thread::spawn(|| with_engine(|e| e.reboot()))
+            .join()
+            .unwrap();
+        assert_eq!(with_engine(|e| e.status(&mut s, 0).issued), 1);
+    }
 
     #[test]
     fn generate_response_decodes_like_opensc_pooled_and_live() {
-        let _g = GLOBAL_ENGINE.lock().unwrap_or_else(|e| e.into_inner());
         let mut s = Store::new();
         let mut rng = TestRng(22);
         with_engine(|e| {
@@ -1170,7 +1205,6 @@ mod tests {
     /// the newest pooled key, marks it taken, and stores it as a fresh key.
     #[test]
     fn sc_hsm_generate_issues_the_newest_pooled_key() {
-        let _g = GLOBAL_ENGINE.lock().unwrap_or_else(|e| e.into_inner());
         use crate::protocol::sc_hsm::ScHsm;
         let mut s = Store::new();
         let mut rng = TestRng(21);

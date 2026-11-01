@@ -831,7 +831,9 @@ impl ScHsm {
     /// Whether `cmd` names a reserved key slot (`RESERVED_KEY_REF_MIN..`)
     /// through a user-facing key command.  Those slots hold the peer record,
     /// the DKEK, the device identity key and the PIN record; they are only
-    /// ever touched by the firmware's own code paths.
+    /// ever touched by the firmware's own code paths.  GENERATE KEY PAIR
+    /// also refuses 0x00, the device key's reference (#36); GENERATE KEY
+    /// and IMPORT KEY refuse it in their handlers.
     fn targets_reserved_slot(cmd: &ApduCommand<'_>) -> bool {
         let reserved = |r: u8| r >= RESERVED_KEY_REF_MIN;
         match cmd.ins {
@@ -843,7 +845,9 @@ impl ScHsm {
             | import_key::INS_IMPORT_KEY
             | generate_key::INS_GENERATE_KEY => reserved(cmd.p1),
             // P1=0xFF asks the card to pick a free slot.
-            generate_keypair::INS_GENERATE_KEYPAIR => cmd.p1 != 0xFF && reserved(cmd.p1),
+            generate_keypair::INS_GENERATE_KEYPAIR => {
+                cmd.p1 == 0x00 || (cmd.p1 != 0xFF && reserved(cmd.p1))
+            }
             _ => false,
         }
     }

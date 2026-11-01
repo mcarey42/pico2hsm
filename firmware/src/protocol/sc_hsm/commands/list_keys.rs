@@ -28,6 +28,15 @@ pub fn handle(state: &mut ScHsmState, cmd: &ApduCommand<'_>) -> ApduResponse {
     // sc_pkcs15emu_sc_hsm_init also scans for 0xCC to call add_prkd per key.
     let mut resp: heapless::Vec<u8, 256> = heapless::Vec::new();
 
+    // Key reference 0 belongs to the device authentication key on a
+    // SmartCard-HSM, and OpenSC's sc_hsm_determine_free_id() starts its
+    // search at 0: always report CC 00 so user keys start at 1.  (It used
+    // to come from a RAM-only key_index entry that INITIALIZE added and a
+    // reboot lost, after which OpenSC generated a key at 0 that PKCS#11
+    // could not see: #36.)
+    let _ = resp.push(0xCC);
+    let _ = resp.push(0x00);
+
     // Iterate key_index: emit CC xx for non-EfFile entries (crypto keys).
     for meta in &state.key_index {
         // Skip EfFile entries (key_type == 16).
@@ -37,14 +46,10 @@ pub fn handle(state: &mut ScHsmState, cmd: &ApduCommand<'_>) -> ApduResponse {
         let proto_ref = (meta.key_id & 0xFF) as u8;
         // Skip internal reserved slots: device identity key (0xFE) and other
         // internal keys above 0xF0. These must not appear in the user-facing
-        // key enumeration or OpenSC will try to load PRKD for them.
-        //
-        // Slot 0 (device auth sentinel) IS included: OpenSC's
-        // sc_hsm_determine_free_id() scans LIST KEYS to find the first free
-        // key reference. If slot 0 is hidden, OpenSC assigns keygen P1=0x00,
-        // which overwrites the sentinel and then gets filtered — making the
-        // generated key invisible.
-        if proto_ref >= 0xF0 {
+        // key enumeration or OpenSC will try to load PRKD for them.  Slot 0
+        // is listed above (a key stored there by older firmware stays
+        // reachable by reference).
+        if proto_ref == 0 || proto_ref >= 0xF0 {
             continue;
         }
         let _ = resp.push(0xCC);
@@ -54,10 +59,9 @@ pub fn handle(state: &mut ScHsmState, cmd: &ApduCommand<'_>) -> ApduResponse {
     // Emit C4 xx (PRKD) for every user key — read_binary generates these
     // dynamically, so they always exist for any key in the keystore.
     // OpenSC's sc_pkcs15emu_sc_hsm_add_prkd needs them in the file list.
-    // Not for slot 0: the sentinel is listed (CC 00, above) only so the
-    // free-slot search skips it; with a PRKD, PKCS#11 showed it as a key
-    // with ID 00 that cannot be used.  A SmartCard-HSM's device key has no
-    // PRKD either.
+    // Not for slot 0: CC 00 is listed (above) only so the free-slot search
+    // skips it; with a PRKD, PKCS#11 showed it as a key with ID 00 that
+    // cannot be used.  A SmartCard-HSM's device key has no PRKD either.
     for meta in &state.key_index {
         if meta.key_type == 16 {
             continue;
