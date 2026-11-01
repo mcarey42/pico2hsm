@@ -915,3 +915,28 @@ fn duplicate_and_outranked_imports_cost_no_flash_write() {
     assert_eq!(a.x(0x49, &forged).0, SW_WRONG_DATA);
     assert_eq!(a.store.saves, saves_after_rev);
 }
+
+/// Key reference 0 is the device key's (#36).  A booted device (key index
+/// loaded from flash, no INITIALIZE this session) lists CC 00 without a
+/// PRKD, so OpenSC's free-ID search starts user keys at 1; GENERATE KEY
+/// PAIR refuses P1 = 00, and auto-assign (P1 = FF) picks 1.
+#[test]
+fn key_ref_zero_is_the_device_key() {
+    let (mut hsm, mut store) = (logged_in(), BlobStore::new());
+    let list = |hsm: &mut ScHsm, store: &mut BlobStore| {
+        let (sw, r) = run(hsm, store, &[0x80, 0x58, 0x00, 0x00, 0x00]);
+        assert_eq!(sw, SW_OK);
+        r.chunks(2)
+            .map(|c| [c[0], c[1]])
+            .collect::<std::vec::Vec<_>>()
+    };
+    assert_eq!(list(&mut hsm, &mut store), [[0xCC, 0x00]]);
+
+    assert_eq!(gen_p256(&mut hsm, &mut store, 0x00), SW_INCORRECT_P1P2);
+    assert!(hsm.state.key_index.is_empty());
+
+    assert_eq!(gen_p256(&mut hsm, &mut store, 0xFF), SW_OK);
+    let files = list(&mut hsm, &mut store);
+    assert_eq!(files, [[0xCC, 0x00], [0xCC, 0x01], [0xC4, 0x01]]);
+    assert!(!files.contains(&[0xC4, 0x00]));
+}

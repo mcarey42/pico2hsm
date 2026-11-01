@@ -262,17 +262,6 @@ pub fn handle(
     state.ef_cache.clear();
     state.op_buf.invalidate();
 
-    // Slot 0 is reserved for the device authentication key on SC-HSM.
-    // Pre-populate a sentinel entry so sc_hsm_determine_free_id skips it
-    // and assigns user keys starting at slot 1.
-    let dev_key_meta = crate::protocol::sc_hsm::KeyMeta {
-        key_id: pico2hsm_core::key::KeyId::sc_hsm(0, 0).0,
-        key_type: pico2hsm_core::key::KeyType::EcPrivateP256 as u8,
-        algo: 0x13,
-        key_flags: 0,
-    };
-    let _ = state.key_index.push(dev_key_meta);
-
     // Reset DKEK state: init share collection for the requested count.
     state.dkek.init_shares(dkek_count);
 

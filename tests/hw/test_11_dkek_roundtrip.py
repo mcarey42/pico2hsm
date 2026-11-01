@@ -154,10 +154,9 @@ def _get_first_key_slot(reader: int = 0) -> int | None:
                     output, result.stderr.decode(errors="replace"))
         return None
     resp = blocks[-1]
-    # Walk pairs looking for 0xCC (key blob), skip slot 0 (device sentinel)
-    # and reserved slots (>= 0xF0).  Slot 0 is pre-populated by INITIALIZE as
-    # a sentinel to prevent sc_hsm_determine_free_id from assigning it;
-    # it has no actual key material and cannot be wrapped.
+    # Walk pairs looking for 0xCC (key blob), skip slot 0 (the device key's
+    # reference, always listed so sc_hsm_determine_free_id never assigns
+    # it; no key material, cannot be wrapped) and reserved slots (>= 0xF0).
     i = 0
     while i + 1 < len(resp):
         hi, lo = resp[i], resp[i + 1]
