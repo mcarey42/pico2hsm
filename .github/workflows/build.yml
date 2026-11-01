@@ -1,6 +1,11 @@
 name: Build All Targets
 on: [push, pull_request]
 
+# Read-only token by default; build-artifacts asks for contents: write
+# (it attaches the UF2s to a release on version tags).
+permissions:
+  contents: read
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -24,14 +29,15 @@ jobs:
           - waveshare_rp2350_lcd_sdcard
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable, 2026-10-16
         with:
+          toolchain: stable
           targets: thumbv8m.main-none-eabihf
 
       - name: Cache cargo registry
-        uses: actions/cache@v4
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
@@ -152,9 +158,10 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable, 2026-10-16
         with:
+          toolchain: stable
           targets: thumbv8m.main-none-eabihf
           components: clippy, rustfmt
 
@@ -181,14 +188,14 @@ jobs:
   audit:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # Cache the cargo-audit binary — without caching, every CI run reinstalls
       # it from source (~90 s). Cache key is pinned to the version below so a
       # version bump invalidates the cache automatically.
       - name: Cache cargo-audit install
         id: cache-cargo-audit
-        uses: actions/cache@v4
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cargo/bin/cargo-audit
           key: ${{ runner.os }}-cargo-audit-0.21.1
@@ -231,10 +238,10 @@ jobs:
   python-tests:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
 
@@ -264,6 +271,8 @@ jobs:
   build-artifacts:
     name: Build unsigned UF2 artifacts
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     needs: [build]
     strategy:
       fail-fast: false
@@ -278,14 +287,15 @@ jobs:
           - waveshare_rp2350_lcd_sdcard
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable, 2026-10-16
         with:
+          toolchain: stable
           targets: thumbv8m.main-none-eabihf
 
       - name: Cache cargo registry
-        uses: actions/cache@v4
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
@@ -303,7 +313,7 @@ jobs:
       # pinned version so subsequent runs skip the ~2 min build entirely.
       - name: Cache picotool binary
         id: cache-picotool
-        uses: actions/cache@v4
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: /usr/local/bin/picotool
           key: ${{ runner.os }}-picotool-2.2.0
@@ -355,7 +365,7 @@ jobs:
           ls -l pico2hsm-${{ matrix.board }}-pt-*.uf2
 
       - name: Upload UF2 artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: pico2hsm-${{ matrix.board }}-unsigned
           path: |
@@ -367,7 +377,7 @@ jobs:
       # Upload as release asset when a version tag is pushed
       - name: Upload to GitHub Release
         if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           files: |
             pico2hsm-${{ matrix.board }}-unsigned.uf2
