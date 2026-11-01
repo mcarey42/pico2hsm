@@ -1497,19 +1497,26 @@ recommend an update.
 **Response** (`9000`):
 
 ```text
-6F 15
+6F 1B
   80 01 [production mode: 0|1]
   81 01 [JTAG bookkeeping bit, boot flags row bit 0: 0|1]
   82 01 [OTP key page read-locked this boot: 0|1]
   83 01 [secure boot enabled: 0|1]
   84 01 [glitch detector armed by the firmware: 0|1]
   85 04 [image version: major u16, minor u16, big-endian]
+  86 04 [SC-HSM objects not loaded at boot: u32, big-endian]
 ```
 
 Tag `85` is the IMAGE_DEF version the bootrom compares between A/B slots:
 `minor = minor * 256 + patch`, so `00 01 00 01` is 1.0.1 and `00 02 00 00`
 is 2.0.0.  Older firmware omits it (inner length `0F`): parse the TLVs and
 treat a missing `85` as "older than the first version that reports it".
+
+Tag `86` counts SC-HSM objects on flash that boot could not load because
+the key index was full (a store written by firmware with a larger index).
+Non-zero means keys exist that this firmware cannot reach; they stay on
+flash, and boot also logs the count (CDC and RTT).  INITIALIZE, which wipes
+them, resets it to 0.  Firmware up to 2.1.0 omits the tag.
 
 ---
 

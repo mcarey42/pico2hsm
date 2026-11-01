@@ -259,6 +259,8 @@ pub fn handle(
     state.initialized = true;
     state.creds_locked = false;
     state.key_index.clear();
+    // INITIALIZE wiped the SC-HSM objects boot could not index too.
+    state.skipped_at_boot = 0;
     state.ef_cache.clear();
     state.op_buf.invalidate();
 

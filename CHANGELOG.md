@@ -6,6 +6,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Objects past the key index (#38).** Boot dropped SC-HSM objects
+  beyond the key index without a word. It now counts them, logs the count
+  (CDC and RTT), and reports it in GET PROVISIONING STATUS (new tag `86`,
+  shown by `tools/provision-device.py status`). The objects stay on flash.
+  Ordinary use cannot get there (new saves past the index are refused);
+  a store written by firmware with a larger index can.
+
 ## [2.1.0] - 2026-10-31
 
 One definition for every board's flash map (issue #24, step 1), a key cap
