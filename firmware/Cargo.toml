@@ -91,7 +91,7 @@ k256 = { version = "0.13", default-features = false, features = ["ecdsa", "ecdh"
 ecdsa = { version = "0.16", default-features = false, features = ["hazmat", "der"] }
 # RFC 6979 HMAC-DRBG for P-521 nonces (already a transitive dependency).
 rfc6979 = { version = "0.4", default-features = false }
-elliptic-curve = { version = "0.13", default-features = false, features = ["arithmetic", "sec1", "ecdh"] }
+elliptic-curve = { version = "0.14", default-features = false, features = ["arithmetic", "sec1", "ecdh"] }
 rand_core = { version = "0.6", default-features = false }
 
 # Curve25519 — feature-gated (applet-openpgp-curve25519)
