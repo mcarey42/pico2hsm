@@ -365,12 +365,13 @@ Returns a list of occupied key container slots. No authentication required (Open
 Sequence of 2-byte pairs. Each pair is `<prefix> <key_id>`:
 
 ```
+CC 00          -- always first: key reference 0 is the device key's
 CC <key_id>    -- occupied key container (EC or RSA key at slot key_id)
-C4 <key_id>    -- PRKD EF present (from ef_files)
+C4 <key_id>    -- PRKD EF present (from ef_files); never for slot 0
 CE <key_id>    -- EE certificate EF present (from ef_files)
 ```
 
-OpenSC's `sc_hsm_determine_free_id` uses the `0xCC` prefix to find the next free key slot ID.
+OpenSC's `sc_hsm_determine_free_id` uses the `0xCC` prefix to find the next free key slot ID, starting at 0; the fixed `CC 00` makes user keys start at 1. (Up to 2.1.0 `CC 00` came from a RAM entry that INITIALIZE added and a reboot dropped, so after a reboot OpenSC put the first new key at 0, where PKCS#11 could not see it.)
 
 **Status words:**
 
@@ -567,7 +568,6 @@ Formats the HSM: wipes SC-HSM-owned keys from flash, clears in-memory state, set
 **Effects:**
 - Clears all in-memory keys (EC, RSA, symmetric, EF files)
 - Wipes SC-HSM-owned keys and domain records from flash, and sets the new SO-PIN with them
-- Pre-populates a sentinel entry at key slot 0 (reserved for device auth key)
 - Resets all auth state, MSE state, and challenge
 
 **Status words:**
@@ -705,7 +705,7 @@ Generates an asymmetric key pair (EC or RSA) on-device. Requires User PIN. Retur
 |---|---|
 | CLA | `0x00` |
 | INS | `0x46` |
-| P1 | Key slot ID (`0x01–0xFE`, or `0x00` for auto-assign) |
+| P1 | Key slot ID (`0x01–0xFB`), or `0xFF` for auto-assign (first free from `0x01`). `0x00` and `0xFC–0xFE` are refused with `6A86` |
 | P2 | `0x00` |
 | Data | GAK parameters TLV (extended APDU) |
 
@@ -1773,7 +1773,7 @@ SC-HSM key slot ID conventions and corresponding internal types.
 
 | Key slot ID range | Owner | Type examples | Notes |
 |---|---|---|---|
-| `0x00` | SC-HSM (reserved) | EC P-256 | Sentinel entry for device auth key; slot is pre-occupied after INITIALIZE |
+| `0x00` | SC-HSM (reserved) | — | Device key reference: LIST KEYS always reports `CC 00`; GENERATE KEY PAIR, GENERATE KEY and IMPORT KEY refuse it |
 | `0x01–0x7F` | SC-HSM | EC P-256/384/521/K-256; RSA-2048/4096; AES-128/192/256 | User-assigned key range |
 | `0x80–0x8F` | PIV applet (reserved) | (varies) | See storage namespace design |
 | `0x90–0x92` | OpenPGP applet (reserved) | (varies) | SIG=0x90, DEC=0x91, AUTH=0x92 |

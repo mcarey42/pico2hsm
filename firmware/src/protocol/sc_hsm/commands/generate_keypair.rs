@@ -4,7 +4,7 @@
 //! in the volatile keystore; the public key is returned in the response.
 //!
 //! # Command format (OpenSC PKCS#15-SC-HSM path)
-//! - CLA=0x00, INS=0x46, P1=key_id (or 0 for auto-assign), P2=0x00
+//! - CLA=0x00, INS=0x46, P1=key_id 0x01..0xFB (or 0xFF for auto-assign), P2=0x00
 //! - Data: GAK parameters (extended APDU):
 //!   - Tag 5F29 (two-byte): algorithm byte (SC-HSM AlgorithmId; 0x00 = infer from params)
 //!   - Tag 42: key reference/label (optional)
@@ -512,14 +512,15 @@ pub fn handle(
     }
 
     // key_id: P1=0xFF means auto-assign (first free slot below the reserved range).
-    // P1=0x00..0xFE is used directly as the key reference — OpenSC's
+    // P1=0x01..0xFB is used directly as the key reference — OpenSC's
     // sc_hsm_determine_free_id() pre-computes the free slot and passes it
-    // as P1, including P1=0x00 for the very first key.
+    // as P1.  0x00 is the device key's reference (LIST KEYS reports it, so
+    // OpenSC never picks it) and is refused before this handler.
     let key_id_proto: u8 = if cmd.p1 != 0xFF {
         cmd.p1
     } else {
         let limit = crate::protocol::sc_hsm::RESERVED_KEY_REF_MIN;
-        let mut id = 0u8;
+        let mut id = 1u8;
         while id < limit
             && state
                 .key_index

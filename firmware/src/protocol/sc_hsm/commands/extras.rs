@@ -659,7 +659,7 @@ fn handle_get_key_manifest(
         MANIFEST_V1_ENTRY
     };
     let mut resp = ApduResponse::ok(&[]);
-    // User keys only: 0x00 is the device sentinel, 0xFC.. are records.
+    // User keys only: 0x00 is the device key's reference, 0xFC.. are records.
     let first = cmd.p2.max(0x01);
     for key_ref in first..crate::protocol::sc_hsm::RESERVED_KEY_REF_MIN {
         let kid = KeyId::sc_hsm(0, key_ref);

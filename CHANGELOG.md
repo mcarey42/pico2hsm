@@ -6,6 +6,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Key reference 0 (#36).** After a reboot, the first key OpenSC
+  generated landed at reference 0x00, where PKCS#11 could not see it and
+  domain sync skipped it. LIST KEYS now always reports `CC 00`, the
+  device key's reference, so OpenSC starts at 0x01. GENERATE KEY PAIR
+  refuses P1 = 0x00 with `6A86` (GENERATE KEY and IMPORT KEY already
+  refused it), and auto-assign (P1 = 0xFF) starts at 0x01. A key that
+  older firmware stored at 0x00 stays on flash and usable by reference,
+  but stays hidden from PKCS#11: generate a replacement and delete it.
+
 ## [2.1.0] - 2026-10-31
 
 One definition for every board's flash map (issue #24, step 1), a key cap
