@@ -6,6 +6,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.1.1] - 2026-11-01
+
+Bug fixes for issues #36, #37 and #38. No flash layout, partition table or
+keystore format change: a 2.1.0 device keeps its keys across the update.
+
 ### Fixed
 
 - **Key reference 0 (#36).** After a reboot, the first key OpenSC
@@ -22,6 +27,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   shown by `tools/provision-device.py status`). The objects stay on flash.
   Ordinary use cannot get there (new saves past the index are refused);
   a store written by firmware with a larger index can.
+- **Flaky RSA pool host test (#37).** Host test threads shared the global
+  pool engine; each now has its own. Device code is unchanged.
 
 ## [2.1.0] - 2026-10-31
 
