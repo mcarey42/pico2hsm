@@ -235,6 +235,8 @@ class Card:
             elif t == 0x85 and ln == 4:   # image version: major, minor * 256 + patch
                 minor = int.from_bytes(data[i + 4:i + 6], "big")
                 res["image"] = f"{int.from_bytes(data[i + 2:i + 4], 'big')}.{minor >> 8}.{minor & 0xFF}"
+            elif t == 0x86 and ln == 4:   # SC-HSM objects boot could not load (key index full)
+                res["not_loaded"] = int.from_bytes(data[i + 2:i + 6], "big")
             i += 2 + ln
         return res
 
@@ -344,7 +346,11 @@ class Device:
         self.boot()
         if self.card.present():
             try:
-                say(f"  firmware       {self.card.prov_status()}; store state {self.card.store_state()}")
+                st = self.card.prov_status()
+                say(f"  firmware       {st}; store state {self.card.store_state()}")
+                if st.get("not_loaded"):
+                    say(f"  WARNING        {st['not_loaded']} keystore objects past the key index were "
+                        "not loaded (still on flash; firmware with a larger index reaches them)")
             except Fail as e:
                 say(f"  firmware       {e}")
 

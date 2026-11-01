@@ -265,14 +265,18 @@ impl Dispatcher {
             pico2hsm_core::key::KeyId,
             { crate::protocol::sc_hsm::MAX_KEY_INDEX },
         > = Vec::new();
+        // Objects past the key index stay on flash but cannot be reached
+        // this boot (a store written with a larger index): never silently
+        // (#38) — logged, and reported in GET PROVISIONING STATUS tag 86.
+        let mut skipped = 0u32;
         store.for_each_key(&mut |kid| {
             // Skip firmware records that are not keys: PIN record (0xFF),
             // persisted DKEK (0xFD) and enrolled peer key (0xFC).  The
             // device identity key (0xFE) is a real key and stays listed.
             let is_ef = (kid.0 >> 8) & 0xFF != 0;
             let record = !is_ef && matches!(kid.proto_ref(), 0xFC | 0xFD | 0xFF);
-            if kid.applet_byte() == 0 && !record {
-                let _ = sc_hsm_ids.push(kid);
+            if kid.applet_byte() == 0 && !record && sc_hsm_ids.push(kid).is_err() {
+                skipped += 1;
             }
         });
         let mut loaded = 0usize;
@@ -283,18 +287,36 @@ impl Dispatcher {
                     // identified by having file_id_hi in bits 15-8 of the
                     // key_id — normal SC-HSM keys have bits 15-8 = 0.
                     let is_ef = (kid.0 >> 8) & 0xFF != 0;
-                    if is_ef {
-                        push_ef_to_state(&mut self.sc_hsm.state, &obj);
+                    let indexed = if is_ef {
+                        push_ef_to_state(&mut self.sc_hsm.state, &obj)
                     } else {
-                        push_key_object_to_state(&mut self.sc_hsm.state, obj);
+                        push_key_object_to_state(&mut self.sc_hsm.state, obj)
+                    };
+                    if indexed {
+                        loaded += 1;
+                    } else {
+                        skipped += 1;
                     }
-                    loaded += 1;
                 }
                 Ok(None) => {}
                 Err(_) => {}
             }
         }
         let _ = loaded;
+        self.sc_hsm.state.skipped_at_boot = skipped;
+        if skipped > 0 {
+            crate::cdc_warn!(
+                "keystore: {} SC-HSM objects past the key index ({}) not loaded",
+                skipped,
+                crate::protocol::sc_hsm::MAX_KEY_INDEX
+            );
+            #[cfg(target_arch = "arm")]
+            defmt::warn!(
+                "keystore: {} SC-HSM objects past the key index ({}) not loaded",
+                skipped,
+                crate::protocol::sc_hsm::MAX_KEY_INDEX
+            );
+        }
 
         #[cfg(feature = "applet-piv")]
         self.piv.load_from_store(store);
@@ -1147,11 +1169,11 @@ fn rsa_size_algo(
 
 /// Convert a `KeyObject` (security layer) to a `KeyMeta` entry and push it
 /// into `ScHsmState.key_index`. Key material stays in flash; only lightweight
-/// metadata is kept in RAM.
+/// metadata is kept in RAM.  `false` if the index is full.
 fn push_key_object_to_state(
     state: &mut crate::protocol::sc_hsm::ScHsmState,
     obj: crate::security::key_management::KeyObject,
-) {
+) -> bool {
     use crate::protocol::sc_hsm::KeyMeta;
 
     let (algo, core_key_type) = match rsa_size_algo(&obj) {
@@ -1168,17 +1190,18 @@ fn push_key_object_to_state(
         algo,
         key_flags: obj.key_flags,
     };
-    let _ = state.key_index.push(meta);
+    state.key_index.push(meta).is_ok()
 }
 
 /// Convert a `KeyObject` representing an EF file (written via WRITE DATA) to
 /// a `KeyMeta` entry + ef_cache data.  EF files are stored in flash with
 /// `KmType::Generic` / `AlgorithmId::AesGcm`, but their key_index metadata
-/// uses `key_type=16` (EfFile) and `algo=file_id_hi`.
+/// uses `key_type=16` (EfFile) and `algo=file_id_hi`.  `false` if the
+/// index is full.
 fn push_ef_to_state(
     state: &mut crate::protocol::sc_hsm::ScHsmState,
     obj: &crate::security::key_management::KeyObject,
-) {
+) -> bool {
     use crate::protocol::sc_hsm::KeyMeta;
 
     // Extract file_id_hi from key_id bits 15-8.
@@ -1193,10 +1216,13 @@ fn push_ef_to_state(
         algo: file_id_hi,
         key_flags: 0,
     };
-    let _ = state.key_index.push(meta);
+    if state.key_index.push(meta).is_err() {
+        return false;
+    }
 
     // Populate ef_cache so read_binary can serve the data.
     state.ef_cache_put(obj.key_id, &obj.private_key);
+    true
 }
 
 /// Build the FCI (File Control Information) template returned on SELECT SC-HSM AID.
@@ -1372,6 +1398,62 @@ mod tests {
                 "{bytes}-byte modulus"
             );
         }
+    }
+
+    /// More SC-HSM objects on flash than the key index holds (a store
+    /// written with a larger index): boot counts the ones it could not
+    /// load instead of dropping them silently (#38).
+    #[test]
+    fn boot_counts_objects_past_the_key_index() {
+        use crate::protocol::sc_hsm::MAX_KEY_INDEX;
+        use crate::security::key_management::{AlgorithmId, KeyObject, KeyType as KmType};
+        use pico2hsm_core::key::{AppletId, KeyId};
+
+        /// EF-style IDs (file-ID high byte set) `0x0100..`, one EF each.
+        struct Many(u32);
+        impl crate::storage::KeyStore for Many {
+            fn save_key(&mut self, _: &KeyObject) -> Result<(), pico2hsm_core::error::HsmError> {
+                Ok(())
+            }
+            fn fetch_key(
+                &mut self,
+                kid: KeyId,
+            ) -> Result<Option<KeyObject>, pico2hsm_core::error::HsmError> {
+                let ef = (kid.0 >> 8) & 0xFF != 0 && kid.applet_byte() == 0;
+                Ok(ef.then(|| {
+                    KeyObject::new(KmType::Generic, kid.0, AppletId::ScHsm, AlgorithmId::AesGcm)
+                }))
+            }
+            fn erase_key(&mut self, _: KeyId) -> Result<(), pico2hsm_core::error::HsmError> {
+                Ok(())
+            }
+            fn wipe_all(&mut self) -> Result<(), pico2hsm_core::error::HsmError> {
+                Ok(())
+            }
+            fn wipe_by_owner(&mut self, _: AppletId) -> Result<(), pico2hsm_core::error::HsmError> {
+                Ok(())
+            }
+            fn enumerate_keys(&self) -> Vec<KeyId, 64> {
+                Vec::new()
+            }
+            fn for_each_key(&self, f: &mut dyn FnMut(KeyId)) {
+                for i in 0..self.0 {
+                    f(KeyId(0x0100 + i));
+                }
+            }
+        }
+
+        let mut slot = core::mem::MaybeUninit::<Dispatcher>::uninit();
+        let d = Dispatcher::init_in_place(&mut slot);
+        d.load_keys_from_store(&mut Many(MAX_KEY_INDEX as u32));
+        assert_eq!(d.sc_hsm.state.key_index.len(), MAX_KEY_INDEX);
+        assert_eq!(d.sc_hsm.state.skipped_at_boot, 0);
+
+        let mut slot = core::mem::MaybeUninit::<Dispatcher>::uninit();
+        let d = Dispatcher::init_in_place(&mut slot);
+        d.load_keys_from_store(&mut Many(MAX_KEY_INDEX as u32 + 3));
+        assert_eq!(d.sc_hsm.state.key_index.len(), MAX_KEY_INDEX);
+        assert_eq!(d.sc_hsm.state.skipped_at_boot, 3);
     }
 
     #[test]

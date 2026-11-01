@@ -16,6 +16,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   refused it), and auto-assign (P1 = 0xFF) starts at 0x01. A key that
   older firmware stored at 0x00 stays on flash and usable by reference,
   but stays hidden from PKCS#11: generate a replacement and delete it.
+- **Objects past the key index (#38).** Boot dropped SC-HSM objects
+  beyond the key index without a word. It now counts them, logs the count
+  (CDC and RTT), and reports it in GET PROVISIONING STATUS (new tag `86`,
+  shown by `tools/provision-device.py status`). The objects stay on flash.
+  Ordinary use cannot get there (new saves past the index are refused);
+  a store written by firmware with a larger index can.
 
 ## [2.1.0] - 2026-10-31
 

@@ -552,6 +552,11 @@ pub struct ScHsmState {
     /// Vec fields. Key material stays in flash; only metadata lives in RAM.
     pub key_index: Vec<KeyMeta, MAX_KEY_INDEX>,
 
+    /// SC-HSM objects on flash that the last load could not index (the key
+    /// index was full; #38).  They stay on flash.  GET PROVISIONING STATUS
+    /// tag 86.
+    pub skipped_at_boot: u32,
+
     /// Single operational buffer for key/EF data access.
     /// Loaded on-demand from flash; flushed back when dirty.
     pub op_buf: OpBuffer,
@@ -649,6 +654,7 @@ impl ScHsmState {
             puk_salt: [0u8; 16],
             puk_retry_count: 10,
             key_index: Vec::new(),
+            skipped_at_boot: 0,
             op_buf: OpBuffer::new(),
             write_target_file: None,
             dkek: DkekManager::new([0u8; 16]),
@@ -701,6 +707,7 @@ impl ScHsmState {
             addr_of_mut!((*dest).puk_salt).write([0u8; 16]);
             addr_of_mut!((*dest).puk_retry_count).write(10);
             addr_of_mut!((*dest).key_index).write(Vec::new());
+            addr_of_mut!((*dest).skipped_at_boot).write(0);
             addr_of_mut!((*dest).op_buf).write(OpBuffer::new());
             addr_of_mut!((*dest).write_target_file).write(None);
             addr_of_mut!((*dest).dkek).write(DkekManager::new([0u8; 16]));

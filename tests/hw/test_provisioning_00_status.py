@@ -108,7 +108,7 @@ def test_get_security_status(runner: CLIRunner, run_dir: Path) -> None:
         tag = payload[i]
         length = payload[i + 1]
         found_tags.add(tag)
-        want = 4 if tag == 0x85 else 1
+        want = 4 if tag in (0x85, 0x86) else 1
         assert length == want, f"Tag 0x{tag:02X} has length {length}, expected {want}"
         i += 2 + length
 
