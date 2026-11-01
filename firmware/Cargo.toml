@@ -132,7 +132,7 @@ embedded-hal-async = { version = "1.0" }
 embedded-sdmmc = { version = "0.9" }
 
 # Logging / diagnostics
-defmt = { version = "0.3" }
+defmt = { version = "1.0" }
 defmt-rtt = { version = "0.4", features = ["disable-blocking-mode"] }
 
 # ARM Cortex-M runtime
