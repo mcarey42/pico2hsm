@@ -63,9 +63,10 @@ Work through this list on a clean, up-to-date `main` checkout.
    `## [X.Y.Z]` section verbatim — so keep it self-contained and well-edited.
 
 4. **Version bump.** Set `version` under `[workspace.package]` in the root
-   `Cargo.toml`; every workspace crate (`pico2hsm-core`, `pico2hsm-layout`,
-   `firmware`, `tests/integration`) inherits it (`version.workspace = true`),
-   so all crates move in lockstep.
+   `Cargo.toml`. Every workspace crate (`pico2hsm-core`, `pico2hsm-layout`,
+   `pico2hsm-firmware`, `pico2hsm-integration-tests`) inherits it
+   (`version.workspace = true`), so all crates move in lockstep. Refresh
+   `Cargo.lock` (`cargo update --workspace`) and commit it with the bump.
 
 5. **Docs review.** Confirm `SECURITY.md`'s "Supported versions" table
    names the new release line (§6.2).
@@ -173,7 +174,7 @@ workspace crate. Spot-check one:
 ```sh
 gh release download v1.0.0 --pattern 'firmware.cdx.json'
 jq '.metadata.component.name, .components | length' firmware.cdx.json
-# Expected: "firmware"  followed by a component count (typically 80-120).
+# Expected: "pico2hsm-firmware", then a non-zero component count.
 ```
 
 SBOMs can be ingested by standard SCA tooling (Grype, Dependency-Track,
@@ -202,8 +203,8 @@ unsigned UF2 via BOOTSEL:
    starting `3B FE 18 00 00 81 31 FE 45`).
 
 If the device enumerates, an ATR is returned, and `opensc-tool --send-apdu
-00A404000BA000000308000010000100` (SELECT PIV) responds with a reasonable SW, the UF2 is
-good.
+00A404000BA000000308000010000100` (SELECT PIV) responds with a reasonable
+SW, the UF2 is good.
 
 ---
 
