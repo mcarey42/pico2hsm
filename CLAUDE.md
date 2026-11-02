@@ -366,7 +366,9 @@ write/erase and key load, for blocking storage work on core0.
   `80 FE 11 00` wedges core0 after replying, `80 FE 12 00` resets now,
   `80 FE 13 nn` moves the keystore anchor ahead, `80 FE 14 00` reboots
   into BOOTSEL, `80 FE 15 00` returns the image version and boot info
-  (slot booted, trial state), `80 FE 16 00` the loaded partition table.
+  (slot booted, trial state), `80 FE 16 00` the loaded partition table;
+  `rsa` builds add `80 FE 20 nn` (Montgomery benchmark, nn = modulus
+  words) and `80 FE 21 00` (UMAAL kernel self-test).
 - Boards without SWD (the Waveshare LCD): each core leaves breadcrumbs
   (`watchdog::crumb`, code table in `watchdog.rs`) in watchdog scratch
   registers and a 16-entry ring in `.uninit`; HardFaults and panics record
