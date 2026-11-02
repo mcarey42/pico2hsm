@@ -22,6 +22,8 @@ pub mod asymmetric;
 #[cfg(feature = "rsa")]
 pub mod bignum;
 pub mod ec_params;
+#[cfg(test)]
+mod ecc_kat;
 pub mod kdf;
 /// Sliceable FIPS 186-5 RSA key generation (A.1.3 / B.3).
 #[cfg(feature = "rsa")]

@@ -561,7 +561,7 @@ fn ecdsa_sign_p521(
 
 /// P-521 ECDSA with an RFC 6979 nonce over SHA-512 and additional data `ad`
 /// (empty = plain deterministic RFC 6979, used by the test vectors).
-fn ecdsa_sign_p521_with_ad(
+pub(crate) fn ecdsa_sign_p521_with_ad(
     private_key_raw: &[u8],
     hash_data: &[u8],
     ad: &[u8],
