@@ -82,6 +82,10 @@ mod tests {
 
     impl CryptoRng for CounterRng {}
 
+    // This can't fail on its own: both sides go through `Compat`, so a broken
+    // adapter changes them identically. It only checks that keygen uses the
+    // `NonZeroScalar` path; `ecc_kat::public_points_are_unchanged` (pinned on
+    // 0.13) is the real check of what keygen draws.
     #[test]
     fn compat_feeds_0_14_keygen() {
         let nz = p256::NonZeroScalar::generate_from_rng(&mut Compat(&mut CounterRng(1)));

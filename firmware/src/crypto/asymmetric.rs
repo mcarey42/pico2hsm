@@ -131,9 +131,13 @@ macro_rules! ec_keygen_for_curve {
         // field bytes, as 0.13's `SecretKey::random` did); 0.14's
         // `SecretKey::generate_from_rng` draws a little-endian integer instead,
         // which maps the same RNG output to a different key.
-        let nz = elliptic_curve::NonZeroScalar::<$Curve>::generate_from_rng(&mut Compat($rng));
-        let secret = SecretKey::<$Curve>::from(nz);
-        let priv_bytes = secret.to_bytes();
+        // `nz` and `priv_bytes` are copies of the secret scalar: wipe them on drop
+        // (`SecretKey` itself is ZeroizeOnDrop).
+        let nz = zeroize::Zeroizing::new(
+            elliptic_curve::NonZeroScalar::<$Curve>::generate_from_rng(&mut Compat($rng)),
+        );
+        let secret = SecretKey::<$Curve>::from(*nz);
+        let priv_bytes = zeroize::Zeroizing::new(secret.to_bytes());
 
         let public_key: PublicKey<$Curve> = secret.public_key();
         let encoded_pub = public_key.to_sec1_point(/*compress=*/ false);
@@ -462,20 +466,21 @@ fn push_der_len_rsa<const N: usize>(buf: &mut Vec<u8, N>, len: usize) {
 /// RFC 6979 nonce is hedged with fresh TRNG bytes (see `ecdsa_sign_p521`).
 ///
 /// Short hashes (e.g. MD5, SHA-1, RIPEMD-160) are left-padded with zeros to the
-/// curve's full field size before signing. `p521_bits2field` (ecdsa 0.16's
-/// `bits2field`, which ecdsa 0.17 dropped) requires input length >=
-/// FieldBytesSize/2; pre-padding ensures that constraint is met for all hashes
-/// and all curves.
+/// curve's full field size before signing. Since ecdsa 0.17 the minimum-length
+/// rule (input >= FieldBytesSize/2) applies only to P-521, through
+/// `p521_bits2field` (ecdsa 0.16's `bits2field`, which 0.17 dropped); padding
+/// lets short hashes through it. On the other curves padding is redundant but
+/// harmless: `bytes2scalar` and RFC 6979 see the same integer either way.
 pub fn ecdsa_sign(
     key_type: KeyType,
     private_key_raw: &[u8],
     hash_data: &[u8],
     rng: &mut (impl rand_core::CryptoRng + RngCore),
 ) -> Result<EcdsaSignature, CryptoError> {
-    // Left-pad hash to full field size so p521_bits2field never rejects it.
-    // It rejects inputs shorter than FieldBytesSize/2; padding to the full
-    // field size ensures short hashes (MD5=16 B, SHA-1=20 B, SHA-256=32 B on P-521)
-    // are accepted. Excess bytes are truncated (leftmost bytes kept), so
+    // Left-pad hash to full field size. On P-521 this keeps p521_bits2field
+    // (which rejects inputs shorter than FieldBytesSize/2) from refusing short
+    // hashes (MD5=16 B, SHA-1=20 B, SHA-256=32 B); on the other curves it does
+    // not change the integer signed. Excess bytes are truncated (leftmost bytes kept), so
     // over-length hashes (e.g. SHA-512 for P-256) are also handled correctly.
     let field_size: usize = match key_type {
         KeyType::EcPrivateP256 | KeyType::EcPrivateK256 => 32,
@@ -551,10 +556,10 @@ fn ecdsa_sign_p521(
     hash_data: &[u8],
     rng: &mut (impl rand_core::CryptoRng + RngCore),
 ) -> Result<EcdsaSignature, CryptoError> {
-    let mut extra = [0u8; 32];
-    rng.try_fill_bytes(&mut extra)
+    let mut extra = zeroize::Zeroizing::new([0u8; 32]);
+    rng.try_fill_bytes(extra.as_mut_slice())
         .map_err(|_| CryptoError::RngFailure)?;
-    ecdsa_sign_p521_with_ad(private_key_raw, hash_data, &extra)
+    ecdsa_sign_p521_with_ad(private_key_raw, hash_data, extra.as_slice())
 }
 
 /// P-521 ECDSA with an RFC 6979 nonce over SHA-512 and additional data `ad`
@@ -569,7 +574,8 @@ pub(crate) fn ecdsa_sign_p521_with_ad(
 
     let secret = SecretKey::<p521::NistP521>::from_slice(private_key_raw)
         .map_err(|_| CryptoError::WrongKeyLength)?;
-    let d = secret.to_nonzero_scalar();
+    // `d` and `k` are secret scalars (Copy, not ZeroizeOnDrop): wipe on drop.
+    let d = zeroize::Zeroizing::new(secret.to_nonzero_scalar());
     let z = p521_bits2field(hash_data).ok_or(CryptoError::SignFailure)?;
 
     // RFC 6979 §3.2 with qlen = 521, rlen = 528: x = int2octets(d),
@@ -577,7 +583,7 @@ pub(crate) fn ecdsa_sign_p521_with_ad(
     let x = zeroize::Zeroizing::new(d.to_repr());
     let h1 = p521_reduce(&z);
     let mut drbg = rfc6979::HmacDrbg::<sha2::Sha512>::new(x.as_slice(), h1.as_slice(), ad);
-    let k = loop {
+    let k = zeroize::Zeroizing::new(loop {
         // T = 66 bytes of DRBG output; k = bits2int(T) = leftmost 521 bits.
         let mut t = zeroize::Zeroizing::new(p521::FieldBytes::default());
         drbg.fill_bytes(t.as_mut_slice());
@@ -588,10 +594,10 @@ pub(crate) fn ecdsa_sign_p521_with_ad(
             // k ≥ n or k = 0: fill_bytes already did the §3.2(h) K/V update.
             _ => continue,
         }
-    };
+    });
 
     // Sign z mod n (`h1`), as the 0.16 `SignPrimitive` did; see `p521_reduce`.
-    let (sig, _recid) = ecdsa::hazmat::sign_prehashed(&d, &k, h1.as_slice())
+    let (sig, _recid) = ecdsa::hazmat::sign_prehashed(&*d, &*k, h1.as_slice())
         .map_err(|_| CryptoError::SignFailure)?;
     let der_sig = sig.to_der();
     let sig_bytes = der_sig.as_bytes();
@@ -619,7 +625,12 @@ fn p521_bits2field(hash: &[u8]) -> Option<p521::FieldBytes> {
 }
 
 /// `z mod n` as field bytes, the way ecdsa 0.16 reduced P-521 prehashes
-/// (the whole 66-byte value, one conditional subtraction of `n`).
+/// (the whole 66-byte value).
+///
+/// p521 0.14's `Reduce<FieldBytes>` does one conditional subtraction of `n`
+/// and then `from_uint_unchecked`, i.e. `MontyFieldElement::from_uint_reduced`,
+/// which fully reduces mod `n`. So `h1` is exactly `z mod n` for every 66-byte
+/// `z` (even `z` >= 2n), which is why it is canonical (< n).
 ///
 /// ecdsa 0.17's `sign_prehashed` / `verify_prehashed` instead keep only the
 /// low 521 bits of a 66-byte `z`; handing them this canonical encoding (< n)

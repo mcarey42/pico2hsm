@@ -1111,17 +1111,21 @@ pub fn p256_ecdh(
         .into_option()
         .ok_or(DkekError::EcdhFailure)?;
 
-    // Construct NonZeroScalar from the raw 32-byte private key.
-    let scalar_value =
-        ScalarValue::<NistP256>::from_slice(priv_key).map_err(|_| DkekError::EcdhFailure)?;
-    let scalar: p256::Scalar = scalar_value.into();
-    let nz_scalar = NonZeroScalar::new(scalar)
-        .into_option()
-        .ok_or(DkekError::EcdhFailure)?;
+    // Construct NonZeroScalar from the raw 32-byte private key. All three are
+    // Copy copies of the secret scalar, so each is wiped on drop.
+    let scalar_value = Zeroizing::new(
+        ScalarValue::<NistP256>::from_slice(priv_key).map_err(|_| DkekError::EcdhFailure)?,
+    );
+    let scalar: Zeroizing<p256::Scalar> = Zeroizing::new((*scalar_value).into());
+    let nz_scalar = Zeroizing::new(
+        NonZeroScalar::new(*scalar)
+            .into_option()
+            .ok_or(DkekError::EcdhFailure)?,
+    );
 
     // Multiply peer point by our scalar.
     let peer_point: ProjectivePoint = peer_pk.into();
-    let shared_point = (peer_point * *nz_scalar).to_affine();
+    let shared_point = (peer_point * **nz_scalar).to_affine();
 
     // Extract X-coordinate (the ECDH shared secret).
     let shared_encoded = shared_point.to_sec1_point(false);
