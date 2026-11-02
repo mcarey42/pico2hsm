@@ -80,8 +80,10 @@ pkcs11-tool --login --pin 648219 \
 ```
 
 This generates an ECDSA P-256 key pair on the device. The private key never
-leaves the HSM. The `--id 01` sets the key reference (hex byte); valid
-range is `01` to `FE`.
+leaves the HSM. The `--id 01` sets the PKCS#15 object ID (`CKA_ID`), not
+the device's key reference: the device takes the first free reference from
+`01` (`00` and `FC`–`FF` are refused for user keys). `sc-hsm-tool
+--key-reference` (Step 5) takes that key reference.
 
 Other supported key types:
 
@@ -91,9 +93,8 @@ Other supported key types:
 | `EC:secp384r1` | ECDSA / ECDH P-384 |
 | `EC:secp521r1` | ECDSA / ECDH P-521 |
 | `EC:secp256k1` | ECDSA secp256k1 (Bitcoin curve) |
-| `EC:brainpoolP256r1` | ECDSA Brainpool 256 |
-| `EC:brainpoolP384r1` | ECDSA Brainpool 384 |
-| `EC:brainpoolP512r1` | ECDSA Brainpool 512 |
+
+Brainpool curves are not supported: key generation refuses them.
 
 ---
 
@@ -230,7 +231,7 @@ The device supports the PIV standard (NIST SP 800-73-4), compatible with:
 - Windows Hello for Business (PIV credential provider)
 - SSH via `ssh-agent` with PIV middleware
 
-PIV operations use separate key slots (9A, 9C, 9D, 9E) and a separate PIN
+PIV operations use separate key slots (9A, 9C, 9D, 9E, retired 82–95) and a separate PIN
 from the SC-HSM applet. Initialize PIV keys using the PIV-compatible
 tools or via APDU commands documented in
 [PIV_APDU_REFERENCE.md](PIV_APDU_REFERENCE.md).

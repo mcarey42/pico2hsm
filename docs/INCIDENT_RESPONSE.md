@@ -8,7 +8,7 @@ A single device that refuses its keystore (a swapped or damaged SD card,
 lost writes, E11/E12 on the display) is an operator matter, not a project
 incident: see [KEYSTORE_RECOVERY.md](KEYSTORE_RECOVERY.md).
 
-Last updated: 2026-04-17
+Last updated: 2026-10-15
 
 ---
 

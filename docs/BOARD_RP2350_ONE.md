@@ -22,7 +22,7 @@ flash chips, no SD card, no carrier board.
 | USB connector          | PCB Type-A male (plug directly into host port)                |
 | Status LED             | Single WS2812B RGB LED on GPIO 16                             |
 | GPIO count             | 29 total (20 via edge pinout; 9 via solder castellations)     |
-| SD card slot           | None built-in (external SPI module required)                  |
+| SD card slot           | None (no SD-card build; external modules are not supported)   |
 | Keystore               | Internal QSPI flash via QMI: 2,044 KB (4 MB), ~7.8 MB (16 MB) |
 | PIO state machines     | 12 total; PIO0 SM0 claimed by WS2812B driver                  |
 | ADC channels           | 4 × 12-bit                                                    |

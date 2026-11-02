@@ -208,8 +208,9 @@ shipped to a remote party with the card sent separately.  The card alone is
 useless: its objects are encrypted under keys derived from the device's
 OTP-based storage master key.  The device alone holds no user keys.  When
 the card goes back in, the device checks it and resumes domain sync.  The
-card checks (store ID, MACs, rollback anchor on internal flash) are planned
-for 2.0; see `docs/STORAGE_V2.md` §8 and §11 and `docs/CLUSTER_PLAN_V3.md`.
+card checks (store ID, MACs, rollback anchor on internal flash) are
+implemented (Storage V2, `docs/STORAGE_V2.md` §8 and §11); domain sync is
+designed in `docs/CLUSTER_PLAN_V3.md`.
 
 ---
 

@@ -169,7 +169,7 @@ See [BUILDING.md](BUILDING.md) for the full reference.
 
 ### Optional capabilities
 - `rsa` — Enable RSA-2048/3072/4096 support and the RSA key pool (adds ~115 KB flash, ~57 KB RAM)
-- `applet-piv` — PIV applet (NIST SP 800-73-4); slots 9A/9C/9D/9E
+- `applet-piv` — PIV applet (NIST SP 800-73-4); slots 9A/9C/9D/9E and retired 82–95
 - `applet-openpgp` — OpenPGP Card 3.4 applet; NIST ECC (P-256/384/521)
 - `applet-openpgp-curve25519` — Add Ed25519/X25519 to OpenPGP (implies `applet-openpgp`)
 - `debug` — Debug mode: debug APDUs (INS `0xFE`: test hooks, BOOTSEL reboot, boot info), skips the production-mode boot checks (NEVER use in production)
@@ -181,7 +181,7 @@ See [BUILDING.md](BUILDING.md) for the full reference.
 pico2hsm/
 ├── Cargo.toml                  # Workspace root
 ├── .cargo/config.toml          # Build target and runner config
-├── boards/                     # Linker scripts and partition tables (pt_*.json)
+├── boards/                     # Partition tables (pt_*.json, rendered from layout/)
 ├── pico2hsm-core/              # Shared no_std types and traits
 │   └── src/
 │       ├── apdu.rs             # APDU types and status words
