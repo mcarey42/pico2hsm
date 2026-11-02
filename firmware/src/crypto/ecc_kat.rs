@@ -67,7 +67,12 @@ const K256_SIG: &str = "3045022100dce7353b4a16aff72f3d846147709be49bdee49a7f0d8b
 const P256_H16: &str = "Ok(3045022100d81dad5dad02cd02cfc5c043aaa9a9185c349b5ea7316edb8b83348f863f424e022020c8e5a5094eff29c9f54d1d8ba4919397ff2d320825dec43a0a8f46568dd542)";
 const P256_H20: &str = "Ok(304402201b0c0d933b9fde4701371c382e44da767207a5daf1c54183e4defb27d0d09be4022068cc53f26b9af8a32b6047cca39319eaca9c7ce30cb7ff386442d730e5bbb915)";
 const P256_H64: &str = "Ok(3046022100990010cba57e6b7023fea81860b5f75b9e3a02f96a488833bead233370c6b852022100ae472926162299108f9bc4a196b29658a8c78711ffa9d72488ba7cc9193baef8)";
-const P521_H20: &str = "Err(SignFailure)";
+// P-521 / 20-byte hash, left-padded to 66 bytes as `ecdsa_sign` does (the
+// production path), signed with the deterministic `ad = &[]` entry point.
+const P521_H20: &str = "Ok(30818802420113edf89ed6d0800fa99a59b9737a522ec090e4c78ac4b981c073501e74e25eb2dfe6e29e3034143bfea05f78d815bf7dc1caf97deda129bf90d94bb068fb9af6c602420171f544db4732315e315a0d540b2c5907acbd5755a9621070f05a388a03184f0191a94e67be72f5959caad2c1338cbfa26edb0252636e6d243f7769b861e1e38192)";
+// Internal-API invariant, not a Review Focus case: the raw entry point does
+// no padding of its own, so an unpadded 20-byte hash is refused.
+const P521_H20_RAW: &str = "Err(SignFailure)";
 
 // Domain key helpers.
 const DOMAIN_ID: &str = "e1f2b60bf7bd82f9d20ab50612d3e100";
@@ -84,30 +89,34 @@ const SLIP10_K256_PUB: &str = "04a174b306c6463537d94fd21b33a2e545a32fc74edd21853
 const SLIP10_P256_PUB: &str = "0474637dfbb4cb70bdc7b57813e2206857fda9bcbbf640d0612ad3b862b7bbcc8c0f8f61ea930fe4d45a33558ad76741f094928bd70dad1a49b538568dea00fffe";
 
 // Negative cases: today's result for each input, as a string.
-// Peer points: truncated, 0x04 || zeros, Y + 1, compressed.
-const P256_BAD_PEER: [&str; 4] = [
+// Peer points: truncated, 0x04 || zeros, Y + 1, compressed, SEC1 identity (0x00).
+const P256_BAD_PEER: [&str; 5] = [
     "Err(EcdhFailure)",
     "Err(EcdhFailure)",
     "Err(EcdhFailure)",
     "Ok(e9ab500eb7fc602cb5e2cd95994a049fc5a9a2284780e25c66d6287443de02a8)",
+    "Err(EcdhFailure)",
 ];
-const P384_BAD_PEER: [&str; 4] = [
+const P384_BAD_PEER: [&str; 5] = [
     "Err(EcdhFailure)",
     "Err(EcdhFailure)",
     "Err(EcdhFailure)",
     "Ok(adf0079ceb6239e3c3b61472fd6a9127319e6433b52b721b620d474a0eb1d98638ae5d4547745d7e98c18b6766e31595)",
+    "Err(EcdhFailure)",
 ];
-const P521_BAD_PEER: [&str; 4] = [
+const P521_BAD_PEER: [&str; 5] = [
     "Err(EcdhFailure)",
     "Err(EcdhFailure)",
     "Err(EcdhFailure)",
     "Ok(0046d1963f3e13bd69dcef6848cd9ef22b61b3a423b275383ab79bd07e88aba2fec54c6fc2b23147ba5ed9bf5890e0b58a6dc21fc5dcf9889d8b3a8e610b7c4e4e82)",
+    "Err(EcdhFailure)",
 ];
-const K256_BAD_PEER: [&str; 4] = [
+const K256_BAD_PEER: [&str; 5] = [
     "Err(EcdhFailure)",
     "Err(EcdhFailure)",
     "Err(EcdhFailure)",
     "Ok(06e538821aac0f4d680bbcb3a0f993c104738694cd9c27f90dd022458a960b82)",
+    "Err(EcdhFailure)",
 ];
 // Scalars: zero, n, n + 1, one byte short.
 const P256_BAD_SCALAR: [&str; 4] = [
@@ -225,7 +234,7 @@ struct Cv {
     n: &'static str,
     ecdh: &'static str,
     sig: &'static str,
-    bad_peer: [&'static str; 4],
+    bad_peer: [&'static str; 5],
     bad_scalar: [&'static str; 4],
     bad_sig: [&'static str; 3],
 }
@@ -508,12 +517,10 @@ fn hd_derivation_is_unchanged() {
 #[test]
 fn hash_lengths_are_unchanged() {
     let p256 = &curves()[0];
-    let p521 = &curves()[2];
     for (label, c, len, expected) in [
         ("P256_H16", p256, 16usize, P256_H16),
         ("P256_H20", p256, 20, P256_H20),
         ("P256_H64", p256, 64, P256_H64),
-        ("P521_H20", p521, 20, P521_H20),
     ] {
         let hash = vec![0x55u8; len];
         let sig = sign_a(c, &hash, &[]);
@@ -526,6 +533,27 @@ fn hash_lengths_are_unchanged() {
             );
         }
     }
+
+    // P-521 / SHA-1-sized hash. Production `ecdsa_sign` left-pads to the
+    // 66-byte field and then signs; pin that through the deterministic entry.
+    let p521 = &curves()[2];
+    let hash = [0x55u8; 20];
+    let mut padded = [0u8; 66];
+    padded[46..].copy_from_slice(&hash);
+    let sig = sign_a(p521, &padded, &[]);
+    cks("P521_H20", bytes_res(sig.clone()), P521_H20);
+    // The public API must accept the short hash and verify against it.
+    let public = ecdsa_sign(P521, &h(P521_A_PRIV), &hash, &mut CounterRng(7)).unwrap();
+    assert_eq!(ecdsa_verify(P521, &h(P521_A_PUB), &hash, &public), Ok(true));
+    if let Ok(sig) = sig {
+        assert_eq!(ecdsa_verify(P521, &h(P521_A_PUB), &hash, &sig), Ok(true));
+    }
+    // Internal-API invariant: the unpadded hash is refused by the raw entry.
+    cks(
+        "P521_H20_RAW",
+        bytes_res(sign_a(p521, &hash, &[])),
+        P521_H20_RAW,
+    );
 }
 
 #[test]
@@ -546,7 +574,10 @@ fn bad_peer_points_are_refused() {
         let mut compressed = vec![0x02 | (b_pub[b_pub.len() - 1] & 1)];
         compressed.extend_from_slice(&b_pub[1..1 + coord]);
 
-        for (i, peer) in [truncated, zeros, y_plus_one, compressed]
+        // SEC1 identity (point at infinity) encoding.
+        let identity = vec![0x00];
+
+        for (i, peer) in [truncated, zeros, y_plus_one, compressed, identity]
             .iter()
             .enumerate()
         {
