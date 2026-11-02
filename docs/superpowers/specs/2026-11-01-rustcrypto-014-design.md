@@ -60,10 +60,14 @@ set builds for `thumbv8m.main-none-eabihf` (rustc 1.97.1).
   `signature` 3 and `hybrid-array` in place of `generic-array`. These sit
   next to the 0.6/0.10 versions that `rsa`, `dalek`, `aes-gcm`, `hkdf` and
   `pbkdf2` keep using.
-- `FwRng` (`protocol/sc_hsm/mod.rs`) implements both the `rand_core` 0.6
-  and the 0.10 traits over the same hardware TRNG/CSPRNG. Test RNGs do the
-  same where the ECC tests need them. There is no second RNG and no new
-  entropy path.
+- `FwRng` (`protocol/sc_hsm/mod.rs`) stays a `rand_core` 0.6 RNG with no
+  new trait impls. A thin adapter, `crypto::rng_compat::Compat<'_, R>`,
+  borrows any 0.6 `RngCore + CryptoRng` and implements the 0.10
+  `TryRng`/`TryCryptoRng` traits by delegating to it (`Error =
+  Infallible`). Its only call site is EC key generation; ECDSA/ECDH need
+  no RNG under 0.14 and the P-521 hedge bytes come from the 0.6 RNG
+  directly. Public signatures keep their 0.6 bounds, test RNGs need no
+  change, and there is one RNG and no new entropy path.
 - Code changes are limited to the ECC call sites, about 140 uses in 9 files
   (`crypto/asymmetric.rs`, `crypto/kdf.rs`, `security/dkek.rs`,
   `security/key_blob.rs`, `domain/key.rs`, `domain/member.rs`, sc_hsm

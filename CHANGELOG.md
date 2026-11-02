@@ -8,12 +8,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
-- **RUSTSEC-2026-0387 (`crypto-bigint`) fixed.** All elliptic-curve
-  code moved from RustCrypto 0.13 (`crypto-bigint` 0.5.5, affected) to
-  RustCrypto 0.14 (`crypto-bigint` 0.7.x). The operations that used the
-  affected bignum code were every EC operation: P-256, P-384, P-521 and
-  K-256 ECDSA signing and verification, and ECDH on the same curves. No
-  stored data changes and no re-INITIALIZE is needed.
+- **RUSTSEC-2026-0387 (`crypto-bigint`) fixed.** All NIST
+  P-256/P-384/P-521 and secp256k1 code moved from RustCrypto 0.13
+  (`crypto-bigint` 0.5.5, affected) to RustCrypto 0.14 (`crypto-bigint`
+  0.7.x). Ed25519/X25519 did not use it and are unchanged. The affected
+  operations on those curves were key generation, ECDSA sign/verify,
+  ECDH, public-key derivation on import, and BIP32/SLIP-10 public keys.
+  For operators: public keys and deterministic signatures are
+  byte-identical; P-521 signatures stay randomized (hedged). No stored
+  data changes and no re-INITIALIZE is needed.
 
 ## [2.1.1] - 2026-11-01
 
