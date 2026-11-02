@@ -1098,34 +1098,37 @@ pub fn p256_ecdh(
     priv_key: &[u8; 32],
     peer_pub: &[u8; P256_UNCOMPRESSED_SIZE],
 ) -> Result<Zeroizing<[u8; 32]>, DkekError> {
-    use p256::elliptic_curve::sec1::ToEncodedPoint;
-    use p256::elliptic_curve::ScalarPrimitive;
+    use p256::elliptic_curve::sec1::ToSec1Point;
+    use p256::elliptic_curve::ScalarValue;
     use p256::{
-        elliptic_curve::sec1::FromEncodedPoint, EncodedPoint, NistP256, NonZeroScalar,
-        ProjectivePoint, PublicKey,
+        elliptic_curve::sec1::FromSec1Point, NistP256, NonZeroScalar, ProjectivePoint, PublicKey,
+        Sec1Point,
     };
 
     // Parse peer public key.
-    let encoded =
-        EncodedPoint::from_bytes(peer_pub.as_slice()).map_err(|_| DkekError::EcdhFailure)?;
-    let peer_pk = PublicKey::from_encoded_point(&encoded)
+    let encoded = Sec1Point::from_bytes(peer_pub.as_slice()).map_err(|_| DkekError::EcdhFailure)?;
+    let peer_pk = PublicKey::from_sec1_point(&encoded)
         .into_option()
         .ok_or(DkekError::EcdhFailure)?;
 
-    // Construct NonZeroScalar from the raw 32-byte private key.
-    let scalar_primitive =
-        ScalarPrimitive::<NistP256>::from_slice(priv_key).map_err(|_| DkekError::EcdhFailure)?;
-    let scalar: p256::Scalar = scalar_primitive.into();
-    let nz_scalar = NonZeroScalar::new(scalar)
-        .into_option()
-        .ok_or(DkekError::EcdhFailure)?;
+    // Construct NonZeroScalar from the raw 32-byte private key. All three are
+    // Copy copies of the secret scalar, so each is wiped on drop.
+    let scalar_value = Zeroizing::new(
+        ScalarValue::<NistP256>::from_slice(priv_key).map_err(|_| DkekError::EcdhFailure)?,
+    );
+    let scalar: Zeroizing<p256::Scalar> = Zeroizing::new((*scalar_value).into());
+    let nz_scalar = Zeroizing::new(
+        NonZeroScalar::new(*scalar)
+            .into_option()
+            .ok_or(DkekError::EcdhFailure)?,
+    );
 
     // Multiply peer point by our scalar.
     let peer_point: ProjectivePoint = peer_pk.into();
-    let shared_point = (peer_point * *nz_scalar).to_affine();
+    let shared_point = (peer_point * **nz_scalar).to_affine();
 
     // Extract X-coordinate (the ECDH shared secret).
-    let shared_encoded = shared_point.to_encoded_point(false);
+    let shared_encoded = shared_point.to_sec1_point(false);
     let x = shared_encoded.x().ok_or(DkekError::EcdhFailure)?;
 
     let mut out = Zeroizing::new([0u8; 32]);
@@ -1682,10 +1685,10 @@ mod tests {
     }
 
     fn ec_key_pub(d: &[u8; 32]) -> heapless::Vec<u8, 65> {
-        use p256::elliptic_curve::sec1::ToEncodedPoint;
+        use p256::elliptic_curve::sec1::ToSec1Point;
         let sk = p256::SecretKey::from_slice(d).unwrap();
         let mut v = heapless::Vec::new();
-        v.extend_from_slice(sk.public_key().to_encoded_point(false).as_bytes())
+        v.extend_from_slice(sk.public_key().to_sec1_point(false).as_bytes())
             .unwrap();
         v
     }

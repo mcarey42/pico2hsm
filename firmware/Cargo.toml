@@ -82,17 +82,19 @@ pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
 hmac = { version = "0.12", default-features = false }
 
 # Elliptic curves
-p256 = { version = "0.13", default-features = false, features = ["ecdsa", "ecdh", "arithmetic", "sha256"] }
-p384 = { version = "0.13", default-features = false, features = ["ecdsa", "ecdh", "arithmetic", "sha384"] }
-p521 = { version = "0.13", default-features = false, features = ["ecdsa", "ecdh", "arithmetic", "sha512"] }
-k256 = { version = "0.13", default-features = false, features = ["ecdsa", "ecdh", "arithmetic", "sha256"] }
+p256 = { version = "0.14", default-features = false, features = ["ecdsa", "ecdh", "arithmetic", "sha256"] }
+p384 = { version = "0.14", default-features = false, features = ["ecdsa", "ecdh", "arithmetic", "sha384"] }
+p521 = { version = "0.14", default-features = false, features = ["ecdsa", "ecdh", "arithmetic", "sha512"] }
+k256 = { version = "0.14", default-features = false, features = ["ecdsa", "ecdh", "arithmetic", "sha256"] }
 
 # ECC trait crates — versions match those re-exported by p256/p384/p521/k256
-ecdsa = { version = "0.16", default-features = false, features = ["hazmat", "der"] }
-# RFC 6979 HMAC-DRBG for P-521 nonces (already a transitive dependency).
+ecdsa = { version = "0.17", default-features = false, features = ["algorithm", "der"] }
+# RFC 6979 HMAC-DRBG for P-521 nonces. Kept on 0.4 (hmac 0.12 / sha2 0.10, like the
+# rest of the firmware); ecdsa 0.17 brings its own rfc6979 0.6 for the other curves.
 rfc6979 = { version = "0.4", default-features = false }
-elliptic-curve = { version = "0.13", default-features = false, features = ["arithmetic", "sec1", "ecdh"] }
+elliptic-curve = { version = "0.14", default-features = false, features = ["arithmetic", "sec1", "ecdh"] }
 rand_core = { version = "0.6", default-features = false }
+rand_core_010 = { package = "rand_core", version = "0.10", default-features = false }
 
 # Curve25519 — feature-gated (applet-openpgp-curve25519)
 ed25519-dalek = { version = "2", default-features = false, features = ["rand_core"], optional = true }

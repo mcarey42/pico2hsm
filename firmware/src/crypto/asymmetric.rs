@@ -20,7 +20,7 @@
 //! The `bp-curves` / `bign-curve` crates that implement brainpool curves with
 //! the `ecdsa` + `elliptic-curve` trait ecosystem exist but are **not
 //! available as published crates on crates.io** with no_std support at the
-//! versions compatible with ecdsa-0.16 / elliptic-curve-0.13.  The `bp256r1`,
+//! versions compatible with ecdsa-0.17 / elliptic-curve-0.14.  The `bp256r1`,
 //! `bp384r1`, and `bp512r1` crates on crates.io do not yet implement the
 //! `CurveArithmetic` trait required for ECDSA signing/verification.
 //! TODO: Revisit when <https://github.com/RustCrypto/elliptic-curves> lands
@@ -59,9 +59,11 @@ use ecdsa::{
 };
 use elliptic_curve::{
     ecdh::diffie_hellman,
-    sec1::{EncodedPoint, FromEncodedPoint, ToEncodedPoint},
-    PublicKey, SecretKey,
+    sec1::{FromSec1Point, ToSec1Point},
+    Generate, PublicKey, SecretKey,
 };
+
+use crate::crypto::rng_compat::Compat;
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -120,17 +122,25 @@ pub type EcdsaSignature = Vec<u8, 139>;
 /// Generate an EC key pair for `$Curve` using the `elliptic-curve` / `ecdsa` crates.
 ///
 /// Requires that the curve type implements `CurveArithmetic` (for key-gen and
-/// ECDH) and that `AffinePoint` implements `ToEncodedPoint`.
+/// ECDH) and that `AffinePoint` implements `ToSec1Point`.
 macro_rules! ec_keygen_for_curve {
     ($Curve:ty, $key_type:expr, $rng:expr, $priv_len:expr, $pub_len:expr) => {{
         use elliptic_curve::CurveArithmetic;
 
-        // Generate random secret key
-        let secret = SecretKey::<$Curve>::random($rng);
-        let priv_bytes = secret.to_bytes();
+        // Generate random secret key. Rejection-sample a `NonZeroScalar` (big-endian
+        // field bytes, as 0.13's `SecretKey::random` did); 0.14's
+        // `SecretKey::generate_from_rng` draws a little-endian integer instead,
+        // which maps the same RNG output to a different key.
+        // `nz` and `priv_bytes` are copies of the secret scalar: wipe them on drop
+        // (`SecretKey` itself is ZeroizeOnDrop).
+        let nz = zeroize::Zeroizing::new(
+            elliptic_curve::NonZeroScalar::<$Curve>::generate_from_rng(&mut Compat($rng)),
+        );
+        let secret = SecretKey::<$Curve>::from(*nz);
+        let priv_bytes = zeroize::Zeroizing::new(secret.to_bytes());
 
         let public_key: PublicKey<$Curve> = secret.public_key();
-        let encoded_pub = public_key.to_encoded_point(/*compress=*/ false);
+        let encoded_pub = public_key.to_sec1_point(/*compress=*/ false);
         let pub_bytes = encoded_pub.as_bytes();
 
         let mut pair = EcKeyPair {
@@ -182,7 +192,7 @@ pub fn generate_ec_keypair(
         | KeyType::EcPrivateBrainpoolP384
         | KeyType::EcPrivateBrainpoolP512 => {
             // TODO: Implement once bp-curves crate supports CurveArithmetic
-            // in a no_std context compatible with elliptic-curve 0.13.
+            // in a no_std context compatible with elliptic-curve 0.14.
             // See module-level doc comment for tracking details.
             Err(CryptoError::UnsupportedAlgorithm)
         }
@@ -452,26 +462,26 @@ fn push_der_len_rsa<const N: usize>(buf: &mut Vec<u8, N>, len: usize) {
 ///
 /// Returns a DER-encoded ECDSA signature.
 ///
-/// Signing is deterministic per RFC 6979 for all curves except P-521.
-/// P-521 uses randomized k (hardware TRNG) because no standard hash function
-/// matches P-521's 66-byte field size — RFC 6979 type bounds cannot be satisfied.
-/// Randomized ECDSA with a CSPRNG is cryptographically equivalent in security.
+/// Signing is deterministic per RFC 6979 for all curves except P-521, whose
+/// RFC 6979 nonce is hedged with fresh TRNG bytes (see `ecdsa_sign_p521`).
 ///
 /// Short hashes (e.g. MD5, SHA-1, RIPEMD-160) are left-padded with zeros to the
-/// curve's full field size before signing. `ecdsa::hazmat::bits2field` requires
-/// input length >= FieldBytesSize/2; pre-padding ensures that constraint is met for
-/// all hashes and all curves.
+/// curve's full field size before signing. Since ecdsa 0.17 the minimum-length
+/// rule (input >= FieldBytesSize/2) applies only to P-521, through
+/// `p521_bits2field` (ecdsa 0.16's `bits2field`, which 0.17 dropped); padding
+/// lets short hashes through it. On the other curves padding is redundant but
+/// harmless: `bytes2scalar` and RFC 6979 see the same integer either way.
 pub fn ecdsa_sign(
     key_type: KeyType,
     private_key_raw: &[u8],
     hash_data: &[u8],
     rng: &mut (impl rand_core::CryptoRng + RngCore),
 ) -> Result<EcdsaSignature, CryptoError> {
-    // Left-pad hash to full field size so bits2field never rejects it.
-    // bits2field rejects inputs shorter than FieldBytesSize/2; padding to the full
-    // field size ensures short hashes (MD5=16 B, SHA-1=20 B, SHA-256=32 B on P-521)
-    // are accepted. Excess bytes are truncated by bits2field, so over-length hashes
-    // (e.g. SHA-512 for P-256) are also handled correctly.
+    // Left-pad hash to full field size. On P-521 this keeps p521_bits2field
+    // (which rejects inputs shorter than FieldBytesSize/2) from refusing short
+    // hashes (MD5=16 B, SHA-1=20 B, SHA-256=32 B); on the other curves it does
+    // not change the integer signed. Excess bytes are truncated (leftmost bytes kept), so
+    // over-length hashes (e.g. SHA-512 for P-256) are also handled correctly.
     let field_size: usize = match key_type {
         KeyType::EcPrivateP256 | KeyType::EcPrivateK256 => 32,
         KeyType::EcPrivateP384 => 48,
@@ -491,8 +501,7 @@ pub fn ecdsa_sign(
         KeyType::EcPrivateP256 => ecdsa_sign_curve::<p256::NistP256>(private_key_raw, hash),
         KeyType::EcPrivateP384 => ecdsa_sign_curve::<p384::NistP384>(private_key_raw, hash),
         KeyType::EcPrivateP521 => {
-            // P-521 does not implement DigestPrimitive (no hash matches 66-byte field size).
-            // Use randomized k from hardware TRNG — equivalent security to RFC 6979.
+            // RFC 6979 over SHA-512, hedged with hardware TRNG bytes.
             ecdsa_sign_p521(private_key_raw, hash, rng)
         }
         KeyType::EcPrivateK256 => ecdsa_sign_curve::<k256::Secp256k1>(private_key_raw, hash),
@@ -512,17 +521,11 @@ fn ecdsa_sign_curve<C>(
     hash_data: &[u8],
 ) -> Result<EcdsaSignature, CryptoError>
 where
-    C: elliptic_curve::PrimeCurve
-        + elliptic_curve::CurveArithmetic
-        + ecdsa::hazmat::DigestPrimitive,
-    C::Scalar: elliptic_curve::ops::Invert<Output = subtle::CtOption<C::Scalar>>
-        + ecdsa::hazmat::SignPrimitive<C>,
-    elliptic_curve::FieldBytesSize<C>: elliptic_curve::sec1::ModulusSize,
-    elliptic_curve::AffinePoint<C>: elliptic_curve::sec1::FromEncodedPoint<C> + ToEncodedPoint<C>,
-    ecdsa::SignatureSize<C>: elliptic_curve::generic_array::ArrayLength<u8>,
-    ecdsa::der::MaxSize<C>: elliptic_curve::generic_array::ArrayLength<u8>,
+    C: ecdsa::EcdsaCurve + elliptic_curve::CurveArithmetic + ecdsa::DigestAlgorithm,
+    C::Scalar: elliptic_curve::ops::Invert<Output = subtle::CtOption<C::Scalar>>,
+    ecdsa::der::MaxSize<C>: elliptic_curve::array::ArraySize,
     <elliptic_curve::FieldBytesSize<C> as core::ops::Add>::Output:
-        core::ops::Add<ecdsa::der::MaxOverhead> + elliptic_curve::generic_array::ArrayLength<u8>,
+        core::ops::Add<ecdsa::der::MaxOverhead> + elliptic_curve::array::ArraySize,
 {
     use ecdsa::SigningKey;
 
@@ -542,7 +545,7 @@ where
     Ok(out)
 }
 
-/// P-521 ECDSA sign — dedicated impl because NistP521 has no DigestPrimitive.
+/// P-521 ECDSA sign — dedicated impl for the hedged nonce below.
 ///
 /// The nonce is RFC 6979 (HMAC-DRBG over SHA-512) *hedged* with 32 fresh
 /// random bytes as additional data (RFC 6979 §3.6): a weak or faulted RNG no
@@ -553,52 +556,48 @@ fn ecdsa_sign_p521(
     hash_data: &[u8],
     rng: &mut (impl rand_core::CryptoRng + RngCore),
 ) -> Result<EcdsaSignature, CryptoError> {
-    let mut extra = [0u8; 32];
-    rng.try_fill_bytes(&mut extra)
+    let mut extra = zeroize::Zeroizing::new([0u8; 32]);
+    rng.try_fill_bytes(extra.as_mut_slice())
         .map_err(|_| CryptoError::RngFailure)?;
-    ecdsa_sign_p521_with_ad(private_key_raw, hash_data, &extra)
+    ecdsa_sign_p521_with_ad(private_key_raw, hash_data, extra.as_slice())
 }
 
 /// P-521 ECDSA with an RFC 6979 nonce over SHA-512 and additional data `ad`
 /// (empty = plain deterministic RFC 6979, used by the test vectors).
-fn ecdsa_sign_p521_with_ad(
+pub(crate) fn ecdsa_sign_p521_with_ad(
     private_key_raw: &[u8],
     hash_data: &[u8],
     ad: &[u8],
 ) -> Result<EcdsaSignature, CryptoError> {
-    use ecdsa::hazmat::{bits2field, SignPrimitive};
-    use elliptic_curve::ops::Reduce;
+    use elliptic_curve::NonZeroScalar;
     use elliptic_curve::PrimeField;
 
     let secret = SecretKey::<p521::NistP521>::from_slice(private_key_raw)
         .map_err(|_| CryptoError::WrongKeyLength)?;
-    // SignPrimitive<NistP521> is implemented on p521::Scalar, not NonZeroScalar.
-    let nz = secret.to_nonzero_scalar();
-    let scalar: p521::Scalar = *nz;
-    let z = bits2field::<p521::NistP521>(hash_data).map_err(|_| CryptoError::SignFailure)?;
+    // `d` and `k` are secret scalars (Copy, not ZeroizeOnDrop): wipe on drop.
+    let d = zeroize::Zeroizing::new(secret.to_nonzero_scalar());
+    let z = p521_bits2field(hash_data).ok_or(CryptoError::SignFailure)?;
 
     // RFC 6979 §3.2 with qlen = 521, rlen = 528: x = int2octets(d),
     // h1 = bits2octets(z) = int2octets(z mod n).
-    let x = zeroize::Zeroizing::new(scalar.to_repr());
-    let h1 =
-        <p521::Scalar as Reduce<<p521::NistP521 as elliptic_curve::Curve>::Uint>>::reduce_bytes(&z)
-            .to_repr();
-    let mut drbg = rfc6979::HmacDrbg::<sha2::Sha512>::new(x.as_slice(), &h1, ad);
-    let k = loop {
+    let x = zeroize::Zeroizing::new(d.to_repr());
+    let h1 = p521_reduce(&z);
+    let mut drbg = rfc6979::HmacDrbg::<sha2::Sha512>::new(x.as_slice(), h1.as_slice(), ad);
+    let k = zeroize::Zeroizing::new(loop {
         // T = 66 bytes of DRBG output; k = bits2int(T) = leftmost 521 bits.
         let mut t = zeroize::Zeroizing::new(p521::FieldBytes::default());
         drbg.fill_bytes(t.as_mut_slice());
         shift_right_bits(t.as_mut_slice(), 66 * 8 - 521);
-        let candidate: Option<p521::Scalar> = p521::Scalar::from_repr(*t).into();
+        let candidate: Option<NonZeroScalar<p521::NistP521>> = NonZeroScalar::from_repr(*t).into();
         match candidate {
-            Some(k) if !bool::from(k.is_zero()) => break k,
+            Some(k) => break k,
             // k ≥ n or k = 0: fill_bytes already did the §3.2(h) K/V update.
             _ => continue,
         }
-    };
+    });
 
-    let (sig, _recid) = scalar
-        .try_sign_prehashed(k, &z)
+    // Sign z mod n (`h1`), as the 0.16 `SignPrimitive` did; see `p521_reduce`.
+    let (sig, _recid) = ecdsa::hazmat::sign_prehashed(&*d, &*k, h1.as_slice())
         .map_err(|_| CryptoError::SignFailure)?;
     let der_sig = sig.to_der();
     let sig_bytes = der_sig.as_bytes();
@@ -606,6 +605,41 @@ fn ecdsa_sign_p521_with_ad(
     out.extend_from_slice(sig_bytes)
         .map_err(|_| CryptoError::BufferTooSmall)?;
     Ok(out)
+}
+
+/// ecdsa 0.16's `bits2field` for P-521, which ecdsa 0.17 dropped: refuse
+/// inputs shorter than half the 66-byte field, left-pad shorter ones with
+/// zeros and keep the leftmost 66 bytes of longer ones.
+fn p521_bits2field(hash: &[u8]) -> Option<p521::FieldBytes> {
+    const LEN: usize = 66;
+    if hash.len() < LEN / 2 {
+        return None;
+    }
+    let mut z = p521::FieldBytes::default();
+    if hash.len() >= LEN {
+        z.copy_from_slice(&hash[..LEN]);
+    } else {
+        z[LEN - hash.len()..].copy_from_slice(hash);
+    }
+    Some(z)
+}
+
+/// `z mod n` as field bytes, the way ecdsa 0.16 reduced P-521 prehashes
+/// (the whole 66-byte value).
+///
+/// p521 0.14's `Reduce<FieldBytes>` does one conditional subtraction of `n`
+/// and then `from_uint_unchecked`, i.e. `MontyFieldElement::from_uint_reduced`,
+/// which fully reduces mod `n`. So `h1` is exactly `z mod n` for every 66-byte
+/// `z` (even `z` >= 2n), which is why it is canonical (< n).
+///
+/// ecdsa 0.17's `sign_prehashed` / `verify_prehashed` instead keep only the
+/// low 521 bits of a 66-byte `z`; handing them this canonical encoding (< n)
+/// keeps the old signatures for every input, including `z` >= 2^521.
+fn p521_reduce(z: &p521::FieldBytes) -> p521::FieldBytes {
+    use elliptic_curve::ops::Reduce;
+    use elliptic_curve::PrimeField;
+
+    <p521::Scalar as Reduce<p521::FieldBytes>>::reduce(z).to_repr()
 }
 
 /// Shift a big-endian integer right by `bits` (< 8) in place.
@@ -619,22 +653,22 @@ fn shift_right_bits(be: &mut [u8], bits: usize) {
     }
 }
 
-/// P-521 ECDSA verify — dedicated impl because NistP521 has no DigestPrimitive.
+/// P-521 ECDSA verify — dedicated impl matching `ecdsa_sign_p521_with_ad`'s
+/// prehash handling.
 fn ecdsa_verify_p521(
     public_key_raw: &[u8],
     hash_data: &[u8],
     signature_der: &[u8],
 ) -> Result<bool, CryptoError> {
-    use ecdsa::hazmat::{bits2field, VerifyPrimitive};
     use ecdsa::Signature as EcdsaSig;
 
     let public_key = PublicKey::<p521::NistP521>::from_sec1_bytes(public_key_raw)
         .map_err(|_| CryptoError::VerifyFailure)?;
     let sig = EcdsaSig::<p521::NistP521>::from_der(signature_der)
         .map_err(|_| CryptoError::VerifyFailure)?;
-    let z = bits2field::<p521::NistP521>(hash_data).map_err(|_| CryptoError::VerifyFailure)?;
-    match public_key.as_affine().verify_prehashed(&z, &sig) {
-        // z by reference
+    let z = p521_bits2field(hash_data).ok_or(CryptoError::VerifyFailure)?;
+    let q = p521::ProjectivePoint::from(*public_key.as_affine());
+    match ecdsa::hazmat::verify_prehashed(&q, p521_reduce(&z).as_slice(), &sig) {
         Ok(()) => Ok(true),
         Err(_) => Ok(false),
     }
@@ -701,17 +735,12 @@ fn ecdsa_verify_curve<C>(
     signature_der: &[u8],
 ) -> Result<bool, CryptoError>
 where
-    C: elliptic_curve::PrimeCurve
-        + elliptic_curve::CurveArithmetic
-        + ecdsa::hazmat::DigestPrimitive,
-    elliptic_curve::AffinePoint<C>: ecdsa::hazmat::VerifyPrimitive<C>
-        + elliptic_curve::sec1::FromEncodedPoint<C>
-        + ToEncodedPoint<C>,
+    C: ecdsa::EcdsaCurve + elliptic_curve::CurveArithmetic,
+    elliptic_curve::AffinePoint<C>: FromSec1Point<C> + ToSec1Point<C>,
     elliptic_curve::FieldBytesSize<C>: elliptic_curve::sec1::ModulusSize,
-    ecdsa::SignatureSize<C>: elliptic_curve::generic_array::ArrayLength<u8>,
-    ecdsa::der::MaxSize<C>: elliptic_curve::generic_array::ArrayLength<u8>,
+    ecdsa::der::MaxSize<C>: elliptic_curve::array::ArraySize,
     <elliptic_curve::FieldBytesSize<C> as core::ops::Add>::Output:
-        core::ops::Add<ecdsa::der::MaxOverhead> + elliptic_curve::generic_array::ArrayLength<u8>,
+        core::ops::Add<ecdsa::der::MaxOverhead> + elliptic_curve::array::ArraySize,
 {
     use ecdsa::VerifyingKey;
 
@@ -772,7 +801,7 @@ pub fn ecdh_agree(
 /// # Bounds
 /// - `C: CurveArithmetic` — provides scalar multiplication and affine<->projective conversion.
 ///   This bound also implies `AffinePoint<C>: AffineCoordinates` (x-coordinate extraction).
-/// - `AffinePoint<C>: FromEncodedPoint + ToEncodedPoint` — for SEC1 deserialization of the
+/// - `AffinePoint<C>: FromSec1Point + ToSec1Point` — for SEC1 deserialization of the
 ///   peer public key.
 /// - `FieldBytesSize<C>: ModulusSize` — for uncompressed-point encoding.
 fn ecdh_agree_curve<C>(
@@ -781,7 +810,7 @@ fn ecdh_agree_curve<C>(
 ) -> Result<Vec<u8, 66>, CryptoError>
 where
     C: elliptic_curve::CurveArithmetic,
-    elliptic_curve::AffinePoint<C>: elliptic_curve::sec1::FromEncodedPoint<C> + ToEncodedPoint<C>,
+    elliptic_curve::AffinePoint<C>: FromSec1Point<C> + ToSec1Point<C>,
     elliptic_curve::FieldBytesSize<C>: elliptic_curve::sec1::ModulusSize,
 {
     let secret =
@@ -1389,8 +1418,8 @@ mod p521_rfc6979_tests {
         let public = SecretKey::<p521::NistP521>::from_slice(&hex(X))
             .unwrap()
             .public_key();
-        use elliptic_curve::sec1::ToEncodedPoint;
-        let sec1 = public.to_encoded_point(false);
+        use elliptic_curve::sec1::ToSec1Point;
+        let sec1 = public.to_sec1_point(false);
         for der in [a, b] {
             assert_eq!(ecdsa_verify_p521(sec1.as_bytes(), &h, &der), Ok(true));
         }

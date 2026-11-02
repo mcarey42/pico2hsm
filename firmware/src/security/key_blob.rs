@@ -208,11 +208,11 @@ impl Curve {
     fn public(self, d: &[u8]) -> Result<Vec<u8, 133>, BlobError> {
         macro_rules! public_of {
             ($C:ty) => {{
-                use elliptic_curve::sec1::ToEncodedPoint;
+                use elliptic_curve::sec1::ToSec1Point;
                 let sk = elliptic_curve::SecretKey::<$C>::from_slice(d)
                     .map_err(|_| BlobError::Malformed)?;
                 let mut out = Vec::new();
-                out.extend_from_slice(sk.public_key().to_encoded_point(false).as_bytes())
+                out.extend_from_slice(sk.public_key().to_sec1_point(false).as_bytes())
                     .map_err(|_| BlobError::Malformed)?;
                 Ok(out)
             }};

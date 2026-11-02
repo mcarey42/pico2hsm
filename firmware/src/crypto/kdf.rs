@@ -462,7 +462,7 @@ pub fn slip10_child_key(
 /// Uses the `k256` or `p256` crate depending on the curve.
 /// Returns 33-byte compressed point (0x02/0x03 || X).
 fn compressed_pubkey(private_key: &[u8; 32], curve: Slip10Curve) -> Result<[u8; 33], CryptoError> {
-    use elliptic_curve::sec1::ToEncodedPoint;
+    use elliptic_curve::sec1::ToSec1Point;
 
     match curve {
         Slip10Curve::Secp256k1 => {
@@ -470,7 +470,7 @@ fn compressed_pubkey(private_key: &[u8; 32], curve: Slip10Curve) -> Result<[u8; 
             let sk =
                 SecretKey::from_bytes(private_key.into()).map_err(|_| CryptoError::KdfFailure)?;
             let pk = sk.public_key();
-            let encoded = pk.to_encoded_point(true);
+            let encoded = pk.to_sec1_point(true);
             let bytes = encoded.as_bytes();
             if bytes.len() != 33 {
                 return Err(CryptoError::KdfFailure);
@@ -484,7 +484,7 @@ fn compressed_pubkey(private_key: &[u8; 32], curve: Slip10Curve) -> Result<[u8; 
             let sk =
                 SecretKey::from_bytes(private_key.into()).map_err(|_| CryptoError::KdfFailure)?;
             let pk = sk.public_key();
-            let encoded = pk.to_encoded_point(true);
+            let encoded = pk.to_sec1_point(true);
             let bytes = encoded.as_bytes();
             if bytes.len() != 33 {
                 return Err(CryptoError::KdfFailure);

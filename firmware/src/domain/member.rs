@@ -764,10 +764,10 @@ mod tests {
     use super::*;
 
     fn member_pub(seed: u8) -> [u8; 65] {
-        use p256::elliptic_curve::sec1::ToEncodedPoint;
+        use p256::elliptic_curve::sec1::ToSec1Point;
         let sk = p256::SecretKey::from_slice(&[seed; 32]).unwrap();
         let mut out = [0u8; 65];
-        out.copy_from_slice(sk.public_key().to_encoded_point(false).as_bytes());
+        out.copy_from_slice(sk.public_key().to_sec1_point(false).as_bytes());
         out
     }
 
