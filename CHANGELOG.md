@@ -6,6 +6,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **GENERATE KEY PAIR no longer substitutes a NIST curve (#51).** With
+  CPI `5F29 = 00`, OpenSC names the curve by its domain parameters in
+  `7F49`. The firmware went by the order's length, so a request for
+  brainpoolP256r1 or brainpoolP384r1 quietly produced a P-256 or P-384
+  key. The parameters must now equal those of P-256, P-384, P-521 or
+  secp256k1 exactly; anything else is refused with `6A80` and no key is
+  made. An explicit algorithm in `5F29` must agree with the parameters
+  sent with it.
+
 ## [2.1.1] - 2026-11-01
 
 Bug fixes for issues #36, #37 and #38. No flash layout, partition table or

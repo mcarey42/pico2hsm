@@ -8,7 +8,9 @@
 //! - Data: GAK parameters (extended APDU):
 //!   - Tag 5F29 (two-byte): algorithm byte (SC-HSM AlgorithmId; 0x00 = infer from params)
 //!   - Tag 42: key reference/label (optional)
-//!   - Tag 7F49: EC domain parameters containing tag 85 (order n)
+//!   - Tag 7F49: EC domain parameters (81 prime .. 85 order n); with CPI 0x00
+//!     they name the curve, and must be exactly P-256, P-384, P-521 or
+//!     secp256k1 (anything else, e.g. brainpool, is refused with 6A80)
 //!   - Tag 5F20: CA reference (optional)
 //!
 //! # Response data
@@ -35,6 +37,7 @@ use crate::protocol::sc_hsm::{FwRng, KeyMeta, ScHsmState};
 pub const INS_GENERATE_KEYPAIR: u8 = 0x46;
 
 use crate::crypto::ec_params::ec_domain_params;
+use crate::security::key_policy::for_each_tlv;
 
 // ---------------------------------------------------------------------------
 // TLV / DER helpers
@@ -116,57 +119,78 @@ fn find_tlv_2(data: &[u8], tag0: u8, tag1: u8) -> Option<&[u8]> {
     None
 }
 
-/// Infer EC algorithm byte from the EC domain parameter order length (tag 0x85 inside data).
+/// The 7F49 public-key template of a GAKP body, if there is one.
 ///
-/// Searches `data` for EC domain parameter tags:
-/// - Tag 0x81 (prime): captured to distinguish P-256 from K-256
-/// - Tag 0x85 (order) length maps to the SC-HSM AlgorithmId:
-///   - 0x20 (32 bytes) → P-256 (0x13) or K-256 (0x19) — disambiguated by prime
-///   - 0x30 (48 bytes) → P-384  → 0x15
-///   - 0x42 (66 bytes) → P-521  → 0x17
-///
-/// P-256 and K-256 both have 32-byte orders; the prime distinguishes them:
-/// - P-256 prime[4] == 0x00 (`FFFFFFFF 00000001 ...`)
-/// - K-256 prime[4] == 0xFF (`FFFFFFFF FFFFFFFF ...`)
-fn algo_from_order_tag(data: &[u8]) -> Option<u8> {
-    let mut prime32: Option<u8> = None; // byte[4] of a 32-byte prime field
-    let mut i = 0;
-    while i + 1 < data.len() {
-        match data[i] {
-            0x81 if data[i + 1] == 0x20 && i + 2 + 32 <= data.len() => {
-                // 32-byte prime field — save byte[4] to distinguish P-256 vs K-256
-                prime32 = Some(data[i + 2 + 4]);
-            }
-            0x85 => match data[i + 1] {
-                0x20 => {
-                    // 32-byte order: P-256 or K-256
-                    // P-256 prime byte[4] == 0x00; K-256 prime byte[4] == 0xFF
-                    return match prime32 {
-                        Some(0xFF) => Some(0x19), // K-256 (secp256k1)
-                        _ => Some(0x13),          // P-256 (default)
-                    };
-                }
-                0x30 => return Some(0x15), // P-384
-                0x42 => return Some(0x17), // P-521
-                _ => {}
-            },
-            // Tag 0x02 with a 2-byte length field = RSA modulusSize (bits).
-            // OpenSC encodes the requested key size as `02 02 <hi> <lo>` inside
-            // the 7F49 public-key template when the CPI (5F29) byte is 0x00.
-            0x02 if i + 3 < data.len() && data[i + 1] == 0x02 => {
-                let bits = ((data[i + 2] as u16) << 8) | (data[i + 3] as u16);
-                match bits {
-                    0x0800 => return Some(0x05), // RSA-2048
-                    0x0C00 => return Some(0x06), // RSA-3072
-                    0x1000 => return Some(0x07), // RSA-4096
-                    _ => {}
-                }
-            }
-            _ => {}
+/// OpenSC's P-384 / P-521 templates need a two-byte length, so this walks
+/// the body with the strict BER-TLV walker rather than `find_tlv_2`.
+fn public_key_template(data: &[u8]) -> Result<Option<&[u8]>, u16> {
+    let mut template = None;
+    for_each_tlv(data, |tag, value| {
+        if tag == 0x7F49 && template.is_none() {
+            template = Some(value);
         }
-        i += 1;
+        Ok(())
+    })?;
+    Ok(template)
+}
+
+/// Equal as unsigned big-endian integers (leading zero bytes ignored).
+fn same_integer(a: &[u8], b: &[u8]) -> bool {
+    let strip = |x: &[u8]| -> usize { x.iter().take_while(|&&b| b == 0).count() };
+    a[strip(a)..] == b[strip(b)..]
+}
+
+/// The supported curve that a 7F49 template's EC domain parameters name.
+///
+/// `Ok(None)` when the template carries no order (tag 85), i.e. no EC
+/// domain parameters (an RSA template uses 81/82 for modulus/exponent).
+/// With an order, every parameter present (81 prime, 82 a, 83 b, 84 G,
+/// 85 order) must equal that of one supported curve, else 6A80: a host
+/// asking for brainpoolP256r1 must be refused, never handed a P-256 key
+/// (issue #51).
+fn ec_curve_from_template(template: &[u8]) -> Result<Option<u8>, u16> {
+    let mut fields: [Option<&[u8]>; 5] = [None; 5]; // tags 81..=85
+    for_each_tlv(template, |tag, value| {
+        if let 0x81..=0x85 = tag {
+            fields[usize::from(tag - 0x81)] = Some(value);
+        }
+        Ok(())
+    })?;
+    if fields[4].is_none() {
+        return Ok(None);
     }
-    None
+    for algo in [0x13u8, 0x15, 0x17, 0x19] {
+        let Some(p) = ec_domain_params(algo) else {
+            continue;
+        };
+        let known = [p.prime, p.coeff_a, p.coeff_b, p.base_g, p.order];
+        let matches = fields
+            .iter()
+            .zip(known)
+            .all(|(given, want)| given.map_or(true, |g| same_integer(g, want)));
+        if matches {
+            return Ok(Some(algo));
+        }
+    }
+    Err(SW_WRONG_DATA)
+}
+
+/// RSA AlgorithmId from the template's modulus size (`02 02 <bits>`):
+/// OpenSC encodes the requested key size this way when the CPI is 0x00.
+fn rsa_algo_from_template(template: &[u8]) -> Option<u8> {
+    let mut algo = None;
+    let _ = for_each_tlv(template, |tag, value| {
+        if tag == 0x02 && algo.is_none() {
+            algo = match value {
+                [0x08, 0x00] => Some(0x05), // RSA-2048
+                [0x0C, 0x00] => Some(0x06), // RSA-3072
+                [0x10, 0x00] => Some(0x07), // RSA-4096
+                _ => None,
+            };
+        }
+        Ok(())
+    });
+    algo
 }
 
 /// Map SC-HSM AlgorithmId byte to the `pico2hsm_core` KeyType.
@@ -536,8 +560,19 @@ pub fn handle(
     };
     let key_id = pico2hsm_core::key::KeyId::sc_hsm(0, key_id_proto).0; // u32 full internal ID
 
-    // Determine algorithm byte: try two-byte tag 5F29 first, then single-byte 0x41,
-    // then fall back to inferring from EC order length (tag 0x85) in the data.
+    // The curve the 7F49 template's domain parameters name, if any; a set
+    // that is not exactly a supported curve is refused here.
+    let template = match public_key_template(cmd.data) {
+        Ok(t) => t,
+        Err(sw) => return ApduResponse::err(sw),
+    };
+    let named_curve = match template.map(ec_curve_from_template).transpose() {
+        Ok(c) => c.flatten(),
+        Err(sw) => return ApduResponse::err(sw),
+    };
+
+    // Determine algorithm byte: try two-byte tag 5F29 first, then single-byte
+    // 0x41, then infer it from the template (curve, or RSA modulus size).
     let algo: u8 = {
         let from_5f29 = find_tlv_2(cmd.data, 0x5F, 0x29)
             .and_then(|v| v.first().copied())
@@ -549,7 +584,7 @@ pub fn handle(
 
         match from_5f29.or(from_41) {
             Some(a) => a,
-            None => match algo_from_order_tag(cmd.data) {
+            None => match named_curve.or_else(|| template.and_then(rsa_algo_from_template)) {
                 Some(a) => a,
                 None => return ApduResponse::err(SW_WRONG_DATA),
             },
@@ -560,6 +595,12 @@ pub fn handle(
         Some(kt) => kt,
         None => return ApduResponse::err(SW_INS_NOT_SUPPORTED),
     };
+    // An explicit algorithm must agree with the parameters sent with it.
+    if let Some(curve) = named_curve {
+        if algo_to_key_type(curve) != Some(key_type) {
+            return ApduResponse::err(SW_WRONG_DATA);
+        }
+    }
 
     // Parse key flags from TLV tag 0xD4 (SC-HSM key access conditions).
     // Bit 3 = NO_EXPORT: if set, EXPORT KEY (INS=0x72) will reject wrapping.

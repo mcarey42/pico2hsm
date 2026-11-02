@@ -731,13 +731,21 @@ than stored without its attributes (OpenSC's P-521 request has a 2-byte
 
 | `7F49` content | Algorithm byte | Key type |
 |---|---|---|
-| Tag `0x85` (order) length = 32 bytes (P-256 prime) | `0x13` | ECDSA P-256 |
-| Tag `0x85` length = 32 bytes (K-256 prime) | `0x19` | ECDSA K-256 |
-| Tag `0x85` length = 48 bytes | `0x15` | ECDSA P-384 |
-| Tag `0x85` length = 66 bytes | `0x17` | ECDSA P-521 |
+| Domain parameters of P-256 | `0x13` | ECDSA P-256 |
+| Domain parameters of secp256k1 | `0x19` | ECDSA K-256 |
+| Domain parameters of P-384 | `0x15` | ECDSA P-384 |
+| Domain parameters of P-521 | `0x17` | ECDSA P-521 |
 | Tag `0x02` value = `0x0800` (2048 bits) | `0x05` | RSA-2048 |
 | Tag `0x02` value = `0x0C00` (3072 bits) | `0x06` | RSA-3072 |
 | Tag `0x02` value = `0x1000` (4096 bits) | `0x07` | RSA-4096 |
+
+A template with an order (tag `85`) carries EC domain parameters. Every
+parameter present (`81` prime, `82` a, `83` b, `84` G, `85` order) must
+equal those of one of the four curves above, or the command fails with
+`6A80` and no key is made. This refuses brainpool and any other curve;
+before 2.2.0 the firmware went by the order's length and quietly made a
+NIST key instead (#51). When `5F29` names an algorithm explicitly and the
+template also names a curve, the two must agree (`6A80` otherwise).
 
 **Response data:** A CVC in BSI TR-03110 "authenticated request" format:
 

@@ -2512,3 +2512,6 @@ mod domain_tests;
 
 #[cfg(test)]
 mod store_recovery_tests;
+
+#[cfg(test)]
+mod curve_tests;
