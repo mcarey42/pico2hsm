@@ -140,6 +140,35 @@ fn same_integer(a: &[u8], b: &[u8]) -> bool {
     a[strip(a)..] == b[strip(b)..]
 }
 
+/// The EC domain parameters in a 7F49 template, tags 81..=85 (prime, a,
+/// b, G, order).  A repeated tag is refused (6A80): which copy counts must
+/// never be the walker's choice.
+fn ec_fields(template: &[u8]) -> Result<[Option<&[u8]>; 5], u16> {
+    let mut fields: [Option<&[u8]>; 5] = [None; 5];
+    for_each_tlv(template, |tag, value| {
+        if let 0x81..=0x85 = tag {
+            let slot = &mut fields[usize::from(tag - 0x81)];
+            if slot.replace(value).is_some() {
+                return Err(SW_WRONG_DATA);
+            }
+        }
+        Ok(())
+    })?;
+    Ok(fields)
+}
+
+/// True when every parameter present equals that of curve `algo`.
+fn fields_match(fields: &[Option<&[u8]>; 5], algo: u8) -> bool {
+    let Some(p) = ec_domain_params(algo) else {
+        return false;
+    };
+    let known = [p.prime, p.coeff_a, p.coeff_b, p.base_g, p.order];
+    fields
+        .iter()
+        .zip(known)
+        .all(|(given, want)| given.map_or(true, |g| same_integer(g, want)))
+}
+
 /// The supported curve that a 7F49 template's EC domain parameters name.
 ///
 /// `Ok(None)` when the template carries no order (tag 85), i.e. no EC
@@ -149,30 +178,29 @@ fn same_integer(a: &[u8], b: &[u8]) -> bool {
 /// asking for brainpoolP256r1 must be refused, never handed a P-256 key
 /// (issue #51).
 fn ec_curve_from_template(template: &[u8]) -> Result<Option<u8>, u16> {
-    let mut fields: [Option<&[u8]>; 5] = [None; 5]; // tags 81..=85
-    for_each_tlv(template, |tag, value| {
-        if let 0x81..=0x85 = tag {
-            fields[usize::from(tag - 0x81)] = Some(value);
-        }
-        Ok(())
-    })?;
+    let fields = ec_fields(template)?;
     if fields[4].is_none() {
         return Ok(None);
     }
-    for algo in [0x13u8, 0x15, 0x17, 0x19] {
-        let Some(p) = ec_domain_params(algo) else {
-            continue;
-        };
-        let known = [p.prime, p.coeff_a, p.coeff_b, p.base_g, p.order];
-        let matches = fields
-            .iter()
-            .zip(known)
-            .all(|(given, want)| given.map_or(true, |g| same_integer(g, want)));
-        if matches {
-            return Ok(Some(algo));
-        }
+    [0x13u8, 0x15, 0x17, 0x19]
+        .into_iter()
+        .find(|&algo| fields_match(&fields, algo))
+        .map(Some)
+        .ok_or(SW_WRONG_DATA)
+}
+
+/// Whether the template agrees with the algorithm chosen for the key: for
+/// an EC key, every domain parameter present is that curve's and there is
+/// no RSA size; for RSA, no curve and no other RSA size.  Matters when
+/// 5F29 / 41 names the algorithm explicitly, and keeps a template without
+/// an order (so naming no curve) from carrying another curve's field.
+fn template_agrees(template: &[u8], algo: u8, key_type: CoreKeyType) -> bool {
+    let rsa = rsa_algo_from_template(template);
+    if is_rsa_key_type(key_type) {
+        matches!(ec_fields(template), Ok([.., None])) && rsa.map_or(true, |r| r == algo)
+    } else {
+        rsa.is_none() && ec_fields(template).is_ok_and(|f| fields_match(&f, algo))
     }
-    Err(SW_WRONG_DATA)
 }
 
 /// RSA AlgorithmId from the template's modulus size (`02 02 <bits>`):
@@ -596,8 +624,8 @@ pub fn handle(
         None => return ApduResponse::err(SW_INS_NOT_SUPPORTED),
     };
     // An explicit algorithm must agree with the parameters sent with it.
-    if let Some(curve) = named_curve {
-        if algo_to_key_type(curve) != Some(key_type) {
+    if let Some(t) = template {
+        if !template_agrees(t, algo, key_type) {
             return ApduResponse::err(SW_WRONG_DATA);
         }
     }

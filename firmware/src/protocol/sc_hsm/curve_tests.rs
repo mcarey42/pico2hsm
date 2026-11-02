@@ -239,3 +239,71 @@ fn an_explicit_algorithm_must_agree_with_the_parameters() {
     );
     assert_eq!(sw, 0x9000);
 }
+
+/// Wrap a raw 7F49 content in a GAKP body with CPI `cpi`.
+fn gakp_raw(cpi: u8, pk: &[u8]) -> heapless::Vec<u8, 1024> {
+    let mut d: heapless::Vec<u8, 1024> = heapless::Vec::new();
+    push_tlv(&mut d, &[0x5F, 0x29], &[cpi]);
+    push_tlv(&mut d, &[0x7F, 0x49], pk);
+    d
+}
+
+#[test]
+fn brainpool_field_without_an_order_and_an_explicit_algorithm_is_refused() {
+    let bp = brainpool_p256r1();
+    let mut pk: heapless::Vec<u8, 1024> = heapless::Vec::new();
+    push_tlv(&mut pk, &[0x81], &bp.prime);
+    push_tlv(&mut pk, &[0x82], &bp.a);
+    push_tlv(&mut pk, &[0x83], &bp.b);
+    push_tlv(&mut pk, &[0x84], &bp.g);
+    let mut store = BlobStore::new();
+    let mut hsm = logged_in();
+    refused_without_a_key(&mut hsm, &mut store, &gakp_raw(0x13, &pk));
+}
+
+#[test]
+fn an_ec_algorithm_with_an_rsa_template_is_refused() {
+    let mut store = BlobStore::new();
+    let mut hsm = logged_in();
+    refused_without_a_key(
+        &mut hsm,
+        &mut store,
+        &gakp_raw(0x13, &[0x02, 0x02, 0x08, 0x00]),
+    );
+}
+
+#[test]
+fn a_repeated_domain_parameter_is_refused() {
+    let bp = brainpool_p256r1();
+    let p256 = ec_domain_params(0x13).unwrap();
+    let mut pk: heapless::Vec<u8, 1024> = heapless::Vec::new();
+    push_tlv(&mut pk, &[0x85], &bp.order);
+    push_tlv(&mut pk, &[0x85], p256.order);
+    let mut store = BlobStore::new();
+    let mut hsm = logged_in();
+    refused_without_a_key(&mut hsm, &mut store, &gakp_raw(0x00, &pk));
+}
+
+#[test]
+fn order_only_and_explicit_algorithm_requests_still_work() {
+    // The shape tests/hw and older host tests send: 7F49 [85 n].
+    let p256 = ec_domain_params(0x13).unwrap();
+    let mut pk: heapless::Vec<u8, 1024> = heapless::Vec::new();
+    push_tlv(&mut pk, &[0x85], p256.order);
+    let mut store = BlobStore::new();
+    let mut hsm = logged_in();
+    let (sw, _) = run(
+        &mut hsm,
+        &mut store,
+        &apdu_ext(0x46, 0x01, &gakp_raw(0x00, &pk)),
+    );
+    assert_eq!(sw, 0x9000);
+    // Explicit algorithm with an empty template.
+    let (sw, _) = run(
+        &mut hsm,
+        &mut store,
+        &apdu_ext(0x46, 0x02, &gakp_raw(0x19, &[])),
+    );
+    assert_eq!(sw, 0x9000);
+    assert_eq!(hsm.state.key_index[1].algo, 0x19);
+}
