@@ -6,6 +6,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.2.0] - 2026-11-02
+
+Security release: the ECC code moves to RustCrypto 0.14, which fixes
+RUSTSEC-2026-0387, and GENERATE KEY PAIR stops substituting NIST curves
+for Brainpool requests (#51). No flash layout, partition table or
+keystore format change: a 2.1.x device keeps its keys across the update,
+and existing keys give the same public keys and signatures.
+
 ### Security
 
 - **RUSTSEC-2026-0387 (`crypto-bigint`) fixed.** All NIST
