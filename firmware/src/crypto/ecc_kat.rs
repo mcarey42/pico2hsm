@@ -143,7 +143,9 @@ const K256_BAD_SCALAR: [&str; 4] = [
     "Err(WrongKeyLength)",
     "Ok",
 ];
-// Signatures: truncated by a byte, high-S (s -> n - s), r = 0.
+// Signatures: truncated by a byte, s -> n - s, r = 0. The pinned s is low on
+// P-256, P-521 and K-256 (so s -> n - s is high-S there) and high on P-384
+// (so it is low-S there); only K-256's verify rejects high-S.
 const P256_BAD_SIG: [&str; 3] = ["Err(VerifyFailure)", "Ok(true)", "Ok(false)"];
 const P384_BAD_SIG: [&str; 3] = ["Err(VerifyFailure)", "Ok(true)", "Ok(false)"];
 const P521_BAD_SIG: [&str; 3] = ["Err(VerifyFailure)", "Ok(true)", "Err(VerifyFailure)"];
@@ -155,12 +157,69 @@ const P384_N: &str = "ffffffffffffffffffffffffffffffffffffffffffffffffc7634d81f4
 const P521_N: &str = "01fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffa51868783bf2f966b7fcc0148f709a5d03bb5c9b8899c47aebb6fb71e91386409";
 const K256_N: &str = "fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141";
 
+// Sign-path edge cases (see `edge_results`): label, signing result, and the
+// verify result for that signature over the same input ("-" if signing
+// failed). Captured on 0.13 (5e3f22e) like everything above.
+const EDGE_RESULTS: [(&str, &str, &str); 10] = [
+    (
+        "P521_RAW_FF66",
+        "Ok(308187024103519e2c3b87cbc99a023eb0f351c0167fbaa9391f0aa7d11d5134265cfd1665f86a15db10e4d3fb254df68610436de82bd0e381beadc5e4db49432af2b9984edc024201b1401ad4ed26d566e8c77b18cac805c2fb8c5f179fdfc731393748c4ac66eeb8c82f343f25b6cb974bdd5342994c4c6588af2e65681effa97e4da1827e75765f0b)",
+        "Ok(true)",
+    ),
+    (
+        "P521_RAW_0266",
+        "Ok(3081860241721dc0b1a0d5cc29511fef9fd5a603bfc7583f2c23defc57a65ddd1452cffdb77a664cc0a0b9db7b25af4d50c57bb73c22196dd4f1fb3af9d02e8dcc37526884a9024173d43b7971d9d8562b50297b57d7dc17a25f550736a3f75390c414cc91aa106398f6e44fdf9614cace9e6114c8463ef3a7a9d8a14340a2e2145be5163c71636c3a)",
+        "Ok(true)",
+    ),
+    (
+        "P521_RAW_0166",
+        "Ok(308188024200d94295f40e485ab4975c30820869d2368907c0cc07e37835ecc775ee36d96e2848abb33363be6dc08b2c19fd856721dfef13dfac67c5cf3a7e83adb8f9e60e40cd024200dbfd5c2ca27d8056b8c6dba08d54ce56d2ce20ff902bb0f43b4fd255d4056b75259e56f794d71c5351f79b4f542da66bc7508ff144765959f02c59c9b1dad61bb0)",
+        "Ok(true)",
+    ),
+    (
+        "P521_RAW_0370",
+        "Ok(308188024200e34bd0cc01c937f141d833ed0b64fe6582bd149293f1161c1c12dd17b161301eb44acabb76d2d6bb54d005542c3a90004341927acc4a2a86e7b58adc1b2e95ea8a02420158668977ed844954a57c0ecf071d24c7a5d3fde49e6890b6aa0d48583d77db6ccfdc1e30315ee622874ea3a86d8e7316a5469e03f378ed517f2bcf4956d21b1802)",
+        "Ok(true)",
+    ),
+    (
+        "P521_RAW_7740",
+        "Ok(308187024201a6a3478b69085aa951bd9a549e986d975ac11cb40d156ac58828aa4459c2a51db424de0e8b544239529048136be2037651226b0f3c2bc6c2ef60bd4b73e8428c8102416140b2fec0e3205df2e944048825b7bfe5f59d73e6c110ebb1f121cca203ca72fb25a277d3630fface24fef198beac6a86663a3c38fa315885cbf5b2ece7c4d4c8)",
+        "Ok(true)",
+    ),
+    (
+        "P256_SK_33",
+        "Err(WrongKeyLength)",
+        "-",
+    ),
+    (
+        "P256_SK_00N",
+        "Err(WrongKeyLength)",
+        "-",
+    ),
+    (
+        "P256_SK_00A",
+        "Err(WrongKeyLength)",
+        "-",
+    ),
+    (
+        "P384_H32",
+        "Ok(30660231008135bfb934c3e235f85ec99678dda344a0ca952b7e0c0e6e4dffff678361e036d794af1d0b4ae120222cf48189ddf5d0023100c78c38915161df049c2898bf60796167f6f920aa8c7f7d8bfb119e44e1a76de3594e330e8aabb0863fc94cf687000764)",
+        "Ok(true)",
+    ),
+    (
+        "K256_H20",
+        "Ok(3045022100b0bb12c66817f4e3b5729f762eb50b7a730c79ab81bc4959fd025e1d8c6e9e1a02206491019769ef57d79046af76dc4f8ac63145d715617fe28fc8f3969c60c2a55a)",
+        "Ok(true)",
+    ),
+];
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
 /// Counter-hash PRNG with a fixed output stream (same shape as the one in the
-/// SC-HSM command tests); only used to capture the key vectors once.
+/// SC-HSM command tests). It drives keygen and the signing calls on every
+/// test run, so the captured keys are reproduced each time.
 struct CounterRng(u64);
 
 impl RngCore for CounterRng {
@@ -351,6 +410,8 @@ fn inc_be(a: &[u8]) -> Vec<u8> {
 }
 
 /// Split a DER `SEQUENCE { INTEGER r, INTEGER s }` into its raw integers.
+/// Assumes short-form INTEGER lengths and at most a single-byte long-form
+/// SEQUENCE length, which holds for every signature in these vectors.
 fn der_rs(der: &[u8]) -> (Vec<u8>, Vec<u8>) {
     let mut i = 2;
     if der[1] & 0x80 != 0 {
@@ -395,6 +456,78 @@ fn der_encode(r: &[u8], s: &[u8]) -> Vec<u8> {
     }
     out.push(body.len() as u8);
     out.extend(body);
+    out
+}
+
+/// Sign-path edge inputs: (label, signing result, verify result of that
+/// signature over the same input, or "-" when signing failed).
+fn edge_results() -> Vec<(&'static str, String, String)> {
+    let mut out = Vec::new();
+    let p521_priv = h(P521_A_PRIV);
+    let p521_pub = h(P521_A_PUB);
+    // Raw (unpadded) P-521 prehashes through the deterministic entry: z >= 2n,
+    // 2^521 <= z, z < 2^521, longer than the field, and a short-but-legal one.
+    for (label, z) in [
+        ("P521_RAW_FF66", vec![0xffu8; 66]),
+        ("P521_RAW_0266", vec![0x02u8; 66]),
+        ("P521_RAW_0166", vec![0x01u8; 66]),
+        ("P521_RAW_0370", vec![0x03u8; 70]),
+        ("P521_RAW_7740", vec![0x77u8; 40]),
+    ] {
+        let sig = ecdsa_sign_p521_with_ad(&p521_priv, &z, &[]);
+        let v = match &sig {
+            Ok(s) => format!("{:?}", ecdsa_verify(P521, &p521_pub, &z, s)),
+            Err(_) => "-".into(),
+        };
+        out.push((label, bytes_res(sig), v));
+    }
+    // Over-length P-256 scalars: one byte too long, n behind a 0x00, and the
+    // valid key behind a 0x00.
+    let p256_priv = h(P256_A_PRIV);
+    let p256_pub = h(P256_A_PUB);
+    let mut long = p256_priv.clone();
+    long.push(0x01);
+    let mut zero_n = vec![0u8];
+    zero_n.extend(h(P256_N));
+    let mut zero_a = vec![0u8];
+    zero_a.extend(&p256_priv);
+    let hash = hash_for(P256);
+    for (label, sk) in [
+        ("P256_SK_33", long),
+        ("P256_SK_00N", zero_n),
+        ("P256_SK_00A", zero_a),
+    ] {
+        let sig = ecdsa_sign(P256, &sk, &hash, &mut CounterRng(9));
+        let v = match &sig {
+            Ok(s) => format!("{:?}", ecdsa_verify(P256, &p256_pub, &hash, s)),
+            Err(_) => "-".into(),
+        };
+        out.push((label, bytes_res(sig), v));
+    }
+    // Short hashes on the padding path: P-384 over 32 bytes, K-256 over 20.
+    for (label, kt, sk, pk, hash) in [
+        (
+            "P384_H32",
+            P384,
+            h(P384_A_PRIV),
+            h(P384_A_PUB),
+            vec![0x66u8; 32],
+        ),
+        (
+            "K256_H20",
+            K256,
+            h(K256_A_PRIV),
+            h(K256_A_PUB),
+            vec![0x77u8; 20],
+        ),
+    ] {
+        let sig = ecdsa_sign(kt, &sk, &hash, &mut CounterRng(9));
+        let v = match &sig {
+            Ok(s) => format!("{:?}", ecdsa_verify(kt, &pk, &hash, s)),
+            Err(_) => "-".into(),
+        };
+        out.push((label, bytes_res(sig), v));
+    }
     out
 }
 
@@ -598,11 +731,7 @@ fn bad_private_scalars_are_refused() {
             .iter()
             .enumerate()
         {
-            let r = if c.kt == P521 {
-                sign_res(ecdsa_sign(c.kt, sk, &hash, &mut CounterRng(9)))
-            } else {
-                sign_res(ecdsa_sign(c.kt, sk, &hash, &mut CounterRng(9)))
-            };
+            let r = sign_res(ecdsa_sign(c.kt, sk, &hash, &mut CounterRng(9)));
             cks(&format!("{}_BAD_SCALAR[{i}]", c.tag), r, c.bad_scalar[i]);
         }
     }
@@ -619,12 +748,23 @@ fn bad_signatures_verify_as_before() {
         let n = h(c.n);
         let mut s_full = vec![0u8; n.len() - s.len()];
         s_full.extend_from_slice(&s);
-        let high_s = der_encode(&r, &sub_be(&n, &s_full));
+        let s_negated = der_encode(&r, &sub_be(&n, &s_full));
         let r_zero = der_encode(&[0], &s);
         let truncated = sig[..sig.len() - 1].to_vec();
-        for (i, bad) in [truncated, high_s, r_zero].iter().enumerate() {
+        for (i, bad) in [truncated, s_negated, r_zero].iter().enumerate() {
             let r = format!("{:?}", ecdsa_verify(c.kt, &pubkey, &hash, bad));
             cks(&format!("{}_BAD_SIG[{i}]", c.tag), r, c.bad_sig[i]);
         }
+    }
+}
+
+#[test]
+fn sign_edge_cases_are_unchanged() {
+    let got = edge_results();
+    assert_eq!(got.len(), EDGE_RESULTS.len());
+    for ((label, sig, verify), (e_label, e_sig, e_verify)) in got.into_iter().zip(EDGE_RESULTS) {
+        assert_eq!(label, e_label);
+        cks(label, sig, e_sig);
+        cks(&format!("{label} verify"), verify, e_verify);
     }
 }
