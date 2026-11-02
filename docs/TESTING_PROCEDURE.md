@@ -51,12 +51,10 @@ cargo test --target x86_64-unknown-linux-gnu --no-default-features \
 Verify that all 7 board variants compile in both debug and release profiles.
 
 ```sh
-./build-all.sh          # Release builds of 6 variants (rp2350_one_16m is not in its list)
+./build-all.sh          # Release builds of all 7 variants
 
-# The seventh release build, and the debug builds (build-all-debug.sh
-# always flashes, so build them with cargo):
-cargo build --release -p pico2hsm-firmware --no-default-features \
-    --features rp2350_one_16m,rsa,applet-piv,applet-openpgp-curve25519
+# The debug builds (build-all-debug.sh always flashes, so build them with
+# cargo):
 for b in pico2_4m rp2350_one_4m rp2350_one_16m rp2350_geek_16m rp2350_geek_sdcard \
          waveshare_rp2350_lcd_16m waveshare_rp2350_lcd_sdcard; do
   cargo build -p pico2hsm-firmware --no-default-features \

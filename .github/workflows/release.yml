@@ -188,13 +188,17 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p sbom-output
-          for crate in pico2hsm-core firmware pico2hsm-integration-tests; do
+          # The firmware package is `pico2hsm-firmware`; its SBOM keeps the
+          # published name `firmware.cdx.json` (docs/RELEASE_PROCESS.md §5.2).
+          for crate in pico2hsm-core pico2hsm-layout pico2hsm-firmware pico2hsm-integration-tests; do
+            out="${crate}"
+            [ "$crate" = pico2hsm-firmware ] && out=firmware
             echo "=== SBOM for $crate ==="
             cargo sbom \
               --cargo-package "$crate" \
               --output-format cyclone_dx_json_1_4 \
-              > "sbom-output/${crate}.cdx.json"
-            ls -la "sbom-output/${crate}.cdx.json"
+              > "sbom-output/${out}.cdx.json"
+            ls -la "sbom-output/${out}.cdx.json"
           done
 
       - name: Fallback — always emit cargo tree dump

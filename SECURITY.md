@@ -4,8 +4,9 @@
 
 | Version | Status |
 |---------|--------|
-| 2.0.x | Current release series (`v2.0.0`: Storage V2, partition tables; breaking) |
-| 1.0.x | Previous release series (`v1.0.1`); upgrade to 2.0 |
+| 2.1.x | Current release series (`v2.1.1`); a 2.0.x device keeps its keys across the update |
+| 2.0.x | Previous release series (`v2.0.0`: Storage V2, partition tables; breaking); upgrade to 2.1 |
+| 1.0.x | Older release series (`v1.0.1`); upgrade to 2.x (1.x keys do not carry over) |
 | 0.9.x | Pre-release series; not supported |
 
 ## Threat model summary
