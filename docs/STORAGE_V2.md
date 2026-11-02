@@ -14,9 +14,10 @@ layout with partition tables on every board, A/B slots on the 16 MB
 boards and the store closed to BOOTSEL, is in:
 [FLASH_LAYOUT_2_0.md](FLASH_LAYOUT_2_0.md).  Still to do: removing the
 SC-HSM key index and EF cache from RAM, CMD13 on SD (R12), the SD
-power-pull campaign, then `v2.0.0-rc1` (phase 7).**  Ships in the 2.0.0 series.  It is a
-breaking change: 1.x keystores are not migrated (no devices are in use),
-and 2.0 firmware refuses a 1.x keystore with a clear error.
+power-pull campaign (phase 7).**  Shipped in 2.0.0 (2026-10-16) without
+those phase 7 items.  It is a breaking change: 1.x keystores are not
+migrated (no devices are in use), and 2.0 firmware refuses a 1.x keystore
+with a clear error.
 
 **Reviews (2026-10-12).**  The first review of the draft found 3
 critical, 6 high, 5 medium and several low issues; §17 maps each to its

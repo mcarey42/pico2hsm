@@ -7,7 +7,7 @@ with exact cargo commands and flash/RAM budget estimates.
 
 ## Quick reference: default features
 
-`Cargo.toml` sets:
+`firmware/Cargo.toml` sets:
 ```toml
 default = ["rp2350_one_4m", "rsa", "applet-piv", "applet-openpgp-curve25519"]
 ```
@@ -44,9 +44,9 @@ The `build-all-debug.sh` and `build-all.sh` scripts handle this correctly.
 
 ## Recommended full-featured builds
 
-All three applets plus RSA. `build-all.sh` builds these for every board
-except `rp2350_one_16m` (not yet in its variant list). The CI release
-artifacts (`pico2hsm-<board>-unsigned.uf2`) are built **without** `rsa`.
+All three applets plus RSA. `build-all.sh` builds these for every board,
+and the CI release artifacts (`pico2hsm-<board>-unsigned.uf2`) use the same
+features.
 
 ```sh
 # Raspberry Pi Pico 2 (internal flash)
@@ -249,7 +249,8 @@ cargo build --release -p pico2hsm-firmware --no-default-features \
 ## Flash / RAM budget
 
 Measured 2026-10-15 (workspace version 1.0.1, Storage V2 phase 6) from
-release builds with `arm-none-eabi-size -A`:
+release builds with `arm-none-eabi-size -A`; these figures predate 2.x and
+are to be re-measured:
 
 - **Flash** = `.boot2` + `.vector_table` + `.text` + `.rodata` + `.data`
   (what goes into the firmware slot).
@@ -359,7 +360,7 @@ The features included are: `rsa,applet-piv,applet-openpgp-curve25519`
 To build manually with the same set:
 
 ```sh
-cargo build --no-default-features \
+cargo build -p pico2hsm-firmware --no-default-features \
   --features pico2_4m,rsa,applet-piv,applet-openpgp-curve25519
 ```
 

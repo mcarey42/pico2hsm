@@ -661,7 +661,7 @@ The DKEK never passes through the host in plaintext. The exchange uses the P-256
 
 The host sees only ciphertexts and public keys. Even a fully compromised host cannot extract the DKEK.
 
-**Limitation:** The V1 protocol does not include mutual HSM authentication or replay protection. These are specified in `CLUSTER_PLAN_V2.md` and will be implemented before production deployment.
+**Limitation:** The V1 protocol (EXTRAS P1=0x31–0x33) does not include mutual HSM authentication or replay protection. The firmware no longer accepts it (6D00); it implements the V2 exchange from `CLUSTER_PLAN_V2.md` (P1=0x35–0x38), which authenticates each device against a peer key enrolled with the SO-PIN (P1=0x3D).
 
 ### 10.2 TCP Transport Encryption
 

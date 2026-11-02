@@ -2,13 +2,13 @@
 
 Operator runbook for cutting a tagged release of pico2hsm. Releases are
 tag-triggered: pushing an annotated tag matching `v*` to the upstream remote
-fires `.github/workflows/release.yml`, which builds UF2 firmware for all six
+fires `.github/workflows/release.yml`, which builds UF2 firmware for all seven
 supported boards, emits SBOMs, aggregates SHA256SUMS, and publishes a GitHub
 Release with all assets attached.
 
 The UF2s shipped in the GitHub Release are **unsigned**. Production signing
 (with a per-project EC firmware signing key) is performed offline and is out of
-scope for this workflow — see [SECURE_PROVISIONING_PLAN.md](SECURE_PROVISIONING_PLAN.md).
+scope for this workflow — see [PROVISIONING.md](PROVISIONING.md).
 
 ---
 
@@ -62,15 +62,14 @@ Work through this list on a clean, up-to-date `main` checkout.
    `## [Unreleased]` section above it. The release workflow extracts the
    `## [X.Y.Z]` section verbatim — so keep it self-contained and well-edited.
 
-4. **Version bumps in `Cargo.toml` members.** Each workspace crate
-   (`pico2hsm-core`, `firmware`, `tests/integration`) should advertise the
-   release version. _The exact scheme — whether all crates move in lockstep or
-   stay on independent semver — is owned by admin. See admin before bumping._
+4. **Version bump.** Set `version` under `[workspace.package]` in the root
+   `Cargo.toml`. Every workspace crate (`pico2hsm-core`, `pico2hsm-layout`,
+   `pico2hsm-firmware`, `pico2hsm-integration-tests`) inherits it
+   (`version.workspace = true`), so all crates move in lockstep. Refresh
+   `Cargo.lock` (`cargo update --workspace`) and commit it with the bump.
 
-5. **Docs review.** Confirm the top-of-file "Last updated" stamps in
-   `docs/PROVISIONING.md`, `docs/SECURE_PROVISIONING_PLAN.md`, and
-   `SECURITY.md` reference the new version (or at least the correct RC
-   lineage).
+5. **Docs review.** Confirm `SECURITY.md`'s "Supported versions" table
+   names the new release line (§6.2).
 
 6. **Local repro build.** Pick one board and verify the release profile
    builds:
@@ -116,7 +115,7 @@ gh release delete v1.0.0 --yes
 
 The release workflow takes roughly 15 minutes to complete end-to-end:
 
-- `build-uf2` matrix (6 boards, parallel): ~10 min each, but parallel so the
+- `build-uf2` matrix (7 boards, parallel): ~10 min each, but parallel so the
   slowest board gates. Cold-cache ~12 min, warm-cache ~4 min.
 - `sbom`: ~2 min cold, ~30 s warm.
 - `release`: ~30 s (pure asset assembly).
@@ -175,7 +174,7 @@ workspace crate. Spot-check one:
 ```sh
 gh release download v1.0.0 --pattern 'firmware.cdx.json'
 jq '.metadata.component.name, .components | length' firmware.cdx.json
-# Expected: "firmware"  followed by a component count (typically 80-120).
+# Expected: "pico2hsm-firmware", then a non-zero component count.
 ```
 
 SBOMs can be ingested by standard SCA tooling (Grype, Dependency-Track,
@@ -186,23 +185,26 @@ SBOMs can be ingested by standard SCA tooling (Grype, Dependency-Track,
 Pick one board (the `pico2_4m` is the recommended reference) and flash the
 unsigned UF2 via BOOTSEL:
 
-1. Hold `BOOTSEL` on the Pico 2 and plug USB → a `RPI-RP2` mass-storage volume
+1. Hold `BOOTSEL` on the Pico 2 and plug USB → an `RP2350` mass-storage volume
    appears.
-2. Flash:
+2. Flash the board's partition table once (`docs/FLASH_LAYOUT_2_0.md` §4),
+   then the firmware into slot 0:
    ```sh
-   picotool load pico2hsm-pico2_4m-unsigned.uf2 -t uf2 -x
-   # Or drag-and-drop the .uf2 onto the mass-storage volume.
+   picotool load pico2hsm-pico2_4m-pt-dev.uf2
+   picotool reboot -u
+   picotool load -p 0 -x pico2hsm-pico2_4m-unsigned.uf2
    ```
 3. After re-enumeration, confirm the smartcard reader is visible:
    ```sh
    opensc-tool --list-readers
    opensc-tool --atr
    ```
-   Expected ATR is the SC-HSM 2 ATR (see memory note `sc_hsm_atr.md`).
+   Expected ATR is the SC-HSM 2 ATR (`ATR` in `firmware/src/transport/mod.rs`,
+   starting `3B FE 18 00 00 81 31 FE 45`).
 
 If the device enumerates, an ATR is returned, and `opensc-tool --send-apdu
-00A4040B A0000003080000100001` SELECT responds with a reasonable SW, the UF2 is
-good.
+00A404000BA000000308000010000100` (SELECT PIV) responds with a reasonable
+SW, the UF2 is good.
 
 ---
 
@@ -215,7 +217,7 @@ Draft announcement template (adjust channels as appropriate):
 > **pico2hsm v1.0.0 is out.**
 >
 > - Release: https://github.com/mcarey42/pico2hsm/releases/tag/v1.0.0
-> - UF2 firmware for all six supported RP2350 boards (unsigned — sign locally
+> - UF2 firmware for all seven supported RP2350 boards (unsigned — sign locally
 >   for production).
 > - Highlights: [pull key bullets from CHANGELOG].
 >
@@ -273,8 +275,8 @@ must delete the tag separately on both the remote and the local repo.
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
-| `build-uf2` job fails for one board only | New code broke that board's feature flag | Fix on `main`, re-tag. Use `cargo check --no-default-features --features <board>,applet-piv,applet-openpgp-curve25519` locally to reproduce. |
-| UF2 for a board is missing from the release | The `build-uf2` matrix job for that board failed but the `release` job still ran | The release job's "Assemble release directory" step enforces all six boards are present; this should now fail fast. If you see a release published with a missing UF2 anyway, the enforcement regressed — file a bug. |
+| `build-uf2` job fails for one board only | New code broke that board's feature flag | Fix on `main`, re-tag. Use `cargo check -p pico2hsm-firmware --no-default-features --features <board>,applet-piv,applet-openpgp-curve25519` locally to reproduce. |
+| UF2 for a board is missing from the release | The `build-uf2` matrix job for that board failed but the `release` job still ran | The release job's "Assemble release directory" step enforces all seven boards are present; this should now fail fast. If you see a release published with a missing UF2 anyway, the enforcement regressed — file a bug. |
 | `SHA256SUMS` is empty or incomplete | Artifact download step lost a shard | Check the workflow logs under "Download all UF2 artifacts" for download failures. Re-run the workflow with `gh run rerun`. |
 | Release body says "No CHANGELOG.md section found for version X.Y.Z" | CHANGELOG header uses a different format than `## [X.Y.Z]` or tag name has a leading `v` that didn't get stripped | The extractor strips a single leading `v` from the tag. Ensure CHANGELOG uses `## [1.0.0] - 2026-04-16` (Keep-a-Changelog) exactly. |
 | `cargo install cargo-sbom` fails in the `sbom` job | crates.io outage or toolchain breakage | Re-run the workflow. The cached install path (`~/.cargo/bin/cargo-sbom`) is keyed on version 0.9.1; if the version is bumped, the cache miss forces a fresh install. |
@@ -306,7 +308,7 @@ dependency with its SPDX license tag — enough for manual audit.
 
 - Release workflow: `.github/workflows/release.yml`
 - Build workflow: `.github/workflows/build.yml`
-- Secure provisioning (signing): [SECURE_PROVISIONING_PLAN.md](SECURE_PROVISIONING_PLAN.md)
+- Secure provisioning plan (superseded, April 2026): [SECURE_PROVISIONING_PLAN.md](SECURE_PROVISIONING_PLAN.md)
 - Production provisioning playbook: [PROVISIONING.md](PROVISIONING.md)
 - Board matrix reference: [BUILD_CONFIGURATIONS.md](BUILD_CONFIGURATIONS.md)
 - Keep a Changelog: https://keepachangelog.com/en/1.1.0/

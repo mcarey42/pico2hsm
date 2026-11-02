@@ -77,7 +77,7 @@ Replace `pico2_4m` with your board. Valid board arguments:
 
 ### Feature flag discipline
 
-Board features are mutually exclusive. The `Cargo.toml` defaults include `rp2350_one_4m`, so using bare `--features X` will add to the defaults and cause a compile failure. Always use `--no-default-features`:
+Board features are mutually exclusive. The `firmware/Cargo.toml` defaults include `rp2350_one_4m`, so using bare `--features X` will add to the defaults and cause a compile failure. Always use `--no-default-features`:
 
 ```sh
 # Correct -- specifies board explicitly
