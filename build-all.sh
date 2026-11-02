@@ -237,8 +237,10 @@ if [[ $SKIP_ARM -eq 0 ]]; then
                 continue
             fi
 
+            # picotool 2.x: no --platform; the family names the chip and
+            # image type (rp2350-arm-s = 0xe48bff59, as in CI).
             if picotool uf2 convert "$ELF_COPY" -t elf "$UF2_OUT" \
-                    --family 0xe48bff59 --platform rp2350 \
+                    --family rp2350-arm-s \
                     >/dev/null 2>&1; then
                 UF2_SIZE=$(du -h "$UF2_OUT" | cut -f1)
                 ok "  $NAME → dist/pico2hsm-${FEAT}.uf2  (${UF2_SIZE})"
