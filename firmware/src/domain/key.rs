@@ -24,7 +24,7 @@
 
 use elliptic_curve::ops::Reduce;
 use hkdf::Hkdf;
-use p256::elliptic_curve::sec1::ToEncodedPoint;
+use p256::elliptic_curve::sec1::ToSec1Point;
 use p256::{FieldBytes, NonZeroScalar, Scalar, U256};
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
@@ -54,9 +54,9 @@ fn reduce_okm(okm: &[u8; OKM_LEN]) -> Scalar {
     let mut lo = FieldBytes::default();
     lo.copy_from_slice(&okm[16..]);
     // 2^256 mod n = (2^256 - 1 mod n) + 1.
-    let two_256 = <Scalar as Reduce<U256>>::reduce(U256::MAX) + Scalar::ONE;
-    let hi = <Scalar as Reduce<U256>>::reduce_bytes(&hi);
-    let lo = <Scalar as Reduce<U256>>::reduce_bytes(&lo);
+    let two_256 = <Scalar as Reduce<U256>>::reduce(&U256::MAX) + Scalar::ONE;
+    let hi = <Scalar as Reduce<FieldBytes>>::reduce(&hi);
+    let lo = <Scalar as Reduce<FieldBytes>>::reduce(&lo);
     hi * two_256 + lo
 }
 
@@ -81,7 +81,7 @@ impl DomainKey {
         let mut d = Zeroizing::new([0u8; 32]);
         d.copy_from_slice(&nz.to_bytes());
         let public = p256::PublicKey::from_secret_scalar(&nz);
-        let encoded = public.to_encoded_point(false);
+        let encoded = public.to_sec1_point(false);
         let mut q = [0u8; 65];
         q.copy_from_slice(encoded.as_bytes());
         Ok(DomainKey {

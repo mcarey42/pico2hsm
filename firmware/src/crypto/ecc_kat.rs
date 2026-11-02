@@ -481,13 +481,13 @@ fn hd_master(kt: KeyType) -> KeyMaterial {
 
 /// Uncompressed public point for a 32-byte private key on K-256 / P-256.
 fn pub_of(kt: KeyType, sk: &[u8]) -> Vec<u8> {
-    use elliptic_curve::sec1::ToEncodedPoint;
+    use elliptic_curve::sec1::ToSec1Point;
     if kt == K256 {
         let k = k256::SecretKey::from_slice(sk).unwrap();
-        k.public_key().to_encoded_point(false).as_bytes().to_vec()
+        k.public_key().to_sec1_point(false).as_bytes().to_vec()
     } else {
         let k = p256::SecretKey::from_slice(sk).unwrap();
-        k.public_key().to_encoded_point(false).as_bytes().to_vec()
+        k.public_key().to_sec1_point(false).as_bytes().to_vec()
     }
 }
 

@@ -25,6 +25,8 @@ pub mod ec_params;
 #[cfg(test)]
 mod ecc_kat;
 pub mod kdf;
+/// `rand_core` 0.6 RNGs presented to the RustCrypto 0.14 ECC crates.
+pub mod rng_compat;
 /// Sliceable FIPS 186-5 RSA key generation (A.1.3 / B.3).
 #[cfg(feature = "rsa")]
 pub mod rsa_keygen;
