@@ -188,7 +188,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p sbom-output
-          for crate in pico2hsm-core firmware pico2hsm-integration-tests; do
+          for crate in pico2hsm-core pico2hsm-layout firmware pico2hsm-integration-tests; do
             echo "=== SBOM for $crate ==="
             cargo sbom \
               --cargo-package "$crate" \

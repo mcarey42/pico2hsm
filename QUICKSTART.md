@@ -187,9 +187,8 @@ What it does:
 1. Checks that all tools are installed
 2. Runs the host tests
 3. Detects your signing key and signs every firmware file it builds
-4. Builds release firmware for every board variant (all applets + RSA;
-   `rp2350_one_16m` is not in its list yet: build that one by hand, see
-   [docs/BUILD_CONFIGURATIONS.md](docs/BUILD_CONFIGURATIONS.md))
+4. Builds release firmware for every board variant, all seven (all
+   applets + RSA; see [docs/BUILD_CONFIGURATIONS.md](docs/BUILD_CONFIGURATIONS.md))
 5. Creates UF2 files for each board
 
 A full build takes about 5–10 minutes. When it finishes you should see a

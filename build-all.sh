@@ -250,7 +250,7 @@ if [[ $SKIP_ARM -eq 0 ]]; then
         done
 
         info "UF2 files written to dist/"
-        info "To flash: hold BOOTSEL, plug USB, copy .uf2 to the RPI-RP2 drive"
+        info "To flash: hold BOOTSEL, plug USB, copy .uf2 to the RP2350 drive"
     fi
 
     # Summary table
