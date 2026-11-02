@@ -94,7 +94,8 @@ Other supported key types:
 | `EC:secp521r1` | ECDSA / ECDH P-521 |
 | `EC:secp256k1` | ECDSA secp256k1 (Bitcoin curve) |
 
-Brainpool curves are not supported; do not request them.
+Brainpool curves are not supported: the device refuses them with `6A80`
+(2.2.0 and later; older firmware made a NIST key instead).
 
 ---
 
