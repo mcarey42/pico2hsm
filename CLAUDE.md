@@ -114,17 +114,18 @@ These compose freely with the board feature flags, e.g.:
 
 ```sh
 # SC-HSM + PIV on Pico 2:
-cargo build --release --no-default-features --features pico2_4m,applet-piv
+cargo build -p pico2hsm-firmware --release --no-default-features --features pico2_4m,applet-piv
 
 # All three applets + Ed25519:
-cargo build --release --no-default-features \
+cargo build -p pico2hsm-firmware --release --no-default-features \
     --features pico2_4m,applet-piv,applet-openpgp,applet-openpgp-curve25519
 ```
 
 **Flash / RAM budget (release, all applets + RSA + curve25519, 1.0.1 workspace
 version after Storage V2 phase 6, measured 2026-10-15 with `arm-none-eabi-size -A`;
 flash = `.boot2`+`.vector_table`+`.text`+`.rodata`+`.data`, static RAM =
-`.data`+`.bss`+`.uninit` of the 520 KB SRAM; the rest is core0's stack):**
+`.data`+`.bss`+`.uninit` of the 520 KB SRAM; the rest is core0's stack).
+These figures predate 2.x and are to be re-measured:**
 
 | Board | Flash | Static RAM | SRAM % |
 |---|---|---|---|
@@ -399,10 +400,10 @@ or `watchdog::crumb`.  Any other lock core1 shares with core0 must be a
 
 ### Feature flags and default features
 
-`Cargo.toml` sets `default = ["rp2350_one_4m", "rsa", "applet-piv", "applet-openpgp-curve25519"]`. Using `--features X` adds to the defaults, which causes multiple conflicting board features to be active simultaneously and will fail to compile. Always use `--no-default-features` when specifying a non-default board:
+`firmware/Cargo.toml` sets `default = ["rp2350_one_4m", "rsa", "applet-piv", "applet-openpgp-curve25519"]`. Using `--features X` adds to the defaults, which causes multiple conflicting board features to be active simultaneously and will fail to compile. Always use `--no-default-features` when specifying a non-default board:
 
 ```sh
-cargo check --no-default-features --features rp2350_geek_16m
+cargo check -p pico2hsm-firmware --no-default-features --features rp2350_geek_16m
 ```
 
 The debug script handles this correctly automatically.
