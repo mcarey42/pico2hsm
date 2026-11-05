@@ -447,7 +447,7 @@ def test_wrapped_key_moves_between_devices(enrolled_peers, runner: CLIRunner, co
     from cryptography.hazmat.primitives import hashes, serialization
     from cryptography.hazmat.primitives.asymmetric import ec
 
-    k0, k1 = _kcv(runner, 0), _kcv(runner, 1)
+    k0, k1 = _kcv(runner, R0()), _kcv(runner, R1())
     if not k0 or k0 != k1:
         pytest.skip(f"devices do not share a DKEK (KCV {k0} / {k1})")
     slots = [_pkcs11_slot(runner, R0()), _pkcs11_slot(runner, R1())]
@@ -468,7 +468,7 @@ def test_wrapped_key_moves_between_devices(enrolled_peers, runner: CLIRunner, co
     assert rd.returncode == 0, rd.stderr[-2000:]
     pub = serialization.load_der_public_key(pub_der.read_bytes())
 
-    ref = _key_ref_for_id(0, key_id)
+    ref = _key_ref_for_id(R0(), key_id)
     if ref is None:
         # Fall back to the newest key reference.
         from helpers.pcsc import session

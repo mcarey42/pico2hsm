@@ -6,6 +6,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.3.0] - 2026-11-05
+
+Maintenance and hardening release. No flash layout, partition table or
+keystore format change: a 2.2.x device keeps its keys across the update.
+pico2hsm-tool is now versioned in lock step with the firmware; tool 2.3.0
+goes with this release.
+
 ### Security
 
 - **The ECDH secret is wiped after the DKEK exchange.** `p256_ecdh`
@@ -14,8 +21,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   overwritten. Both are now wiped on drop. Output is unchanged (the
   known-answer vector passes).
 
+### Dependencies
+
+- `rand` 0.8.5 → 0.8.8 (clears a `cargo audit` unsound warning), `cortex-m`
+  0.7.7 → 0.7.10, `defmt` 0.3 → 1.0 (0.3.100 was already the shim over
+  1.0.1; log format unchanged). Sha1 stays on 0.10 until the `rsa` 0.10
+  move (sha1 0.11 needs the newer digest traits).
+- CI: `actions/setup-python` 7.1.0, pinned by commit.
+
 ### Documentation
 
+- `docs/RELEASE_PROCESS.md`: release pico2hsm-tool with the same version.
 - Flash and RAM budgets in CLAUDE.md and `docs/BUILD_CONFIGURATIONS.md`
   re-measured on 2.2.0 (RustCrypto 0.14 made the full build 125 KB
   smaller), plus the 2.2.0 hardware core1 stack peak.
