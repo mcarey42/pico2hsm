@@ -121,21 +121,20 @@ cargo build -p pico2hsm-firmware --release --no-default-features \
     --features pico2_4m,applet-piv,applet-openpgp,applet-openpgp-curve25519
 ```
 
-**Flash / RAM budget (release, all applets + RSA + curve25519, 1.0.1 workspace
-version after Storage V2 phase 6, measured 2026-10-15 with `arm-none-eabi-size -A`;
-flash = `.boot2`+`.vector_table`+`.text`+`.rodata`+`.data`, static RAM =
-`.data`+`.bss`+`.uninit` of the 520 KB SRAM; the rest is core0's stack).
-These figures predate 2.x and are to be re-measured:**
+**Flash / RAM budget (release, all applets + RSA + curve25519, firmware 2.2.0,
+measured 2026-11-04 with `arm-none-eabi-size -A`; flash =
+`.boot2`+`.vector_table`+`.text`+`.rodata`+`.data`, static RAM =
+`.data`+`.bss`+`.uninit` of the 520 KB SRAM; the rest is core0's stack):**
 
 | Board | Flash | Static RAM | SRAM % |
 |---|---|---|---|
-| Pico 2 4MB | 647 KB | 251 KB | 48% |
-| RP2350-One 4MB | 650 KB | 251 KB | 48% |
-| RP2350-One 16MB | 650 KB | 254 KB | 49% |
-| RP2350-Geek 16MB | 679 KB | 246 KB | 47% |
-| RP2350-Geek SDCard | 684 KB | 246 KB | 47% |
-| Waveshare LCD 16MB | 684 KB | 248 KB | 48% |
-| Waveshare LCD SDCard | 689 KB | 248 KB | 48% |
+| Pico 2 4MB | 522 KB | 251 KB | 48% |
+| RP2350-One 4MB | 526 KB | 251 KB | 48% |
+| RP2350-One 16MB | 526 KB | 254 KB | 49% |
+| RP2350-Geek 16MB | 554 KB | 246 KB | 47% |
+| RP2350-Geek SDCard | 559 KB | 246 KB | 47% |
+| Waveshare LCD 16MB | 560 KB | 248 KB | 48% |
+| Waveshare LCD SDCard | 564 KB | 248 KB | 48% |
 
 Flash is not a concern (slot A is 1,880 KB on 4 MB boards, 4,088 KB on
 16 MB boards).  RAM is the metric to watch; the 96 KB core1 stack (128 KB
@@ -321,7 +320,7 @@ when changing the code.
 
 **Cause**: core1 runs the whole dispatch chain on its own 96 KB stack (`CORE1_STACK` in `firmware/src/main.rs`). Large stack temporaries — `Vec<u8, 4096>` response buffers, `KeyObject`s (~3 KB), 4 KB flash sector buffers, PKCS#1 DER buffers — add up across `dispatcher_loop → Dispatcher::dispatch_into → <protocol>::process_apdu_with_store → route_with_store → handler → store`. MSPLIM is set at the stack base, so an overflow faults (UsageFault) instead of silently corrupting memory, but core1 still stops. (The protocol *state*, e.g. `ScHsmState`, lives in BSS via `DISPATCHER_CELL`, not on this stack.)
 
-**Measured on hardware** (2026-10-12, debug, full `run_tests.sh`): the stack is painted at boot and the watchdog feeder logs `core1 stack high water: N of 98304 bytes` (RTT and the CDC log) whenever it grows by 1 KB.  Peak on pico2_4m: **60.5 KB** (81 KB before the core0/core1 mailboxes, which took `dispatcher_loop`'s frame from 20.6 KB to 72 B); on waveshare_rp2350_lcd_sdcard (storage I/O on core1): **62.9 KB** of the 96 KB stack.  Static frame sums, for orientation (pre-mailbox): PIV PUT DATA on an SD board ≈ 89 KB; RSA GENERATE from the key pool ≈ 86 KB; the idle-time pool slice ≈ 31 KB.
+**Measured on hardware** (2026-10-12, debug, full `run_tests.sh`): the stack is painted at boot and the watchdog feeder logs `core1 stack high water: N of 98304 bytes` (RTT and the CDC log) whenever it grows by 1 KB.  Peak on pico2_4m: **60.5 KB** (81 KB before the core0/core1 mailboxes, which took `dispatcher_loop`'s frame from 20.6 KB to 72 B); on waveshare_rp2350_lcd_sdcard (storage I/O on core1): **62.9 KB** of the 96 KB stack.  Firmware 2.2.0 (RustCrypto 0.14, 2026-11-02, full hw suite on pico2_4m): **59.4 KB** (60,844 B).  Static frame sums, for orientation (pre-mailbox): PIV PUT DATA on an SD board ≈ 89 KB; RSA GENERATE from the key pool ≈ 86 KB; the idle-time pool slice ≈ 31 KB.
 
 **Re-measure** after adding large locals or a deeper call path (the boot log is the real number; the frame sizes below show where it goes):
 ```sh

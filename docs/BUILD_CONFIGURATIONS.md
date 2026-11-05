@@ -231,7 +231,7 @@ cargo build --release -p pico2hsm-firmware --no-default-features \
 
 ### With RSA support
 
-RSA support is feature-gated (`rsa`). It adds ~115 KB of flash and ~57 KB of
+RSA support is feature-gated (`rsa`). It adds ~118 KB of flash and ~57 KB of
 RAM (the 48 KB RSA heap and the key pool's generator state). It can be
 combined with any board and applet combination:
 
@@ -248,9 +248,8 @@ cargo build --release -p pico2hsm-firmware --no-default-features \
 
 ## Flash / RAM budget
 
-Measured 2026-10-15 (workspace version 1.0.1, Storage V2 phase 6) from
-release builds with `arm-none-eabi-size -A`; these figures predate 2.x and
-are to be re-measured:
+Measured 2026-11-04 (firmware 2.2.0) from release builds with
+`arm-none-eabi-size -A`:
 
 - **Flash** = `.boot2` + `.vector_table` + `.text` + `.rodata` + `.data`
   (what goes into the firmware slot).
@@ -267,25 +266,25 @@ arm-none-eabi-size -A target/thumbv8m.main-none-eabihf/release/pico2hsm
 
 | Board | Flash | Static RAM | SRAM % |
 |-------|-------|------------|--------|
-| `pico2_4m` | 647 KB | 251 KB | 48% |
-| `rp2350_one_4m` | 650 KB | 251 KB | 48% |
-| `rp2350_one_16m` | 650 KB | 254 KB | 49% |
-| `rp2350_geek_16m` | 679 KB | 246 KB | 47% |
-| `rp2350_geek_sdcard` | 684 KB | 246 KB | 47% |
-| `waveshare_rp2350_lcd_16m` | 684 KB | 248 KB | 48% |
-| `waveshare_rp2350_lcd_sdcard` | 689 KB | 248 KB | 48% |
+| `pico2_4m` | 522 KB | 251 KB | 48% |
+| `rp2350_one_4m` | 526 KB | 251 KB | 48% |
+| `rp2350_one_16m` | 526 KB | 254 KB | 49% |
+| `rp2350_geek_16m` | 554 KB | 246 KB | 47% |
+| `rp2350_geek_sdcard` | 559 KB | 246 KB | 47% |
+| `waveshare_rp2350_lcd_16m` | 560 KB | 248 KB | 48% |
+| `waveshare_rp2350_lcd_sdcard` | 564 KB | 248 KB | 48% |
 
 ### Per applet combination, `pico2_4m`
 
 | Applets | Flash | Static RAM |
 |---------|-------|------------|
-| SC-HSM only | 500 KB | 186 KB |
-| SC-HSM + PIV | 515 KB | 194 KB |
-| SC-HSM + OpenPGP (NIST) | 500 KB | 186 KB |
-| SC-HSM + OpenPGP + curve25519 | 517 KB | 186 KB |
-| All three + curve25519 (no RSA) | 532 KB | 194 KB |
-| SC-HSM + RSA | 614 KB | 243 KB |
-| All three + curve25519 + RSA | 647 KB | 251 KB |
+| SC-HSM only | 356 KB | 183 KB |
+| SC-HSM + PIV | 372 KB | 191 KB |
+| SC-HSM + OpenPGP (NIST) | 371 KB | 186 KB |
+| SC-HSM + OpenPGP + curve25519 | 389 KB | 186 KB |
+| All three + curve25519 (no RSA) | 404 KB | 194 KB |
+| SC-HSM + RSA | 474 KB | 240 KB |
+| All three + curve25519 + RSA | 522 KB | 251 KB |
 
 The display boards add ~30–40 KB of flash for the display code; they hold
 no framebuffer (a 16-row band buffer of 5.6 KB on the Geek, 7.5 KB on the
