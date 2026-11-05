@@ -1123,12 +1123,13 @@ pub fn p256_ecdh(
             .ok_or(DkekError::EcdhFailure)?,
     );
 
-    // Multiply peer point by our scalar.
+    // Multiply peer point by our scalar.  The shared point and its SEC1
+    // encoding both hold the secret X coordinate: wiped on drop.
     let peer_point: ProjectivePoint = peer_pk.into();
-    let shared_point = (peer_point * **nz_scalar).to_affine();
+    let shared_point = Zeroizing::new((peer_point * **nz_scalar).to_affine());
 
     // Extract X-coordinate (the ECDH shared secret).
-    let shared_encoded = shared_point.to_sec1_point(false);
+    let shared_encoded = Zeroizing::new(shared_point.to_sec1_point(false));
     let x = shared_encoded.x().ok_or(DkekError::EcdhFailure)?;
 
     let mut out = Zeroizing::new([0u8; 32]);

@@ -6,6 +6,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **The ECDH secret is wiped after the DKEK exchange.** `p256_ecdh`
+  wiped its private scalar but left the shared point and its SEC1
+  encoding, both holding the secret X coordinate, on core1's stack until
+  overwritten. Both are now wiped on drop. Output is unchanged (the
+  known-answer vector passes).
+
+### Documentation
+
+- Flash and RAM budgets in CLAUDE.md and `docs/BUILD_CONFIGURATIONS.md`
+  re-measured on 2.2.0 (RustCrypto 0.14 made the full build 125 KB
+  smaller), plus the 2.2.0 hardware core1 stack peak.
+
 ## [2.2.0] - 2026-11-02
 
 Security release: the ECC code moves to RustCrypto 0.14, which fixes
