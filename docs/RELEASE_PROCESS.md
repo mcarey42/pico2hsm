@@ -210,6 +210,16 @@ SW, the UF2 is good.
 
 ## 6. Post-release
 
+### 6.0 Release pico2hsm-tool with the same version
+
+[pico2hsm-tool](https://github.com/mcarey42/pico2hsm-tool) is versioned in
+lock step with the firmware: tool vX.Y.Z goes out right after firmware
+vX.Y.Z, and its `LATEST_FIRMWARE` is that version (so `pico2hsm-tool status`
+recommends it). In the tool repository: bump the workspace version and
+`LATEST_FIRMWARE`, merge, then tag `vX.Y.Z`; its `release.yml` refuses to
+publish if the tag, the version and `LATEST_FIRMWARE` disagree. See the
+tool's CONTRIBUTING.md.
+
 ### 6.1 Announce
 
 Draft announcement template (adjust channels as appropriate):
