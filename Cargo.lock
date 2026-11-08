@@ -1805,7 +1805,6 @@ dependencies = [
  "pico2hsm-layout",
  "png",
  "rand_core 0.10.1",
- "rand_core 0.6.4",
  "rfc6979 0.4.0",
  "rsa",
  "sha1",
