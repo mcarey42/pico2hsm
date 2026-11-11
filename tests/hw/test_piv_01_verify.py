@@ -99,15 +99,30 @@ def test_piv_verify_default_pin_accepted(runner: CLIRunner, run_dir: Path) -> No
     )
 
 
+def _restore_pin_counter(runner: CLIRunner) -> str | None:
+    """VERIFY with the correct PIN, which resets the retry counter to its maximum."""
+    restore = _send_apdus(runner, _SELECT_PIV, _VERIFY_DEFAULT_PIN_CLEAN)
+    sw = _sw_from_output(restore.stdout + restore.stderr)
+    log.info("Restore verify SW: %s", sw)
+    return sw
+
+
 def test_piv_verify_wrong_pin_returns_63cx(runner: CLIRunner, run_dir: Path) -> None:
-    """VERIFY with a wrong PIN must return SW=63Cx (x = retries remaining)."""
-    result = _send_apdus(
-        runner,
-        _SELECT_PIV,
-        _VERIFY_WRONG_PIN,
-        save_as="piv_01_verify_wrong_pin",
-        timeout=30,
-    )
+    """VERIFY with a wrong PIN must return SW=63Cx (x = retries remaining).
+
+    The correct PIN is verified afterwards, so the counter is back at its
+    maximum for the tests that follow.
+    """
+    try:
+        result = _send_apdus(
+            runner,
+            _SELECT_PIV,
+            _VERIFY_WRONG_PIN,
+            save_as="piv_01_verify_wrong_pin",
+            timeout=30,
+        )
+    finally:
+        _restore_pin_counter(runner)
 
     combined = result.stdout + result.stderr
     sw = _sw_from_output(combined)
@@ -128,66 +143,42 @@ def test_piv_verify_wrong_pin_returns_63cx(runner: CLIRunner, run_dir: Path) -> 
 
 
 def test_piv_verify_retry_counter_decrements(runner: CLIRunner) -> None:
-    """Submitting a wrong PIN twice must decrement the retry counter by 2.
+    """Two wrong PINs take the retry counter 3 -> 2 -> 1; the correct PIN resets it.
 
-    This test re-selects the PIV applet between each attempt so the session
-    is clean.  It reads the counter via the query form first, then checks
-    that two wrong-PIN attempts each decrease it by one.
-
-    Note: This test consumes real retry attempts.  A fresh card with the
-    default PIN has 3 retries; after this test 1 retry will remain.
-    The test is designed to avoid locking the PIN by never exhausting all
-    retries.
+    Self-contained: it verifies the correct PIN first (resetting the counter
+    to 3 whatever earlier tests left), and again at the end, even when an
+    assertion fails.  It never comes near locking the PIN.  Each APDU batch
+    is its own card session, so the query form reads the counter fresh.
     """
-    import re
 
-    def get_counter(runner: CLIRunner) -> int | None:
-        """Return retry count from VERIFY query SW=63Cx, or None if unavailable."""
+    def get_counter() -> int | None:
+        """Retry count from the VERIFY query's SW 63Cx, or None."""
         result = _send_apdus(runner, _SELECT_PIV, _VERIFY_QUERY)
-        combined = result.stdout + result.stderr
-        sw = _sw_from_output(combined)
+        sw = _sw_from_output(result.stdout + result.stderr)
         if sw and sw.upper().startswith("63C"):
             return int(sw[3], 16)
-        if sw == "9000":
-            return None  # already verified
         return None
 
-    initial = get_counter(runner)
-    if initial is None:
-        pytest.skip("Could not read initial retry counter via VERIFY query.")
-    if initial < 3:
-        pytest.skip(
-            f"Retry counter is already below 3 ({initial}); "
-            "skipping destructive test to avoid locking the PIN."
+    sw = _restore_pin_counter(runner)
+    assert sw == "9000", f"Correct PIN refused before the test (SW={sw!r}); PIN blocked or changed?"
+    try:
+        initial = get_counter()
+        assert initial == 3, f"Expected 3 retries after a correct VERIFY, got {initial}"
+
+        _send_apdus(runner, _SELECT_PIV, _VERIFY_WRONG_PIN)
+        after_first = get_counter()
+        _send_apdus(runner, _SELECT_PIV, _VERIFY_WRONG_PIN)
+        after_second = get_counter()
+        log.info(
+            "Retry counter: initial=%s  after_1st_wrong=%s  after_2nd_wrong=%s",
+            initial, after_first, after_second,
         )
-
-    # First wrong PIN
-    _send_apdus(runner, _SELECT_PIV, _VERIFY_WRONG_PIN)
-    after_first = get_counter(runner)
-
-    # Second wrong PIN
-    _send_apdus(runner, _SELECT_PIV, _VERIFY_WRONG_PIN)
-    after_second = get_counter(runner)
-
-    log.info(
-        "Retry counter: initial=%s  after_1st_wrong=%s  after_2nd_wrong=%s",
-        initial, after_first, after_second,
-    )
-
-    if after_first is not None:
-        assert after_first == initial - 1, (
-            f"Expected counter {initial - 1} after first wrong PIN, got {after_first}"
-        )
-    if after_second is not None:
-        assert after_second == initial - 2, (
-            f"Expected counter {initial - 2} after second wrong PIN, got {after_second}"
-        )
-
-    # Restore counter by verifying with the correct PIN
-    restore = _send_apdus(runner, _SELECT_PIV, _VERIFY_DEFAULT_PIN_CLEAN)
-    combined = restore.stdout + restore.stderr
-    sw = _sw_from_output(combined)
-    log.info("Restore verify SW: %s", sw)
+        assert after_first == 2, f"Expected 2 retries after one wrong PIN, got {after_first}"
+        assert after_second == 1, f"Expected 1 retry after two wrong PINs, got {after_second}"
+    finally:
+        sw = _restore_pin_counter(runner)
+    assert sw == "9000", f"Correct PIN refused after the test (SW={sw!r})"
+    assert get_counter() == 3, "Counter not reset to 3 by the correct PIN"
 
 
 def test_piv_change_pin_succeeds(runner: CLIRunner, run_dir: Path) -> None:
