@@ -97,7 +97,7 @@ rand_core = { version = "0.6", default-features = false }
 rand_core_010 = { package = "rand_core", version = "0.10", default-features = false }
 
 # Curve25519 — feature-gated (applet-openpgp-curve25519)
-ed25519-dalek = { version = "2", default-features = false, features = ["rand_core"], optional = true }
+ed25519-dalek = { version = "3", default-features = false, features = ["rand_core"], optional = true }
 x25519-dalek  = { version = "2", default-features = false, features = ["static_secrets"], optional = true }
 
 # Display rendering (DrawTarget, mono fonts).  Platform-agnostic so the
