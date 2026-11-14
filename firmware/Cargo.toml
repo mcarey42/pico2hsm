@@ -93,7 +93,7 @@ ecdsa = { version = "0.17", default-features = false, features = ["algorithm", "
 # rest of the firmware); ecdsa 0.17 brings its own rfc6979 0.6 for the other curves.
 rfc6979 = { version = "0.4", default-features = false }
 elliptic-curve = { version = "0.14", default-features = false, features = ["arithmetic", "sec1", "ecdh"] }
-rand_core = { version = "0.6", default-features = false }
+rand_core = { version = "0.10", default-features = false }
 rand_core_010 = { package = "rand_core", version = "0.10", default-features = false }
 
 # Curve25519 — feature-gated (applet-openpgp-curve25519)
@@ -153,7 +153,7 @@ hex = { version = "0.4" }
 # Display preview images (host render harness only).
 png = { version = "0.17" }
 heapless = { version = "0.9" }
-rand_core = { version = "0.6" }
+rand_core = { version = "0.10" }
 # Partition-table generator for the committed-table test.
 pico2hsm-layout = { path = "../layout", features = ["std"] }
 
